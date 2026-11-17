@@ -6,7 +6,7 @@ Git-Graveyard diagnoses why an abandoned GitHub repository died and brings it ba
 
 ## Status
 
-Core engine & Cryptic Gothic Terminal UI are complete on `main`: Necromancer backend orchestration, Grimoire M1–M6 rules/gate, Warden verification, Next.js 16 UI, `/debug/ui?uiDebug=1` showcase & live-state inspector, live-state diagnostic APIs (`/api/health?detail=1`, `/api/debug/status`, `/api/debug/runs/[runId]`, `/api/debug/sim`), Playwright E2E suite (`T35`), code neatness & pre-public privacy cleanup (`T37`/`T38`), and a real sandboxed Kiro CLI recorded resurrection (`live-gulp-plumber-t40` for `T40`). See [`output/demo-and-inspector-guide-2026-11-17.md`](output/demo-and-inspector-guide-2026-11-17.md) for demo replay and live-state inspection instructions; only final demo video recording and submission visibility switch remain.
+Increment 0 and Increment 1 (core engine & Cryptic Gothic Terminal UI baseline) are complete on `main`: Necromancer backend orchestration, Grimoire M1–M6 rules/gate, Warden verification, Next.js 16 UI, `/debug/ui?uiDebug=1` showcase & live-state inspector, live-state diagnostic APIs (`/api/health?detail=1`, `/api/debug/status`, `/api/debug/runs/[runId]`, `/api/debug/sim`), Playwright E2E suite (`T35`), pre-public privacy & history cleanup, and a real sandboxed Kiro CLI recorded resurrection (`live-gulp-plumber-t40`). See [`output/handoff-increment2-5-2026-11-18.md`](output/handoff-increment2-5-2026-11-18.md) for the teammate continuation plan covering **Increment 2–5**, and [`output/demo-and-inspector-guide-2026-11-17.md`](output/demo-and-inspector-guide-2026-11-17.md) for offline demo replay and live-state inspection instructions.
 
 ## Workspace
 
@@ -70,8 +70,8 @@ $env:GITHUB_TOKEN = "<token>"   # raises the GitHub rate limit
 
 ## Documents
 
+- `output/handoff-increment2-5-2026-11-18.md`: completed Increment 0–1 baseline & teammate continuation guide for Increment 2–5
 - `output/demo-and-inspector-guide-2026-11-17.md`: live-state inspector endpoints, Playwright E2E, and offline recorded-run demo replay guide
-- `output/project-handoff-2026-11-16.md`: earlier milestone handoff baseline (superseded on `main` by the guide above)
 - `PLAN.md`: short overview
 - `.kiro/specs/resurrection-engine/`: requirements, design and task plan
 - `REFERENCES.md`: contest rules, past winners, Kiro mechanics

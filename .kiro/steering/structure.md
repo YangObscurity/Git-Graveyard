@@ -25,11 +25,11 @@ inclusion: always
 
 - Top-level actions use `app/api/<verb-noun>/route.ts`: `/api/run-autopsy`, `/api/start-run`.
 - Resources nest under a noun with dynamic segments:
-  - Implemented in Increment 1: `/api/runs/[runId]`, `/api/runs/[runId]/events`, `/api/runs/[runId]/pact`, `/api/runs/[runId]/approvals`, `/api/runs/[runId]/asks`, `/api/runs/[runId]/skeletons/[skeletonId]`, `/api/runs/[runId]/control`, `/runs/[runId]/relic/download`, `/api/history`, `/api/health`, `/api/debug/status`, `/api/debug/runs/[runId]`, `/api/debug/sim`.
-  - Deferred to Increment 3+ (per scope stop at Increment 1): `/api/runs/[runId]/messages`, `/api/runs/[runId]/artifacts`, `/api/runs/[runId]/push-fork`, `/api/admin/...`.
+  - Implemented (Increment 1 baseline): `/api/runs/[runId]`, `/api/runs/[runId]/events`, `/api/runs/[runId]/pact`, `/api/runs/[runId]/approvals`, `/api/runs/[runId]/asks`, `/api/runs/[runId]/skeletons/[skeletonId]`, `/api/runs/[runId]/control`, `/runs/[runId]/relic/download`, `/api/history`, `/api/health`, `/api/debug/status`, `/api/debug/runs/[runId]`, `/api/debug/sim`.
+  - Increment 2-5 continuation targets (handed over; see `output/handoff-increment2-5-2026-11-18.md`): `/api/runs/[runId]/messages`, `/api/runs/[runId]/artifacts`, `/api/runs/[runId]/push-fork`, `/api/admin/...`.
 - Pages:
-  - Implemented in Increment 1: `/`, `/tomb/[owner]/[repo]`, `/runs/[runId]`, `/runs/[runId]/pact`, `/runs/[runId]/legion`, `/runs/[runId]/relic`, `/history`, `/replay`, `/replay/[runId]`, `/debug/ui`.
-  - Deferred to Increment 3+: `/built-with-kiro`, `/admin`.
+  - Implemented (Increment 1 baseline): `/`, `/tomb/[owner]/[repo]`, `/runs/[runId]`, `/runs/[runId]/pact`, `/runs/[runId]/legion`, `/runs/[runId]/relic`, `/history`, `/replay`, `/replay/[runId]`, `/debug/ui`.
+  - Increment 2-5 continuation pages: `/built-with-kiro`, `/admin`.
 
 ## Naming
 
