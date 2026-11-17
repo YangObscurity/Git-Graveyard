@@ -1,0 +1,44 @@
+{
+  "signals": [
+    {
+      "ruleId": "M2",
+      "file": "index.js",
+      "line": 1,
+      "column": 16,
+      "matched": "require('request')",
+      "confidence": "high",
+      "manifestDir": "."
+    },
+    {
+      "ruleId": "M3",
+      "file": "index.js",
+      "line": 1,
+      "column": 16,
+      "matched": "require('request')",
+      "confidence": "high",
+      "manifestDir": "."
+    },
+    {
+      "ruleId": "M6",
+      "file": "package.json",
+      "line": 1,
+      "column": 1,
+      "matched": "missing lock file",
+      "confidence": "high",
+      "manifestDir": "."
+    }
+  ],
+  "verdict": {
+    "status": "dead",
+    "deadReasons": [
+      "deprecation_signal"
+    ],
+    "reasons": [
+      "deprecation_signal"
+    ],
+    "lifespanYears": "unknown",
+    "yearsDead": 0,
+    "asOf": "2026-11-08T00:00:00.000Z"
+  },
+  "unknowns": []
+}

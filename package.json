@@ -1,0 +1,47 @@
+{
+  "name": "git-graveyard",
+  "private": true,
+  "scripts": {
+    "predev": "node scripts/copy-monaco.mjs && node scripts/generate-engine-version.mjs && node scripts/check-wasm.mjs",
+    "dev": "next dev",
+    "prebuild": "node scripts/copy-monaco.mjs && node scripts/generate-engine-version.mjs && node scripts/check-wasm.mjs",
+    "build": "next build",
+    "start": "next start",
+    "typecheck": "tsc --noEmit",
+    "status": "tsx scripts/dev-status.ts",
+    "test": "tsx --test",
+    "test:signals": "tsx test/grimoire/signals.test.ts",
+    "test:props": "tsx --test test/props/*.test.ts",
+    "test:golden": "tsx test/golden/golden.test.ts",
+    "test:debug": "tsx --test test/api/debug-status.test.ts test/ui/ui-debug-contract.test.ts",
+    "test:e2e": "playwright test",
+    "test:oracle": "tsx test/oracle/cpython-oracle.test.ts",
+    "pin:fixtures": "tsx scripts/fixtures/pin.ts",
+    "bake:presets": "tsx scripts/fixtures/bake.ts",
+    "evidence:build": "tsx scripts/evidence/build-evidence.ts"
+  },
+  "dependencies": {
+    "@babel/parser": "^8.1.0",
+    "@monaco-editor/react": "^4.7.0",
+    "diff": "^9.0.0",
+    "fast-check": "^4.10.2",
+    "monaco-editor": "^0.57.0",
+    "next": "16.4.5",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "tree-sitter-python": "0.25.0",
+    "web-tree-sitter": "0.27.1",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.65.1",
+    "@tailwindcss/postcss": "^4.3.5",
+    "@types/node": "^26.6.6",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "postcss": "^8.5.32",
+    "tailwindcss": "^4.3.5",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}

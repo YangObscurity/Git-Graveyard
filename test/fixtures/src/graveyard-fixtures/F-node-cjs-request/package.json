@@ -1,0 +1,9 @@
+{
+  "name": "f-node-cjs-request",
+  "version": "1.0.0",
+  "description": "Test fixture for CommonJS request modernization.",
+  "main": "index.js",
+  "dependencies": {
+    "request": "^2.88.2"
+  }
+}
