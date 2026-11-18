@@ -1,0 +1,10 @@
+{
+  "name": "f-node-webpack2",
+  "version": "1.0.0",
+  "description": "Test fixture for webpack 2 and lodash 3 modernization.",
+  "main": "index.js",
+  "dependencies": {
+    "lodash": "^3.10.1",
+    "webpack": "^2.7.0"
+  }
+}

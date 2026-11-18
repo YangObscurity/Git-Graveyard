@@ -1,0 +1,513 @@
+import { readFileSync } from "node:fs";
+import { parse, type ParserPlugin } from "@babel/parser";
+import type { Signal, RuleId, Confidence, UnknownRecord } from "./types";
+
+export type DetectSignalsInputFile = {
+  path: string;
+  content?: string;
+  text?: string;
+  source?: string;
+  manifestDir?: string;
+  manifestDirectory?: string;
+  [key: string]: unknown;
+};
+
+export type DetectSignalsInput =
+  | readonly DetectSignalsInputFile[]
+  | Iterable<DetectSignalsInputFile>
+  | { files?: readonly DetectSignalsInputFile[]; scannedFiles?: readonly DetectSignalsInputFile[] }
+  | DetectSignalsInputFile;
+
+export interface DetectSignalsOptions {
+  unknowns?: UnknownRecord[];
+}
+
+export interface DetectSignalsResult extends Array<Signal> {
+  signals: Signal[];
+  unknowns: UnknownRecord[];
+  parseErrors: UnknownRecord[];
+}
+
+function normalizePath(filePath: string): string {
+  if (typeof filePath !== "string") return "";
+  let p = filePath.replace(/\\/g, "/");
+  p = p.replace(/^\.?\/+/, "");
+  p = p.replace(/\/+/g, "/");
+  return p.replace(/\/+$/, "");
+}
+
+function isBabelParseable(filePath: string): boolean {
+  if (typeof filePath !== "string") return false;
+  const norm = normalizePath(filePath).toLowerCase();
+  const basename = norm.slice(norm.lastIndexOf("/") + 1);
+  return (
+    basename.endsWith(".js") ||
+    basename.endsWith(".cjs") ||
+    basename.endsWith(".mjs") ||
+    basename.endsWith(".jsx") ||
+    basename.endsWith(".ts") ||
+    basename.endsWith(".tsx")
+  );
+}
+
+function getManifestDir(file: DetectSignalsInputFile): string {
+  if (typeof file.manifestDir === "string" && file.manifestDir.length > 0) {
+    return file.manifestDir;
+  }
+  if (typeof file.manifestDirectory === "string" && file.manifestDirectory.length > 0) {
+    return file.manifestDirectory;
+  }
+  const norm = normalizePath(file.path);
+  const idx = norm.lastIndexOf("/");
+  if (idx === -1) {
+    return ".";
+  }
+  const dir = norm.slice(0, idx);
+  return dir.length === 0 ? "." : dir;
+}
+
+function isRequestPackage(name: string): boolean {
+  if (typeof name !== "string") return false;
+  return (
+    name === "request" ||
+    name.startsWith("request/") ||
+    name === "request-promise" ||
+    name.startsWith("request-promise/") ||
+    name === "request-promise-native" ||
+    name.startsWith("request-promise-native/") ||
+    name === "request-promise-any" ||
+    name.startsWith("request-promise-any/")
+  );
+}
+
+function isRequestPromisePackage(name: string): boolean {
+  if (typeof name !== "string") return false;
+  return (
+    name === "request-promise" ||
+    name.startsWith("request-promise/") ||
+    name === "request-promise-native" ||
+    name.startsWith("request-promise-native/") ||
+    name === "request-promise-any" ||
+    name.startsWith("request-promise-any/")
+  );
+}
+
+function parseSource(source: string, filePath: string): any {
+  const norm = normalizePath(filePath).toLowerCase();
+  const basePlugins: ParserPlugin[] = norm.endsWith(".tsx")
+    ? ["typescript", "jsx"]
+    : norm.endsWith(".ts")
+    ? ["typescript"]
+    : ["jsx"];
+
+  const isMjs = norm.endsWith(".mjs");
+  const isCjs = norm.endsWith(".cjs");
+
+  const pluginAttempts: ParserPlugin[][] = [
+    basePlugins,
+    [...basePlugins, "decorators"],
+    [...basePlugins, "decorators-legacy"],
+  ];
+
+  const sourceTypes: ("module" | "script" | "unambiguous")[] = isMjs
+    ? ["module"]
+    : isCjs
+    ? ["script", "unambiguous", "module"]
+    : ["unambiguous", "module", "script"];
+
+  let lastError: unknown;
+
+  for (const plugins of pluginAttempts) {
+    for (const sourceType of sourceTypes) {
+      try {
+        return parse(source, {
+          sourceType,
+          allowReturnOutsideFunction: true,
+          allowAwaitOutsideFunction: true,
+          allowImportExportEverywhere: true,
+          allowSuperOutsideMethod: true,
+          allowUndeclaredExports: true,
+          plugins,
+        });
+      } catch (err) {
+        lastError = err;
+      }
+    }
+  }
+
+  throw lastError;
+}
+
+function walk(node: unknown, visitor: (node: any) => void): void {
+  if (!node || typeof node !== "object") return;
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      walk(item, visitor);
+    }
+    return;
+  }
+  const obj = node as Record<string, unknown>;
+  if (typeof obj.type === "string") {
+    visitor(obj);
+  }
+  for (const key of Object.keys(obj)) {
+    if (
+      key === "loc" ||
+      key === "comments" ||
+      key === "leadingComments" ||
+      key === "trailingComments" ||
+      key === "innerComments" ||
+      key === "extra"
+    ) {
+      continue;
+    }
+    const val = obj[key];
+    if (val && typeof val === "object") {
+      walk(val, visitor);
+    }
+  }
+}
+
+export function detectSignals(
+  input: DetectSignalsInput,
+  options?: DetectSignalsOptions
+): DetectSignalsResult {
+  const rawList: DetectSignalsInputFile[] = Array.isArray(input)
+    ? input
+    : input && typeof input === "object" && "files" in input && Array.isArray((input as any).files)
+    ? (input as any).files
+    : input && typeof input === "object" && "scannedFiles" in input && Array.isArray((input as any).scannedFiles)
+    ? (input as any).scannedFiles
+    : input && typeof (input as any)[Symbol.iterator] === "function"
+    ? Array.from(input as Iterable<DetectSignalsInputFile>)
+    : input && typeof input === "object" && typeof (input as any).path === "string"
+    ? [input as DetectSignalsInputFile]
+    : [];
+
+  const signals: Signal[] = [];
+  const unknowns: UnknownRecord[] = [];
+
+  for (const file of rawList) {
+    if (!file || typeof file.path !== "string") {
+      continue;
+    }
+
+    const filePath = normalizePath(file.path);
+    if (!isBabelParseable(filePath)) {
+      continue;
+    }
+
+    const manifestDir = getManifestDir(file);
+    let source = file.content ?? file.text ?? (file as any).source;
+    if (typeof source !== "string") {
+      try {
+        source = readFileSync(file.path, "utf-8");
+      } catch {
+        source = undefined;
+      }
+    }
+
+    if (typeof source !== "string") {
+      const errRecord: UnknownRecord = {
+        ruleId: "",
+        reason: "parse_error",
+        file: filePath,
+      };
+      unknowns.push(errRecord);
+      continue;
+    }
+
+    let ast: any;
+    try {
+      ast = parseSource(source, filePath);
+    } catch (err: unknown) {
+      const line =
+        typeof err === "object" && err !== null && "loc" in err
+          ? (err as any).loc?.line
+          : undefined;
+      const errRecord: UnknownRecord = {
+        ruleId: "",
+        reason: "parse_error",
+        file: filePath,
+        ...(line !== undefined ? { line } : {}),
+      };
+      unknowns.push(errRecord);
+      continue;
+    }
+
+    walk(ast, (node: any) => {
+      // 1. CallExpression
+      if (node.type === "CallExpression") {
+        // A) require(...)
+        if (
+          node.callee &&
+          node.callee.type === "Identifier" &&
+          node.callee.name === "require"
+        ) {
+          const loc = node.loc?.start;
+          const line = loc?.line ?? 1;
+          const column = loc?.column ?? 0;
+          const matched =
+            typeof node.start === "number" && typeof node.end === "number"
+              ? source.slice(node.start, node.end)
+              : "require(...)";
+
+          const firstArg = node.arguments?.[0];
+          const isStringArg = firstArg && firstArg.type === "StringLiteral";
+          const argValue = isStringArg ? firstArg.value : undefined;
+
+          // Check M2
+          if (typeof argValue === "string" && isRequestPackage(argValue)) {
+            signals.push({
+              ruleId: "M2",
+              file: filePath,
+              line,
+              column,
+              matched,
+              confidence: "high",
+              manifestDir,
+            });
+            if (isRequestPromisePackage(argValue)) {
+              unknowns.push({
+                ruleId: "M2",
+                reason: "request_promise_unsupported",
+                file: filePath,
+                line,
+              });
+            }
+          }
+
+          // Check M3
+          signals.push({
+            ruleId: "M3",
+            file: filePath,
+            line,
+            column,
+            matched,
+            confidence: isStringArg ? "high" : "medium",
+            manifestDir,
+          });
+        }
+        // B) dynamic import(...) in older Babel AST
+        else if (node.callee && node.callee.type === "Import") {
+          const firstArg = node.arguments?.[0];
+          if (firstArg && firstArg.type === "StringLiteral" && isRequestPackage(firstArg.value)) {
+            const loc = node.loc?.start;
+            const line = loc?.line ?? 1;
+            const column = loc?.column ?? 0;
+            const matched =
+              typeof node.start === "number" && typeof node.end === "number"
+                ? source.slice(node.start, node.end)
+                : `import('${firstArg.value}')`;
+
+            signals.push({
+              ruleId: "M2",
+              file: filePath,
+              line,
+              column,
+              matched,
+              confidence: "high",
+              manifestDir,
+            });
+            if (isRequestPromisePackage(firstArg.value)) {
+              unknowns.push({
+                ruleId: "M2",
+                reason: "request_promise_unsupported",
+                file: filePath,
+                line,
+              });
+            }
+          }
+        }
+      }
+      // 2. ImportExpression (dynamic import('request') in Babel 8)
+      else if (node.type === "ImportExpression") {
+        if (node.source && node.source.type === "StringLiteral" && isRequestPackage(node.source.value)) {
+          const loc = node.loc?.start;
+          const line = loc?.line ?? 1;
+          const column = loc?.column ?? 0;
+          const matched =
+            typeof node.start === "number" && typeof node.end === "number"
+              ? source.slice(node.start, node.end)
+              : `import('${node.source.value}')`;
+
+          signals.push({
+            ruleId: "M2",
+            file: filePath,
+            line,
+            column,
+            matched,
+            confidence: "high",
+            manifestDir,
+          });
+          if (isRequestPromisePackage(node.source.value)) {
+            unknowns.push({
+              ruleId: "M2",
+              reason: "request_promise_unsupported",
+              file: filePath,
+              line,
+            });
+          }
+        }
+      }
+      // 3. ImportDeclaration
+      else if (node.type === "ImportDeclaration") {
+        if (node.source && isRequestPackage(node.source.value)) {
+          const loc = node.loc?.start;
+          const line = loc?.line ?? 1;
+          const column = loc?.column ?? 0;
+          const matched =
+            typeof node.start === "number" && typeof node.end === "number"
+              ? source.slice(node.start, node.end)
+              : `import from '${node.source.value}'`;
+
+          signals.push({
+            ruleId: "M2",
+            file: filePath,
+            line,
+            column,
+            matched,
+            confidence: "high",
+            manifestDir,
+          });
+          if (isRequestPromisePackage(node.source.value)) {
+            unknowns.push({
+              ruleId: "M2",
+              reason: "request_promise_unsupported",
+              file: filePath,
+              line,
+            });
+          }
+        }
+      }
+      // 4. ExportNamedDeclaration / ExportAllDeclaration
+      else if (
+        (node.type === "ExportNamedDeclaration" || node.type === "ExportAllDeclaration") &&
+        node.source &&
+        isRequestPackage(node.source.value)
+      ) {
+        const loc = node.loc?.start;
+        const line = loc?.line ?? 1;
+        const column = loc?.column ?? 0;
+        const matched =
+          typeof node.start === "number" && typeof node.end === "number"
+            ? source.slice(node.start, node.end)
+            : `export from '${node.source.value}'`;
+
+        signals.push({
+          ruleId: "M2",
+          file: filePath,
+          line,
+          column,
+          matched,
+          confidence: "high",
+          manifestDir,
+        });
+        if (isRequestPromisePackage(node.source.value)) {
+          unknowns.push({
+            ruleId: "M2",
+            reason: "request_promise_unsupported",
+            file: filePath,
+            line,
+          });
+        }
+      }
+      // 5. MemberExpression: module.exports
+      else if (node.type === "MemberExpression") {
+        const isModule =
+          node.object && node.object.type === "Identifier" && node.object.name === "module";
+        const isExports =
+          (!node.computed &&
+            node.property &&
+            node.property.type === "Identifier" &&
+            node.property.name === "exports") ||
+          (node.computed &&
+            node.property &&
+            node.property.type === "StringLiteral" &&
+            node.property.value === "exports");
+
+        if (isModule && isExports) {
+          const loc = node.loc?.start;
+          const line = loc?.line ?? 1;
+          const column = loc?.column ?? 0;
+          const matched =
+            typeof node.start === "number" && typeof node.end === "number"
+              ? source.slice(node.start, node.end)
+              : "module.exports";
+
+          signals.push({
+            ruleId: "M3",
+            file: filePath,
+            line,
+            column,
+            matched,
+            confidence: "high",
+            manifestDir,
+          });
+        }
+      }
+      // 6. Identifier: CommonsChunkPlugin
+      else if (node.type === "Identifier" && node.name === "CommonsChunkPlugin") {
+        const loc = node.loc?.start;
+        const line = loc?.line ?? 1;
+        const column = loc?.column ?? 0;
+        const matched =
+          typeof node.start === "number" && typeof node.end === "number"
+            ? source.slice(node.start, node.end)
+            : "CommonsChunkPlugin";
+
+        signals.push({
+          ruleId: "M4",
+          file: filePath,
+          line,
+          column,
+          matched,
+          confidence: "high",
+          manifestDir,
+        });
+      }
+    });
+  }
+
+  // Deduplicate signals that have identical (file, line, column, ruleId, matched)
+  const seenSignals = new Set<string>();
+  const uniqueSignals: Signal[] = [];
+  for (const s of signals) {
+    const key = `${s.file}:${s.line}:${s.column}:${s.ruleId}:${s.matched}`;
+    if (!seenSignals.has(key)) {
+      seenSignals.add(key);
+      uniqueSignals.push(s);
+    }
+  }
+
+  // Sort deterministically by (file, line, column, ruleId)
+  uniqueSignals.sort((a, b) => {
+    if (a.file !== b.file) {
+      return a.file < b.file ? -1 : 1;
+    }
+    if (a.line !== b.line) {
+      return a.line - b.line;
+    }
+    if (a.column !== b.column) {
+      return a.column - b.column;
+    }
+    if (a.ruleId !== b.ruleId) {
+      return a.ruleId < b.ruleId ? -1 : 1;
+    }
+    return 0;
+  });
+
+  if (options?.unknowns) {
+    for (const u of unknowns) {
+      options.unknowns.push(u);
+    }
+  }
+
+  const result = Object.assign(uniqueSignals, {
+    signals: uniqueSignals,
+    unknowns,
+    parseErrors: unknowns.filter((u) => u.reason === "parse_error"),
+  });
+
+  return result as DetectSignalsResult;
+}

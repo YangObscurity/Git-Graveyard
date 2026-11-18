@@ -1,0 +1,11 @@
+{
+  "request": {
+    "latest": "2.88.2"
+  },
+  "lodash": {
+    "latest": "4.17.21"
+  },
+  "webpack": {
+    "latest": "5.98.0"
+  }
+}
