@@ -1,0 +1,55 @@
+# --- workspace discipline (see AGENTS.md) ---
+.agent-ws/
+.agent/scratchpad/
+*.tmp
+~$*
+.DS_Store
+Thumbs.db
+
+# --- node / next ---
+node_modules/
+.next/
+dist/
+build/
+*.tsbuildinfo
+npm-debug.log*
+yarn-error.log*
+
+# --- python ---
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- env / secrets ---
+.env
+.env.*
+!.env.example
+
+# --- editor ---
+.idea/
+.vscode/
+# --- kiro dispatch output ---
+# .kiro-runs/ sits at the repository root, not under .kiro/; nothing under .kiro/ is ignored (contest rule)
+.kiro-runs/
+
+# --- fetch cache ---
+.cache/
+
+# --- monaco assets (generated copy) ---
+public/monaco/
+# --- local work records and memory (not tracked; see progress.md 28) ---
+memory/
+# --- local evidence and research records (not tracked; user decision 2026-11-08) ---
+01_evidence/
+
+# --- Playwright E2E, local SQLite stores, and coverage ---
+.playwright-mcp/
+playwright-report/
+test-results/
+*.db
+*.sqlite*
+coverage/
