@@ -286,6 +286,7 @@ ${signalLines}
 
 ## Requirements for the Pact (tasks.md)
 1. Every failure listed in the Death Certificate must be addressed by at least one task matching its ruleId or file.
+   For a failure without a ruleId (shown as [UNKNOWN]), copy the exact reference after "in" into the \`files:\` line of a task that fixes it.
 2. Roles must be strictly either "bonesetter" (for dependency/package updates) or "soul-stitcher" (for code/API fixes).
 3. Include non-removable requirements:
    - Grimoire syntax/gate task
@@ -300,6 +301,33 @@ ${signalLines}
      - hard: <yes|no>
      - rules: <M1, M2, ...>
 `;
+}
+
+/**
+ * Builds the follow-up message sent once when the first Pact leaves failures uncovered.
+ * It names each uncovered failure by the reference the coverage check matches on.
+ */
+export function buildCoverageRetryPrompt(
+  uncoveredFailures: ReadonlyArray<{
+    ruleId?: string;
+    file?: string;
+    description?: string;
+    message?: string;
+  }>
+): string {
+  const lines = uncoveredFailures
+    .map((f, i) => {
+      const ref = f.ruleId ?? f.file ?? "unknown";
+      const text = f.description ?? f.message;
+      return `  ${i + 1}. ${ref}${text ? ` (${text})` : ""}`;
+    })
+    .join("\n");
+
+  return `Your Pact does not cover all Death Certificate failures. Uncovered:
+${lines}
+
+Output the complete Pact (tasks.md) again, keeping the existing tasks and adding or extending tasks so every uncovered failure is covered.
+Match each failure by its rule in \`rules:\` or by its exact reference in the \`files:\` line of a task.`;
 }
 
 /**
@@ -606,6 +634,19 @@ async function executePlannerWorkflow(
     try {
       const raw = await options.sessionClient.prompt(prompt);
       parsedPact = extractAndParsePact(raw);
+
+      // One retry: tell the live session what is uncovered. The fail-closed
+      // coverage check in step 4 still decides the final outcome.
+      const firstCoverage = verifyDeathCertificateCoverage(
+        parsedPact.tasks,
+        options.deathCertificate
+      );
+      if (!firstCoverage.ok) {
+        const retryRaw = await options.sessionClient.prompt(
+          buildCoverageRetryPrompt(firstCoverage.uncoveredFailures)
+        );
+        parsedPact = extractAndParsePact(retryRaw);
+      }
     } catch (err) {
       if (err instanceof PactPlannerError) {
         throw err;
