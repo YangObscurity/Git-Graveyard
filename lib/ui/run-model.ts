@@ -296,6 +296,28 @@ function setPhase(draft: Draft, phase: RunPhaseView, ts: number | undefined) {
   if (phase === "done" && draft.endedAt === null) {
     draft.endedAt = ts ?? null;
   }
+  if (phase === "done") {
+    settleActiveSkeletons(draft);
+  }
+}
+
+/** Skeleton states that mean "still working"; failed and laid-to-rest states are kept. */
+const ACTIVE_SKELETON_STATES = new Set([
+  "starting",
+  "running",
+  "working",
+  "auditing",
+  "recovering",
+]);
+
+/** A concluded run has no live Skeletons: mark the ones still active as completed. */
+function settleActiveSkeletons(draft: Draft) {
+  for (const skeleton of draft.skeletons) {
+    if (ACTIVE_SKELETON_STATES.has(skeleton.state.toLowerCase())) {
+      skeleton.state = "completed";
+      skeleton.currentToolCall = null;
+    }
+  }
 }
 
 function setOutcome(draft: Draft, data: Record<string, unknown>) {
@@ -436,12 +458,16 @@ function applyOne(draft: Draft, event: RunEvent) {
       if (draft.phase === "unknown" || draft.phase === "queued") {
         setPhase(draft, "exhume", ts);
       }
+      // logRef is unique per command run; the same start recorded twice is one row.
+      const logRef = str(data.logRef);
+      if (logRef && draft.commands.some((row) => row.logRef === logRef)) break;
       draft.commands.push({
         id: `cmd-${event.seq}`,
         seq: event.seq,
         step: str(data.step),
         command,
         status: "running",
+        ...(logRef ? { logRef } : {}),
       });
       break;
     }
@@ -470,7 +496,17 @@ function applyOne(draft: Draft, event: RunEvent) {
         reason: str(data.reason),
         ruleId: str(data.ruleId),
       };
-      // Pair with the most recent still-running row for the same command.
+      // Pair by logRef first: it identifies one command run. A second result for
+      // a row that already finished is a duplicate record and is ignored.
+      if (result.logRef) {
+        const sameRun = draft.commands.find((row) => row.logRef === result.logRef);
+        if (sameRun && sameRun.status !== "running") break;
+        if (sameRun) {
+          Object.assign(sameRun, result);
+          break;
+        }
+      }
+      // Otherwise pair with the most recent still-running row for the same command.
       let open: RunCommand | undefined;
       for (let i = draft.commands.length - 1; i >= 0; i--) {
         const row = draft.commands[i];
@@ -570,10 +606,14 @@ function applyOne(draft: Draft, event: RunEvent) {
         grimoireSummary: str(data.grimoireSummary),
         status: "pending",
       };
+      // approvalId is unique per request; a second record of the same request
+      // refreshes the approval but must not add a second channel entry.
+      const alreadyKnown = draft.approvals.some((a) => a.approvalId === approvalId);
       draft.approvals = [
         ...draft.approvals.filter((a) => a.approvalId !== approvalId),
         approval,
       ];
+      if (alreadyKnown) break;
       draft.channel.push({
         id: `chan-${event.seq}`,
         seq: event.seq,
@@ -861,11 +901,14 @@ export function buildRunView(events: readonly unknown[]): RunView {
   return applyRunEvents(createRunView(), events);
 }
 
+/** Nothing can be answered once the run has concluded, so nothing is pending. */
 export function pendingApprovals(view: RunView): RunApproval[] {
+  if (view.phase === "done") return [];
   return view.approvals.filter((a) => a.status === "pending");
 }
 
 export function openAsks(view: RunView): RunAsk[] {
+  if (view.phase === "done") return [];
   return view.asks.filter((a) => a.status === "open");
 }
 
