@@ -759,4 +759,72 @@ describe("R3-I: fatal gateway result terminates the session and quarantines work
       fs.rmSync(quarantineDir, { recursive: true, force: true });
     }
   });
+
+  it("never sends OS process.kill to process.pid when signaling a mocked child process", async () => {
+    const tmpDir1 = fs.mkdtempSync(path.join(os.tmpdir(), "r3-mock-pid-fatal-"));
+    const quarantineDir1 = fs.mkdtempSync(path.join(os.tmpdir(), "r3-mock-pid-fatal-q-"));
+    const tmpDir2 = fs.mkdtempSync(path.join(os.tmpdir(), "r3-mock-pid-cancel-"));
+    const quarantineDir2 = fs.mkdtempSync(path.join(os.tmpdir(), "r3-mock-pid-cancel-q-"));
+
+    try {
+      const mockChild1 = new MockChildProcess();
+      mockChild1.pid = process.pid;
+      createMockAcpAgent(mockChild1);
+
+      const sup1 = createSkeletonSupervisor({
+        runId: "run-mock-pid-fatal",
+        skeletonId: "skel-mock-pid-fatal",
+        role: "planner",
+        cwd: tmpDir1,
+        spawnFn: () => mockChild1,
+        brokerOptions: getRequiredBrokerSettings(),
+        cancelGracePeriodMs: 10,
+        cancelPromptTimeoutMs: 100,
+        quarantineDir: quarantineDir1,
+      });
+
+      await sup1.raise();
+      await sup1.handleGatewayResult({
+        status: "fatal",
+        fatal: true,
+        quarantine: true,
+        code: "SECRET_DETECTED",
+        error: "test",
+        reason: "test",
+      });
+
+      assert.equal(mockChild1.killed, true);
+      assert.deepEqual(mockChild1.signalsSent, ["SIGTERM"]);
+      assert.equal(sup1.getState(), "terminated");
+
+      const mockChild2 = new MockChildProcess();
+      mockChild2.pid = process.pid;
+      createMockAcpAgent(mockChild2);
+
+      const sup2 = createSkeletonSupervisor({
+        runId: "run-mock-pid-cancel",
+        skeletonId: "skel-mock-pid-cancel",
+        role: "planner",
+        cwd: tmpDir2,
+        spawnFn: () => mockChild2,
+        brokerOptions: getRequiredBrokerSettings(),
+        cancelGracePeriodMs: 10,
+        cancelPromptTimeoutMs: 100,
+        quarantineDir: quarantineDir2,
+      });
+
+      await sup2.raise();
+      await sup2.cancel("test");
+
+      assert.equal(mockChild2.killed, true);
+      assert.ok(mockChild2.signalsSent.includes("SIGTERM"));
+      assert.equal(sup2.getState(), "terminated");
+      await sup2.finish();
+    } finally {
+      fs.rmSync(tmpDir1, { recursive: true, force: true });
+      fs.rmSync(quarantineDir1, { recursive: true, force: true });
+      fs.rmSync(tmpDir2, { recursive: true, force: true });
+      fs.rmSync(quarantineDir2, { recursive: true, force: true });
+    }
+  });
 });

@@ -4,7 +4,7 @@
 // and checks active model with allowlist before any session/prompt.
 // Requirements: 14.1-14.4, 14.18, 15.1-15.8, 16.1-16.21, 41.20, 41.21, 45.12
 
-import { spawn as defaultSpawn } from "node:child_process";
+import { ChildProcess, spawn as defaultSpawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -984,7 +984,16 @@ export class SkeletonSupervisor extends EventEmitter {
    * Requirement 16.14.
    */
   private signalProcess(proc: ChildProcessLike, signal: NodeJS.Signals): void {
-    if (proc.pid && typeof process !== "undefined" && typeof process.kill === "function") {
+    const isRealChildProcess =
+      this.spawnFn === (defaultSpawn as unknown as SpawnFunction) &&
+      proc instanceof ChildProcess;
+
+    if (
+      isRealChildProcess &&
+      proc.pid &&
+      typeof process !== "undefined" &&
+      typeof process.kill === "function"
+    ) {
       try {
         process.kill(-proc.pid, signal);
         return;
@@ -1421,10 +1430,12 @@ export class SkeletonSupervisor extends EventEmitter {
       } catch {
         // Ignore
       }
-      try {
-        this.process.kill("SIGTERM");
-      } catch {
-        // Ignore
+      if (!this.process.killed) {
+        try {
+          this.process.kill("SIGTERM");
+        } catch {
+          // Ignore
+        }
       }
     }
 
