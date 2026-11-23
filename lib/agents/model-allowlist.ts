@@ -5,9 +5,39 @@
  * The three allowed Claude 5.5 model IDs recorded from the specification.
  * Auto is explicitly excluded and never allowed.
  */
-export const CLAUDE_HAIKU_5_5_MODEL_ID = "claude-haiku-5.5" as const;
-export const CLAUDE_SONNET_5_5_MODEL_ID = "claude-sonnet-5.5" as const;
-export const CLAUDE_OPUS_5_5_MODEL_ID = "claude-opus-5.5" as const;
+const DEFAULT_HAIKU_MODEL_ID = "claude-haiku-5.5" as const;
+const DEFAULT_SONNET_MODEL_ID = "claude-sonnet-5.5" as const;
+const DEFAULT_OPUS_MODEL_ID = "claude-opus-5.5" as const;
+
+/**
+ * Resolves a model ID from an optional override (for example an environment variable).
+ * Blank values and "auto" are ignored so the allowlist can never admit auto.
+ */
+export function resolveModelId(override: string | undefined, fallback: string): string {
+  const trimmed = override?.trim() ?? "";
+  if (trimmed.length === 0 || trimmed.toLowerCase() === "auto") {
+    return fallback;
+  }
+  return trimmed;
+}
+
+/**
+ * The names below keep their "5_5" form for compatibility. Accounts that cannot use
+ * the Claude 5.5 models can set GG_MODEL_OPUS / GG_MODEL_SONNET / GG_MODEL_HAIKU.
+ * The literal types stay as the defaults; the runtime value follows the override.
+ */
+export const CLAUDE_HAIKU_5_5_MODEL_ID = resolveModelId(
+  process.env.GG_MODEL_HAIKU,
+  DEFAULT_HAIKU_MODEL_ID
+) as typeof DEFAULT_HAIKU_MODEL_ID;
+export const CLAUDE_SONNET_5_5_MODEL_ID = resolveModelId(
+  process.env.GG_MODEL_SONNET,
+  DEFAULT_SONNET_MODEL_ID
+) as typeof DEFAULT_SONNET_MODEL_ID;
+export const CLAUDE_OPUS_5_5_MODEL_ID = resolveModelId(
+  process.env.GG_MODEL_OPUS,
+  DEFAULT_OPUS_MODEL_ID
+) as typeof DEFAULT_OPUS_MODEL_ID;
 
 export const ALLOWED_MODEL_IDS = [
   CLAUDE_HAIKU_5_5_MODEL_ID,
