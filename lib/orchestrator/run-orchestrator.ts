@@ -108,6 +108,11 @@ export interface FinalCheckResult {
   passed?: boolean;
   installPassed?: boolean;
   buildPassed?: boolean;
+  /**
+   * false when the repository has no build script. buildPassed is then true so
+   * the outcome rule is not blocked, but no build ran and reports say "not run".
+   */
+  hasBuild?: boolean;
   testsPassed?: boolean;
   hasTests?: boolean;
   exitCode?: number;
@@ -1096,6 +1101,7 @@ export class RunOrchestrator extends EventEmitter {
           passed: finalCheckRes.passed ?? finalCheckRes.ok ?? false,
           installPassed: finalCheckRes.installPassed,
           buildPassed: finalCheckRes.buildPassed,
+          hasBuild: finalCheckRes.hasBuild,
           testsPassed: finalCheckRes.testsPassed,
           hasTests: finalCheckRes.hasTests,
         },
@@ -1148,6 +1154,7 @@ export class RunOrchestrator extends EventEmitter {
           ),
           installPassed: finalCheckRes.installPassed,
           buildPassed: finalCheckRes.buildPassed,
+          hasBuild: finalCheckRes.hasBuild,
           testsPassed: finalCheckRes.testsPassed,
           hasTests: finalCheckRes.hasTests,
         },
@@ -1715,6 +1722,7 @@ export class RunOrchestrator extends EventEmitter {
         passed,
         installPassed,
         buildPassed,
+        hasBuild,
         testsPassed: hasTests ? testsPassed : undefined,
         hasTests,
         exitCode: lastExitCode,
