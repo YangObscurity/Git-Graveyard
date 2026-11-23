@@ -102,10 +102,16 @@ export function LegionRunHeader({
 
   // Format "Now" sentence from latest skeleton.tool_call (Requirement 37.1)
   let nowSentence = "Now: Waiting for next tool call";
-  if (latestToolCall) {
+  if (phaseLower === "done") {
+    nowSentence = "Now: Nothing is running";
+  } else if (latestToolCall) {
     const skelPrefix = latestToolCall.skeletonId ? `${latestToolCall.skeletonId}: ` : "";
     nowSentence = `Now: ${skelPrefix}running ${latestToolCall.tool}`;
   }
+
+  // Explain "not reported" once, below the meters, when any value is missing.
+  const creditsNotReported = creditsUsed === null || creditsUsed === undefined;
+  const hasUnreportedValue = !toolCallsCap || !wallClockCapMinutes || creditsNotReported;
 
   // Credits display: "credits or not reported" (Requirement 37.10)
   const creditsText =
@@ -212,7 +218,9 @@ export function LegionRunHeader({
           </div>
 
           <div className="text-xs text-ash">
-            You can leave this page. The run keeps going.
+            {phaseLower === "done"
+              ? "This run has ended. Its record stays readable here."
+              : "You can leave this page. The run keeps going."}
           </div>
         </div>
       </div>
@@ -345,6 +353,13 @@ export function LegionRunHeader({
           )}
         </div>
       </div>
+
+      {hasUnreportedValue && (
+        <p className="text-[11px] text-dust" data-testid="legion-not-reported-note">
+          A value shows as not reported when the run did not record it.
+          {creditsNotReported ? " Credits are not reported by the CLI." : ""}
+        </p>
+      )}
     </header>
   );
 }

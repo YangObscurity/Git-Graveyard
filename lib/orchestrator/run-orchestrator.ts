@@ -71,7 +71,10 @@ import {
   type FinalizeRunResult,
 } from "../lifecycle/run-finalizer";
 import type { SkeletonSupervisor } from "../supervisor/skeleton-supervisor";
-import { getAssignedModelForRole } from "../agents/model-allowlist";
+import {
+  CLAUDE_OPUS_5_5_MODEL_ID,
+  getAssignedModelForRole,
+} from "../agents/model-allowlist";
 import { redactEvent } from "../security/redactor";
 import { neutralizeUntrustedContent } from "../security/untrusted-content";
 import {
@@ -875,7 +878,7 @@ export class RunOrchestrator extends EventEmitter {
         typeof (plannerSupervisor as any).getVerifiedModel !== "function" ||
         !(plannerSupervisor as any).getVerifiedModel()
       ) {
-        (plannerSupervisor as any).getVerifiedModel = () => "claude-opus-5.5";
+        (plannerSupervisor as any).getVerifiedModel = () => CLAUDE_OPUS_5_5_MODEL_ID;
       }
       if (
         typeof (plannerSupervisor as any).getVerifiedAgent !== "function" ||
@@ -1776,17 +1779,47 @@ export class RunOrchestrator extends EventEmitter {
       return kept.length > 0 ? kept.join("\n").trim() : candidate;
     };
 
-    const readSpecOrChunks = (): string => {
-      for (const cand of [
-        path.join(plannerCwd, "specs", "tasks.md"),
-        path.join(plannerCwd, "spec", "tasks.md"),
-      ]) {
+    const specPaths = [
+      path.join(plannerCwd, "specs", "tasks.md"),
+      path.join(plannerCwd, "spec", "tasks.md"),
+    ];
+
+    const snapshotSpecFiles = (): Map<string, string | null> => {
+      const snap = new Map<string, string | null>();
+      for (const cand of specPaths) {
+        if (fs.existsSync(cand)) {
+          try {
+            snap.set(cand, fs.readFileSync(cand, "utf-8").trim());
+          } catch {
+            snap.set(cand, null);
+          }
+        } else {
+          snap.set(cand, null);
+        }
+      }
+      return snap;
+    };
+
+    const readSpecOrChunks = (before?: Map<string, string | null>): string => {
+      for (const cand of specPaths) {
+        if (fs.existsSync(cand)) {
+          const content = fs.readFileSync(cand, "utf-8").trim();
+          if (content && (!before || content !== before.get(cand))) {
+            return content;
+          }
+        }
+      }
+      const streamed = chunks.join("").trim();
+      if (streamed) {
+        return streamed;
+      }
+      for (const cand of specPaths) {
         if (fs.existsSync(cand)) {
           const content = fs.readFileSync(cand, "utf-8").trim();
           if (content) return content;
         }
       }
-      return chunks.join("");
+      return "";
     };
 
     const excerpts = (deathCertificate?.failures ?? [])
@@ -1799,6 +1832,7 @@ export class RunOrchestrator extends EventEmitter {
     return {
       prompt: async (promptText: string) => {
         chunks.length = 0;
+        const beforeTurn = snapshotSpecFiles();
         const guidance = [
           promptText,
           excerpts ? `## Death Certificate Failure Excerpts\n${excerpts}` : "",
@@ -1819,13 +1853,14 @@ export class RunOrchestrator extends EventEmitter {
           role: "planner",
         });
 
-        let candidate = extractCandidatePactText(readSpecOrChunks());
+        let candidate = extractCandidatePactText(readSpecOrChunks(beforeTurn));
         let parsed = parsePact(candidate);
         if (!parsed.ok) {
           const errSummary = parsed.errors
             .map((e) => `[line ${e.line}] ${e.message}`)
             .join("; ");
           chunks.length = 0;
+          const beforeGrammarFix = snapshotSpecFiles();
           await plannerSupervisor.dispatchTask({
             taskId: "plan-fix-grammar",
             taskText:
@@ -1833,7 +1868,7 @@ export class RunOrchestrator extends EventEmitter {
               `Re-output ONLY a valid \`\`\`markdown ... \`\`\` fence containing '- [ ] T1. ...' tasks citing only M1..M6 rules, with NO extra prose inside the fence.`,
             role: "planner",
           });
-          candidate = extractCandidatePactText(readSpecOrChunks());
+          candidate = extractCandidatePactText(readSpecOrChunks(beforeGrammarFix));
           parsed = parsePact(candidate);
         }
 
@@ -2396,7 +2431,7 @@ srv.listen(8080, "0.0.0.0");
       typeof (supervisor as any).getVerifiedModel !== "function" ||
       !(supervisor as any).getVerifiedModel()
     ) {
-      (supervisor as any).getVerifiedModel = () => "claude-opus-5.5";
+      (supervisor as any).getVerifiedModel = () => CLAUDE_OPUS_5_5_MODEL_ID;
     }
     if (
       typeof (supervisor as any).getVerifiedAgent !== "function" ||

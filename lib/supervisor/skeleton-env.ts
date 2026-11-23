@@ -5,7 +5,12 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { normalizeRole } from "./model-allowlist";
+import {
+  CLAUDE_HAIKU_5_5_MODEL_ID,
+  CLAUDE_OPUS_5_5_MODEL_ID,
+  CLAUDE_SONNET_5_5_MODEL_ID,
+  normalizeRole,
+} from "./model-allowlist";
 import type { SkeletonRole } from "./model-allowlist";
 
 /**
@@ -141,7 +146,7 @@ function synthesizeKiroAgentJsonFromMarkdown(
 ): string {
   const normalized = markdownContent.replace(/\r\n/g, "\n");
   let description = `Skeleton role: ${normRole}`;
-  let model = overrideModel ?? "claude-sonnet-5.5";
+  let model = overrideModel ?? CLAUDE_SONNET_5_5_MODEL_ID;
   const tools: string[] = [];
   let body = normalized;
 
@@ -162,11 +167,11 @@ function synthesizeKiroAgentJsonFromMarkdown(
       if (tierMatch && !overrideModel) {
         const tier = tierMatch[1].trim().toLowerCase();
         if (tier.includes("opus")) {
-          model = "claude-opus-5.5";
+          model = CLAUDE_OPUS_5_5_MODEL_ID;
         } else if (tier.includes("haiku")) {
-          model = "claude-haiku-5.5";
+          model = CLAUDE_HAIKU_5_5_MODEL_ID;
         } else if (tier.includes("sonnet")) {
-          model = "claude-sonnet-5.5";
+          model = CLAUDE_SONNET_5_5_MODEL_ID;
         }
         inTools = false;
         continue;
@@ -213,6 +218,53 @@ function synthesizeKiroAgentJsonFromMarkdown(
 }
 
 /**
+ * Locations (relative to HOME) where kiro-cli keeps its login state.
+ * Linux uses the XDG data dir; macOS uses Application Support.
+ */
+const KIRO_AUTH_STORE_RELATIVE_PATHS: ReadonlyArray<readonly string[]> = [
+  [".local", "share", "kiro-cli"],
+  ["Library", "Application Support", "kiro-cli"],
+];
+
+function pathEntryExists(target: string): boolean {
+  try {
+    fs.lstatSync(target);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Exposes the host's kiro-cli auth store inside an isolated HOME via symlinks
+ * (credentials are never copied). Stores that do not exist on the host are
+ * skipped, existing entries are kept, and failures are ignored because linking
+ * is unsupported in some environments (for example Windows without symlink rights).
+ */
+export function linkHostKiroAuthStore(hostHome: string, isolatedHome: string): void {
+  if (path.resolve(isolatedHome) === path.resolve(hostHome)) {
+    return;
+  }
+
+  for (const segments of KIRO_AUTH_STORE_RELATIVE_PATHS) {
+    try {
+      const hostStore = path.join(hostHome, ...segments);
+      if (!fs.existsSync(hostStore)) {
+        continue;
+      }
+      const target = path.join(isolatedHome, ...segments);
+      if (pathEntryExists(target)) {
+        continue;
+      }
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.symlinkSync(hostStore, target, "dir");
+    } catch {
+      // Ignore: symlinks may be unsupported or unnecessary in this environment.
+    }
+  }
+}
+
+/**
  * Provisions the directory tree and settings for an isolated Skeleton.
  * Requirement 14.2: Copy role agent template into $KIRO_HOME/agents/.
  * Requirement 14.13: Set chat.disableInheritingDefaultResources to true in settings.
@@ -251,23 +303,7 @@ export function provisionSkeletonEnvironment(
   // When running with CLI login auth instead of KIRO_API_KEY, expose the host's
   // kiro-cli auth store inside the isolated HOME without copying credentials.
   if (!process.env.KIRO_API_KEY) {
-    try {
-      const hostHome = os.homedir();
-      const hostKiroDataDir = path.join(hostHome, ".local", "share", "kiro-cli");
-      if (
-        fs.existsSync(hostKiroDataDir) &&
-        path.resolve(paths.homeDir) !== path.resolve(hostHome)
-      ) {
-        const localShareDir = path.join(paths.homeDir, ".local", "share");
-        const targetDataDir = path.join(localShareDir, "kiro-cli");
-        fs.mkdirSync(localShareDir, { recursive: true });
-        if (!fs.existsSync(targetDataDir)) {
-          fs.symlinkSync(hostKiroDataDir, targetDataDir, "dir");
-        }
-      }
-    } catch {
-      // Ignore if symlink creation is unsupported or unneeded in test environments
-    }
+    linkHostKiroAuthStore(os.homedir(), paths.homeDir);
   }
 
   // Requirement 14.2: Copy role agent template unchanged
