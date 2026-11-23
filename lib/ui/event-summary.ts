@@ -299,7 +299,9 @@ const summarizeFinalCheck: Summarizer = (data) => {
     passed === undefined ? "Final check finished" : `Final check ${passed ? "passed" : "failed"}`;
   return withParts(base, [
     checkPart("install", data.installPassed),
-    checkPart("build", data.buildPassed),
+    // A run whose repository has no build script never ran a build, even though
+    // buildPassed is true so the outcome rule is not blocked.
+    data.hasBuild === false ? "build not run" : checkPart("build", data.buildPassed),
     checkPart("tests", data.testsPassed),
     data.hasTests === false && "no tests found",
   ]);
