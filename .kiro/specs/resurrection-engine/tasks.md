@@ -18,7 +18,7 @@ Implementation plan for the resurrection engine (design Revision 4). It follows 
   - **Task 28.2 & Task 29.1 (pure validation/schema code)**: Workspace sync path/filter validator logic and Promotion Gate audit schema/engine + offline unit tests (`test/audit/promotion-gate.test.ts`).
 - **Owner Scope (`[Owner — Requires Kiro CLI / Docker Sandbox]`)**:
   - **Task 18 Checkpoint**: Record 2 additional live sandbox runs on the Linux Docker host with `kiro-cli` (Claude 5.5) into `output/recorded-runs/` (reaching 3 recorded runs total) and execute `scripts/calibrate-e11.ts`.
-  - **Task 20 / Task 23 Live Sandbox Verification**: Live multi-Skeleton (`Soul-stitcher`) concurrency and real container OOM/TTL recovery verification on `instabox_dev`.
+  - **Task 20 / Task 23 Live Sandbox Verification**: Live multi-Skeleton (`Soul-stitcher`) concurrency and real container OOM/TTL recovery verification on the Linux Docker development host.
   - **Task 28 (`28.1`, `28.3`, `28.4` live cloud sandbox) & Task 29.2–30**: `DockerCloudSandboxBackend` Topology P-B cloud sandbox integration, `XR-01..XR-03` live sandbox checks, G1/G3 Security Access Audit execution & sign-off, production credential rotation (`T23`), and Checkpoint 30 production verification.
 
 ## Tasks
