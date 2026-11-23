@@ -149,3 +149,45 @@ npm run test:e2e     # Playwright 离线全链路 E2E（含 Gate -> Pact -> Legi
 为避免后续推进 Increment 2–5 时旧版本交接稿和探针报告与新路线产生修改冲突：
 - 原 `output/project-handoff-2026-11-16.md`（Increment 1 阶段交接）与 `output/phase0-probe-report.md`（Increment 0 探针阶段报告）已移出 Git 追踪列表，改名归档至本地未追踪目录 `01_evidence/archive/increment1-completed-2026-11-18/`。
 - 后续所有代码与文档协同请统一以本文件、`output/demo-and-inspector-guide-2026-11-17.md` 以及 `.kiro/specs/resurrection-engine/` 为唯一现行基线。
+
+
+---
+
+## 五、2026-11-23 任务分工更新：Kiro CLI / Docker 沙箱任务归 Owner，纯代码与离线测试任务归队友
+
+> **更新背景**：PR #1（`0ae9e1c`，macOS 登录复用、模型环境变量覆盖、Planner 覆盖率追问重试、Tombstone 按文件分组、Replay 单行摘要、已完成运行终态 UI 修复）与 PR #2（`3ce2a68`，mock PID 信号保护）已全部合入 `main`。
+>
+> **明确职责边界**：
+> - **Owner 负责**：所有需要 **真实 `kiro-cli`（Claude 5.5 凭据）** 或 **真实 Docker 沙箱（Linux 宿主机容器 / Docker Cloud Sandbox 云沙箱）** 的实跑录制、容器生命周期实测、上线安全审计（G1/G3、`XR-01..XR-03`）及凭据轮换（`T23`）。
+> - **队友（Teammate）负责**：所有 **纯代码模块、规则引擎、API 路由、前端 UI 状态、Mock/Fixture 单测、fast-check 属性测试与离线 Playwright E2E**（仅需本地 Node.js 24+，**无需** Claude 5.5 权限或 Docker 守护进程）。
+
+### 1. 队友负责的纯代码与离线测试清单（Teammate Scope — No Kiro CLI / Docker Sandbox Required）
+
+1. **PR #1 遗留的 2 项底层代码修复（`FIX-PR1`）**
+   - **消除事件双写**：修改 `lib/gateway/approval-manager.ts`（`ApprovalManager.emitEvent()`）与 `lib/gateway/execution-tools.ts`，统一只通过单一路径写入 `EventStore`（不再既直接 `eventStore.append()` 又触发 `onEmitEvent -> RuntimeHost.emitEvent()` 重复 `append`），并更新 `test/gateway/approval-manager-rb3.test.ts` 的断言。
+   - **无 `build` 脚本时的终检状态口径对齐**：当目标仓库无 `build` 脚本（Exhume 阶段记录为 `not run`）时，对齐 `final_check.result` 与 `BeforeAfterTable` 中的 build 状态表示，避免 Exhume 显示 `not run` 而终检显示 `buildPassed: true` 的口径不一致。
+2. **Increment 2 纯代码部分（Task 17.1–17.3）**
+   - 实现 `lib/admin/settings-store.ts`（`SettingsStore`：E11 默认上限初始化、缺项拒绝启动、变更审计日志、统计 `EventStore` 已完成录制 run 数满 3 次时置 `recalibrationRequired = true`）。
+   - 实现 `scripts/calibrate-e11.ts`（读取 `EventStore` 聚合前 3 次已完成录制运行的分布并生成 JSON/Markdown 校准对比报告，支持 CLI 参数写回 `SettingsStore`）。
+   - 编写 `test/admin/calibrate-e11.test.ts`（使用 fixture 事件流验证 `SettingsStore` 与 `calibrate-e11.ts`；真实的第 2、3 次沙箱运行由 Owner 录制后提供）。
+3. **Increment 3 Python 2→3 规则、门禁与确定性 Bundle（Task 19.1–19.10）**
+   - 实现 `lib/rules/m1-python.ts`、`lib/grimoire/python-gate.ts`、`lib/grimoire/bundle.ts`（并联动 `scripts/fixtures/bake.ts`）、`scripts/test-oracle.py`、`test/oracle/cpython-oracle.test.ts` 以及属性测试 P2/P4/P5/P7/P8/P9（`npm run test:oracle`、`npm run test:props`、`npm run test:golden`）。
+4. **Increment 3 Bonesetter、Headless Fallback 解析器与并行调度代码（Task 20.1–20.4 代码与 Mock 测试）**
+   - 实现 `lib/agents/bonesetter.ts`、`lib/acp/headless-fallback.ts`、`lib/acp/stream-parser.ts`、`lib/scheduler/parallel-scheduler.ts` 及基于 mock 子进程与本地 git worktree 的 `test/scheduler/parallel-bonesetter.test.ts`。
+5. **Increment 3 双向消息、HITL、硬阻断、Fork Push 路由、Admission、BudgetGovernor 与 Admin 后端（Task 21.1–21.5 & Task 22.1–22.5）**
+   - 实现 `lib/messaging/message-service.ts`、`lib/hitl/ask-manager.ts`、`lib/policy/hard-blocks.ts`、`/api/runs/[runId]/{messages,push-fork}` 等路由及 `test/props/no-upstream-writes.test.ts`（P15）。
+   - 实现 `lib/admission/{invite-code,fifo-queue,admission-controller}.ts`、`lib/governor/budget-governor.ts`、`test/props/caps-stop-new-work.test.ts`（P20）、`lib/admin/{admin-session,kill-switch}.ts` 及 `/api/admin/*` 路由。
+6. **Increment 3 Scribe 报告证据校验与恢复逻辑代码（Task 23.1–23.5 代码与 Mock 测试）**
+   - 实现 `lib/scribe/{scribe-service,report-check}.ts`、`lib/supervisor/failure-recovery.ts`、`lib/recovery/boot-reconciliation.ts` 及基于 mock backend 的 `test/scribe/report-check.test.ts`、`test/recovery/failure-recovery.test.ts`。
+7. **Increment 3 全量 UI 剩余状态、任务图、诚实指标注册表、Built with Kiro 页面与无障碍 E2E（Task 24–27）**
+   - 实现 Task 24（各页剩余状态、`TaskGraph.tsx`/`TaskTable.tsx`、`LayToRestModal.tsx`、`app/built-with-kiro/page.tsx`、`app/admin/page.tsx`、`KillSwitchModal.tsx`）、Task 25（`lib/metrics/{registry,formatters}.ts` M1–M31 + P14、`GlossedTerm.tsx`、`claims-linter.ts`、`components/a11y/*` + `test/e2e/accessibility.spec.ts` Playwright `axe-core`）、Task 26（`scripts/evidence/build-evidence.ts`、`test/ci/evidence-integrity.test.ts`、`lib/evidence/evidence-service.ts`、`OpenInKiroHandoff.tsx`），并在本地离线通过 **Checkpoint 27**（`npm run test:props`、`npm run test:golden`、`npm run test:e2e`）。
+8. **Increment 4 纯代码校验层（Task 28.2 & Task 29.1 离线逻辑）與 Increment 5 纯前端可选加分项**
+   - `lib/execution/sandbox-sync.ts`（或 `lib/backend/sync-validator.ts` 扩展）纯文件同步过滤逻辑与单测；`lib/audit/{promotion-gate,audit-schema,evidence-recorder}.ts` 审计表结构校验逻辑与 `test/audit/promotion-gate.test.ts` 单测。
+   - 可选 Stretch 纯前端/API 项：`F21`（Fork Push 确认流 UI）、`F25`（桌面通知）、`F26`（OSV 依赖提示）、`F27`（分享卡片）。
+
+### 2. Owner 负责的 Kiro CLI / Docker 沙箱与上线任务（Owner Scope — Requires Kiro CLI / Docker Sandbox）
+
+1. **Task 18（Checkpoint 18 — 真实沙箱录制与 E11 校准运行）**：在 Linux Docker 宿主机配合 `kiro-cli`（Claude 5.5）再跑通 **2 个不同真实仓库**并固化至 `output/recorded-runs/`（凑齐 3 份录制包），随后运行队友编写的 `scripts/calibrate-e11.ts` 落盘校准结果。
+2. **Task 20 / Task 23 / Stretch `F24`/`F28`/`F29` 的真实容器与 `kiro-cli` 联调**：在开发机真实 Docker 容器与 `kiro-cli` 会话下验证多 `Soul-stitcher` 并行、容器 OOM/TTL 重建恢复及容器内 CPython 门禁。
+3. **Task 28（28.1/28.3/28.4 真实云沙箱对接）与 Task 29.2–30（上线安全审计与生产环境验证）**：对接 Docker Agentic Platform 云沙箱 SDK 与生产宿主机 `kiro-cli`，执行 `XR-01..XR-03` 实测、G1/G3 安全审计签字、生产凭据轮换与 Checkpoint 30 验收。
+4. **`T23` 凭据轮换与仓库公开**（以及与队友协作完成 `T7` 演示视频录制）。
