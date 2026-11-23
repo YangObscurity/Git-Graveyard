@@ -141,13 +141,16 @@ export class RuntimeHost extends EventEmitter {
     const defaultTimeoutMs = options.defaultTimeoutMs ?? 300000;
     const approvalWaitMs = options.approvalWaitMs ?? 300000;
 
+    // The gateway reports events only through onEmitEvent. RuntimeHost.emitEvent
+    // appends each one to this.eventStore once and notifies subscribers. Passing
+    // this.eventStore to the gateway as well would make ApprovalManager and
+    // execution-tools append every event a second time.
     this.gateway =
       options.gateway ??
       new McpGateway({
         defaultTimeoutMs,
         approvalWaitMs,
         logStore: this.logStore,
-        eventStore: this.eventStore,
         runStore: this.runStore,
         collaborationStore: this.collaborationStore,
         backend: this.backend,
