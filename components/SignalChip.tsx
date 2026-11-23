@@ -1,11 +1,16 @@
 "use client";
 
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import type {
   SignalChip as SignalChipType,
   Receipt,
 } from "@/lib/grimoire/autopsy";
 import type { RuleId } from "@/lib/grimoire/types";
+import {
+  hasUsableLine,
+  receiptCopyValue,
+  receiptTarget,
+} from "@/lib/ui/signal-groups";
 
 export interface SignalChipData {
   ruleId: RuleId | string;
@@ -19,10 +24,44 @@ export interface SignalChipData {
   snippet?: string;
 }
 
+/**
+ * "full" shows the rule badge and the whole `file:line` receipt.
+ * "line" is the compact chip used inside a file row: it shows the line only,
+ * and keeps the full receipt in its accessible text, title and copy value.
+ */
+export type SignalChipVariant = "full" | "line";
+
 export interface SignalChipProps {
   chip: SignalChipType | SignalChipData;
   sha?: string;
   onOpenReceipt?: (chip: SignalChipType | SignalChipData) => void;
+  variant?: SignalChipVariant;
+}
+
+type CopyStatus = "idle" | "copied" | "failed";
+
+const COPY_STATUS_RESET_MS = 2000;
+
+const COPY_LABELS: Record<CopyStatus, string> = {
+  idle: "Copy",
+  copied: "Copied",
+  failed: "Copy failed",
+};
+
+function CopyIcon() {
+  return (
+    <svg
+      aria-hidden="true"
+      viewBox="0 0 16 16"
+      className="w-3 h-3"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.5"
+    >
+      <rect x="5" y="5" width="8.5" height="8.5" rx="1.5" />
+      <path d="M3 10.5V3.5A1.5 1.5 0 0 1 4.5 2h6" />
+    </svg>
+  );
 }
 
 type SignalSeverity = "critical" | "high" | "medium" | "low" | "info";
@@ -81,28 +120,41 @@ const SEVERITY_STYLES: Record<
   },
 };
 
-export function SignalChip({ chip, sha, onOpenReceipt }: SignalChipProps) {
-  const [copied, setCopied] = useState(false);
+export function SignalChip({
+  chip,
+  sha,
+  onOpenReceipt,
+  variant = "full",
+}: SignalChipProps) {
+  const [copyStatus, setCopyStatus] = useState<CopyStatus>("idle");
+
+  useEffect(() => {
+    if (copyStatus === "idle") return;
+    const timer = setTimeout(() => setCopyStatus("idle"), COPY_STATUS_RESET_MS);
+    return () => clearTimeout(timer);
+  }, [copyStatus]);
 
   const ruleId = chip.ruleId || "M1";
   const file = chip.file || "";
-  const line = chip.line ?? 0;
-  const target = chip.target || `${file}:${line}`;
-  const clipboardPayload = chip.clipboardPayload || target;
+  const target = receiptTarget(chip);
+  const clipboardPayload = receiptCopyValue(chip);
   const receiptFormatted = chip.receipt?.formatted || `${ruleId} ${target}`;
   const severity = resolveSignalSeverity(ruleId, chip.confidence);
   const styles = SEVERITY_STYLES[severity];
+  const isLineVariant = variant === "line";
 
   async function handleCopy(e: React.MouseEvent) {
     e.stopPropagation();
+    if (typeof navigator === "undefined" || !navigator.clipboard) {
+      setCopyStatus("failed");
+      return;
+    }
     try {
-      if (typeof navigator !== "undefined" && navigator.clipboard) {
-        await navigator.clipboard.writeText(clipboardPayload);
-      }
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
+      await navigator.clipboard.writeText(clipboardPayload);
+      setCopyStatus("copied");
     } catch {
-      // Clipboard write fallback
+      // Shown to the user as "Copy failed" plus the live status text below.
+      setCopyStatus("failed");
     }
   }
 
@@ -119,11 +171,14 @@ export function SignalChip({ chip, sha, onOpenReceipt }: SignalChipProps) {
       data-ui-element="signal-chip"
       data-ui-state={severity}
       data-ui-variant={ruleId}
+      data-chip-variant={variant}
       data-rule-id={ruleId}
       data-target={target}
       data-sha={sha}
       title={receiptFormatted}
-      className={`crypt-well inline-flex items-center gap-2 px-2.5 py-1.5 text-xs font-mono text-parchment transition-colors ${styles.container}`}
+      className={`crypt-well inline-flex items-center font-mono text-parchment transition-colors ${
+        isLineVariant ? "gap-1 pl-2 pr-1 py-0.5 text-[11px]" : "gap-2 px-2.5 py-1.5 text-xs"
+      } ${styles.container}`}
     >
       {/* Rule and file:line receipt */}
       <button
@@ -131,19 +186,33 @@ export function SignalChip({ chip, sha, onOpenReceipt }: SignalChipProps) {
         onClick={handleOpen}
         data-testid="signal-chip-receipt-button"
         className="flex items-center gap-1.5 hover:text-bone cursor-pointer text-left focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-400 rounded"
-        title="View source receipt line"
+        title={`View source receipt line ${receiptFormatted}`}
       >
-        <span
-          className={`px-1.5 py-0.5 rounded border text-[10px] font-bold uppercase ${styles.badge}`}
-        >
-          {ruleId}
-        </span>
-        <span
-          data-testid="signal-chip-target"
-          className="underline decoration-dotted underline-offset-2 text-bone"
-        >
-          {target}
-        </span>
+        {isLineVariant ? (
+          <span
+            data-testid="signal-chip-target"
+            className="underline decoration-dotted underline-offset-2 text-bone tabular-nums"
+          >
+            {/* The full receipt stays in the text; only the line is drawn,
+                because the rule and file are shown by the surrounding row. */}
+            <span className="sr-only">{`${ruleId} ${file}`}</span>
+            {hasUsableLine(chip) ? `:${chip.line}` : ":line not recorded"}
+          </span>
+        ) : (
+          <>
+            <span
+              className={`px-1.5 py-0.5 rounded border text-[10px] font-bold uppercase ${styles.badge}`}
+            >
+              {ruleId}
+            </span>
+            <span
+              data-testid="signal-chip-target"
+              className="underline decoration-dotted underline-offset-2 text-bone"
+            >
+              {target}
+            </span>
+          </>
+        )}
       </button>
 
       {/* Copy control (Requirement 5.6) */}
@@ -152,12 +221,22 @@ export function SignalChip({ chip, sha, onOpenReceipt }: SignalChipProps) {
         onClick={handleCopy}
         data-testid="signal-chip-copy"
         data-clipboard-payload={clipboardPayload}
-        className="px-1.5 py-0.5 rounded bg-neutral-900/90 hover:bg-neutral-800 text-ash hover:text-bone text-[10px] cursor-pointer border border-white/10 hover:border-white/25 transition-colors"
+        data-copy-status={copyStatus}
+        className={`rounded bg-neutral-900/90 hover:bg-neutral-800 text-ash hover:text-bone text-[10px] cursor-pointer border border-white/10 hover:border-white/25 transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-400 ${
+          isLineVariant ? "inline-flex items-center gap-1 px-1 py-0.5" : "px-1.5 py-0.5"
+        }`}
         title={`Copy ${clipboardPayload} to clipboard`}
         aria-label={`Copy ${clipboardPayload} to clipboard`}
       >
-        {copied ? "Copied" : "Copy"}
+        {isLineVariant && copyStatus === "idle" ? <CopyIcon /> : COPY_LABELS[copyStatus]}
       </button>
+      <span role="status" aria-live="polite" className="sr-only">
+        {copyStatus === "copied"
+          ? `Copied ${clipboardPayload}`
+          : copyStatus === "failed"
+          ? `Could not copy ${clipboardPayload} to the clipboard. The browser did not allow clipboard access.`
+          : ""}
+      </span>
     </div>
   );
 }

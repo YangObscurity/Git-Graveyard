@@ -5,14 +5,13 @@ import type {
   AutopsyResult,
   SignalChip as SignalChipType,
 } from "@/lib/grimoire/autopsy";
-import type { RuleId } from "@/lib/grimoire/types";
 import {
   DISCLAIMER,
   VALID_RULE_IDS,
   escapePlainText,
 } from "@/lib/grimoire/autopsy";
 import { routes } from "@/lib/ui/run-routes";
-import { SignalChip } from "./SignalChip";
+import { SignalRuleGroups } from "./SignalRuleGroups";
 import { ReceiptViewer } from "./ReceiptViewer";
 import { ExhumeView } from "./ExhumeView";
 import { CryptOrnament } from "./ui/CryptOrnament";
@@ -474,45 +473,12 @@ export function TombstoneView({
             </span>
           </div>
 
-          <div className="space-y-3" data-testid="grouped-signal-chips">
-            {VALID_RULE_IDS.map((ruleId: RuleId) => {
-              const chipsForRule = chipsByRule[ruleId] ?? [];
-              return (
-                <div
-                  key={ruleId}
-                  data-testid={`rule-group-${ruleId}`}
-                  className="crypt-panel p-3.5 space-y-2.5"
-                >
-                  <div className="flex items-center justify-between text-xs text-ash">
-                    <span className="font-bold text-bone">
-                      Rule {ruleId}
-                    </span>
-                    <span className="text-[10px] text-dust">
-                      {chipsForRule.length} signal
-                      {chipsForRule.length === 1 ? "" : "s"}
-                    </span>
-                  </div>
-
-                  {chipsForRule.length > 0 ? (
-                    <div className="flex flex-wrap gap-2 pt-1">
-                      {chipsForRule.map((chip, idx) => (
-                        <SignalChip
-                          key={`${chip.ruleId}-${chip.file}-${chip.line}-${idx}`}
-                          chip={chip}
-                          sha={autopsy.sha}
-                          onOpenReceipt={(c) => setSelectedReceiptChip(c as SignalChipType)}
-                        />
-                      ))}
-                    </div>
-                  ) : (
-                    <div className="text-[11px] text-dust italic">
-                      No signals detected for Rule {ruleId}.
-                    </div>
-                  )}
-                </div>
-              );
-            })}
-          </div>
+          <SignalRuleGroups
+            chipsByRule={chipsByRule}
+            ruleIds={VALID_RULE_IDS}
+            sha={autopsy.sha}
+            onOpenReceipt={(c) => setSelectedReceiptChip(c as SignalChipType)}
+          />
         </div>
       </section>
 
