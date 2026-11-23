@@ -1188,8 +1188,9 @@ export function PactEditor({
         </div>
       )}
 
-      {/* Top Sticky Pact Header Bar */}
-      <div className="crypt-panel-engraved p-4 md:p-5 sticky top-14 z-20 backdrop-blur-md space-y-3">
+      {/* Top Pact Header Bar: sticky from md up; on phones it scrolls with the page
+          so it does not cover the sections below it. */}
+      <div className="crypt-panel-engraved p-4 md:p-5 md:sticky md:top-14 md:z-20 backdrop-blur-md space-y-3">
         <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
           <div className="space-y-1.5">
             <div className="flex flex-wrap items-center gap-2.5">
