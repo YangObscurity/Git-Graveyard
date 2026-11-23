@@ -87,6 +87,8 @@ export interface ReportStepVerifyResultInput {
   readonly passed?: boolean;
   readonly installPassed?: boolean | null;
   readonly buildPassed?: boolean | null;
+  /** false when the repository has no build script, so no build ran. */
+  readonly hasBuild?: boolean | null;
   readonly testsPassed?: boolean | null;
   readonly hasTests?: boolean | null;
   readonly install?: unknown;
@@ -517,6 +519,7 @@ export function buildVerifyResultArtifact(
     passed,
     installPassed: normalizedInput.installPassed ?? null,
     buildPassed: normalizedInput.buildPassed ?? null,
+    hasBuild: normalizedInput.hasBuild ?? null,
     testsPassed: normalizedInput.testsPassed ?? null,
     hasTests: normalizedInput.hasTests ?? null,
     gates:
@@ -774,7 +777,7 @@ export function buildReportArtifact(
     "",
     `- Overall verification: ${verifyResultData.passed ? "passed (cmd:verify)" : "failed (cmd:verify)"}`,
     `- Install: ${verifyResultData.installPassed === true ? "passed (cmd:install)" : verifyResultData.installPassed === false ? "failed (cmd:install)" : "not run"}`,
-    `- Build: ${verifyResultData.buildPassed === true ? "passed (cmd:build)" : verifyResultData.buildPassed === false ? "failed (cmd:build)" : "not run"}`,
+    `- Build: ${verifyResultData.hasBuild === false ? "not run (no build script)" : verifyResultData.buildPassed === true ? "passed (cmd:build)" : verifyResultData.buildPassed === false ? "failed (cmd:build)" : "not run"}`,
     `- Tests: ${verifyResultData.testsPassed === true ? "passed (cmd:test)" : verifyResultData.testsPassed === false ? "failed (cmd:test)" : verifyResultData.hasTests === false ? "no tests found" : "not run"}`,
     "",
     "## Scribe's reading",

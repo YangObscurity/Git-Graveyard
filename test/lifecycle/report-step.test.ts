@@ -373,3 +373,23 @@ test("report-step: input format flexibility", async (t) => {
     assert.ok(artifacts.some((a) => a.path === "spec.json"));
   });
 });
+
+test("report-step: a repository without a build script reports build as not run", () => {
+  const result = buildReportStepArtifacts({
+    runId: "run-no-build",
+    verifyResult: {
+      passed: true,
+      installPassed: true,
+      buildPassed: true,
+      hasBuild: false,
+      testsPassed: true,
+      hasTests: true,
+    },
+    tasks: [{ id: "task-1", state: "merged" }],
+  });
+
+  assert.ok(result.report.markdown.includes("- Build: not run (no build script)"));
+  assert.ok(!result.report.markdown.includes("- Build: passed"));
+  // The outcome rule still treats a missing build script as no build failure.
+  assert.equal(result.outcome, "resurrected");
+});

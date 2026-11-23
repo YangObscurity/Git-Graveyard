@@ -353,3 +353,22 @@ describe("summarizeEvent: fallback and missing fields", () => {
     assert.equal(JSON.stringify(event), before);
   });
 });
+
+describe("summarizeEvent: final check without a build script", () => {
+  it("says build not run when the repository has no build script", () => {
+    assert.equal(
+      summarizeEvent(
+        ev("final_check.result", {
+          passed: true,
+          installPassed: true,
+          buildPassed: true,
+          hasBuild: false,
+          testsPassed: true,
+          hasTests: true,
+          refs: [],
+        })
+      ),
+      "Final check passed (install passed, build not run, tests passed)"
+    );
+  });
+});
