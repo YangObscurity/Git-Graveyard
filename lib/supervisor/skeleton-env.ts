@@ -226,6 +226,15 @@ const KIRO_AUTH_STORE_RELATIVE_PATHS: ReadonlyArray<readonly string[]> = [
   ["Library", "Application Support", "kiro-cli"],
 ];
 
+function pathEntryExists(target: string): boolean {
+  try {
+    fs.lstatSync(target);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Exposes the host's kiro-cli auth store inside an isolated HOME via symlinks
  * (credentials are never copied). Stores that do not exist on the host are
@@ -244,7 +253,7 @@ export function linkHostKiroAuthStore(hostHome: string, isolatedHome: string): v
         continue;
       }
       const target = path.join(isolatedHome, ...segments);
-      if (fs.existsSync(target)) {
+      if (pathEntryExists(target)) {
         continue;
       }
       fs.mkdirSync(path.dirname(target), { recursive: true });

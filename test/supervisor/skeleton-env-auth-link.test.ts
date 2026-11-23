@@ -99,4 +99,29 @@ describe("linkHostKiroAuthStore", () => {
       cleanup();
     }
   });
+
+  it("keeps an existing broken symlink instead of crashing or overwriting it", () => {
+    const { hostHome, isolatedHome, cleanup } = makeHomes();
+    try {
+      makeStore(hostHome, MACOS_STORE);
+      const target = path.join(isolatedHome, ...MACOS_STORE);
+      const missingTarget = path.join(hostHome, "missing-store");
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      try {
+        fs.symlinkSync(missingTarget, target, "dir");
+      } catch (err: any) {
+        if (err?.code === "EPERM" || err?.code === "ENOTSUP") {
+          return;
+        }
+        throw err;
+      }
+
+      linkHostKiroAuthStore(hostHome, isolatedHome);
+
+      assert.ok(fs.lstatSync(target).isSymbolicLink());
+      assert.equal(fs.readlinkSync(target), missingTarget);
+    } finally {
+      cleanup();
+    }
+  });
 });

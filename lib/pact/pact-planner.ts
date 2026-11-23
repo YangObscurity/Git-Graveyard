@@ -251,8 +251,15 @@ export function buildPlannerPrompt(options: PactPlannerOptions): string {
           .map((f, i) => {
             const rule = f.ruleId ?? "UNKNOWN";
             const file = f.file ?? f.ref;
+            const stage =
+              typeof f.stage === "string"
+                ? f.stage
+                : typeof f.step === "string"
+                  ? f.step
+                  : undefined;
+            const stageTag = !f.ruleId && stage ? ` (${stage})` : "";
             const desc = f.description ?? f.message ?? "failure";
-            return `  ${i + 1}. [${rule}] ${file ? `in ${file}: ` : ""}${desc}`;
+            return `  ${i + 1}. [${rule}]${stageTag} ${file ? `in ${file}: ` : ""}${desc}`;
           })
           .join("\n")
       : "  None (baseline passed)";
@@ -285,8 +292,9 @@ ${failureLines}
 ${signalLines}
 
 ## Requirements for the Pact (tasks.md)
-1. Every failure listed in the Death Certificate must be addressed by at least one task matching its ruleId or file.
-   For a failure without a ruleId (shown as [UNKNOWN]), copy the exact reference after "in" into the \`files:\` line of a task that fixes it.
+1. Every failure listed in the Death Certificate must be addressed by at least one task matching its ruleId (in \`rules:\`), its repository file path (in \`files:\`), or its step keyword (\`install\`, \`build\`, \`test\`, \`retry\`) in the task title.
+   Always list the actual repository file paths to modify in \`files:\` — never list only a \`cmd:\` reference, because \`files:\` is enforced as the edit scope allow-list.
+   For a failure without a ruleId (shown as [UNKNOWN]), include its step keyword in the task title (e.g., "test", "build", "install") or, if it names a repository file path, include that path in \`files:\`.
 2. Roles must be strictly either "bonesetter" (for dependency/package updates) or "soul-stitcher" (for code/API fixes).
 3. Include non-removable requirements:
    - Grimoire syntax/gate task
@@ -313,11 +321,22 @@ export function buildCoverageRetryPrompt(
     file?: string;
     description?: string;
     message?: string;
+    stage?: string;
+    step?: string;
   }>
 ): string {
   const lines = uncoveredFailures
     .map((f, i) => {
-      const ref = f.ruleId ?? f.file ?? "unknown";
+      const stage = f.stage ?? f.step;
+      const ref = f.ruleId
+        ? `rule ${f.ruleId}`
+        : f.file?.startsWith("cmd:") && stage
+          ? `step "${stage}" (ref ${f.file})`
+          : f.file
+            ? `${f.file.startsWith("cmd:") ? "ref" : "file"} ${f.file}`
+            : stage
+              ? `step "${stage}"`
+              : "unknown";
       const text = f.description ?? f.message;
       return `  ${i + 1}. ${ref}${text ? ` (${text})` : ""}`;
     })
@@ -327,7 +346,8 @@ export function buildCoverageRetryPrompt(
 ${lines}
 
 Output the complete Pact (tasks.md) again, keeping the existing tasks and adding or extending tasks so every uncovered failure is covered.
-Match each failure by its rule in \`rules:\` or by its exact reference in the \`files:\` line of a task.`;
+Match each failure by its rule in \`rules:\`, by its step keyword ("test", "build", "install", "retry") in the task title for command failures, or by its repository file path in \`files:\`.
+Always keep the real repository file paths to modify in \`files:\` (never replace them with only a \`cmd:\` reference).`;
 }
 
 /**
