@@ -71,7 +71,10 @@ import {
   type FinalizeRunResult,
 } from "../lifecycle/run-finalizer";
 import type { SkeletonSupervisor } from "../supervisor/skeleton-supervisor";
-import { getAssignedModelForRole } from "../agents/model-allowlist";
+import {
+  CLAUDE_OPUS_5_5_MODEL_ID,
+  getAssignedModelForRole,
+} from "../agents/model-allowlist";
 import { redactEvent } from "../security/redactor";
 import { neutralizeUntrustedContent } from "../security/untrusted-content";
 import {
@@ -875,7 +878,7 @@ export class RunOrchestrator extends EventEmitter {
         typeof (plannerSupervisor as any).getVerifiedModel !== "function" ||
         !(plannerSupervisor as any).getVerifiedModel()
       ) {
-        (plannerSupervisor as any).getVerifiedModel = () => "claude-opus-5.5";
+        (plannerSupervisor as any).getVerifiedModel = () => CLAUDE_OPUS_5_5_MODEL_ID;
       }
       if (
         typeof (plannerSupervisor as any).getVerifiedAgent !== "function" ||
@@ -2396,7 +2399,7 @@ srv.listen(8080, "0.0.0.0");
       typeof (supervisor as any).getVerifiedModel !== "function" ||
       !(supervisor as any).getVerifiedModel()
     ) {
-      (supervisor as any).getVerifiedModel = () => "claude-opus-5.5";
+      (supervisor as any).getVerifiedModel = () => CLAUDE_OPUS_5_5_MODEL_ID;
     }
     if (
       typeof (supervisor as any).getVerifiedAgent !== "function" ||
