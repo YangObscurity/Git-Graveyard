@@ -3,6 +3,7 @@
 import React, { useEffect, useState, useMemo, useCallback } from "react";
 import Link from "next/link";
 import type { EventEnvelope } from "@/lib/events/types";
+import { summarizeEvent } from "@/lib/ui/event-summary";
 import { StatusPill } from "@/components/ui/StatusPill";
 import { CryptOrnament } from "@/components/ui/CryptOrnament";
 
@@ -735,11 +736,24 @@ export function ReplayPlayer({
                   Redacted by the owner
                 </div>
               ) : (
-                <div className="overflow-x-auto">
-                  <pre className="crypt-well font-mono text-[11px] whitespace-pre-wrap break-all text-parchment p-3">
-                    {JSON.stringify(ev.data, null, 2)}
-                  </pre>
-                </div>
+                <>
+                  <p
+                    data-testid="event-summary"
+                    className="text-sm text-bone leading-snug break-words"
+                  >
+                    {summarizeEvent(ev)}
+                  </p>
+                  <details data-testid="event-raw">
+                    <summary className="cursor-pointer select-none w-fit text-[11px] text-dust hover:text-ash">
+                      Raw event
+                    </summary>
+                    <div className="overflow-x-auto mt-2">
+                      <pre className="crypt-well font-mono text-[11px] whitespace-pre-wrap break-all text-parchment p-3">
+                        {JSON.stringify(ev.data, null, 2)}
+                      </pre>
+                    </div>
+                  </details>
+                </>
               )}
 
               {isLastEventAndKilled ? (
