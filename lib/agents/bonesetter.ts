@@ -11,7 +11,6 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { CLAUDE_SONNET_5_5_MODEL_ID } from "./model-allowlist";
-import { MANIFEST_LOCK_FILENAMES } from "../broker/permission-broker";
 import {
   provisionSkeletonEnvironment,
   resolveSkeletonPaths,
@@ -58,50 +57,45 @@ function isDeniedSecretSegment(segment: string): boolean {
 }
 
 /**
- * True when a root-level file name matches one of the Bonesetter template allow
- * patterns (`BONESETTER_MANIFEST_ALLOW_PATTERNS`). The leading `**` + `/` prefix is
- * dropped because Bonesetter only ever writes at the cwd root, and `*` is the
- * only wildcard used by the allowlist (e.g. `requirements*.txt`). Case-insensitive.
+ * The exact set of manifest and lock file names the Bonesetter may write at the
+ * cwd root. This is the authoritative, single-source write set shared by the
+ * Bonesetter tool client and the PermissionBroker (finding [21]): a manifest or
+ * lock name that is NOT one of these ten is never writable, even when the broader
+ * broker `MANIFEST_LOCK_FILENAMES` list contains it.
+ *
+ * The ten names are exactly the intersection of the broker's
+ * `MANIFEST_LOCK_FILENAMES` and the Bonesetter template allow patterns:
+ * `package.json`, `package-lock.json`, `npm-shrinkwrap.json`, `yarn.lock`,
+ * `pnpm-lock.yaml`, `poetry.lock`, `pipfile`, `pipfile.lock`, `pyproject.toml`
+ * and `requirements.txt`.
  */
-function matchesBonesetterManifestAllowPattern(fileName: string): boolean {
-  const lower = fileName.toLowerCase();
-  return BONESETTER_MANIFEST_ALLOW_PATTERNS.some((pattern) => {
-    const slash = pattern.indexOf("/");
-    const glob = (slash === -1 ? pattern : pattern.slice(slash + 1)).toLowerCase();
-    const star = glob.indexOf("*");
-    if (star === -1) {
-      return glob === lower;
-    }
-    const prefix = glob.slice(0, star);
-    const suffix = glob.slice(star + 1);
-    return (
-      lower.length >= prefix.length + suffix.length &&
-      lower.startsWith(prefix) &&
-      lower.endsWith(suffix)
-    );
-  });
-}
+export const BONESETTER_WRITABLE_FILENAMES: ReadonlySet<string> = new Set([
+  "package.json",
+  "package-lock.json",
+  "npm-shrinkwrap.json",
+  "yarn.lock",
+  "pnpm-lock.yaml",
+  "poetry.lock",
+  "pipfile",
+  "pipfile.lock",
+  "pyproject.toml",
+  "requirements.txt",
+]);
 
 /**
- * The exact intersection of the broker's `MANIFEST_LOCK_FILENAMES` and the
- * Bonesetter template allow patterns, restricted to cwd-root file names. This is
- * the authoritative write set: `package.json`, `package-lock.json`,
- * `npm-shrinkwrap.json`, `yarn.lock`, `pnpm-lock.yaml`, `poetry.lock`,
- * `pipfile`, `pipfile.lock`, `pyproject.toml` and `requirements.txt`.
+ * Backwards-compatible alias for `BONESETTER_WRITABLE_FILENAMES` (the exact
+ * cwd-root manifest/lock intersection). Kept so existing importers keep working.
  */
-export const BONESETTER_ROOT_MANIFEST_FILENAMES: ReadonlySet<string> = new Set(
-  [...MANIFEST_LOCK_FILENAMES].filter((name) =>
-    matchesBonesetterManifestAllowPattern(name)
-  )
-);
+export const BONESETTER_ROOT_MANIFEST_FILENAMES: ReadonlySet<string> =
+  BONESETTER_WRITABLE_FILENAMES;
 
 /**
  * Pure check that a path is writable by the Bonesetter: only a manifest or
- * lockfile name at the cwd root that is in the intersection of the broker's
- * `MANIFEST_LOCK_FILENAMES` and the Bonesetter template allow patterns. Strictly
- * rejects nested manifest paths (e.g. `packages/app/package.json`), `.git/**`,
- * `.kiro/**`, secret names (`.env*`, `*.pem`, `id_*`), `../` traversal, absolute
- * paths, and any arbitrary source file such as `.ts`, `.js`, `.py`.
+ * lockfile name at the cwd root that is in `BONESETTER_WRITABLE_FILENAMES`.
+ * Strictly rejects nested manifest paths (e.g. `packages/app/package.json`),
+ * `.git/**`, `.kiro/**`, secret names (`.env*`, `*.pem`, `id_*`), `../`
+ * traversal, absolute paths, leading/trailing whitespace (finding [11]), and any
+ * arbitrary source file such as `.ts`, `.js`, `.py`.
  *
  * This closes the review finding that a broker-only name (`cargo.toml`,
  * `setup.cfg`, `go.mod`, `Gemfile`, ...) or a template-only glob (`setup.py`,
@@ -113,7 +107,11 @@ export function isBonesetterWritablePath(filePath: string): boolean {
   if (typeof filePath !== "string") {
     return false;
   }
-  const raw = filePath.trim();
+  // Finding [11]: never silently `.trim()` a padded path into an allowed name.
+  if (filePath !== filePath.trim()) {
+    return false;
+  }
+  const raw = filePath;
   if (raw.length === 0 || raw.includes("\0")) {
     return false;
   }
@@ -145,15 +143,12 @@ export function isBonesetterWritablePath(filePath: string): boolean {
 
   // Manifest and lock names are matched only at the cwd root by exact relative
   // path; a nested path is never writable. A root name is writable only when it
-  // is in the intersection of the broker allowlist and the template allowlist.
+  // is in the exact shared intersection set.
   const rel = segments.join("/");
   if (rel.includes("/")) {
     return false;
   }
-  const lower = rel.toLowerCase();
-  return (
-    MANIFEST_LOCK_FILENAMES.has(lower) && matchesBonesetterManifestAllowPattern(lower)
-  );
+  return BONESETTER_WRITABLE_FILENAMES.has(rel.toLowerCase());
 }
 
 // ---------------------------------------------------------------------------
@@ -425,6 +420,24 @@ export function validateBonesetterTemplate(
     }
   }
 
+  // PR-Agent finding: the template must be configured with all eight tools the
+  // Bonesetter tool interface exposes. A missing tool would silently degrade the
+  // agent, so each missing entry is reported with a clear message.
+  for (const tool of [
+    "read",
+    "write",
+    "sandbox_exec",
+    "sandbox_log",
+    "report_task_result",
+    "ask",
+    "report_blocker",
+    "ack_message",
+  ]) {
+    if (!info.tools.includes(tool)) {
+      errors.push(`tools must contain "${tool}"`);
+    }
+  }
+
   const fsReadDenyGlobs = new Set<string>();
   for (const rule of info.rules) {
     if (rule.capability === "fs_read" && rule.effect === "deny") {
@@ -495,6 +508,13 @@ export interface BundleBonesetterSteeringResourcesOptions {
   grimoireGuidance: Array<{ fileName?: string; content: string }>;
   maxFiles?: number;
   maxTotalChars?: number;
+  /**
+   * Trusted worktree root the steering target directory must stay strictly inside
+   * (finding [10]). When set, symlinked components (`.kiro`, `.kiro/steering`, …)
+   * and target files are refused and the resolved target must stay within the
+   * resolved worktree root.
+   */
+  worktreeDir?: string;
 }
 
 export interface BundledSteeringFile {
@@ -549,6 +569,46 @@ function safeSteeringFileName(
   return unique;
 }
 
+/** True when the path exists and is itself a symlink (never follows the link). */
+function isSymbolicLinkSync(target: string): boolean {
+  try {
+    return fs.lstatSync(target).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+/** True when target is inside base or equal to it (lexical, after resolving). */
+function isPathInsideDirSync(base: string, target: string): boolean {
+  const rel = path.relative(base, target);
+  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+}
+
+/**
+ * Realpath of the deepest existing ancestor of `target`, with the non-existent
+ * tail rejoined, so a not-yet-created directory still resolves against its real
+ * parent (finding [10]).
+ */
+function realpathOfExistingPrefixSync(target: string): string {
+  let current = path.resolve(target);
+  const tail: string[] = [];
+  while (!fs.existsSync(current)) {
+    const parent = path.dirname(current);
+    if (parent === current) {
+      break;
+    }
+    tail.unshift(path.basename(current));
+    current = parent;
+  }
+  let real: string;
+  try {
+    real = fs.realpathSync(current);
+  } catch {
+    real = current;
+  }
+  return tail.length > 0 ? path.join(real, ...tail) : real;
+}
+
 /**
  * Writes the task's Grimoire guidance into the steering folder, enforcing the
  * hard limits of at most 32 files and at most 100,000 characters in total
@@ -574,6 +634,10 @@ export function bundleBonesetterSteeringResources(
   const entries = Array.isArray(options.grimoireGuidance)
     ? options.grimoireGuidance
     : [];
+  const worktreeDir =
+    typeof options.worktreeDir === "string" && options.worktreeDir.length > 0
+      ? path.resolve(options.worktreeDir)
+      : null;
 
   const files: BundledSteeringFile[] = [];
   const rejected: RejectedSteeringFile[] = [];
@@ -581,7 +645,43 @@ export function bundleBonesetterSteeringResources(
   let totalChars = 0;
   let truncated = false;
 
-  fs.mkdirSync(targetDir, { recursive: true });
+  // Finding [10]: refuse a symlinked target directory outright, then verify the
+  // whole chain from the trusted worktree root stays symlink-free and contained.
+  if (isSymbolicLinkSync(targetDir)) {
+    throw new Error(
+      `refusing to write steering resources through the symlink at ${targetDir}`
+    );
+  }
+  if (worktreeDir) {
+    const rel = path.relative(worktreeDir, targetDir);
+    if (rel.startsWith("..") || path.isAbsolute(rel)) {
+      throw new Error(
+        `steering target directory ${targetDir} must live inside the worktree ${worktreeDir}`
+      );
+    }
+    let current = worktreeDir;
+    if (isSymbolicLinkSync(current)) {
+      throw new Error(`refusing a symlinked worktree ${current}`);
+    }
+    for (const segment of rel.split(path.sep).filter((s) => s.length > 0)) {
+      current = path.join(current, segment);
+      if (isSymbolicLinkSync(current)) {
+        throw new Error(
+          `refusing to write steering resources through the symlink at ${current}`
+        );
+      }
+    }
+    fs.mkdirSync(targetDir, { recursive: true });
+    const realWorktree = realpathOfExistingPrefixSync(worktreeDir);
+    const realTargetDir = fs.realpathSync(targetDir);
+    if (!isPathInsideDirSync(realWorktree, realTargetDir)) {
+      throw new Error(
+        `steering target directory ${realTargetDir} escapes the worktree ${realWorktree}`
+      );
+    }
+  } else {
+    fs.mkdirSync(targetDir, { recursive: true });
+  }
   const targetPrefix = targetDir.endsWith(path.sep) ? targetDir : targetDir + path.sep;
 
   for (let index = 0; index < entries.length; index += 1) {
@@ -620,6 +720,12 @@ export function bundleBonesetterSteeringResources(
     if (!filePath.startsWith(targetPrefix)) {
       rejected.push({ fileName, reason: "max_files_exceeded" });
       continue;
+    }
+    // Finding [10]: never write THROUGH a symlinked steering file.
+    if (isSymbolicLinkSync(filePath)) {
+      throw new Error(
+        `refusing to write the steering file through the symlink at ${filePath}`
+      );
     }
 
     fs.writeFileSync(filePath, content, "utf-8");
@@ -898,6 +1004,7 @@ export function prepareBonesetterSession(
   const bundled = bundleBonesetterSteeringResources({
     targetDir: steeringDir,
     grimoireGuidance: options.grimoireGuidance ?? [],
+    worktreeDir: resolvedWorktreeDir,
   });
 
   return {
