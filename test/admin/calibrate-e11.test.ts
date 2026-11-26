@@ -4,6 +4,7 @@
  * Covers Requirements 30.1, 30.2, 30.3, 30.18 and 30.20.
  */
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -16,6 +17,7 @@ import {
   RequiredSettingMissingError,
   REQUIRED_SETTING_KEYS,
   SettingsStore,
+  UNSET_VALUE_SENTINEL,
   assertRequiredSettingsConfigured,
   getDefaultSettingsStore,
   resetDefaultSettingsStore,
@@ -23,8 +25,11 @@ import {
 import { EventStore, type EventEnvelope } from "../../lib/events/event-store";
 import { RunStore } from "../../lib/runs/run-store";
 import {
+  APPLY_REQUIRES_STORE_MESSAGE,
+  DEFAULT_CALIBRATION_ACTOR,
   analyzeRecordedRunsForCalibration,
   formatCalibrationMarkdown,
+  loadCompletedRunsFromEventStore,
   loadRecordedRunsFromDir,
   parseCalibrationArgs,
   runCalibration,
@@ -279,6 +284,92 @@ describe("SettingsStore — audit trail", () => {
 });
 
 
+describe("SettingsStore — explicit null vs unset sentinel (FIND-003 regression)", () => {
+  it("round-trips an explicit null and never collapses it to unset", () => {
+    const store = new SettingsStore();
+    const entry = store.setSetting("customNote", null, {
+      actor: "owner",
+      reason: "explicit null",
+    });
+
+    // First write: the key did not exist, so the audit "before" is unset (undefined).
+    assert.equal(entry.beforeValue, undefined);
+    assert.equal(entry.afterValue, null);
+    assert.equal(store.getSetting("customNote"), null);
+
+    const all = store.getAllSettings();
+    assert.ok(Object.prototype.hasOwnProperty.call(all, "customNote"));
+    assert.equal(all.customNote, null);
+
+    const log = store.getAuditLog({ key: "customNote" });
+    assert.equal(log.length, 1);
+    assert.equal(log[0].beforeValue, undefined);
+    assert.equal(log[0].afterValue, null);
+
+    // A second explicit null is still distinguishable from unset in the audit trail.
+    store.setSetting("customNote", null, { actor: "owner", reason: "again" });
+    const log2 = store.getAuditLog({ key: "customNote" });
+    assert.equal(log2.length, 2);
+    assert.equal(log2[1].beforeValue, null);
+    assert.equal(log2[1].afterValue, null);
+    store.close();
+  });
+
+  it("seeds Required_Settings with the non-JSON sentinel, not a literal null", () => {
+    const store = new SettingsStore();
+    const row = store.db
+      .prepare("SELECT valueJson, updatedBy FROM admin_settings WHERE key = ?")
+      .get("toolCallsPerRun") as { valueJson: string; updatedBy: string };
+
+    assert.equal(row.valueJson, UNSET_VALUE_SENTINEL);
+    assert.equal(row.updatedBy, "system:required");
+
+    assert.equal(store.getSetting("toolCallsPerRun"), undefined);
+    assert.ok(
+      !Object.prototype.hasOwnProperty.call(store.getAllSettings(), "toolCallsPerRun")
+    );
+
+    const validation = store.validateRequiredSettings();
+    assert.equal(validation.ok, false);
+    assert.ok(validation.missing.includes("toolCallsPerRun"));
+    store.close();
+  });
+
+  it("treats legacy \"null\" + system:required rows as unset but honours explicit null", () => {
+    const dir = makeTmpDir("gg-settings-legacy-");
+    const dbPath = path.join(dir, "settings.db");
+
+    // Simulate a database written before the sentinel existed.
+    const first = new SettingsStore(dbPath);
+    first.db.exec(
+      "UPDATE admin_settings SET valueJson = 'null', updatedBy = 'system:required' " +
+        "WHERE key = 'brokerWatchdogMs'"
+    );
+    first.close();
+
+    const reopened = new SettingsStore(dbPath);
+    assert.equal(reopened.getSetting("brokerWatchdogMs"), undefined);
+    assert.ok(
+      !Object.prototype.hasOwnProperty.call(reopened.getAllSettings(), "brokerWatchdogMs")
+    );
+    assert.ok(reopened.validateRequiredSettings().missing.includes("brokerWatchdogMs"));
+
+    // An explicit null set by a real actor must survive as a genuine null...
+    reopened.setSetting("brokerWatchdogMs", null, { actor: "owner" });
+    assert.equal(reopened.getSetting("brokerWatchdogMs"), null);
+    assert.equal(reopened.getAllSettings().brokerWatchdogMs, null);
+    // ...while still counting as missing for the Required_Settings gate.
+    assert.ok(reopened.validateRequiredSettings().missing.includes("brokerWatchdogMs"));
+
+    const audit = reopened.getAuditLog({ key: "brokerWatchdogMs" });
+    assert.equal(audit.length, 1);
+    assert.equal(audit[0].beforeValue, undefined);
+    assert.equal(audit[0].afterValue, null);
+    reopened.close();
+  });
+});
+
+
 describe("SettingsStore — recalibrationRequired (Requirement 30.20)", () => {
   function addCompletedRun(eventStore: EventStore, runStore: RunStore, runId: string): void {
     runStore.createRun({
@@ -486,6 +577,73 @@ describe("analyzeRecordedRunsForCalibration — metrics from recorded events", (
 });
 
 
+describe("proposeValue — cap floors (FIND-002 regression)", () => {
+  // Three clean runs: every task approved (0 rejections) and an instant prompt boundary
+  // (skeleton.raised and skeleton.usage share a timestamp) so the deltas are 0 ms.
+  function cleanRun(runId: string, baseTs: number): CalibrationSourceRun {
+    return mkRun(runId, [
+      { seq: 1, ts: baseTs, kind: "run.phase", data: { from: "queued", to: "exhume" } },
+      { seq: 2, ts: baseTs + 5, kind: "skeleton.raised", skeletonId: "sk-clean" },
+      { seq: 3, ts: baseTs + 5, kind: "skeleton.usage", skeletonId: "sk-clean" },
+      { seq: 4, ts: baseTs + 10, kind: "verdict", taskId: "t1", data: { verdict: "approve" } },
+      { seq: 5, ts: baseTs + 20, kind: "run.done", data: { outcome: "resurrected" } },
+    ]);
+  }
+
+  it("never proposes 0 wardenRounds for a run set with no rejections", () => {
+    const runs = [
+      cleanRun("clean-1", 1_000_000),
+      cleanRun("clean-2", 2_000_000),
+      cleanRun("clean-3", 3_000_000),
+    ];
+    const analysis = analyzeRecordedRunsForCalibration(runs);
+
+    // The Warden dimension is "available" with an observed maximum of 0 rejections.
+    assert.equal(analysis.wardenRejectionRoundsPerTask.status, "available");
+    assert.equal(analysis.wardenRejectionRoundsPerTask.max, 0);
+
+    const warden = analysis.proposals.find((p) => p.key === "wardenRounds");
+    assert.ok(warden);
+    assert.notEqual(warden.proposedValue, 0);
+    assert.ok(
+      (warden.proposedValue ?? 0) >= 1,
+      `wardenRounds must stay >= 1 (got ${String(warden.proposedValue)})`
+    );
+  });
+
+  it("never proposes a 0 ms timeout for instant/synthetic runs", () => {
+    const runs = [
+      cleanRun("clean-1", 1_000_000),
+      cleanRun("clean-2", 2_000_000),
+      cleanRun("clean-3", 3_000_000),
+    ];
+    const analysis = analyzeRecordedRunsForCalibration(runs);
+
+    // A paired prompt boundary exists, but its duration is 0 ms.
+    assert.equal(analysis.promptDurationsMs.status, "available");
+    assert.equal(analysis.promptDurationsMs.max, 0);
+
+    const prompt = analysis.proposals.find((p) => p.key === "promptWallClockMs");
+    assert.ok(prompt);
+    assert.notEqual(prompt.proposedValue, 0);
+    assert.ok(
+      (prompt.proposedValue ?? 0) >= 1000,
+      `promptWallClockMs must keep a positive >= 1000 ms floor (got ${String(
+        prompt.proposedValue
+      )})`
+    );
+
+    // Every timeout-like proposal keeps a positive floor too.
+    for (const key of ["promptWallClockMs", "runWallClockMs", "silentSkeletonMs"]) {
+      const proposal = analysis.proposals.find((p) => p.key === key);
+      if (proposal && proposal.proposedValue !== null) {
+        assert.ok(proposal.proposedValue > 0, `${key} must never propose 0`);
+      }
+    }
+  });
+});
+
+
 describe("runCalibration — recorded runs directory and --apply", () => {
   function writeRunDir(root: string, run: CalibrationSourceRun): void {
     const runDir = path.join(root, run.runId);
@@ -605,6 +763,180 @@ describe("runCalibration — recorded runs directory and --apply", () => {
     assert.equal(options.actor, "owner");
     assert.equal(options.out, "/tmp/out.json");
     assert.equal(options.markdown, false);
+  });
+
+  it("throws when --apply is requested without a SettingsStore or settings-db path", () => {
+    assert.throws(
+      () => runCalibration({ apply: true }),
+      (err: unknown) => {
+        assert.ok(err instanceof Error);
+        assert.equal(err.message, APPLY_REQUIRES_STORE_MESSAGE);
+        return true;
+      }
+    );
+    // A runs dir cannot rescue an apply with no store to persist into.
+    assert.throws(
+      () => runCalibration({ apply: true, runsDir: makeTmpDir("gg-calib-noop-") }),
+      /--apply requires a SettingsStore instance or settings-db path/
+    );
+  });
+
+  it("attributes an --apply without an explicit actor to the documented owner default", () => {
+    assert.equal(DEFAULT_CALIBRATION_ACTOR, "owner");
+    const root = writeThreeRuns();
+    const settingsStore = new SettingsStore();
+    runCalibration({ runsDir: root, settingsStore, apply: true });
+
+    const audit = settingsStore.getAuditLog({ key: "wardenRounds" });
+    assert.equal(audit.length, 1);
+    assert.equal(audit[0].actor, DEFAULT_CALIBRATION_ACTOR);
+    settingsStore.close();
+  });
+
+  it("commits settings via the CLI when --settings-db is omitted (SETTINGS_STORE_PATH)", () => {
+    const root = writeThreeRuns();
+    const dbDir = makeTmpDir("gg-calib-cli-");
+    const dbPath = path.join(dbDir, "settings.db");
+
+    const tsxCli = path.resolve(process.cwd(), "node_modules", "tsx", "dist", "cli.mjs");
+    const scriptPath = path.resolve(process.cwd(), "scripts", "calibrate-e11.ts");
+    const proc = spawnSync(
+      process.execPath,
+      [tsxCli, scriptPath, "--runs-dir", root, "--apply", "--actor", "owner", "--json"],
+      {
+        cwd: process.cwd(),
+        env: { ...process.env, SETTINGS_STORE_PATH: dbPath },
+        encoding: "utf8",
+      }
+    );
+
+    assert.equal(proc.status, 0, `CLI exited with ${String(proc.status)}: ${proc.stderr ?? ""}`);
+    assert.ok(fs.existsSync(dbPath), "the settings DB should have been created");
+
+    const store = new SettingsStore(dbPath);
+    assert.equal(store.getSetting("wardenRounds"), 5);
+    assert.equal(store.getSetting("silentSkeletonMs"), 610_000);
+    assert.equal(store.isRecalibrationRequired(), false);
+
+    const audit = store.getAuditLog({ key: "wardenRounds" });
+    assert.equal(audit.length, 1);
+    assert.equal(audit[0].actor, "owner");
+    store.close();
+  });
+});
+
+
+describe("completed-run filtering — errored runs (FIND-004 regression)", () => {
+  // Sorts before "calib-run-a" so a broken filter would wrongly occupy the first slot.
+  const erroredRun = mkRun("0-calib-run-error", [
+    { seq: 1, ts: 500_000, kind: "run.started" },
+    { seq: 2, ts: 600_000, kind: "run.done", data: { outcome: "error" } },
+  ]);
+
+  function writeRunDir(root: string, run: CalibrationSourceRun): void {
+    const runDir = path.join(root, run.runId);
+    fs.mkdirSync(runDir, { recursive: true });
+    const ndjson = `${run.events.map((ev) => JSON.stringify(ev)).join("\n")}\n`;
+    fs.writeFileSync(path.join(runDir, "events.ndjson"), ndjson, "utf8");
+  }
+
+  it("excludes an errored run when loading from --runs-dir", () => {
+    const root = makeTmpDir("gg-calib-runs-err-");
+    writeRunDir(root, runA);
+    writeRunDir(root, runB);
+    writeRunDir(root, runC);
+    writeRunDir(root, erroredRun);
+
+    const loaded = loadRecordedRunsFromDir(root, 4);
+    assert.ok(!loaded.some((r) => r.runId === "0-calib-run-error"));
+    assert.deepEqual(
+      loaded.map((r) => r.runId),
+      ["calib-run-a", "calib-run-b", "calib-run-c"]
+    );
+
+    const result = runCalibration({ runsDir: root, limit: 3 });
+    assert.ok(!result.runIds.includes("0-calib-run-error"));
+    assert.deepEqual(result.runIds, ["calib-run-a", "calib-run-b", "calib-run-c"]);
+  });
+
+  it("excludes an errored run when loading from an EventStore", () => {
+    const eventStore = new EventStore(":memory:");
+    for (const run of [erroredRun, runA, runB, runC]) {
+      eventStore.appendBatch(
+        run.events.map((ev) => ({
+          runId: ev.runId,
+          kind: ev.kind,
+          actor: ev.actor,
+          ts: ev.ts,
+          data: ev.data,
+          skeletonId: ev.skeletonId ?? null,
+          taskId: ev.taskId ?? null,
+        }))
+      );
+    }
+
+    const loaded = loadCompletedRunsFromEventStore(eventStore, 4);
+    assert.ok(!loaded.some((r) => r.runId === "0-calib-run-error"));
+    assert.deepEqual(
+      loaded.map((r) => r.runId),
+      ["calib-run-a", "calib-run-b", "calib-run-c"]
+    );
+
+    const result = runCalibration({ eventStore, limit: 3 });
+    assert.ok(!result.runIds.includes("0-calib-run-error"));
+    assert.equal(result.analysis.wardenRejectionRoundsPerTask.max, 4);
+    eventStore.close();
+  });
+
+  it("syncRecordedRunCount rejects an errored run.done from both stores", () => {
+    const store = new SettingsStore();
+    const eventStore = new EventStore(":memory:");
+    const runStore = new RunStore(":memory:");
+
+    for (const runId of ["r1", "r2", "r3"]) {
+      runStore.createRun({
+        runId,
+        url: `https://github.com/example/${runId}`,
+        sha: "0".repeat(40),
+        phase: "done",
+        outcome: "resurrected",
+      });
+      eventStore.append({
+        runId,
+        kind: "run.done",
+        actor: "necromancer",
+        data: { outcome: "resurrected" },
+      });
+    }
+
+    runStore.createRun({
+      runId: "r-err",
+      url: "https://github.com/example/r-err",
+      sha: "0".repeat(40),
+      phase: "done",
+      outcome: "error",
+    });
+    eventStore.append({
+      runId: "r-err",
+      kind: "run.done",
+      actor: "necromancer",
+      data: { outcome: "error" },
+    });
+
+    const both = store.syncRecordedRunCount({ eventStore, runStore });
+    assert.equal(both.completedRecordedRuns, 3);
+
+    // The eventStore-only path must agree (FIND-004: it used to count the errored run).
+    const eventsOnly = store.syncRecordedRunCount({ eventStore });
+    assert.equal(eventsOnly.completedRecordedRuns, 3);
+
+    // The runStore-only path must agree too.
+    const runsOnly = store.syncRecordedRunCount({ runStore });
+    assert.equal(runsOnly.completedRecordedRuns, 3);
+
+    store.close();
+    eventStore.close();
+    runStore.close();
   });
 });
 

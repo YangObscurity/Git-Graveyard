@@ -17,6 +17,19 @@ import * as path from "node:path";
 import type { EventStore } from "../events/event-store";
 import type { RunStore } from "../runs/run-store";
 
+/**
+ * FIND-003: sentinel written to `admin_settings.valueJson` for Required_Settings that ship without
+ * a value. It is deliberately *not* valid JSON, so it can never collide with a real value — every
+ * JSON value serializes to a different string (`null` -> `"null"`, the string "x" -> `"\"x\""`,
+ * numbers/booleans -> their literals). Reading it back yields `undefined` (unset), which keeps
+ * `getSetting` / `getAllSettings` / `validateRequiredSettings` semantics intact while allowing an
+ * explicit `setSetting(key, null, ...)` to round-trip as a real `null`.
+ */
+export const UNSET_VALUE_SENTINEL = "__UNSET__";
+
+/** `updatedBy` marker written when a Required_Setting is seeded without a value. */
+const REQUIRED_SEED_ACTOR = "system:required";
+
 export interface SettingsStoreOptions {
   path?: string;
   db?: DatabaseSync;
@@ -194,7 +207,13 @@ function isDirectoryWritable(dirPath: string): boolean {
   return false;
 }
 
-function resolveDefaultSettingsStorePath(options?: SettingsStoreOptions): string {
+/**
+ * Resolves the default on-disk settings database path: an explicit `path` option wins, then the
+ * `SETTINGS_STORE_PATH` environment variable, then `/data` when it is writable, and finally a
+ * per-user temp directory. Exported so the calibration CLI (FIND-001) can open the same default
+ * store when `--settings-db` is omitted.
+ */
+export function resolveDefaultSettingsStorePath(options?: SettingsStoreOptions): string {
   if (options?.path) {
     return options.path;
   }
@@ -207,8 +226,16 @@ function resolveDefaultSettingsStorePath(options?: SettingsStoreOptions): string
   return path.join(os.tmpdir(), "git-graveyard-data", "settings.db");
 }
 
+/**
+ * Parses a stored JSON value.
+ *
+ * FIND-003: a `raw` value that is not a string, is empty, or equals the {@link UNSET_VALUE_SENTINEL}
+ * is treated as `undefined` (unset). A literal `"null"` is *not* special-cased here — it parses to
+ * `null`, so an explicit `null` setting and an initial-creation SQL `NULL` audit `beforeJson` stay
+ * distinguishable.
+ */
 function parseStoredValue(raw: unknown): unknown {
-  if (typeof raw !== "string" || raw.length === 0 || raw === "null") {
+  if (typeof raw !== "string" || raw.length === 0 || raw === UNSET_VALUE_SENTINEL) {
     return undefined;
   }
   try {
@@ -216,6 +243,25 @@ function parseStoredValue(raw: unknown): unknown {
   } catch {
     return undefined;
   }
+}
+
+/**
+ * FIND-003 backward compatibility: databases written before the sentinel existed seeded
+ * Required_Settings with the literal string `"null"` and `updatedBy = "system:required"`. That
+ * *combination* means "unset". An explicit `setSetting(key, null, { actor })` stores `"null"` with a
+ * real actor, so it is preserved as a genuine `null`.
+ */
+function isLegacyUnsetValue(valueJson: unknown, updatedBy: unknown): boolean {
+  return valueJson === "null" && updatedBy === REQUIRED_SEED_ACTOR;
+}
+
+/** Reads a setting value, applying the legacy-unset rule on top of {@link parseStoredValue}. */
+function readSettingValue(valueJson: unknown, updatedBy: unknown): unknown {
+  const value = parseStoredValue(valueJson);
+  if (value === null && isLegacyUnsetValue(valueJson, updatedBy)) {
+    return undefined;
+  }
+  return value;
 }
 
 function rowToAuditEntry(row: Record<string, unknown>): SettingsAuditEntry {
@@ -379,14 +425,18 @@ export class SettingsStore {
       insertIfAbsent.run(key, JSON.stringify(value), 0, now, "system:e11-defaults");
     }
     for (const key of REQUIRED_SETTING_KEYS) {
-      insertIfAbsent.run(key, "null", 1, now, "system:required");
+      // FIND-003: use the non-JSON sentinel instead of the literal "null" so an explicit null set
+      // later is never confused with "unset".
+      insertIfAbsent.run(key, UNSET_VALUE_SENTINEL, 1, now, REQUIRED_SEED_ACTOR);
     }
   }
 
   private prepareStatements(): void {
-    this.getSettingStmt = this.db.prepare("SELECT valueJson FROM admin_settings WHERE key = ?");
+    this.getSettingStmt = this.db.prepare(
+      "SELECT valueJson, updatedBy FROM admin_settings WHERE key = ?"
+    );
     this.getAllSettingsStmt = this.db.prepare(
-      "SELECT key, valueJson FROM admin_settings ORDER BY key ASC"
+      "SELECT key, valueJson, updatedBy FROM admin_settings ORDER BY key ASC"
     );
     this.upsertSettingStmt = this.db.prepare(`
       INSERT INTO admin_settings (key, valueJson, isRequired, updatedAt, updatedBy)
@@ -427,19 +477,25 @@ export class SettingsStore {
     if (!key || typeof key !== "string") {
       return undefined;
     }
-    const row = this.getSettingStmt.get(key) as { valueJson?: unknown } | undefined;
+    const row = this.getSettingStmt.get(key) as
+      | { valueJson?: unknown; updatedBy?: unknown }
+      | undefined;
     if (!row) {
       return undefined;
     }
-    const value = parseStoredValue(row.valueJson);
+    const value = readSettingValue(row.valueJson, row.updatedBy);
     return value === undefined ? undefined : (value as T);
   }
 
   getAllSettings(): Record<string, unknown> {
-    const rows = this.getAllSettingsStmt.all() as Array<{ key?: unknown; valueJson?: unknown }>;
+    const rows = this.getAllSettingsStmt.all() as Array<{
+      key?: unknown;
+      valueJson?: unknown;
+      updatedBy?: unknown;
+    }>;
     const out: Record<string, unknown> = {};
     for (const row of rows) {
-      const value = parseStoredValue(row.valueJson);
+      const value = readSettingValue(row.valueJson, row.updatedBy);
       if (value === undefined) {
         continue;
       }
@@ -637,10 +693,17 @@ export class SettingsStore {
           if (ids.has(runId)) {
             continue;
           }
-          const doneEvents = eventStore.getEvents(runId, { kind: "run.done", limit: 1 });
-          if (doneEvents.length > 0) {
-            ids.add(runId);
+          const events = eventStore.getEvents(runId, { kind: "run.done" });
+          if (events.length === 0) {
+            continue;
           }
+          // FIND-004: only the *latest* run.done decides the run's outcome, and an errored run is
+          // not a completed Recorded_Run — mirror the runStore branch above.
+          const latestDone = events[events.length - 1];
+          if (latestDone.data.outcome === "error") {
+            continue;
+          }
+          ids.add(runId);
         }
       }
     }

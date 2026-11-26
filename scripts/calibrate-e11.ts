@@ -15,6 +15,7 @@ import { EventStore, type EventEnvelope } from "../lib/events/event-store";
 import {
   E11_DEFAULT_SETTINGS,
   SettingsStore,
+  resolveDefaultSettingsStorePath,
   type SettingsAuditEntry,
 } from "../lib/admin/settings-store";
 
@@ -98,6 +99,17 @@ export interface RunCalibrationResult {
 
 const DEFAULT_RECORDED_RUNS_DIR = path.join(process.cwd(), "output", "recorded-runs");
 const DEFAULT_LIMIT = 3;
+
+/**
+ * FIND-001: actor attributed to an `--apply` when none is supplied. This is a *documented* default
+ * (not a silent one): an applied change is always written with a real operator identity, so the
+ * audit trail never records an unknown/system actor for a calibration write.
+ */
+export const DEFAULT_CALIBRATION_ACTOR = "owner";
+
+/** FIND-001: thrown when `--apply` is requested without any way to persist the proposal. */
+export const APPLY_REQUIRES_STORE_MESSAGE =
+  "--apply requires a SettingsStore instance or settings-db path";
 
 const PROMPT_START_KINDS = new Set(["skeleton.raised", "skeleton.tool_call"]);
 const PROMPT_END_KINDS = new Set(["skeleton.usage", "skeleton.state", "verdict"]);
@@ -485,6 +497,23 @@ interface HeadroomResult {
 }
 
 /**
+ * FIND-002: per-key minimum floors so a calibration can never collapse a cap to `0`.
+ *
+ * A clean run set (for example zero Warden rejections -> `max = 0`, or an instant/synthetic run ->
+ * a `0` ms prompt or silence delta) must not disable Warden retries or propose a `0 ms` timeout.
+ * `wardenRounds` keeps at least 1 round; every wall-clock/timeout cap keeps at least 1000 ms.
+ * Any other key defaults to a positive floor of 1.
+ */
+const MIN_PROPOSED_VALUE: Readonly<Record<string, number>> = {
+  wardenRounds: 1,
+  promptWallClockMs: 1000,
+  runWallClockMs: 1000,
+  silentSkeletonMs: 1000,
+  approvalWaitMs: 1000,
+  exhumerTriageWallClockMs: 1000,
+};
+
+/**
  * Proposes a value with safe headroom over the observed maximum; when a dimension was not
  * recorded the E11 starting value (or the current store value) is kept.
  */
@@ -503,7 +532,9 @@ function proposeValue(
     };
   }
   const max = distribution.max ?? 0;
-  const proposed = Math.ceil(max * 1.25);
+  const floor = MIN_PROPOSED_VALUE[key] ?? 1;
+  // Never below the per-key floor and never below 1, even when the observed maximum is 0.
+  const proposed = Math.max(floor, Math.ceil(max * 1.25), 1);
   return {
     value: proposed,
     summary: `max ${max}, p90 ${distribution.p90} over ${distribution.samples.length} sample(s)`,
@@ -711,6 +742,30 @@ function parseNdjsonEvents(text: string, fallbackRunId: string): EventEnvelope[]
   return events;
 }
 
+/**
+ * FIND-004: returns the latest `run.done` event of a run (by `seq`), or `null` when the run never
+ * concluded. Both recorded-run loaders and `SettingsStore.syncRecordedRunCount` use this so they
+ * agree on what "the run's terminal outcome" is.
+ */
+function latestRunDoneEvent(events: EventEnvelope[]): EventEnvelope | null {
+  let latest: EventEnvelope | null = null;
+  for (const ev of events) {
+    if (ev.kind !== "run.done") {
+      continue;
+    }
+    if (latest === null || ev.seq >= latest.seq) {
+      latest = ev;
+    }
+  }
+  return latest;
+}
+
+/** FIND-004: a run whose latest `run.done` reports `outcome === "error"` is not a completed run. */
+function isErroredRun(events: EventEnvelope[]): boolean {
+  const done = latestRunDoneEvent(events);
+  return done !== null && done.data.outcome === "error";
+}
+
 export function loadRecordedRunsFromDir(dir: string, limit = DEFAULT_LIMIT): CalibrationSourceRun[] {
   if (!fs.existsSync(dir)) {
     return [];
@@ -731,32 +786,41 @@ export function loadRecordedRunsFromDir(dir: string, limit = DEFAULT_LIMIT): Cal
       continue;
     }
     const events = parseNdjsonEvents(fs.readFileSync(eventsPath, "utf8"), runId);
+    // FIND-004: skip errored runs so they never skew the E11 calibration.
+    if (isErroredRun(events)) {
+      continue;
+    }
     runs.push({ runId, events });
   }
   return runs;
 }
 
-function loadCompletedRunsFromEventStore(
+export function loadCompletedRunsFromEventStore(
   store: EventStore,
   limit: number
 ): CalibrationSourceRun[] {
-  const ordered: Array<{ runId: string; doneTs: number }> = [];
+  const ordered: Array<{ runId: string; doneTs: number; events: EventEnvelope[] }> = [];
   for (const runId of store.getRunIds()) {
-    const doneEvents = store.getEvents(runId, { kind: "run.done" });
-    if (doneEvents.length === 0) {
+    const events = store.getEvents(runId);
+    const done = latestRunDoneEvent(events);
+    // FIND-004: ignore runs that never concluded and runs that errored.
+    if (!done || done.data.outcome === "error") {
       continue;
     }
-    ordered.push({ runId, doneTs: doneEvents[doneEvents.length - 1].ts });
+    ordered.push({ runId, doneTs: done.ts, events });
   }
   ordered.sort((a, b) => a.doneTs - b.doneTs || a.runId.localeCompare(b.runId));
 
-  return ordered.slice(0, limit).map((entry) => ({
-    runId: entry.runId,
-    events: store.getEvents(entry.runId),
-  }));
+  return ordered.slice(0, limit).map(({ runId, events }) => ({ runId, events }));
 }
 
 export function runCalibration(options?: RunCalibrationOptions): RunCalibrationResult {
+  // FIND-001: never silently no-op an --apply. Persisting requires a store; without one the caller
+  // must be told, rather than receiving a result that looks applied but wrote nothing.
+  if (options?.apply === true && !options.settingsStore) {
+    throw new Error(APPLY_REQUIRES_STORE_MESSAGE);
+  }
+
   const limit = options?.limit && options.limit > 0 ? Math.floor(options.limit) : DEFAULT_LIMIT;
 
   let runs: CalibrationSourceRun[];
@@ -784,7 +848,8 @@ export function runCalibration(options?: RunCalibrationOptions): RunCalibrationR
   }
 
   if (options?.apply && settingsStore) {
-    const actor = options.actor && options.actor.trim() !== "" ? options.actor : "owner";
+    const actor =
+      options.actor && options.actor.trim() !== "" ? options.actor : DEFAULT_CALIBRATION_ACTOR;
     for (const proposal of analysis.proposals) {
       if (proposal.proposedValue === null) {
         continue;
@@ -871,7 +936,15 @@ function main(): void {
   const options = parseCalibrationArgs(process.argv.slice(2));
 
   const eventStore = options.db ? new EventStore(options.db) : undefined;
-  const settingsStore = options.settingsDb ? new SettingsStore(options.settingsDb) : undefined;
+  let settingsStore = options.settingsDb ? new SettingsStore(options.settingsDb) : undefined;
+
+  // FIND-001: an explicit `--apply` without `--settings-db` must not be silently dropped. Resolve
+  // the default store (env override, then the shared default path) and open it so the proposal is
+  // actually persisted; `runCalibration` throws if apply is requested with no store at all.
+  if (!settingsStore && options.apply) {
+    const settingsPath = process.env.SETTINGS_STORE_PATH ?? resolveDefaultSettingsStorePath();
+    settingsStore = new SettingsStore(settingsPath);
+  }
 
   try {
     const result = runCalibration({
