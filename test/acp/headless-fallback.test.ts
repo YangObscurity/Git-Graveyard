@@ -700,6 +700,68 @@ describe("HeadlessFallbackChannel cancellation", () => {
       cleanup();
     }
   });
+
+  it("cancels during a pending onApproval await and never spawns the resume turn", async () => {
+    const { logPath, cleanup } = tempLogPath("cancel-approval");
+    try {
+      const captured: Captured = { calls: 0 };
+      let resolveApproval: ((d: "approve" | "deny") => void) | null = null;
+      const approvalGate = new Promise<"approve" | "deny">((resolve) => {
+        resolveApproval = resolve;
+      });
+      const channel = makeChannel({
+        logPath,
+        s2ResumeSupported: true,
+        onApproval: () => approvalGate,
+        spawnFn: makeSpawn(
+          () => ({
+            lines: [
+              {
+                type: "session",
+                sessionId: "sess-cancel",
+                model: "claude-sonnet-5.5",
+              },
+              { type: "approval_request", approvalId: "ap-cancel", tool: "shell" },
+            ],
+            code: 0,
+          }),
+          captured
+        ),
+      });
+
+      const pending = channel.runTurn({ prompt: "run a command" });
+
+      // Wait until the only process has closed and the approval is pending.
+      const deadline = Date.now() + 2000;
+      while (captured.calls < 1 && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 2));
+      }
+      while (
+        (channel.getCurrentProcess() !== null || captured.calls < 1) &&
+        Date.now() < deadline
+      ) {
+        await new Promise((r) => setTimeout(r, 2));
+      }
+      assert.equal(captured.calls, 1);
+      assert.equal(channel.getCurrentProcess(), null);
+
+      // No live process remains, yet cancel() latches the pending turn.
+      assert.equal(channel.cancel(), true);
+      resolveApproval!("approve");
+
+      const result = await pending;
+      assert.equal(result.ok, false);
+      assert.equal(result.status, "cancelled");
+      assert.equal(result.reason, "cancelled");
+      assert.equal(
+        captured.calls,
+        1,
+        "no resume process may spawn after cancel() during approval"
+      );
+    } finally {
+      cleanup();
+    }
+  });
 });
 
 describe("HeadlessFallbackChannel approval interrupts", () => {

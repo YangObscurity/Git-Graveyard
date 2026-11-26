@@ -1344,3 +1344,161 @@ test("Requirement 16.14, 17.8: cancel() kills the active headless channel", asyn
   fs.rmSync(tmpBase, { recursive: true, force: true });
 });
 
+test("Requirement 17.3: steer() mid-headless-turn never runs two concurrent headless processes", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "gg-headless-steer-"));
+  let live = 0;
+  let maxLive = 0;
+  const children: MockChildProcess[] = [];
+
+  const spawnFn: SpawnFunction = () => {
+    live += 1;
+    maxLive = Math.max(maxLive, live);
+    const child = new MockChildProcess();
+    const index = children.length;
+    children.push(child);
+    // The FIRST turn stays open until it is cancelled; the resume turn closes
+    // cleanly so steer() can complete.
+    child.kill = () => {
+      child.killed = true;
+      child.signalCode = "SIGTERM";
+      child.exitCode = null;
+      child.emit("close", null);
+      return true;
+    };
+    setImmediate(() => {
+      child.stdout.write(
+        JSON.stringify({
+          type: "session",
+          sessionId: `cli-steer-${index}`,
+          model: CLAUDE_SONNET_5_5_MODEL_ID,
+        }) + "\n"
+      );
+      if (index > 0) {
+        child.stdout.write(JSON.stringify({ type: "assistant", text: "resumed" }) + "\n");
+        child.stdout.end();
+        setImmediate(() => {
+          child.exitCode = 0;
+          child.emit("close", 0);
+        });
+      }
+    });
+    child.on("close", () => {
+      live -= 1;
+    });
+    return child;
+  };
+
+  const supervisor = createSkeletonSupervisor({
+    runId: "run-headless-steer",
+    skeletonId: "skel-headless-steer",
+    role: "bonesetter",
+    cwd: path.join(tmpBase, "wt"),
+    baseDir: tmpBase,
+    quarantineDir: path.join(tmpBase, "quarantine"),
+    probeResults: {
+      P1: { id: "P1", passed: false },
+      P14: { id: "P14", passed: true },
+    },
+    onAskAutoDeny: () => {},
+    cancelGracePeriodMs: 1,
+    cancelPromptTimeoutMs: 100,
+    brokerOptions: getRequiredBrokerSettings(),
+    spawnFn,
+  });
+
+  await supervisor.raise();
+
+  const firstTurn = supervisor.prompt("first turn").catch(() => {});
+  const spawnDeadline = Date.now() + 2000;
+  while (children.length < 1 && Date.now() < spawnDeadline) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(live, 1, "the first headless turn must have exactly one live process");
+
+  // steer while the first headless turn is still in flight.
+  const steerPromise = supervisor.steer("correction").catch(() => {});
+  await steerPromise;
+  await firstTurn;
+
+  assert.equal(
+    maxLive,
+    1,
+    "steer() must never run two concurrent headless processes"
+  );
+  assert.ok(children.length >= 2, "steer() must spawn a resume process");
+  assert.equal(live, 0);
+
+  await supervisor.finish();
+  fs.rmSync(tmpBase, { recursive: true, force: true });
+});
+
+test("Requirement 17.12: prompt().sessionId is redacted while steer() resumes with the unredacted --resume-id", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "gg-headless-raw-"));
+  // Assemble the key at runtime so no literal secret appears in the source.
+  const kiroKey = ["zq", "7", "over", "lap", "x", "9931"].join("");
+  const rawSessionId = `sess-${kiroKey}-end`;
+  const capturedCommands: Array<{ args: readonly string[] }> = [];
+
+  const spawnFn: SpawnFunction = (command, args) => {
+    capturedCommands.push({ args });
+    const child = new MockChildProcess();
+    setImmediate(() => {
+      child.stdout.write(
+        JSON.stringify({
+          type: "session",
+          sessionId: rawSessionId,
+          model: CLAUDE_SONNET_5_5_MODEL_ID,
+        }) + "\n"
+      );
+      child.stdout.write(JSON.stringify({ type: "assistant", text: "done" }) + "\n");
+      child.stdout.end();
+      setImmediate(() => {
+        child.exitCode = 0;
+        child.emit("close", 0);
+      });
+    });
+    return child;
+  };
+
+  const supervisor = createSkeletonSupervisor({
+    runId: "run-headless-raw",
+    skeletonId: "skel-headless-raw",
+    role: "bonesetter",
+    cwd: path.join(tmpBase, "wt"),
+    baseDir: tmpBase,
+    quarantineDir: path.join(tmpBase, "quarantine"),
+    probeResults: {
+      P1: { id: "P1", passed: false },
+      P14: { id: "P14", passed: true },
+    },
+    kiroApiKey: kiroKey,
+    onAskAutoDeny: () => {},
+    cancelGracePeriodMs: 1,
+    brokerOptions: getRequiredBrokerSettings(),
+    spawnFn,
+  });
+
+  await supervisor.raise();
+
+  const promptResult: any = await supervisor.prompt("do work");
+  assert.equal(promptResult.status, "complete");
+  // Requirement 17.12: the PUBLIC session id never leaks the credential.
+  assert.ok(
+    !String(promptResult.sessionId).includes(kiroKey),
+    "prompt().sessionId must not leak the API key"
+  );
+  assert.notEqual(promptResult.sessionId, rawSessionId);
+
+  // The RAW session id was retained internally and is used verbatim to resume,
+  // even though its characters overlap the API key.
+  await supervisor.steer("correction");
+  assert.equal(capturedCommands.length, 2);
+  const steerArgs = capturedCommands[1].args;
+  const resumeIndex = steerArgs.indexOf("--resume-id");
+  assert.ok(resumeIndex >= 0, "steer must pass --resume-id");
+  assert.equal(steerArgs[resumeIndex + 1], rawSessionId);
+
+  await supervisor.finish();
+  fs.rmSync(tmpBase, { recursive: true, force: true });
+});
+

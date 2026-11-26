@@ -245,6 +245,14 @@ export class HeadlessFallbackChannel {
   private currentProcess: ChildProcessLike | null = null;
   /** Set when `cancel()` aborts the in-flight turn (Requirement 17.8). */
   private turnCancelled = false;
+  /**
+   * The unredacted session id reported by the most recent turn. The PUBLIC
+   * `HeadlessTurnResult.sessionId` is redacted (Requirement 17.12), but the
+   * supervisor must resume `--resume-id` with the REAL CLI session id even when
+   * the raw id shares characters with the KIRO_API_KEY. This field is internal
+   * only and is never returned to callers.
+   */
+  private lastRawSessionId: string | null = null;
 
   constructor(options: HeadlessFallbackChannelOptions) {
     this.options = options;
@@ -274,15 +282,29 @@ export class HeadlessFallbackChannel {
     return this.currentProcess;
   }
 
+  /**
+   * The unredacted session id reported by the most recent turn, or `null` when
+   * no turn has reported one. Used ONLY to build a resume `--resume-id`; the
+   * public `HeadlessTurnResult.sessionId` stays redacted (Requirement 17.12).
+   */
+  public getLastRawSessionId(): string | null {
+    return this.lastRawSessionId;
+  }
+
   /** Cancels the in-flight turn. */
   public cancel(): boolean {
+    // Latch the cancellation BEFORE checking for a live process. A cancel()
+    // issued while an async onApproval await is pending finds no live process
+    // (that round already exited), but the pending turn must still be marked
+    // cancelled so it finalizes as "cancelled" and never spawns a resume
+    // process (Requirement 17.8).
+    this.turnCancelled = true;
     const proc = this.currentProcess;
     if (!proc) {
-      return false;
+      // The pending turn was latched as cancelled; there is no live process to
+      // signal and no subsequent spawn may occur.
+      return true;
     }
-    // Record the explicit cancellation so the turn reports "cancelled" rather
-    // than mapping the SIGTERM exit to "failure" (Requirement 17.8).
-    this.turnCancelled = true;
     try {
       return proc.kill("SIGTERM");
     } catch {
@@ -361,6 +383,12 @@ export class HeadlessFallbackChannel {
   }): HeadlessTurnResult {
     const credits = extractHeadlessCredits(input.records);
     const sessionId = extractSessionId(input.records);
+    // Retain the RAW (unredacted) session id so a later resume can pass the true
+    // CLI session id via `--resume-id` even when it overlaps the API key. Only a
+    // turn that actually reported one updates the retained value.
+    if (sessionId !== null) {
+      this.lastRawSessionId = sessionId;
+    }
     const verification = verifyHeadlessModel(input.records, input.modelId, {
       modelCheckDisabled: this.options.p14ModelCheckDisabled === true,
     });
@@ -646,6 +674,27 @@ export class HeadlessFallbackChannel {
 
       const target = roundApprovals[0];
       const decision = await this.requestApproval(target);
+
+      // Requirement 17.8: a cancel() issued while the approval decision was
+      // pending must finalize as "cancelled" and must NEVER spawn a resume
+      // process or deny the approval after the fact.
+      if (this.turnCancelled) {
+        return this.finalize({
+          base,
+          ok: false,
+          status: "cancelled",
+          reason: "cancelled",
+          exitCode,
+          output,
+          outputDiscarded,
+          records,
+          approvals,
+          autoDeniedAsks,
+          resumed,
+          modelId,
+        });
+      }
+
       if (decision !== "approve") {
         return this.finalize({
           base,

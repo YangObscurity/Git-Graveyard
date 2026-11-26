@@ -858,4 +858,72 @@ describe("M1 remediation: all-zero integers, unicode splats, PEP 440 exclusives"
     // <3.11 excludes 3.11a1 / 3.11.dev0, so the range below is empty.
     assert.equal(classifyVersionSpecifier("<3.11,>3.11a1"), "unknown");
   });
+
+  // The lexical `unicode(...)` check must flag keyword arguments (`k=v`, but not
+  // `==`/`!=`/`<=`/`>=`) and `*args` / `**kwargs` splats as ambiguous.
+  it("lexical fallback flags unicode(...) with keyword, splat, or multi-argument forms", () => {
+    const content = [
+      "a = unicode(x)",
+      'b = unicode(x, "utf-8")',
+      'c = unicode(encoding="utf-8")',
+      "d = unicode(*args)",
+      "e = unicode(**kwargs)",
+      "f = unicode(x == y)",
+      "g = unicode(x != y)",
+      "",
+    ].join("\n");
+    const result = detectPythonSignalsLexical([{ path: "uni.py", content }]);
+    const ambiguousLines = result.unknowns
+      .filter((u) => u.reason === "unicode_decoding_ambiguous")
+      .map((u) => Number(u.line))
+      .sort((a, b) => a - b);
+    assert.deepEqual(ambiguousLines, [2, 3, 4, 5]);
+    assert.ok(!ambiguousLines.includes(1), "single positional arg is unambiguous");
+    assert.ok(!ambiguousLines.includes(6), "== must not look like a keyword arg");
+    assert.ok(!ambiguousLines.includes(7), "!= must not look like a keyword arg");
+  });
+
+  // A digit run inside a Unicode identifier is not a Py2 octal literal.
+  it("lexical fallback does not flag octal digits inside a Unicode identifier", () => {
+    const content = ["\u53d8\u91cf0755 = 1", "x = 0755", ""].join("\n");
+    const result = detectPythonSignalsLexical([{ path: "uni_id.py", content }]);
+    assert.ok(!result.some((s) => s.line === 1), "\u53d8\u91cf0755 must not trigger a signal");
+    assert.ok(result.some((s) => s.line === 2), "0755 is still a Py2 octal");
+  });
+
+  // `0_75` is an illegal leading-zero decimal; `0_0` is valid Python 3.
+  it("flags `0_75` as an illegal leading-zero decimal but allows `0_0`", () => {
+    const content = ["a = 0_75", "b = 0_0", "c = 00_0", ""].join("\n");
+    const lexical = detectPythonSignalsLexical([{ path: "u.py", content }]);
+    assert.ok(lexical.some((s) => s.line === 1), "lexical must flag 0_75");
+    assert.ok(!lexical.some((s) => s.line === 2), "lexical must allow 0_0");
+    assert.ok(!lexical.some((s) => s.line === 3), "lexical must allow 00_0");
+
+    const tree = parsePython(content)!;
+    try {
+      const octalLines = collectResidue(tree)
+        .filter((item) => item.kind === "octal")
+        .map((item) => item.line);
+      assert.ok(octalLines.includes(1), "AST must flag 0_75");
+      assert.ok(!octalLines.includes(2), "AST must allow 0_0");
+      assert.ok(!octalLines.includes(3), "AST must allow 00_0");
+    } finally {
+      tree.delete?.();
+    }
+  });
+
+  // PEP 440 epochs are distinct releases; exclusive comparisons must not treat
+  // `1!3.11` as the same release as `3.11`.
+  it("keeps epochs distinct for PEP 440 exclusive comparisons", () => {
+    assert.equal(classifyVersionSpecifier(">3.11,==1!3.11.post1"), "py3_compatible");
+    assert.equal(classifyVersionSpecifier("<1!3.11,==3.11rc1"), "py3_compatible");
+    assert.equal(isPy2OnlySpecifier(">3.11,==1!3.11.post1"), false);
+    assert.equal(isPy2OnlySpecifier("<1!3.11,==3.11rc1"), false);
+  });
+
+  // A narrow post-release range admits the post-release probe between its ends.
+  it("generates post-release probes for narrow post-release ranges", () => {
+    assert.equal(classifyVersionSpecifier(">3.11.post1,<3.11.post3"), "py3_compatible");
+    assert.equal(isPy2OnlySpecifier(">3.11.post1,<3.11.post3"), false);
+  });
 });
