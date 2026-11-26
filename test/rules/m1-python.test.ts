@@ -411,6 +411,35 @@ describe("Python 2 residue (Requirement 6.14, R3-9)", () => {
   });
 });
 
+describe("Bare `print` under `from __future__ import print_function`", () => {
+  it("leaves a bare `print` unchanged with no edits or residue", () => {
+    const src = "from __future__ import print_function\nprint\n";
+    const res = analyzePython(src, "a.py");
+    assert.equal(res.output, src);
+    assert.equal(res.edits.length, 0);
+    assert.equal(res.residueBefore, 0);
+    assert.equal(res.unknowns.filter((u) => u.reason === "py2_residue").length, 0);
+
+    const tree = parsePython(src)!;
+    assert.ok(
+      !collectResidue(tree).some((item) => item.kind === "bare_print"),
+      "bare print must not be classified as residue when print_function is active"
+    );
+  });
+
+  it("still rewrites a bare `print` without the print_function future import", () => {
+    const res = analyzePython("print\n", "a.py");
+    assert.equal(res.output, "print()\n");
+    assert.equal(res.edits.length, 1);
+
+    const tree = parsePython("print\n")!;
+    assert.ok(
+      collectResidue(tree).some((item) => item.kind === "bare_print"),
+      "bare print without print_function is still residue"
+    );
+  });
+});
+
 describe("Edit conflicts (Requirement 6.16)", () => {
   it("skips the later overlapping edit and records edit_conflict", () => {
     const first = makeEdit([{ start: 0, end: 5, replacement: "aaaaa" }], 1, 1);
