@@ -19,6 +19,7 @@ import { GitService, TaskWorktreeResult } from "../git/git-service";
 import type { PactRole } from "../pact/pact-parser";
 import type { RuntimeHost } from "../runtime/runtime-host";
 import type { HeadlessAskRequest } from "../acp/stream-parser";
+import { buildAskAutoDeniedEventData } from "../acp/headless-fallback";
 import {
   SkeletonSupervisor,
 } from "../supervisor/skeleton-supervisor";
@@ -1192,16 +1193,16 @@ export class TaskDispatcher {
       ? curPath
       : `${localBin}${path.delimiter}${curPath}`;
 
-    // Requirement 17.11: forward an explicit auto-deny hook, otherwise supply a
-    // production default that records the auto-denial through the configured
-    // event sink, so a headless turn constructed via the Dispatcher never fails
-    // closed merely because the caller omitted the hook.
-    const emitCapable = Boolean(
-      this.host || this.eventStore || this.options.emitEvent
-    );
+    // Requirement 17.11: forward an explicit auto-deny hook. When a host is
+    // present it supplies its own single default handler (forwarding one from the
+    // Dispatcher too would emit duplicate ask.auto_denied events), so the
+    // Dispatcher only builds its fallback when there is no host to delegate to
+    // and it has an event sink to record through.
     const askAutoDeny =
       this.options.onAskAutoDeny ??
-      (emitCapable ? this.buildDefaultAskAutoDeny(skeletonId) : undefined);
+      (!this.host && (this.eventStore || this.options.emitEvent)
+        ? this.buildDefaultAskAutoDeny(skeletonId)
+        : undefined);
 
     const supervisorOpts: SkeletonSupervisorOptions = {
       runId: this.runId,
@@ -1272,11 +1273,7 @@ export class TaskDispatcher {
         kind: "ask.auto_denied",
         actor: "SkeletonSupervisor",
         skeletonId,
-        data: {
-          askId: ask.askId,
-          question: (ask as any).question ?? ask.text ?? null,
-          options: (ask as any).options ?? (ask.raw as any)?.options ?? null,
-        },
+        data: buildAskAutoDeniedEventData(ask),
       });
     };
   }
