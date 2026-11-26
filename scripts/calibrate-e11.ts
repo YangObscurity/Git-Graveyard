@@ -302,12 +302,10 @@ function calcRunWallClock(runs: CalibrationSourceRun[]): {
       }
     }
 
-    let endEv: EventEnvelope | null = null;
-    for (const ev of events) {
-      if (ev.kind === "run.done") {
-        endEv = ev;
-      }
-    }
+    // Pick the `run.done` with the highest `seq` (via the shared helper) instead of the last one in
+    // array order, so an out-of-order store replay resolves the same terminal event as the settings
+    // store's completion counter.
+    const endEv = pickLatestRunDoneEvent(events);
 
     if (!startEv || !endEv || endEv.ts < startEv.ts) {
       continue;
@@ -480,16 +478,28 @@ function calcApprovalWaits(runs: CalibrationSourceRun[]): MetricDistribution {
  * Requirement 41.12: `silentSkeletonMs` measures silence *only* while no tool call or command is
  * pending. This builds the in-flight spans from matched pairs so a long-running command/tool call is
  * never mistaken for silence:
- *  - `command.started` -> `command.result`   (paired by actor)
+ *  - `command.started` -> `command.result`   (paired by data.logRef, else skeleton, else actor)
  *  - `skeleton.tool_call` -> `skeleton.tool_result` (paired by skeleton-scoped tool call id)
  * Unmatched halves are ignored: a lone start or result is not a span, and treating it as one would
  * wrongly erase real silence (recorded fixtures and logs frequently omit the other half).
+ *
+ * The spans are bucketed by the *skeleton scope* of the matched start (`skeletonId`, else
+ * `actor:<actor>`) so an in-flight command in one skeleton never erases another skeleton's silence.
  */
 function pendingActivityIntervals(
   events: EventEnvelope[]
-): Array<{ startTs: number; endTs: number }> {
+): Map<string, Array<{ startTs: number; endTs: number }>> {
   const ordered = [...events].sort((a, b) => a.seq - b.seq);
-  const intervals: Array<{ startTs: number; endTs: number }> = [];
+  const byScope = new Map<string, Array<{ startTs: number; endTs: number }>>();
+
+  const addSpan = (scope: string, startTs: number, endTs: number): void => {
+    const list = byScope.get(scope);
+    if (list) {
+      list.push({ startTs, endTs });
+    } else {
+      byScope.set(scope, [{ startTs, endTs }]);
+    }
+  };
 
   const pair = (startKind: string, endKind: string, keyOf: (ev: EventEnvelope) => string): void => {
     const awaiting = new Map<string, EventEnvelope>();
@@ -504,7 +514,7 @@ function pendingActivityIntervals(
         const start = awaiting.get(key);
         if (start) {
           if (ev.ts > start.ts) {
-            intervals.push({ startTs: start.ts, endTs: ev.ts });
+            addSpan(start.skeletonId ?? `actor:${start.actor}`, start.ts, ev.ts);
           }
           awaiting.delete(key);
         }
@@ -531,7 +541,7 @@ function pendingActivityIntervals(
       ? `tool:${skelScope}:${toolCallId}`
       : `tool:${skelScope}`;
   });
-  return intervals;
+  return byScope;
 }
 
 /**
@@ -560,39 +570,71 @@ function calcSilenceDurations(runs: CalibrationSourceRun[]): MetricDistribution 
   let anyRunWithActivity = false;
 
   for (const run of runs) {
-    const activity = run.events
-      .filter((ev) => SILENCE_ACTIVITY_KINDS.has(ev.kind))
-      .sort((a, b) => a.seq - b.seq);
-    if (activity.length < 2) {
-      continue;
-    }
-    anyRunWithActivity = true;
-
-    // Requirement 41.12: time while a tool call or command is in flight is not silence, so the
-    // in-flight portion of each gap is subtracted before the maximum gap is taken.
-    const pending = pendingActivityIntervals(run.events);
-
-    let maxGap = 0;
-    let from = activity[0];
-    let to = activity[0];
-    for (let i = 1; i < activity.length; i += 1) {
-      const previous = activity[i - 1];
-      const current = activity[i];
-      const raw = current.ts - previous.ts;
-      const gap = Math.max(0, raw - pendingOverlapMs(pending, previous.ts, current.ts));
-      if (gap > maxGap) {
-        maxGap = gap;
-        from = previous;
-        to = current;
+    // Partition activity per skeleton scope. Combining every skeleton into one timeline would let a
+    // busy skeleton A fan its events across skeleton B's frozen window and split B's single long gap
+    // into many short ones, so a genuinely silent skeleton would be reported as active.
+    const activityBySkeleton = new Map<string, EventEnvelope[]>();
+    for (const ev of run.events) {
+      if (!SILENCE_ACTIVITY_KINDS.has(ev.kind)) {
+        continue;
+      }
+      const skelScope = ev.skeletonId ?? `actor:${ev.actor}`;
+      const list = activityBySkeleton.get(skelScope);
+      if (list) {
+        list.push(ev);
+      } else {
+        activityBySkeleton.set(skelScope, [ev]);
       }
     }
-    samples.push(maxGap);
-    citations.push(`${evCitation(from.seq)}..${evCitation(to.seq)}`);
+
+    // In-flight spans are bucketed the same way, so a pending tool call/command only erases silence
+    // inside its own skeleton.
+    const pendingBySkeleton = pendingActivityIntervals(run.events);
+
+    let runMaxGap = -1;
+    let winner: { from: EventEnvelope; to: EventEnvelope } | null = null;
+
+    for (const [skelScope, scopeEvents] of activityBySkeleton) {
+      if (scopeEvents.length < 2) {
+        continue;
+      }
+      anyRunWithActivity = true;
+
+      const ordered = [...scopeEvents].sort((a, b) => a.seq - b.seq);
+      const pending = pendingBySkeleton.get(skelScope) ?? [];
+
+      // Requirement 41.12: time while a tool call or command is in flight is not silence, so the
+      // in-flight portion of each gap is subtracted before the maximum gap is taken.
+      let scopeMaxGap = 0;
+      let from = ordered[0];
+      let to = ordered[0];
+      for (let i = 1; i < ordered.length; i += 1) {
+        const previous = ordered[i - 1];
+        const current = ordered[i];
+        const raw = current.ts - previous.ts;
+        const gap = Math.max(0, raw - pendingOverlapMs(pending, previous.ts, current.ts));
+        if (gap > scopeMaxGap) {
+          scopeMaxGap = gap;
+          from = previous;
+          to = current;
+        }
+      }
+
+      if (scopeMaxGap > runMaxGap) {
+        runMaxGap = scopeMaxGap;
+        winner = { from, to };
+      }
+    }
+
+    if (winner) {
+      samples.push(Math.max(0, runMaxGap));
+      citations.push(`${evCitation(winner.from.seq)}..${evCitation(winner.to.seq)}`);
+    }
   }
 
   return makeDistribution(samples, citations, {
     available: anyRunWithActivity,
-    note: anyRunWithActivity ? undefined : "fewer than two activity events per run",
+    note: anyRunWithActivity ? undefined : "no skeleton with two activity events per run",
   });
 }
 
