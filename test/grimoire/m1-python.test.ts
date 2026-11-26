@@ -1,5 +1,7 @@
 import test, { describe, it, before } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import * as path from "node:path";
 import {
   analyzePython,
   applyM1,
@@ -24,6 +26,8 @@ import {
 before(async () => {
   await initPythonParser();
 });
+
+const PROJECT_ROOT = path.resolve(__dirname, "../..");
 
 function makeEdit(
   splices: PythonSplice[],
@@ -499,6 +503,55 @@ describe("Python M1 signal detection", () => {
     assert.ok(result.some((s) => s.ruleId === "M1" && s.line === 1));
     assert.ok(result.some((s) => s.ruleId === "M1" && s.line === 4));
     assert.equal(result.filter((s) => s.line === 2 || s.line === 3).length, 0);
+  });
+
+  it("returns empty signals for non-.py inputs without initializing the parser", async () => {
+    const empty = await detectPythonSignals([]);
+    assert.equal(empty.signals.length, 0);
+    assert.equal(empty.unknowns.length, 0);
+    assert.equal(empty.parseErrors.length, 0);
+
+    const jsOnly = await detectPythonSignals([
+      { path: "index.js", content: "const x = 1;" },
+    ]);
+    assert.equal(jsOnly.signals.length, 0);
+    assert.equal(jsOnly.unknowns.length, 0);
+    assert.equal(jsOnly.parseErrors.length, 0);
+  });
+
+  it("does not load or initialize the Python parser when no .py files are present", () => {
+    const script = [
+      'const signals = require("./lib/grimoire/signals");',
+      'const m1 = require("./lib/rules/m1-python");',
+      "(async () => {",
+      "  const empty = await signals.detectPythonSignals([]);",
+      '  const jsOnly = await signals.detectPythonSignals([{ path: "index.js", content: "const x = 1;" }]);',
+      "  console.log('RESULT:' + JSON.stringify({",
+      "    parserReady: m1.isPythonParserReady(),",
+      "    emptySignals: empty.signals.length,",
+      "    emptyUnknowns: empty.unknowns.length,",
+      "    jsSignals: jsOnly.signals.length,",
+      "    jsUnknowns: jsOnly.unknowns.length,",
+      "  }));",
+      "})();",
+    ].join("\n");
+    const stdout = execFileSync(
+      process.execPath,
+      ["--import", "tsx", "-e", script],
+      { cwd: PROJECT_ROOT, encoding: "utf-8" }
+    );
+    const resultLine = stdout
+      .split("\n")
+      .find((line) => line.startsWith("RESULT:"));
+    assert.ok(resultLine, "child process did not report a RESULT line");
+    const parsed = JSON.parse(resultLine!.slice("RESULT:".length));
+    assert.deepEqual(parsed, {
+      parserReady: false,
+      emptySignals: 0,
+      emptyUnknowns: 0,
+      jsSignals: 0,
+      jsUnknowns: 0,
+    });
   });
 
   it("lexical fallback detects M1 patterns outside comments and strings", () => {
