@@ -45,6 +45,7 @@ import type {
 } from "../supervisor/types";
 import { redactEvent } from "../security/redactor";
 import type { HeadlessAskRequest } from "../acp/stream-parser";
+import { buildAskAutoDeniedEventData } from "../acp/headless-fallback";
 
 export type { FatalEventPayload };
 
@@ -416,11 +417,7 @@ export class RuntimeHost extends EventEmitter {
           kind: "ask.auto_denied",
           actor: "SkeletonSupervisor",
           skeletonId: opts.skeletonId,
-          data: {
-            askId: ask.askId,
-            question: (ask as any).question ?? ask.text ?? null,
-            options: (ask as any).options ?? (ask.raw as any)?.options ?? null,
-          },
+          data: buildAskAutoDeniedEventData(ask),
         });
       });
     const supervisor = new SkeletonSupervisor({

@@ -53,6 +53,7 @@ const sampleShortCredential = ["k9", "z!"].join("");
 interface Captured {
   args?: readonly string[];
   env?: Record<string, string>;
+  user?: string;
   calls: number;
 }
 
@@ -73,6 +74,7 @@ function makeSpawn(
     captured.calls += 1;
     captured.args = args;
     captured.env = options.env;
+    captured.user = options.user as string | undefined;
     const proc = new MockProcess();
     const { lines, code, stderrLines } = script(captured.calls - 1, args);
     setImmediate(() => {
@@ -758,6 +760,114 @@ describe("HeadlessFallbackChannel cancellation", () => {
         1,
         "no resume process may spawn after cancel() during approval"
       );
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("cancel() unblocks a turn stalled on a never-resolving onApproval and never spawns a resume turn", async () => {
+    const { logPath, cleanup } = tempLogPath("cancel-approval-stall");
+    try {
+      const captured: Captured = { calls: 0 };
+      const channel = makeChannel({
+        logPath,
+        s2ResumeSupported: true,
+        // An approval that never settles must not hang the turn forever.
+        onApproval: () => new Promise<"approve" | "deny">(() => {}),
+        spawnFn: makeSpawn(
+          () => ({
+            lines: [
+              {
+                type: "session",
+                sessionId: "sess-stall",
+                model: "claude-sonnet-5.5",
+              },
+              { type: "approval_request", approvalId: "ap-stall", tool: "shell" },
+            ],
+            code: 0,
+          }),
+          captured
+        ),
+      });
+
+      const pending = channel.runTurn({ prompt: "run a command" });
+
+      // Wait until the only process has closed and the approval is pending.
+      const deadline = Date.now() + 2000;
+      while (
+        (channel.getCurrentProcess() !== null || captured.calls < 1) &&
+        Date.now() < deadline
+      ) {
+        await new Promise((r) => setTimeout(r, 2));
+      }
+      assert.equal(captured.calls, 1);
+
+      assert.equal(channel.cancel(), true);
+
+      const result = await Promise.race([
+        pending,
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () => reject(new Error("runTurn did not resolve after cancel()")),
+            2000
+          )
+        ),
+      ]);
+      assert.equal(result.ok, false);
+      assert.equal(result.status, "cancelled");
+      assert.equal(result.reason, "cancelled");
+      assert.equal(
+        captured.calls,
+        1,
+        "no resume process may spawn after cancel() while the approval is pending"
+      );
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe("HeadlessFallbackChannel spawn options", () => {
+  it("passes the configured sandbox user to spawnFn", async () => {
+    const { logPath, cleanup } = tempLogPath("spawn-user");
+    try {
+      const captured: Captured = { calls: 0 };
+      const channel = makeChannel({
+        logPath,
+        user: "sandbox-runner",
+        spawnFn: makeSpawn(
+          () => ({
+            lines: [{ type: "session", sessionId: "s-1", model: "claude-sonnet-5.5" }],
+            code: 0,
+          }),
+          captured
+        ),
+      });
+      await channel.runTurn({ prompt: "x" });
+      assert.equal(captured.calls, 1);
+      assert.equal(captured.user, "sandbox-runner");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("omits the user option when none is configured", async () => {
+    const { logPath, cleanup } = tempLogPath("spawn-user-none");
+    try {
+      const captured: Captured = { calls: 0 };
+      const channel = makeChannel({
+        logPath,
+        spawnFn: makeSpawn(
+          () => ({
+            lines: [{ type: "session", sessionId: "s-2", model: "claude-sonnet-5.5" }],
+            code: 0,
+          }),
+          captured
+        ),
+      });
+      await channel.runTurn({ prompt: "x" });
+      assert.equal(captured.calls, 1);
+      assert.equal(captured.user, undefined);
     } finally {
       cleanup();
     }
