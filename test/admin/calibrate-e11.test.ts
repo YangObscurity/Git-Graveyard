@@ -527,15 +527,17 @@ describe("analyzeRecordedRunsForCalibration — metrics from recorded events", (
     assert.ok(metric.citations.includes("ev:9..ev:10"));
   });
 
-  it("measures the maximum skeleton silence gap per run (excluding in-flight spans)", () => {
+  it("measures the maximum per-skeleton silence gap per run (excluding in-flight spans)", () => {
     const metric = analysis.silenceDurationsMs;
     assert.equal(metric.status, "available");
-    // Run A keeps its 488_000 gap (its lone skeleton.tool_call has no result, so it is not an
-    // in-flight span); run C keeps 100_000. Run B's 200_000 command.started -> command.result span
-    // is in-flight work, not silence, so its maximum gap drops to 90_000 (Requirement 41.12).
-    assert.deepEqual([...metric.samples].sort((a, b) => a - b), [90_000, 100_000, 488_000]);
-    assert.equal(metric.max, 488_000);
-    assert.ok(metric.citations.includes("ev:7..ev:13"));
+    // Each skeleton is measured independently against its own in-flight spans. Run A's only skeleton
+    // with two activity events is `soulstitcher`, whose command span is in-flight, so its gap is 0;
+    // run B's 200_000 command.started -> command.result span is likewise in-flight; run C's lone
+    // skeleton keeps 100_000. A gap spanning two *different* skeletons is never one skeleton's
+    // silence, so run A's 488_000 cross-skeleton stretch is not counted.
+    assert.deepEqual([...metric.samples].sort((a, b) => a - b), [0, 0, 100_000]);
+    assert.equal(metric.max, 100_000);
+    assert.ok(metric.citations.includes("ev:5..ev:6"));
   });
 
   it("proposes calibrated settings with citations", () => {
@@ -548,7 +550,7 @@ describe("analyzeRecordedRunsForCalibration — metrics from recorded events", (
     const silence = analysis.proposals.find((p) => p.key === "silentSkeletonMs");
     assert.ok(silence);
     assert.equal(silence.currentDefault, 120_000);
-    assert.equal(silence.proposedValue, 610_000); // ceil(488_000 * 1.25)
+    assert.equal(silence.proposedValue, 125_000); // ceil(100_000 * 1.25)
 
     const approval = analysis.proposals.find((p) => p.key === "approvalWaitMs");
     assert.ok(approval);
@@ -761,7 +763,7 @@ describe("runCalibration — recorded runs directory and --apply", () => {
 
     assert.equal(result.applied.length, 5);
     assert.equal(settingsStore.getSetting("wardenRounds"), 5);
-    assert.equal(settingsStore.getSetting("silentSkeletonMs"), 610_000);
+    assert.equal(settingsStore.getSetting("silentSkeletonMs"), 125_000);
     assert.equal(settingsStore.getSetting("approvalWaitMs"), 375_000);
 
     const audit = settingsStore.getAuditLog({ key: "wardenRounds" });
@@ -879,7 +881,7 @@ describe("runCalibration — recorded runs directory and --apply", () => {
 
     const store = new SettingsStore(dbPath);
     assert.equal(store.getSetting("wardenRounds"), 5);
-    assert.equal(store.getSetting("silentSkeletonMs"), 610_000);
+    assert.equal(store.getSetting("silentSkeletonMs"), 125_000);
     // The CLI applied against four completed runs (writeThreeRuns writes calib-run-a..d) with the
     // default sample of three, so calib-run-d is still uncalibrated and recalibration stays required.
     assert.equal(store.isRecalibrationRequired(), true);
@@ -1165,6 +1167,24 @@ describe("SettingsStore & calibration — hardening regressions", () => {
     assert.equal(store.syncRecordedRunCount({ eventStore }).completedRecordedRuns, 4);
     store.close();
     eventStore.close();
+  });
+
+  // --- run wall-clock resolves the terminal run.done by seq -------
+
+  it("uses the highest-seq run.done for the wall clock even when the events array is out of order", () => {
+    // The higher-seq terminal event sits *earlier* in the array, so scanning for the last `run.done`
+    // would wrongly resolve the shorter, superseded one.
+    const run = mkRun("calib-run-done-order", [
+      { seq: 1, ts: 0, kind: "run.started" },
+      { seq: 5, ts: 500_000, kind: "run.done", data: { outcome: "partial" } },
+      { seq: 2, ts: 100_000, kind: "run.done", data: { outcome: "resurrected" } },
+    ]);
+
+    const detail = analyzeRecordedRunsForCalibration([run]).runWallClockDetails[0];
+    assert.ok(detail);
+    assert.equal(detail.endCitation, "ev:5");
+    assert.equal(detail.totalMs, 500_000);
+    assert.equal(detail.activeMs, 500_000);
   });
 
   // --- directory loader completeness ---------------------------------
@@ -1636,6 +1656,45 @@ describe("event pairing & ordering", () => {
     // Both skeleton-scoped in-flight spans are recognised, so neither interleaving counts as silence.
     assert.equal(metric.max, 0);
     assert.deepEqual(metric.samples, [0]);
+  });
+
+  // --- silence is partitioned per skeleton ----------------------------
+
+  it("partitions silence per skeleton so a busy skeleton cannot hide a frozen one", () => {
+    // Skeleton A emits activity every 1 s across the whole window and holds an in-flight tool call
+    // spanning it; skeleton B emits once at each end, leaving a 150 s silence gap. A run-level
+    // interleaved timeline would fan A's beats across B's gap (reporting < 2 s), and A's in-flight
+    // span would subtract the overlap — but B's silence must survive both.
+    const specs: EvSpec[] = [
+      { seq: 1, ts: 0, kind: "skeleton.tool_call", skeletonId: "sk-a", data: { toolCallId: "ta" } },
+      { seq: 2, ts: 0, kind: "skeleton.log", skeletonId: "sk-b" },
+    ];
+    let seq = 3;
+    for (let ts = 1_000; ts <= 150_000; ts += 1_000) {
+      specs.push({ seq: seq++, ts, kind: "skeleton.log", skeletonId: "sk-a" });
+    }
+    specs.push({ seq: seq++, ts: 150_000, kind: "skeleton.log", skeletonId: "sk-b" });
+    specs.push({
+      seq: seq++,
+      ts: 150_000,
+      kind: "skeleton.tool_result",
+      skeletonId: "sk-a",
+      data: { toolCallId: "ta" },
+    });
+    specs.push({ seq: seq++, ts: 150_000, kind: "run.done", data: { outcome: "resurrected" } });
+
+    const metric = analyzeRecordedRunsForCalibration([
+      mkRun("calib-per-skeleton-silence", specs),
+    ]).silenceDurationsMs;
+
+    assert.equal(metric.status, "available");
+    // Skeleton B's 150 s silence must be reported, not A's ~1 s rhythm.
+    assert.ok(
+      (metric.max ?? 0) >= 150_000,
+      `expected >= 150000 ms, got ${String(metric.max)}`
+    );
+    assert.ok((metric.max ?? 0) >= 2_000, "the frozen skeleton must not be hidden by the busy one");
+    assert.deepEqual(metric.samples, [150_000]);
   });
 
   // --- directory mode sorts runs by run.done ts -----------------------
