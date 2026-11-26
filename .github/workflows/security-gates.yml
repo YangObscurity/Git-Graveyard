@@ -2,7 +2,7 @@ name: Security Gates
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, 'wave/**']
   push:
     branches: [main]
 
