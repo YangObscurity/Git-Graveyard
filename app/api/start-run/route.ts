@@ -294,10 +294,8 @@ export async function POST(request: Request): Promise<Response> {
 
   // 5. Refuse to start when a Required_Setting has no value (Requirement 30.2).
   //
-  // `assertRequiredSettingsConfigured` previously had no production caller, so runs were created
-  // and enqueued even while the Necromancer still had Required_Settings without values. This gate
-  // runs *before* `createRun` / the FIFO enqueue: on failure it returns 503 with the missing keys
-  // and no run is created or queued.
+  // This gate runs *before* `createRun` / the FIFO enqueue: on failure it returns 503 with the
+  // missing keys and no run is created or queued.
   if (isSettingsStoreConfigured(request)) {
     try {
       assertRequiredSettingsConfigured(resolveSettingsStore(request));

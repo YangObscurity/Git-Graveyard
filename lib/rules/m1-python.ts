@@ -6,7 +6,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { Parser, Tree, Node } from "web-tree-sitter";
-import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
 import * as Diff from "diff";
 import type { Confidence, UnknownRecord } from "../grimoire/types";
 import type { PatchStep } from "../grimoire/gate-js";
@@ -128,12 +128,55 @@ export function getPythonParser(): Parser | null {
   return pythonParser;
 }
 
-function makeRequire(): NodeRequire {
+const TREE_SITTER_PYTHON_WASM = path.join(
+  "node_modules",
+  "tree-sitter-python",
+  "tree-sitter-python.wasm"
+);
+
+/**
+ * Locates the bundled `tree-sitter-python` WASM file by walking up from the
+ * current working directory (and, defensively, from this module's own
+ * directory) towards the filesystem root. This deliberately avoids
+ * `createRequire(...).resolve("tree-sitter-python/package.json")`: a dynamic
+ * `require.resolve` expression is flagged by the Webpack/Turbopack bundler as
+ * `Can't resolve <dynamic>` and pollutes the build output.
+ */
+function findTreeSitterPythonWasm(): string | null {
+  const starts: string[] = [];
   try {
-    return createRequire(import.meta.url);
+    starts.push(process.cwd());
   } catch {
-    return createRequire(process.cwd() + "/__m1_python__.js");
+    // `process.cwd()` can throw in exotic runtimes; ignore.
   }
+  try {
+    // `import.meta.url` is unavailable in some CJS / bundled runtimes, so this
+    // is wrapped in `try/catch` for safety.
+    starts.push(path.dirname(fileURLToPath(import.meta.url)));
+  } catch {
+    // CJS / bundled runtime without `import.meta.url`.
+  }
+
+  const MAX_HOPS = 10;
+  for (const start of starts) {
+    let dir = start;
+    for (let hop = 0; hop < MAX_HOPS; hop++) {
+      const candidate = path.join(dir, TREE_SITTER_PYTHON_WASM);
+      if (fs.existsSync(candidate)) return candidate;
+      const parent = path.dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+  }
+  return null;
+}
+
+/** Resolves the WASM path, falling back to `cwd/node_modules` when not found. */
+function resolveTreeSitterPythonWasm(): string {
+  return (
+    findTreeSitterPythonWasm() ??
+    path.join(process.cwd(), TREE_SITTER_PYTHON_WASM)
+  );
 }
 
 const GLOBAL_PYTHON_PARSE_SYNC_KEY = "__ggPythonParseSync";
@@ -155,30 +198,7 @@ export async function initPythonParser(): Promise<Parser> {
     parserPromise = (async () => {
       const { Parser, Language } = await import("web-tree-sitter");
       await Parser.init();
-      const req = makeRequire();
-      let wasmPath = "";
-      try {
-        const pyPkgDir = path.dirname(
-          req.resolve(["tree-sitter-python", "package.json"].join("/"))
-        );
-        const candidate = path.join(
-          pyPkgDir,
-          ["tree-sitter-python", "wasm"].join(".")
-        );
-        if (fs.existsSync(candidate)) {
-          wasmPath = candidate;
-        }
-      } catch {
-        // Fallback below for bundled runtimes.
-      }
-      if (!wasmPath) {
-        wasmPath = path.join(
-          process.cwd(),
-          "node_modules",
-          "tree-sitter-python",
-          ["tree-sitter-python", "wasm"].join(".")
-        );
-      }
+      const wasmPath = resolveTreeSitterPythonWasm();
       const language = await Language.load(wasmPath);
       const parser = new Parser();
       parser.setLanguage(language);
@@ -452,7 +472,12 @@ function classifyResidue(node: Node): string | null {
     }
     case "integer": {
       const text = node.text;
-      if (/^0[0-9]+$/.test(text)) return "octal";
+      // Python 3 removed the legacy octal literal: a decimal run that starts
+      // with `0` and contains at least one non-zero digit (`0755`, `0644`,
+      // `010`, `007`). All-zero integers (`0`, `00`, `000`) are valid Python 3
+      // and must never be flagged. Hex/binary/`0o` literals carry a non-digit
+      // right after the leading `0`, so they are excluded by construction.
+      if (/^0[0-9]*[1-9][0-9]*$/.test(text)) return "octal";
       if (/[Ll]$/.test(text)) return "long";
       return null;
     }
@@ -893,11 +918,27 @@ export function planFromTree(
           argsNode.namedChildren.some(
             (arg) => arg.type === "keyword_argument"
           );
-        // `unicode(bytes, encoding, errors)` and `unicode(encoding="utf-8")`
-        // both change meaning/arity when rewritten to `str(...)`: Python 3
-        // `str()` takes no `encoding=` keyword (TypeError). Keep them
+        // `*args` / `**kwargs` splats forward an arbitrary number of arguments,
+        // so even `unicode(*args)` (statically one argument) can be a Py2
+        // `unicode(bytes, encoding, errors)` call. Rewriting it to `str(*args)`
+        // would change arity/meaning, so keep it unrewritten and flag the
+        // decoding as ambiguous.
+        const hasSplatArgument =
+          !!argsNode &&
+          argsNode.namedChildren.some(
+            (arg) =>
+              arg.type === "list_splat" || arg.type === "dictionary_splat"
+          );
+        // `unicode(bytes, encoding, errors)`, `unicode(encoding="utf-8")`, and
+        // `unicode(*args)` / `unicode(**kwargs)` all change meaning/arity when
+        // rewritten to `str(...)`: Python 3 `str()` takes no `encoding=`
+        // keyword (TypeError) and no splat with the Py2 arity. Keep them
         // unrewritten and flag the decoding as ambiguous.
-        if (totalArgumentCount(node) >= 2 || hasKeywordArgument) {
+        if (
+          totalArgumentCount(node) >= 2 ||
+          hasKeywordArgument ||
+          hasSplatArgument
+        ) {
           unknowns.push({
             ruleId: "M1",
             reason: "unicode_decoding_ambiguous",
@@ -1206,6 +1247,18 @@ function prefixMatches(version: number[], prefix: number[]): boolean {
   return true;
 }
 
+/**
+ * True when two versions share the same release segment (trailing zeros
+ * padded), e.g. `3.11` and `3.11.0` or `3.11` and `3.11.post1`.
+ */
+function sameRelease(a: ParsedVersion, b: ParsedVersion): boolean {
+  const length = Math.max(a.release.length, b.release.length);
+  for (let i = 0; i < length; i++) {
+    if ((a.release[i] ?? 0) !== (b.release[i] ?? 0)) return false;
+  }
+  return true;
+}
+
 function versionMatchesClause(version: ParsedVersion, clause: ParsedClause): boolean {
   const { op, version: spec, star } = clause;
   switch (op) {
@@ -1220,11 +1273,35 @@ function versionMatchesClause(version: ParsedVersion, clause: ParsedClause): boo
     case ">=":
       return compareParsedVersions(version, spec) >= 0;
     case ">":
-      return compareParsedVersions(version, spec) > 0;
+      // PEP 440: an exclusive ordered comparison `>V` MUST NOT match a
+      // post-release of `V` unless `V` itself is a post-release. Otherwise
+      // `.postN` sorts above the final release and would wrongly satisfy it.
+      if (compareParsedVersions(version, spec) <= 0) return false;
+      if (
+        spec.post === null &&
+        version.post !== null &&
+        sameRelease(version, spec)
+      ) {
+        return false;
+      }
+      return true;
     case "<=":
       return compareParsedVersions(version, spec) <= 0;
     case "<":
-      return compareParsedVersions(version, spec) < 0;
+      // PEP 440: an exclusive ordered comparison `<V` MUST NOT match a
+      // pre-release or dev-release of `V` unless `V` itself specifies a
+      // pre-release / dev-release. Otherwise `3.11a1` / `3.11.dev0` sort below
+      // the final release and would wrongly satisfy it.
+      if (compareParsedVersions(version, spec) >= 0) return false;
+      if (
+        spec.pre === null &&
+        spec.dev === null &&
+        (version.pre !== null || version.dev !== null) &&
+        sameRelease(version, spec)
+      ) {
+        return false;
+      }
+      return true;
     case "~=": {
       if (compareParsedVersions(version, spec) < 0) return false;
       const prefix =

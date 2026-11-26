@@ -34,6 +34,10 @@ import {
 import { BudgetCapTracker, type BudgetCapSnapshot } from "./budget-caps";
 import { HeadlessFallbackChannel } from "../acp/headless-fallback";
 import type {
+  HeadlessApprovalRequest,
+  HeadlessAskRequest,
+} from "../acp/stream-parser";
+import type {
   ChildProcessLike,
   ExecutionChannel,
   GatewayEventSource,
@@ -56,6 +60,25 @@ import {
   MalformedRequestError,
   DuplicateOptionIdError,
 } from "../broker/permission-broker";
+
+declare module "./types" {
+  interface SkeletonSupervisorOptions {
+    /**
+     * Bridges the Headless Fallback approval prompt to the caller. When absent (or
+     * when it rejects) the channel fails closed and denies the approval. After a
+     * cancellation or termination it is never asked to resume.
+     */
+    onApproval?: (
+      request: HeadlessApprovalRequest
+    ) => "approve" | "deny" | Promise<"approve" | "deny">;
+    /**
+     * Requirement 17.11: invoked as soon as a headless `ask` is observed so the
+     * Gateway records the auto-denial. Required for headless turns: a missing hook
+     * fails the turn closed with `ask_auto_deny_failed` before any process spawns.
+     */
+    onAskAutoDeny?: (ask: HeadlessAskRequest) => Promise<void> | void;
+  }
+}
 
 export class SkeletonSupervisorError extends Error {
   readonly reason: SupervisorFailureReason;
@@ -232,6 +255,15 @@ export class SkeletonSupervisor extends EventEmitter {
     | ((payload: GatewayFatalEventPayload) => void)
     | null = null;
   private gatewayListenerAttached: boolean = false;
+  /** The Headless Fallback channel driving the in-flight turn, if any. */
+  private activeHeadlessChannel: HeadlessFallbackChannel | null = null;
+  /**
+   * The REAL session id reported by the CLI on a previous headless turn. It is
+   * kept separate from `sessionId` (which may hold a supervisor-side placeholder)
+   * and is the ONLY value ever passed as `--resume-id`. `null` until the CLI
+   * reports one, so the first headless turn is always a fresh (non-resumed) run.
+   */
+  private headlessCliSessionId: string | null = null;
 
   constructor(options: SkeletonSupervisorOptions) {
     super();
@@ -741,36 +773,21 @@ export class SkeletonSupervisor extends EventEmitter {
         ? formatTaskPrompt(promptText as TaskPromptOptions)
         : promptText;
 
+    // Requirements 17.2, 17.3, 17.4: the Headless Fallback execution is delegated
+    // ENTIRELY to HeadlessFallbackChannel, which streams stdout to disk
+    // (`headless-stream.jsonl`) BEFORE parsing, maps the exit code, verifies the
+    // active model against the allowlist, handles approval resumes via
+    // `--resume-id`, and auto-denies every `ask` during live streaming (failing
+    // closed when the required hook rejects). The turn is awaited and its real
+    // result or failure is propagated.
+    if (this.executionChannel === "Headless_Fallback") {
+      return this.runHeadlessTurn(resolvedPrompt, this.headlessLogPath());
+    }
+
     this.state = "prompting";
     this.promptPending = true;
 
     try {
-      // Requirements 17.2, 17.3, 17.4 / finding [2]: the Headless Fallback
-      // execution is delegated ENTIRELY to HeadlessFallbackChannel. The channel
-      // streams stdout to disk (`headless-stream.jsonl`) BEFORE parsing, maps the
-      // exit code, verifies the active model against the allowlist, handles
-      // approval resumes via `--resume-id`, and auto-denies every `ask` during
-      // live streaming (failing closed when the required hook rejects).
-      if (this.executionChannel === "Headless_Fallback") {
-        const rawLogPath = this.headlessLogPath();
-        const channel = this.createHeadlessChannel(rawLogPath);
-        void channel
-          .runTurn({
-            prompt:
-              typeof resolvedPrompt === "string"
-                ? resolvedPrompt
-                : String(resolvedPrompt),
-            resumeId: this.sessionId ?? undefined,
-          })
-          .catch(() => {
-            // The channel never rejects; a defensive catch keeps the turn alive.
-          });
-
-        this.promptPending = false;
-        this.state = "raised";
-        return { status: "complete", output: "", rawLogPath };
-      }
-
       const result = await this.client!.sessionPrompt({
         sessionId: this.sessionId,
         prompt: resolvedPrompt,
@@ -786,8 +803,84 @@ export class SkeletonSupervisor extends EventEmitter {
       return result;
     } catch (err) {
       this.promptPending = false;
-      this.state = "raised";
+      if (!this.failureReason) {
+        this.state = "raised";
+      }
       throw err;
+    }
+  }
+
+  /**
+   * Runs one Headless Fallback turn through the channel and awaits its real
+   * result. A failed turn transitions the supervisor into the failed state with
+   * the channel's real reason (for example `model_mismatch`, `gateway_missing`,
+   * `missing_agent`, `stream_log_write_failed`, `ask_auto_deny_failed` or
+   * `headless_fallback_disabled`) and throws a `SkeletonSupervisorError`.
+   * Requirements 17.2-17.4, 17.11.
+   */
+  private async runHeadlessTurn(
+    resolvedPrompt: unknown,
+    rawLogPath: string
+  ): Promise<unknown> {
+    // The stream log lives under the Skeleton's sessions dir, never inside the
+    // worktree, so it can never be staged into a candidate commit.
+    fs.mkdirSync(this.paths.sessionsDir, { recursive: true });
+    const channel = this.createHeadlessChannel(rawLogPath);
+    this.activeHeadlessChannel = channel;
+    this.state = "prompting";
+    this.promptPending = true;
+
+    try {
+      const turn = await channel.runTurn({
+        prompt:
+          typeof resolvedPrompt === "string"
+            ? resolvedPrompt
+            : String(resolvedPrompt),
+        // The supervisor's own id is NOT a CLI session id. Only a real id
+        // reported by a previous headless turn may be used to resume.
+        resumeId: this.headlessCliSessionId ?? undefined,
+      });
+
+      if (!turn.ok) {
+        const reason = (turn.reason ?? turn.status) as SupervisorFailureReason;
+        const detail =
+          turn.spawnError ??
+          turn.logError ??
+          `Headless Fallback turn failed: ${turn.status}`;
+        this.failSkeleton(reason, detail);
+        throw new SkeletonSupervisorError(
+          reason,
+          `Headless Fallback turn failed: ${detail}`,
+          String(this.role),
+          this.skeletonId
+        );
+      }
+
+      if (
+        typeof turn.sessionId === "string" &&
+        turn.sessionId.trim().length > 0
+      ) {
+        this.headlessCliSessionId = turn.sessionId;
+      }
+      this.promptPending = false;
+      this.state = "raised";
+      return {
+        status: "complete",
+        output: turn.output,
+        rawLogPath,
+        sessionId: turn.sessionId,
+        credits: turn.credits,
+      };
+    } catch (err) {
+      this.promptPending = false;
+      if (!this.failureReason) {
+        this.state = "raised";
+      }
+      throw err;
+    } finally {
+      if (this.activeHeadlessChannel === channel) {
+        this.activeHeadlessChannel = null;
+      }
     }
   }
 
@@ -833,15 +926,10 @@ export class SkeletonSupervisor extends EventEmitter {
     }
 
     if (this.executionChannel === "Headless_Fallback") {
-      // Requirement 17.3 / finding [2]: the correction is delegated to the
-      // Headless Fallback channel, which resumes the session with `--resume-id`.
-      const channel = this.createHeadlessChannel(this.headlessLogPath());
-      const resumeId = this.sessionId ?? undefined;
-      void channel
-        .runTurn({ prompt: correctionText, resumeId })
-        .catch(() => {
-          // The channel never rejects; a defensive catch keeps the steer alive.
-        });
+      // Requirement 17.3: the correction is delegated to the Headless Fallback
+      // channel, which resumes the CLI session with the real session id reported
+      // by an earlier turn (never the supervisor-side placeholder).
+      await this.runHeadlessTurn(correctionText, this.headlessLogPath());
       return;
     }
 
@@ -891,6 +979,10 @@ export class SkeletonSupervisor extends EventEmitter {
    */
   public async cancel(reason: string = "cancelled"): Promise<void> {
     this.state = "cancelling";
+
+    // Requirement 17.8: abort the in-flight headless turn, if any, so its child
+    // process is signalled and the turn reports "cancelled".
+    this.activeHeadlessChannel?.cancel();
 
     if (this.client && this.sessionId) {
       try {
@@ -972,6 +1064,9 @@ export class SkeletonSupervisor extends EventEmitter {
   public async finish(): Promise<void> {
     this.isTerminating = true;
 
+    // Abort any in-flight headless turn before tearing the Skeleton down.
+    this.activeHeadlessChannel?.cancel();
+
     // Audit N-B1: a finished Skeleton no longer listens for gateway fatal events.
     this.removeGatewayFatalListener();
 
@@ -1020,30 +1115,29 @@ export class SkeletonSupervisor extends EventEmitter {
   }
 
   /**
-   * The disk path the Headless Fallback channel writes the raw stream-json to
-   * (Requirement 17.4 / finding [2]).
+   * The disk path the Headless Fallback channel writes the raw stream-json to.
+   * It lives under the Skeleton's sessions dir, NEVER inside the worktree, so
+   * `commitDirtyWorktreeIfNeeded` can never stage the raw stream into a candidate
+   * (Requirement 17.4).
    */
   private headlessLogPath(): string {
-    return path.join(this.cwd, "headless-stream.jsonl");
+    return path.join(this.paths.sessionsDir, "headless-stream.jsonl");
   }
 
   /**
    * Builds the Headless Fallback channel for a turn or correction, wiring the
    * Skeleton's command, working directory, model, isolated environment, gateway
    * tool ids, injectable spawn function and stream log location. Approval is
-   * bridged to `options.onApproval` (failing closed to `deny`) and every `ask`
-   * is auto-denied through the injected handler (finding [2], Requirement 17.11).
+   * bridged to `options.onApproval` (failing closed to `deny`), and the required
+   * auto-deny hook is forwarded verbatim (Requirement 17.11): when it is missing
+   * the channel is left without one so it fails closed with `ask_auto_deny_failed`
+   * before spawning, and a present hook's errors propagate.
    */
   private createHeadlessChannel(logPath: string): HeadlessFallbackChannel {
     const modelId =
       this.verifiedModelId ??
       getAssignedModelForRole(this.role, { hard: this.options.hard });
-    const options = this.options as {
-      onApproval?: (
-        request: unknown
-      ) => Promise<"approve" | "deny"> | "approve" | "deny";
-      onAskAutoDeny?: (ask: unknown) => Promise<void> | void;
-    };
+    const onAskAutoDeny = this.options.onAskAutoDeny;
     return new HeadlessFallbackChannel({
       runId: this.runId,
       skeletonId: this.skeletonId,
@@ -1059,28 +1153,33 @@ export class SkeletonSupervisor extends EventEmitter {
       spawnFn: this.spawnFn,
       gatewayToolIds: this.options.gatewayToolIds,
       logPath,
-      logTrustedBaseDir: this.cwd,
+      logTrustedBaseDir: this.paths.sessionsDir,
       // Requirement 17.1: the supervisor already selected the Headless channel on
-      // P1 failure; P14 defaults to passed so the channel actually runs.
+      // P1 failure, so the channel runs only when P1 failed and P14 passed.
       p1Passed: this.options.probeResults?.P1?.passed ?? false,
-      p14Passed: this.options.probeResults?.P14?.passed ?? true,
+      p14Passed: this.options.probeResults?.P14?.passed === true,
+      s2ResumeSupported: this.options.probeResults?.S2?.passed === true,
       onApproval: async (request) => {
-        if (typeof options.onApproval === "function") {
-          try {
-            return await options.onApproval(request);
-          } catch {
-            return "deny";
-          }
+        // Never auto-approve (or resume) after cancellation or termination.
+        if (
+          this.isTerminating ||
+          this.state === "terminated" ||
+          this.state === "cancelling"
+        ) {
+          return "deny";
         }
-        // Fail closed: an unhandled approval is denied, never auto-approved.
-        return "deny";
-      },
-      onAskAutoDeny: async (ask) => {
-        if (typeof options.onAskAutoDeny === "function") {
-          // A failing auto-deny handler propagates so the channel fails closed.
-          await options.onAskAutoDeny(ask);
+        const handler = this.options.onApproval;
+        if (typeof handler !== "function") {
+          // Fail closed: an unhandled approval is denied, never auto-approved.
+          return "deny";
+        }
+        try {
+          return await handler(request);
+        } catch {
+          return "deny";
         }
       },
+      ...(typeof onAskAutoDeny === "function" ? { onAskAutoDeny } : {}),
     });
   }
 
@@ -1431,6 +1530,9 @@ export class SkeletonSupervisor extends EventEmitter {
   private terminateSkeletonProcess(): void {
     this.removeGatewayFatalListener();
     this.isTerminating = true;
+
+    // Abort any in-flight headless turn before tearing the Skeleton down.
+    this.activeHeadlessChannel?.cancel();
 
     if (this.client) {
       try {

@@ -510,7 +510,7 @@ export interface StreamDiskLoggerOptions {
    */
   secrets?: readonly string[];
   /**
-   * Trusted base directory the log path must stay strictly inside (finding [5]).
+   * Trusted base directory the log path must stay strictly inside.
    * When set, `createStreamDiskLogger` refuses a symlink at the log path or at any
    * intermediate component between this base and the log path, and asserts the
    * resolved parent directory stays within the base's realpath. Nothing outside
@@ -543,10 +543,22 @@ function isSymlinkPath(target: string): boolean {
   }
 }
 
-/** True when target is inside base or equal to it (lexical, after resolving). */
+/**
+ * True when target is inside base or equal to it (lexical, after resolving).
+ * Only a genuine parent escape is rejected: the relative path is exactly "..",
+ * starts with "../" (or "..\\"), or is absolute. A sibling directory whose name
+ * merely begins with two dots (for example `<base>/..diagnostics/stream.jsonl`)
+ * is NOT an escape and stays inside the base.
+ */
 function isInsideDir(base: string, target: string): boolean {
   const rel = path.relative(base, target);
-  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+  if (rel === "") {
+    return true;
+  }
+  if (path.isAbsolute(rel)) {
+    return false;
+  }
+  return rel !== ".." && !rel.startsWith(`..${path.sep}`);
 }
 
 /**
