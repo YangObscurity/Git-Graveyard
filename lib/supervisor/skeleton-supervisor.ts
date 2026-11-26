@@ -235,6 +235,12 @@ export class SkeletonSupervisor extends EventEmitter {
   /** The Headless Fallback channel driving the in-flight turn, if any. */
   private activeHeadlessChannel: HeadlessFallbackChannel | null = null;
   /**
+   * The channel whose in-flight turn a mid-turn `steer()` intentionally
+   * cancelled. While it matches the channel being finalized, a "cancelled" turn
+   * is a steer-driven resume rather than a Skeleton failure.
+   */
+  private steeringHeadlessChannel: HeadlessFallbackChannel | null = null;
+  /**
    * The promise of the in-flight headless turn, if any. `steer()` awaits it after
    * cancelling the active channel so two concurrent `kiro-cli` processes can never
    * be spawned at the same time (Requirement 17.3).
@@ -845,6 +851,30 @@ export class SkeletonSupervisor extends EventEmitter {
       });
 
       if (!turn.ok) {
+        // A mid-turn steer() cancelled this turn on purpose; it is NOT a Skeleton
+        // failure. Preserve the real CLI session id so the replacement resume
+        // turn continues the same session, then return cleanly so steer() can
+        // start that resume turn with the Skeleton still "raised".
+        if (
+          turn.status === "cancelled" &&
+          this.steeringHeadlessChannel === channel
+        ) {
+          const rawSessionId = channel.getLastRawSessionId() ?? turn.sessionId;
+          if (
+            typeof rawSessionId === "string" &&
+            rawSessionId.trim().length > 0
+          ) {
+            this.headlessCliSessionId = rawSessionId;
+          }
+          this.steeringHeadlessChannel = null;
+          this.promptPending = false;
+          this.state = "raised";
+          return {
+            status: "cancelled",
+            rawLogPath,
+            sessionId: turn.sessionId,
+          };
+        }
         const reason = (turn.reason ?? turn.status) as SupervisorFailureReason;
         const detail =
           turn.spawnError ??
@@ -945,6 +975,9 @@ export class SkeletonSupervisor extends EventEmitter {
         this.state === "prompting" ||
         this.promptPending
       ) {
+        // Record the channel BEFORE cancelling it so `runHeadlessTurn` treats the
+        // cancellation as steer-driven (resume) rather than a Skeleton failure.
+        this.steeringHeadlessChannel = this.activeHeadlessChannel;
         this.activeHeadlessChannel?.cancel();
         const inFlight = this.activeHeadlessTurn;
         if (inFlight) {
@@ -953,7 +986,12 @@ export class SkeletonSupervisor extends EventEmitter {
           } catch {
             // The cancelled turn fails closed; steer still resumes from the
             // settled CLI session state.
+          } finally {
+            // Clear the steer marker once the cancelled turn has settled.
+            this.steeringHeadlessChannel = null;
           }
+        } else {
+          this.steeringHeadlessChannel = null;
         }
       }
       await this.runTrackedHeadlessTurn(correctionText, this.headlessLogPath());
@@ -1176,6 +1214,9 @@ export class SkeletonSupervisor extends EventEmitter {
       worktreeDir: this.cwd,
       kiroApiKey: this.options.kiroApiKey,
       pathEnv: this.options.pathEnv,
+      // The sandbox user defaults to "skel" so the headless process runs as the
+      // Skeleton user unless the caller overrides it.
+      user: this.options.user ?? "skel",
       command: this.options.command ?? "kiro-cli",
       spawnFn: this.spawnFn,
       gatewayToolIds: this.options.gatewayToolIds,

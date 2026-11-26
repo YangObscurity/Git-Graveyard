@@ -1347,12 +1347,12 @@ test("Requirement 16.14, 17.8: cancel() kills the active headless channel", asyn
 test("Requirement 17.3: steer() mid-headless-turn never runs two concurrent headless processes", async () => {
   const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "gg-headless-steer-"));
   let live = 0;
-  let maxLive = 0;
+  let maxConcurrentSpawns = 0;
   const children: MockChildProcess[] = [];
 
   const spawnFn: SpawnFunction = () => {
     live += 1;
-    maxLive = Math.max(maxLive, live);
+    maxConcurrentSpawns = Math.max(maxConcurrentSpawns, live);
     const child = new MockChildProcess();
     const index = children.length;
     children.push(child);
@@ -1408,28 +1408,108 @@ test("Requirement 17.3: steer() mid-headless-turn never runs two concurrent head
 
   await supervisor.raise();
 
-  const firstTurn = supervisor.prompt("first turn").catch(() => {});
+  const firstTurn = supervisor.prompt("first turn");
   const spawnDeadline = Date.now() + 2000;
   while (children.length < 1 && Date.now() < spawnDeadline) {
     await new Promise((resolve) => setImmediate(resolve));
   }
   assert.equal(live, 1, "the first headless turn must have exactly one live process");
 
-  // steer while the first headless turn is still in flight.
-  const steerPromise = supervisor.steer("correction").catch(() => {});
+  // steer while the first headless turn is still in flight. It must resolve
+  // without throwing and must NOT mark the Skeleton failed.
+  const steerPromise = supervisor.steer("correction");
   await steerPromise;
   await firstTurn;
 
   assert.equal(
-    maxLive,
+    maxConcurrentSpawns,
     1,
     "steer() must never run two concurrent headless processes"
   );
+  assert.equal(
+    supervisor.getState(),
+    "raised",
+    "a mid-turn steer() must leave the Skeleton raised"
+  );
+  assert.equal(
+    supervisor.getFailureReason(),
+    null,
+    "a mid-turn steer() must not fail the Skeleton"
+  );
   assert.ok(children.length >= 2, "steer() must spawn a resume process");
+
+  // The Skeleton stays usable: a follow-up prompt must still succeed.
+  const followUp: any = await supervisor.prompt("follow-up");
+  assert.equal(followUp.status, "complete");
   assert.equal(live, 0);
 
   await supervisor.finish();
   fs.rmSync(tmpBase, { recursive: true, force: true });
+});
+
+test("Requirement 16.2: headless spawn runs as the sandbox user (default \"skel\", override honored)", async () => {
+  const capturedUsers: Array<string | undefined> = [];
+
+  const buildSupervisor = (user?: string) => {
+    const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "gg-headless-user-"));
+    const supervisor = createSkeletonSupervisor({
+      runId: "run-headless-user",
+      skeletonId: "skel-headless-user",
+      role: "bonesetter",
+      cwd: path.join(tmpBase, "wt"),
+      baseDir: tmpBase,
+      quarantineDir: path.join(tmpBase, "quarantine"),
+      ...(user ? { user } : {}),
+      probeResults: {
+        P1: { id: "P1", passed: false },
+        P14: { id: "P14", passed: true },
+      },
+      onAskAutoDeny: () => {},
+      cancelGracePeriodMs: 1,
+      brokerOptions: getRequiredBrokerSettings(),
+      spawnFn: ((
+        _command: string,
+        _args: readonly string[],
+        options: SpawnOptions
+      ) => {
+        capturedUsers.push(options.user);
+        const child = new MockChildProcess();
+        setImmediate(() => {
+          child.stdout.write(
+            JSON.stringify({
+              type: "session",
+              sessionId: "cli-user",
+              model: CLAUDE_SONNET_5_5_MODEL_ID,
+            }) + "\n"
+          );
+          child.stdout.write(JSON.stringify({ type: "assistant", text: "done" }) + "\n");
+          child.stdout.end();
+          setImmediate(() => {
+            child.exitCode = 0;
+            child.emit("close", 0);
+          });
+        });
+        return child;
+      }) as SpawnFunction,
+    });
+    return { supervisor, tmpBase };
+  };
+
+  // Default: the sandbox user is "skel".
+  const defaultRun = buildSupervisor();
+  await defaultRun.supervisor.raise();
+  await defaultRun.supervisor.prompt("work");
+  assert.equal(capturedUsers[0], "skel", "headless spawn must default to user skel");
+  await defaultRun.supervisor.finish();
+  fs.rmSync(defaultRun.tmpBase, { recursive: true, force: true });
+
+  // Explicit override: options.user wins.
+  const overrideRun = buildSupervisor("sandbox-runner");
+  await overrideRun.supervisor.raise();
+  await overrideRun.supervisor.prompt("work");
+  assert.equal(capturedUsers[1], "sandbox-runner", "an explicit user must be honored");
+  await overrideRun.supervisor.finish();
+  fs.rmSync(overrideRun.tmpBase, { recursive: true, force: true });
 });
 
 test("Requirement 17.12: prompt().sessionId is redacted while steer() resumes with the unredacted --resume-id", async () => {
