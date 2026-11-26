@@ -212,6 +212,64 @@ describe("checkPythonCandidateGate (Requirement 9.10, 9.11, 9.13)", () => {
     assert.equal(emitted[0].data.ok, true);
   });
 
+  it("carries the candidate tree on both the GateResult and the gate.result event data", async () => {
+    const { events, store } = makeEventStore();
+    const emitted: any[] = [];
+    const tree = "1111111111111111111111111111111111111111";
+    const result = await checkPythonCandidateGate(
+      {
+        before: [{ path: "a.py", content: "print x\n" }],
+        after: [{ path: "a.py", content: "print(x)\n" }],
+        tree,
+      },
+      { eventStore: store, emit: (event) => emitted.push(event), refs: [] }
+    );
+    assert.equal(result.ok, true);
+    assert.equal(result.tree, tree);
+    assert.equal(events.length, 1);
+    assert.equal(events[0].data.tree, tree);
+    assert.equal(emitted.length, 1);
+    assert.equal(emitted[0].data.tree, tree);
+  });
+
+  it("propagates candidateTree supplied via options to the result and event data", async () => {
+    const { events, store } = makeEventStore();
+    const emitted: any[] = [];
+    const tree = "2222222222222222222222222222222222222222";
+    const result = await checkPythonCandidateGate(
+      {
+        before: [{ path: "a.py", content: "print x\n" }],
+        after: [{ path: "a.py", content: "print(x)\n" }],
+      },
+      {
+        eventStore: store,
+        candidateTree: tree,
+        emit: (event) => emitted.push(event),
+        refs: [],
+      }
+    );
+    assert.equal(result.tree, tree);
+    assert.equal(events[0].data.tree, tree);
+    assert.equal(emitted[0].data.tree, tree);
+  });
+
+  it("omits tree from the result and gate.result event data when no tree is supplied", async () => {
+    const { events, store } = makeEventStore();
+    const emitted: any[] = [];
+    const result = await checkPythonCandidateGate(
+      {
+        before: [{ path: "a.py", content: "print x\n" }],
+        after: [{ path: "a.py", content: "print(x)\n" }],
+      },
+      { eventStore: store, emit: (event) => emitted.push(event), refs: [] }
+    );
+    assert.ok(!("tree" in result));
+    assert.equal(events.length, 1);
+    assert.ok(!("tree" in events[0].data));
+    assert.equal(emitted.length, 1);
+    assert.ok(!("tree" in emitted[0].data));
+  });
+
   it("only inspects changed .py files and ignores other languages", async () => {
     const before = [
       { path: "a.py", content: "print x\n" },

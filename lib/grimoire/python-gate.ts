@@ -413,6 +413,10 @@ export async function checkPythonCandidateGate(
     files,
     reasons,
     refs: options?.refs ?? [],
+    // Carry the candidate tree SHA on the event when supplied so gate.result
+    // events correlate with the GateResult and the reviewed candidate tree.
+    // Omit the key entirely when no tree was provided (no `tree: undefined`).
+    ...(tree !== undefined ? { tree } : {}),
   };
 
   if (options?.eventStore && typeof options.eventStore.append === "function") {
