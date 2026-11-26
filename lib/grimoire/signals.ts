@@ -220,14 +220,33 @@ function finalizeSignals(
   }) as DetectSignalsResult;
 }
 
-function residueConfidenceFor(kind: string): Confidence {
-  switch (kind) {
-    case "unicode_call":
-    case "iterator_call":
-      return "medium";
-    default:
-      return "high";
-  }
+/**
+ * Single source of truth for Python M1 signal confidence, keyed by residue
+ * kind. Both the tree-sitter AST path (`collectPythonSignals` /
+ * `detectPythonSignals`) and the comment/string-aware lexical fallback
+ * (`lexicalPythonSignals`) resolve their confidence through this helper so the
+ * two paths can never drift apart for the same kind.
+ */
+const SIGNAL_CONFIDENCE_BY_KIND: Record<string, Confidence> = {
+  print_statement: "high",
+  bare_print: "high",
+  chevron: "high",
+  except_clause: "high",
+  unicode_call: "medium",
+  iterator_call: "medium",
+  exec_statement: "high",
+  not_equal: "high",
+  backtick_string: "high",
+  ur_prefix: "high",
+  octal: "high",
+  long: "high",
+  tuple_param: "high",
+  raise_statement: "high",
+  except_target_unsupported: "high",
+};
+
+function signalConfidenceFor(kind: string): Confidence {
+  return SIGNAL_CONFIDENCE_BY_KIND[kind] ?? "high";
 }
 
 /** Masks Python comments and string literals (newlines preserved). */
@@ -385,39 +404,46 @@ function lexicalPythonSignals(
   manifestDir: string
 ): { signals: Signal[]; unknowns: UnknownRecord[] } {
   const masked = maskPython(source);
+  // Each pattern is tagged with its residue `kind`; confidence is sourced from
+  // the shared `signalConfidenceFor` mapping so the lexical fallback and the
+  // tree-sitter AST path always agree on confidence for the same kind.
   const patterns: Array<{
     re: RegExp;
-    confidence: Confidence;
+    kind: string;
     unhandled?: boolean;
   }> = [
-    { re: /(?<![\w.])print(?![A-Za-z0-9_])(?!\s*\()/g, confidence: "high" },
+    { re: /(?<![\w.])print(?![A-Za-z0-9_])(?!\s*\()/g, kind: "print_statement" },
     // `exec` Py2 statement: require horizontal whitespace after `exec` and rule
     // out a following call. `[ \t]+(?![ \t]*\()` avoids the `\s+(?!\()` backtrack
     // where `exec  (code)` / `exec\t (code)` matched as Py2 because `\s+` gave
     // back a whitespace char, letting the lookahead see whitespace instead of `(`.
     // `[ \t]+` (not `\s+`) also keeps `exec\n(x)` from matching across statements.
-    { re: /(?<![\w.])exec[ \t]+(?![ \t]*\()/g, confidence: "high", unhandled: true },
-    { re: /(?<![\w.])unicode\s*\(/g, confidence: "medium" },
-    { re: /\.(?:iteritems|iterkeys|itervalues)\s*\(/g, confidence: "medium" },
-    { re: /<>/g, confidence: "high", unhandled: true },
-    { re: /`[^`\r\n]*`?/g, confidence: "high", unhandled: true },
-    { re: /except\s+[^:,\n()]+\s*,\s*[A-Za-z_]\w*\s*:/g, confidence: "high" },
-    { re: /(?<!\.)\b0[0-9]+\b(?!\.)/g, confidence: "high", unhandled: true },
+    { re: /(?<![\w.])exec[ \t]+(?![ \t]*\()/g, kind: "exec_statement", unhandled: true },
+    { re: /(?<![\w.])unicode\s*\(/g, kind: "unicode_call" },
+    { re: /\.(?:iteritems|iterkeys|itervalues)\s*\(/g, kind: "iterator_call" },
+    { re: /<>/g, kind: "not_equal", unhandled: true },
+    { re: /`[^`\r\n]*`?/g, kind: "backtick_string", unhandled: true },
+    { re: /except\s+[^:,\n()]+\s*,\s*[A-Za-z_]\w*\s*:/g, kind: "except_clause" },
+    // Legacy Py2 octal literal: a decimal run starting with `0` that contains at
+    // least one non-zero digit. `00`/`000` (valid Python 3) are excluded, as are
+    // `0`/`0x10`/`0b10`/`0o755` (a non-digit follows the leading zero) and the
+    // float forms `00.5`/`.005` (guarded by the `.` lookarounds).
+    { re: /(?<!\.)\b0[0-9]*[1-9][0-9]*\b(?!\.)/g, kind: "octal", unhandled: true },
     {
       re: /(?<!\.)\b(?:0[xX][0-9a-fA-F]+|0[bB][01]+|0[oO][0-7]+|\d+)[Ll]\b/g,
-      confidence: "high",
+      kind: "long",
       unhandled: true,
     },
     {
       re: /(?<![\w.])(?:def\s+[A-Za-z_]\w*\s*\([^()\n=]*|lambda\s+[^:\n=]*)\([^()\n]+\)/g,
-      confidence: "high",
+      kind: "tuple_param",
       unhandled: true,
     },
   ];
   const signals: Signal[] = [];
   const unknowns: UnknownRecord[] = [];
 
-  for (const { re, confidence, unhandled } of patterns) {
+  for (const { re, kind, unhandled } of patterns) {
     re.lastIndex = 0;
     let match: RegExpExecArray | null;
     while ((match = re.exec(masked)) !== null) {
@@ -429,7 +455,7 @@ function lexicalPythonSignals(
         line,
         column,
         matched: source.slice(index, index + match[0].length),
-        confidence,
+        confidence: signalConfidenceFor(kind),
         manifestDir,
       });
       if (unhandled) {
@@ -469,7 +495,7 @@ function lexicalPythonSignals(
       line,
       column,
       matched: source.slice(index, index + urMatch[0].length + 1),
-      confidence: "high",
+      confidence: signalConfidenceFor("ur_prefix"),
       manifestDir,
     });
     unknowns.push({
@@ -501,7 +527,7 @@ function lexicalPythonSignals(
       line,
       column,
       matched: source.slice(index, index + raiseMatch[0].length).trimEnd(),
-      confidence: "high",
+      confidence: signalConfidenceFor("raise_statement"),
       manifestDir,
     });
     unknowns.push({
@@ -537,7 +563,7 @@ function collectPythonSignals(
           line: item.line,
           column: item.column,
           matched: item.text,
-          confidence: residueConfidenceFor(item.kind),
+          confidence: signalConfidenceFor(item.kind),
           manifestDir,
         });
       }
@@ -545,6 +571,11 @@ function collectPythonSignals(
       return;
     }
   }
+  // The tree-sitter parser is loaded asynchronously (WASM) and registers a
+  // synchronous hook on `globalThis` only once ready. `detectSignals` itself is
+  // synchronous, so before the parser is initialized it must fall back to the
+  // comment/string-aware lexical detector; the two paths share
+  // `signalConfidenceFor` so their confidences never diverge.
   const fallback = lexicalPythonSignals(source, file, manifestDir);
   for (const signal of fallback.signals) signals.push(signal);
   for (const unknown of fallback.unknowns) unknowns.push(unknown);
@@ -939,7 +970,7 @@ export async function detectPythonSignals(
         line: item.line,
         column: item.column,
         matched: item.text,
-        confidence: residueConfidenceFor(item.kind),
+        confidence: signalConfidenceFor(item.kind),
         manifestDir,
       });
     }
