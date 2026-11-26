@@ -34,10 +34,6 @@ import {
 import { BudgetCapTracker, type BudgetCapSnapshot } from "./budget-caps";
 import { HeadlessFallbackChannel } from "../acp/headless-fallback";
 import type {
-  HeadlessApprovalRequest,
-  HeadlessAskRequest,
-} from "../acp/stream-parser";
-import type {
   ChildProcessLike,
   ExecutionChannel,
   GatewayEventSource,
@@ -60,25 +56,6 @@ import {
   MalformedRequestError,
   DuplicateOptionIdError,
 } from "../broker/permission-broker";
-
-declare module "./types" {
-  interface SkeletonSupervisorOptions {
-    /**
-     * Bridges the Headless Fallback approval prompt to the caller. When absent (or
-     * when it rejects) the channel fails closed and denies the approval. After a
-     * cancellation or termination it is never asked to resume.
-     */
-    onApproval?: (
-      request: HeadlessApprovalRequest
-    ) => "approve" | "deny" | Promise<"approve" | "deny">;
-    /**
-     * Requirement 17.11: invoked as soon as a headless `ask` is observed so the
-     * Gateway records the auto-denial. Required for headless turns: a missing hook
-     * fails the turn closed with `ask_auto_deny_failed` before any process spawns.
-     */
-    onAskAutoDeny?: (ask: HeadlessAskRequest) => Promise<void> | void;
-  }
-}
 
 export class SkeletonSupervisorError extends Error {
   readonly reason: SupervisorFailureReason;
@@ -257,6 +234,12 @@ export class SkeletonSupervisor extends EventEmitter {
   private gatewayListenerAttached: boolean = false;
   /** The Headless Fallback channel driving the in-flight turn, if any. */
   private activeHeadlessChannel: HeadlessFallbackChannel | null = null;
+  /**
+   * The promise of the in-flight headless turn, if any. `steer()` awaits it after
+   * cancelling the active channel so two concurrent `kiro-cli` processes can never
+   * be spawned at the same time (Requirement 17.3).
+   */
+  private activeHeadlessTurn: Promise<unknown> | null = null;
   /**
    * The REAL session id reported by the CLI on a previous headless turn. It is
    * kept separate from `sessionId` (which may hold a supervisor-side placeholder)
@@ -781,7 +764,7 @@ export class SkeletonSupervisor extends EventEmitter {
     // closed when the required hook rejects). The turn is awaited and its real
     // result or failure is propagated.
     if (this.executionChannel === "Headless_Fallback") {
-      return this.runHeadlessTurn(resolvedPrompt, this.headlessLogPath());
+      return this.runTrackedHeadlessTurn(resolvedPrompt, this.headlessLogPath());
     }
 
     this.state = "prompting";
@@ -808,6 +791,26 @@ export class SkeletonSupervisor extends EventEmitter {
       }
       throw err;
     }
+  }
+
+  /**
+   * Starts a headless turn and tracks its promise so a concurrent `steer()` can
+   * cancel and await it BEFORE starting a resume turn. Exactly one headless turn
+   * is ever in flight (Requirement 17.3).
+   */
+  private runTrackedHeadlessTurn(
+    resolvedPrompt: unknown,
+    rawLogPath: string
+  ): Promise<unknown> {
+    const turn = this.runHeadlessTurn(resolvedPrompt, rawLogPath);
+    this.activeHeadlessTurn = turn;
+    const clear = (): void => {
+      if (this.activeHeadlessTurn === turn) {
+        this.activeHeadlessTurn = null;
+      }
+    };
+    turn.then(clear, clear);
+    return turn;
   }
 
   /**
@@ -856,11 +859,15 @@ export class SkeletonSupervisor extends EventEmitter {
         );
       }
 
+      // Requirement 17.12: the PUBLIC session id stays redacted, but the resume
+      // must use the RAW CLI session id the channel retained internally, so a
+      // raw id that overlaps the API key still resumes correctly.
+      const rawSessionId = channel.getLastRawSessionId() ?? turn.sessionId;
       if (
-        typeof turn.sessionId === "string" &&
-        turn.sessionId.trim().length > 0
+        typeof rawSessionId === "string" &&
+        rawSessionId.trim().length > 0
       ) {
-        this.headlessCliSessionId = turn.sessionId;
+        this.headlessCliSessionId = rawSessionId;
       }
       this.promptPending = false;
       this.state = "raised";
@@ -928,8 +935,28 @@ export class SkeletonSupervisor extends EventEmitter {
     if (this.executionChannel === "Headless_Fallback") {
       // Requirement 17.3: the correction is delegated to the Headless Fallback
       // channel, which resumes the CLI session with the real session id reported
-      // by an earlier turn (never the supervisor-side placeholder).
-      await this.runHeadlessTurn(correctionText, this.headlessLogPath());
+      // by an earlier turn (never the supervisor-side placeholder). If a headless
+      // turn is already in flight, cancel the active channel and wait for that
+      // turn to settle BEFORE starting the resume, so two concurrent `kiro-cli`
+      // processes can never be spawned at the same time.
+      if (
+        this.activeHeadlessChannel !== null ||
+        this.activeHeadlessTurn !== null ||
+        this.state === "prompting" ||
+        this.promptPending
+      ) {
+        this.activeHeadlessChannel?.cancel();
+        const inFlight = this.activeHeadlessTurn;
+        if (inFlight) {
+          try {
+            await inFlight;
+          } catch {
+            // The cancelled turn fails closed; steer still resumes from the
+            // settled CLI session state.
+          }
+        }
+      }
+      await this.runTrackedHeadlessTurn(correctionText, this.headlessLogPath());
       return;
     }
 

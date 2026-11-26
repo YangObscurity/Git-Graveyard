@@ -26,6 +26,27 @@ import {
   resetRuntimeHost,
 } from "../../lib/runtime/runtime-host";
 import { getRequiredBrokerSettings } from "../supervisor/fixtures";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
+import { CLAUDE_SONNET_5_5_MODEL_ID } from "../../lib/supervisor/model-allowlist";
+
+/**
+ * Minimal injectable child process for exercising a headless turn through a
+ * RuntimeHost-constructed supervisor without spawning a real OS process.
+ */
+class RuntimeHostMockChild extends EventEmitter {
+  stdin = new PassThrough();
+  stdout = new PassThrough();
+  stderr = new PassThrough();
+  pid = 4242;
+  killed = false;
+  exitCode: number | null = null;
+  signalCode: NodeJS.Signals | string | null = null;
+  kill(): boolean {
+    this.killed = true;
+    return true;
+  }
+}
 
 function requestHttp(
   url: string,
@@ -484,5 +505,94 @@ describe("RuntimeHost and Shared Singletons", () => {
     });
     assert.notEqual(host1, host3);
     await resetRuntimeHost({ closeStores: true });
+  });
+
+  it("11. createSupervisor supplies a default onAskAutoDeny that spawns a headless turn and records ask.auto_denied", async () => {
+    const eventStore = new EventStore(":memory:");
+    const runStore = new RunStore(":memory:");
+    const logStore = new LogStore({ inMemory: true });
+    const tmpBase = makeTmpDir("sup-headless-");
+    const worktreeDir = path.join(tmpBase, "wt");
+    const quarantineDir = path.join(tmpBase, "quarantine");
+    fs.mkdirSync(worktreeDir, { recursive: true });
+    fs.mkdirSync(quarantineDir, { recursive: true });
+
+    const host = createRuntimeHost({
+      eventStore,
+      runStore,
+      logStore,
+      skipReconcile: true,
+    });
+
+    try {
+      const runId = "run-sup-headless";
+      const skeletonId = "skel-sup-headless";
+      let spawned = false;
+
+      const supervisor = host.createSupervisor({
+        runId,
+        skeletonId,
+        role: "bonesetter",
+        cwd: worktreeDir,
+        quarantineDir,
+        allowedRoot: tmpBase,
+        baseDir: tmpBase,
+        watchdogLimitMs: 5000,
+        cancelGracePeriodMs: 5000,
+        brokerOptions: getRequiredBrokerSettings(),
+        probeResults: {
+          P1: { id: "P1", passed: false },
+          P14: { id: "P14", passed: true },
+        },
+        // onAskAutoDeny is intentionally omitted: RuntimeHost must supply a
+        // production default that records the auto-denial on its event stream.
+        spawnFn: ((command: string, args: readonly string[]) => {
+          spawned = true;
+          void command;
+          void args;
+          const child = new RuntimeHostMockChild();
+          setImmediate(() => {
+            child.stdout.write(
+              JSON.stringify({
+                type: "session",
+                sessionId: "cli-rh",
+                model: CLAUDE_SONNET_5_5_MODEL_ID,
+              }) + "\n"
+            );
+            child.stdout.write(
+              JSON.stringify({
+                type: "ask_request",
+                askId: "ask-rh",
+                question: "Proceed?",
+                options: ["go", "stop"],
+              }) + "\n"
+            );
+            child.stdout.end();
+            setImmediate(() => {
+              child.exitCode = 0;
+              child.emit("close", 0);
+            });
+          });
+          return child as any;
+        }) as any,
+      } as any);
+
+      await supervisor.raise();
+      await supervisor.prompt("do work");
+
+      assert.equal(spawned, true, "the headless turn must spawn a process");
+
+      const events = eventStore.getEvents(runId);
+      const autoDenied = events.find((e) => e.kind === "ask.auto_denied");
+      assert.ok(autoDenied, "ask.auto_denied event must be recorded");
+      assert.equal(autoDenied.actor, "SkeletonSupervisor");
+      assert.equal(autoDenied.skeletonId, skeletonId);
+      const data = autoDenied.data as any;
+      assert.equal(data.askId, "ask-rh");
+      assert.equal(data.question, "Proceed?");
+      assert.deepEqual(data.options, ["go", "stop"]);
+    } finally {
+      await host.shutdown({ closeStores: true });
+    }
   });
 });

@@ -34,6 +34,28 @@ import {
   resetDefaultLogStore,
 } from "../../lib/events/log-store";
 import { buildVerdictRecord } from "../../lib/warden/warden-review";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
+import { SkeletonSupervisor } from "../../lib/supervisor/skeleton-supervisor";
+import { CLAUDE_SONNET_5_5_MODEL_ID } from "../../lib/supervisor/model-allowlist";
+
+/**
+ * Minimal injectable child process for exercising a headless turn through a
+ * Dispatcher-constructed supervisor without spawning a real OS process.
+ */
+class DispatcherMockChild extends EventEmitter {
+  stdin = new PassThrough();
+  stdout = new PassThrough();
+  stderr = new PassThrough();
+  pid = 4242;
+  killed = false;
+  exitCode: number | null = null;
+  signalCode: NodeJS.Signals | string | null = null;
+  kill(): boolean {
+    this.killed = true;
+    return true;
+  }
+}
 
 interface TestRepoContext {
   tmpDir: string;
@@ -760,5 +782,116 @@ describe("TaskDispatcher: T34 Wave 2A Execution & Merge Pipeline", () => {
     );
 
     await host.stop();
+  });
+
+  it("(v) createWorkerSupervisor forwards probeResults/onApproval and a default onAskAutoDeny that spawns a headless turn and emits ask.auto_denied", async () => {
+    const runId = "run-dispatch-headless";
+    const repoCtx = createTestRepo(runId);
+    tmpDirs.push(repoCtx.tmpDir);
+
+    const eventStore = new EventStore(path.join(repoCtx.tmpDir, "events.db"));
+    const gitService = new GitService({ runsDir: repoCtx.tmpDir });
+
+    const pactMarkdown = `
+- [ ] T1. Headless Task
+  - role: bonesetter
+  - depends:
+  - files: h.txt
+  - accept: npm test
+  - hard: no
+  - rules: M1
+`;
+    const scheduler = new Scheduler({ pact: pactMarkdown, runId });
+    const task = scheduler.getTask("T1");
+    assert.ok(task);
+
+    const capturedOpts: any[] = [];
+    let spawnCount = 0;
+
+    const dispatcher = new TaskDispatcher({
+      runId,
+      scheduler,
+      gitService,
+      eventStore,
+      runDir: path.join(repoCtx.tmpDir, "run"),
+      gitDir: repoCtx.gitDir,
+      baseSha: repoCtx.baseSha,
+      probeResults: { P1: { passed: false }, P14: { passed: true } },
+      onApproval: () => "approve",
+      // onAskAutoDeny is intentionally omitted: the Dispatcher must supply a
+      // production default from its event sink.
+      supervisorFactory: (opts) => {
+        capturedOpts.push(opts);
+        return new SkeletonSupervisor({
+          ...opts,
+          spawnFn: ((command: string, args: readonly string[]) => {
+            spawnCount += 1;
+            void args;
+            const child = new DispatcherMockChild();
+            setImmediate(() => {
+              child.stdout.write(
+                JSON.stringify({
+                  type: "session",
+                  sessionId: "cli-dispatch",
+                  model: CLAUDE_SONNET_5_5_MODEL_ID,
+                }) + "\n"
+              );
+              child.stdout.write(
+                JSON.stringify({
+                  type: "ask_request",
+                  askId: "ask-9",
+                  question: "Proceed?",
+                  options: ["yes", "no"],
+                }) + "\n"
+              );
+              child.stdout.end();
+              setImmediate(() => {
+                child.exitCode = 0;
+                child.emit("close", 0);
+              });
+            });
+            return child as any;
+          }) as any,
+        });
+      },
+    });
+
+    const supervisor = (dispatcher as any).createWorkerSupervisor(
+      task,
+      "skel-dispatch-headless",
+      path.join(repoCtx.tmpDir, "wt"),
+      undefined
+    );
+
+    // The Dispatcher forwarded its probe results and approval bridge.
+    assert.equal(capturedOpts.length, 1);
+    const opts = capturedOpts[0];
+    assert.deepEqual(opts.probeResults, {
+      P1: { passed: false },
+      P14: { passed: true },
+    });
+    assert.equal(typeof opts.onApproval, "function");
+    assert.equal(
+      typeof opts.onAskAutoDeny,
+      "function",
+      "the Dispatcher must supply a default onAskAutoDeny from its event sink"
+    );
+
+    await supervisor.raise();
+    await supervisor.prompt("do work");
+
+    assert.equal(spawnCount, 1, "the headless turn must spawn exactly one process");
+
+    const events = eventStore.getEvents(runId);
+    const autoDenied = events.find((e) => e.kind === "ask.auto_denied");
+    assert.ok(autoDenied, "ask.auto_denied event must be emitted");
+    assert.equal(autoDenied.actor, "SkeletonSupervisor");
+    assert.equal(autoDenied.skeletonId, "skel-dispatch-headless");
+    const data = autoDenied.data as any;
+    assert.equal(data.askId, "ask-9");
+    assert.equal(data.question, "Proceed?");
+    assert.deepEqual(data.options, ["yes", "no"]);
+
+    await supervisor.finish();
   });
 });
