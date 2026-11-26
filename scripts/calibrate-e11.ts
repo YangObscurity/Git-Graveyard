@@ -40,7 +40,7 @@ export interface RunWallClockPauseInterval {
   startCitation: string;
   endCitation: string | null;
   durationMs: number;
-  source: "run.clock" | "pact_review";
+  source: "run.clock" | "pact_review" | "approval_wait";
 }
 
 export interface RunWallClockDetail {
@@ -314,10 +314,11 @@ function calcRunWallClock(runs: CalibrationSourceRun[]): {
     const rawIntervals: Array<{
       start: EventEnvelope;
       end: EventEnvelope | null;
-      source: "run.clock" | "pact_review";
+      source: "run.clock" | "pact_review" | "approval_wait";
     }> = [];
     let clockPause: EventEnvelope | null = null;
     let pactPause: EventEnvelope | null = null;
+    const approvalAwaiting = new Map<string, EventEnvelope>();
 
     for (const ev of events) {
       if (ev.ts < startEv.ts) {
@@ -346,6 +347,18 @@ function calcRunWallClock(runs: CalibrationSourceRun[]): {
       } else if (ev.kind === "pact.approved" && pactPause) {
         rawIntervals.push({ start: pactPause, end: ev, source: "pact_review" });
         pactPause = null;
+      } else if (ev.kind === "approval.requested") {
+        const id = String((ev.data as Record<string, unknown>).approvalId ?? `${run.runId}:${ev.seq}`);
+        if (!approvalAwaiting.has(id)) {
+          approvalAwaiting.set(id, ev);
+        }
+      } else if (ev.kind === "approval.resolved") {
+        const id = String((ev.data as Record<string, unknown>).approvalId ?? "");
+        const request = approvalAwaiting.get(id);
+        if (request) {
+          rawIntervals.push({ start: request, end: ev, source: "approval_wait" });
+          approvalAwaiting.delete(id);
+        }
       }
     }
     if (clockPause) {
@@ -353,6 +366,11 @@ function calcRunWallClock(runs: CalibrationSourceRun[]): {
     }
     if (pactPause) {
       rawIntervals.push({ start: pactPause, end: null, source: "pact_review" });
+    }
+    // WP-17-fix2: an approval that never resolved still counts as a wait; clamp it to the run end
+    // (the shared clamp below turns `end: null` into `endEv.ts`).
+    for (const request of approvalAwaiting.values()) {
+      rawIntervals.push({ start: request, end: null, source: "approval_wait" });
     }
 
     const clamped = rawIntervals
@@ -456,6 +474,71 @@ function calcApprovalWaits(runs: CalibrationSourceRun[]): MetricDistribution {
   });
 }
 
+/**
+ * Requirement 41.12: `silentSkeletonMs` measures silence *only* while no tool call or command is
+ * pending. This builds the in-flight spans from matched pairs so a long-running command/tool call is
+ * never mistaken for silence:
+ *  - `command.started` -> `command.result`   (paired by actor)
+ *  - `skeleton.tool_call` -> `skeleton.tool_result` (paired by skeleton id)
+ * Unmatched halves are ignored: a lone start or result is not a span, and treating it as one would
+ * wrongly erase real silence (recorded fixtures and logs frequently omit the other half).
+ */
+function pendingActivityIntervals(
+  events: EventEnvelope[]
+): Array<{ startTs: number; endTs: number }> {
+  const ordered = [...events].sort((a, b) => a.seq - b.seq);
+  const intervals: Array<{ startTs: number; endTs: number }> = [];
+
+  const pair = (startKind: string, endKind: string, keyOf: (ev: EventEnvelope) => string): void => {
+    const awaiting = new Map<string, EventEnvelope>();
+    for (const ev of ordered) {
+      if (ev.kind === startKind) {
+        const key = keyOf(ev);
+        if (!awaiting.has(key)) {
+          awaiting.set(key, ev);
+        }
+      } else if (ev.kind === endKind) {
+        const key = keyOf(ev);
+        const start = awaiting.get(key);
+        if (start) {
+          if (ev.ts > start.ts) {
+            intervals.push({ startTs: start.ts, endTs: ev.ts });
+          }
+          awaiting.delete(key);
+        }
+      }
+    }
+  };
+
+  pair("command.started", "command.result", (ev) => `command:${ev.actor}`);
+  pair(
+    "skeleton.tool_call",
+    "skeleton.tool_result",
+    (ev) => `tool:${ev.skeletonId ?? `actor:${ev.actor}`}`
+  );
+  return intervals;
+}
+
+/**
+ * Milliseconds of `[startTs, endTs)` covered by any pending (in-flight) interval. The result is
+ * clamped to the window length so two overlapping in-flight spans are never subtracted twice.
+ */
+function pendingOverlapMs(
+  intervals: Array<{ startTs: number; endTs: number }>,
+  startTs: number,
+  endTs: number
+): number {
+  let covered = 0;
+  for (const interval of intervals) {
+    const lo = Math.max(interval.startTs, startTs);
+    const hi = Math.min(interval.endTs, endTs);
+    if (hi > lo) {
+      covered += hi - lo;
+    }
+  }
+  return Math.min(covered, Math.max(0, endTs - startTs));
+}
+
 function calcSilenceDurations(runs: CalibrationSourceRun[]): MetricDistribution {
   const samples: number[] = [];
   const citations: string[] = [];
@@ -469,15 +552,23 @@ function calcSilenceDurations(runs: CalibrationSourceRun[]): MetricDistribution 
       continue;
     }
     anyRunWithActivity = true;
+
+    // Requirement 41.12: time while a tool call or command is in flight is not silence, so the
+    // in-flight portion of each gap is subtracted before the maximum gap is taken.
+    const pending = pendingActivityIntervals(run.events);
+
     let maxGap = 0;
     let from = activity[0];
     let to = activity[0];
     for (let i = 1; i < activity.length; i += 1) {
-      const gap = activity[i].ts - activity[i - 1].ts;
+      const previous = activity[i - 1];
+      const current = activity[i];
+      const raw = current.ts - previous.ts;
+      const gap = Math.max(0, raw - pendingOverlapMs(pending, previous.ts, current.ts));
       if (gap > maxGap) {
         maxGap = gap;
-        from = activity[i - 1];
-        to = activity[i];
+        from = previous;
+        to = current;
       }
     }
     samples.push(maxGap);
@@ -729,7 +820,9 @@ function parseNdjsonEvents(text: string, fallbackRunId: string): EventEnvelope[]
       ts: Number(record.ts ?? 0),
       kind: String(record.kind ?? "unknown"),
       actor: String(record.actor ?? "unknown"),
-      data: { refs: Array.isArray(data.refs) ? data.refs.map(String) : [], ...data },
+      // WP-17-fix2: spread `data` first so the normalized `refs` (always an array of strings) sits
+      // *after* the spread and can never be overwritten by a non-string `data.refs`.
+      data: { ...data, refs: Array.isArray(data.refs) ? data.refs.map(String) : [] },
     };
     if (typeof record.skeletonId === "string") {
       envelope.skeletonId = record.skeletonId;
@@ -767,6 +860,16 @@ function isErroredRun(events: EventEnvelope[]): boolean {
 }
 
 export function loadRecordedRunsFromDir(dir: string, limit = DEFAULT_LIMIT): CalibrationSourceRun[] {
+  return collectCompletedRunsFromDir(dir).slice(0, Math.max(0, limit));
+}
+
+/**
+ * WP-17-fix2: every *completed, non-error* run in a directory, in directory-name order. Kept
+ * separate from {@link loadRecordedRunsFromDir} (which slices to `limit` samples) so the full
+ * completed-run id set can feed `recalibrationRequired` while only the first `limit` runs feed the
+ * distributions.
+ */
+function collectCompletedRunsFromDir(dir: string): CalibrationSourceRun[] {
   if (!fs.existsSync(dir)) {
     return [];
   }
@@ -778,16 +881,15 @@ export function loadRecordedRunsFromDir(dir: string, limit = DEFAULT_LIMIT): Cal
 
   const runs: CalibrationSourceRun[] = [];
   for (const runId of runIds) {
-    if (runs.length >= limit) {
-      break;
-    }
     const eventsPath = path.join(dir, runId, "events.ndjson");
     if (!fs.existsSync(eventsPath)) {
       continue;
     }
     const events = parseNdjsonEvents(fs.readFileSync(eventsPath, "utf8"), runId);
-    // FIND-004: skip errored runs so they never skew the E11 calibration.
-    if (isErroredRun(events)) {
+    // FIND-004 + completeness: skip errored runs *and* runs that never concluded (no `run.done`) so
+    // an incomplete run can never enter calibration or displace a completed one.
+    const done = latestRunDoneEvent(events);
+    if (done === null || isErroredRun(events)) {
       continue;
     }
     runs.push({ runId, events });
@@ -799,6 +901,11 @@ export function loadCompletedRunsFromEventStore(
   store: EventStore,
   limit: number
 ): CalibrationSourceRun[] {
+  return collectCompletedRunsFromEventStore(store).slice(0, Math.max(0, limit));
+}
+
+/** WP-17-fix2: every completed, non-errored run in an EventStore (see the directory sibling). */
+function collectCompletedRunsFromEventStore(store: EventStore): CalibrationSourceRun[] {
   const ordered: Array<{ runId: string; doneTs: number; events: EventEnvelope[] }> = [];
   for (const runId of store.getRunIds()) {
     const events = store.getEvents(runId);
@@ -811,7 +918,7 @@ export function loadCompletedRunsFromEventStore(
   }
   ordered.sort((a, b) => a.doneTs - b.doneTs || a.runId.localeCompare(b.runId));
 
-  return ordered.slice(0, limit).map(({ runId, events }) => ({ runId, events }));
+  return ordered.map(({ runId, events }) => ({ runId, events }));
 }
 
 export function runCalibration(options?: RunCalibrationOptions): RunCalibrationResult {
@@ -823,16 +930,20 @@ export function runCalibration(options?: RunCalibrationOptions): RunCalibrationR
 
   const limit = options?.limit && options.limit > 0 ? Math.floor(options.limit) : DEFAULT_LIMIT;
 
-  let runs: CalibrationSourceRun[];
+  // WP-17-fix2 / Requirement 8: collect *every* completed, non-error run so the recalibration
+  // counter sees runs beyond the sample window, then slice the first `limit` for the distributions.
+  let allCompletedRuns: CalibrationSourceRun[];
   if (options?.runsDir) {
-    runs = loadRecordedRunsFromDir(options.runsDir, limit);
+    allCompletedRuns = collectCompletedRunsFromDir(options.runsDir);
   } else if (options?.eventStore) {
-    runs = loadCompletedRunsFromEventStore(options.eventStore, limit);
+    allCompletedRuns = collectCompletedRunsFromEventStore(options.eventStore);
   } else {
-    runs = loadRecordedRunsFromDir(DEFAULT_RECORDED_RUNS_DIR, limit);
+    allCompletedRuns = collectCompletedRunsFromDir(DEFAULT_RECORDED_RUNS_DIR);
   }
+  const allCompletedRunIds = allCompletedRuns.map((run) => run.runId);
+  const sampleRuns = allCompletedRuns.slice(0, limit);
 
-  const analysis = analyzeRecordedRunsForCalibration(runs, {
+  const analysis = analyzeRecordedRunsForCalibration(sampleRuns, {
     settingsStore: options?.settingsStore,
   });
   const markdown = formatCalibrationMarkdown(analysis);
@@ -843,7 +954,9 @@ export function runCalibration(options?: RunCalibrationOptions): RunCalibrationR
 
   const settingsStore = options?.settingsStore;
   if (settingsStore) {
-    settingsStore.syncRecordedRunCount({ recordedRunIds: analysis.runIds });
+    // Requirement 30.20: sync *all* completed run ids (not just the sampled three) so run 4+ re-arms
+    // `recalibrationRequired` after a calibration over the first three.
+    settingsStore.syncRecordedRunCount({ recordedRunIds: allCompletedRunIds });
     recalibrationRequired = settingsStore.isRecalibrationRequired();
   }
 
@@ -892,28 +1005,39 @@ export interface CliOptions {
 
 export function parseCalibrationArgs(argv: string[]): CliOptions {
   const options: CliOptions = { json: false, markdown: false, apply: false };
+
+  // WP-17-fix2: a value flag must be followed by a real value. Without this check a missing value
+  // (end of argv) or a following flag (`--db --json`) was swallowed into the option, silently
+  // dropping the flag that should have been parsed next.
+  const requireValue = (flag: string, at: number, noun = "path"): string => {
+    const value = argv[at + 1];
+    if (value === undefined || value.startsWith("--")) {
+      throw new Error(`${flag} requires a ${noun} argument`);
+    }
+    return value;
+  };
+
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
-    const next = argv[i + 1];
     switch (arg) {
       case "--db":
-        options.db = next;
+        options.db = requireValue("--db", i);
         i += 1;
         break;
       case "--settings-db":
-        options.settingsDb = next;
+        options.settingsDb = requireValue("--settings-db", i);
         i += 1;
         break;
       case "--runs-dir":
-        options.runsDir = next;
+        options.runsDir = requireValue("--runs-dir", i);
         i += 1;
         break;
       case "--out":
-        options.out = next;
+        options.out = requireValue("--out", i);
         i += 1;
         break;
       case "--actor":
-        options.actor = next;
+        options.actor = requireValue("--actor", i, "value");
         i += 1;
         break;
       case "--json":
