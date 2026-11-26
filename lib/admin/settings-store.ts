@@ -192,10 +192,43 @@ const INTEGER_SETTING_KEYS = new Set<string>([
 ]);
 
 /**
+ * FIND-9: every numeric setting. A numeric setting must never accept a string/boolean/array/object
+ * value, even though the generic fallback in {@link assertValidSettingValue} still allows those
+ * *types* for free-form settings. `assertValidSettingValue` checks this set before the generic
+ * string/boolean branch, so `setSetting("toolCallsPerRun", "300")` is rejected instead of being
+ * stored as a string that would then (wrongly) satisfy `validateRequiredSettings()`.
+ *
+ * Every key in {@link INTEGER_SETTING_KEYS} is numeric too, so the two sets are composed.
+ */
+const NUMERIC_SETTING_KEYS = new Set<string>([
+  ...INTEGER_SETTING_KEYS,
+  "promptWallClockMs",
+  "exhumerTriageWallClockMs",
+  "runWallClockMs",
+  "silentSkeletonMs",
+  "approvalWaitMs",
+  "queueIdleLimitMs",
+  "pactIdleLimitMs",
+  "repoSizeCapKb",
+  "boxCpu",
+  "boxMemoryMb",
+  "boxPids",
+  "boxDiskMb",
+  "brokerWatchdogMs",
+]);
+
+/** FIND-15: the live-run concurrency ceiling (Requirement 30.3: prod at most 5 under quota 10). */
+const MAX_CONCURRENT_LIVE_RUNS = 5;
+
+/**
  * Validates a setting value: numeric settings must be finite and non-negative (and, for count
  * settings, integers); other settings must be a string, boolean, null or a plain object. Arrays,
  * functions, symbols and exotic objects (`Map`/`Set`/`Date`/`RegExp`) are rejected, as are the
  * reserved prototype-pollution keys.
+ *
+ * FIND-9: numeric keys are validated *before* the generic string/boolean/plain-object branch, so a
+ * string (or boolean/array/object) can never be stored against a numeric key. FIND-15: the
+ * `concurrentLiveRuns` cap is enforced here.
  */
 function assertValidSettingValue(key: string, value: unknown): void {
   if (RESERVED_SETTING_KEYS.has(key)) {
@@ -207,6 +240,10 @@ function assertValidSettingValue(key: string, value: unknown): void {
   if (value === null) {
     return;
   }
+
+  const isIntegerKey = INTEGER_SETTING_KEYS.has(key);
+  const isNumericKey = NUMERIC_SETTING_KEYS.has(key);
+
   if (typeof value === "number") {
     if (!Number.isFinite(value)) {
       throw new RangeError(`Setting "${key}" must be a finite number (received ${String(value)})`);
@@ -214,13 +251,29 @@ function assertValidSettingValue(key: string, value: unknown): void {
     if (value < 0) {
       throw new RangeError(`Setting "${key}" must not be negative (received ${value})`);
     }
-    if (INTEGER_SETTING_KEYS.has(key) && !Number.isInteger(value)) {
+    if (isIntegerKey && !Number.isInteger(value)) {
       throw new RangeError(
         `Setting "${key}" must be a non-negative integer (received ${value})`
       );
     }
+    // FIND-15: the live-run concurrency setting is capped (Requirement 30.3).
+    if (key === "concurrentLiveRuns" && value > MAX_CONCURRENT_LIVE_RUNS) {
+      throw new RangeError(
+        `Setting "${key}" must be at most ${MAX_CONCURRENT_LIVE_RUNS} (received ${value})`
+      );
+    }
     return;
   }
+
+  // FIND-9: numeric/integer keys accept a number or null only — never a string/boolean/array/object.
+  if (isNumericKey) {
+    throw new TypeError(
+      `Setting "${key}" must be ${
+        isIntegerKey ? "a non-negative integer" : "a finite non-negative number"
+      }`
+    );
+  }
+
   if (typeof value === "string" || typeof value === "boolean") {
     return;
   }
