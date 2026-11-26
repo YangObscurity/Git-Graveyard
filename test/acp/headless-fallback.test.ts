@@ -1305,7 +1305,7 @@ describe("HeadlessFallbackChannel output accumulation", () => {
   });
 });
 
-describe("HeadlessFallbackChannel auto-deny fail-closed (findings [1] & [8])", () => {
+describe("HeadlessFallbackChannel auto-deny fail-closed", () => {
   it("fails closed when onAskAutoDeny is missing and never spawns", async () => {
     let spawned = false;
     const channel = new HeadlessFallbackChannel({
@@ -1414,7 +1414,7 @@ describe("HeadlessFallbackChannel auto-deny fail-closed (findings [1] & [8])", (
 });
 
 
-describe("HeadlessFallbackChannel missing-resume-id fail-closed (finding [7])", () => {
+describe("HeadlessFallbackChannel missing-resume-id fail-closed", () => {
   it("refuses to resume when no session id is reported", async () => {
     const { logPath, cleanup } = tempLogPath("missing-resume");
     try {
@@ -1446,7 +1446,7 @@ describe("HeadlessFallbackChannel missing-resume-id fail-closed (finding [7])", 
   });
 });
 
-describe("HeadlessFallbackChannel returned sessionId redaction (finding [6])", () => {
+describe("HeadlessFallbackChannel returned sessionId redaction", () => {
   it("redacts a credential embedded in the returned sessionId", async () => {
     const { logPath, cleanup } = tempLogPath("session-redact");
     try {
@@ -1481,7 +1481,7 @@ describe("HeadlessFallbackChannel returned sessionId redaction (finding [6])", (
   });
 });
 
-describe("createStreamDiskLogger symlink containment (finding [5])", () => {
+describe("createStreamDiskLogger symlink containment", () => {
   it("refuses to write through a symlinked log file", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gg-headless-symlink-"));
     const outside = fs.mkdtempSync(path.join(os.tmpdir(), "gg-headless-outside-"));
@@ -1515,6 +1515,23 @@ describe("createStreamDiskLogger symlink containment (finding [5])", () => {
     } finally {
       fs.rmSync(base, { recursive: true, force: true });
       fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("accepts a log path whose parent directory name begins with two dots", () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "gg-headless-dotdot-"));
+    try {
+      // `..diagnostics` is a SIBLING of the base's other entries, not a parent
+      // escape: a naive `rel.startsWith("..")` check rejected it outright.
+      const logPath = path.join(base, "..diagnostics", "stream.jsonl");
+      const logger = createStreamDiskLogger(logPath, { trustedBaseDir: base });
+      logger.appendLine('{"type":"log"}');
+      assert.equal(logger.ok, true);
+      assert.equal(logger.getLastError(), null);
+      logger.close();
+      assert.ok(fs.existsSync(logPath));
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
     }
   });
 });

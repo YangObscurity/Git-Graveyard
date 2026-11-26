@@ -1019,16 +1019,6 @@ export async function onSubmit(
     if (pyChangedFiles.length > 0) {
       const pyBeforeObjects: Array<{ path: string; content: string }> = [];
 
-      // Deleted `.py` files that are not already the source of a detected rename
-      // are the only remaining candidates for basename-based baseline recovery.
-      const claimedRenameSources = new Set(renameSourceByDest.values());
-      const unmatchedDeletedPy = pyDeletedFiles.filter(
-        (p) => !claimedRenameSources.has(p)
-      );
-      const addedPyWithoutRename = pyAfterObjects.filter(
-        (f) => !renameSourceByDest.has(f.path)
-      );
-
       for (const pyFile of pyAfterObjects) {
         // For a rename, the true baseline of the destination path is the
         // pre-rename source content, but only when the source was itself a
@@ -1051,7 +1041,11 @@ export async function onSubmit(
         }
 
         // No rename mapping: the path may be an in-place modification (show at
-        // expectedHeadSha succeeds) or a new / undetected-move destination.
+        // expectedHeadSha succeeds) or a new file. Git rename detection is the
+        // only source of a moved-file baseline (`-M20` for `R...` entries); an
+        // unrelated deleted `.py` file must never supply a baseline for a new
+        // `.py` file, so an absent path at expectedHeadSha keeps an empty
+        // baseline.
         try {
           const baseline = await execGitShow(
             gitService,
@@ -1059,43 +1053,8 @@ export async function onSubmit(
             `${expectedHeadSha}:${pyFile.path}`
           );
           pyBeforeObjects.push({ path: pyFile.path, content: baseline });
-          continue;
         } catch {
-          // Absent at expectedHeadSha. A moved + heavily rewritten `.py` file
-          // can surface as `D` + `A` instead of `R`; recover its baseline from
-          // the unmatched deleted `.py` files below.
-        }
-
-        if (deletedSet.has(pyFile.path)) continue;
-
-        // Prefer an unambiguous basename match. If there is none but exactly one
-        // unmatched added `.py` and one unmatched deleted `.py`, pair them.
-        // Two deleted `.py` files sharing a basename stay ambiguous and are
-        // skipped (conservative: no baseline recovery).
-        const basenameMatches = unmatchedDeletedPy.filter(
-          (delPath) => path.basename(delPath) === path.basename(pyFile.path)
-        );
-        let recoveredSource: string | undefined;
-        if (basenameMatches.length === 1) {
-          recoveredSource = basenameMatches[0];
-        } else if (
-          basenameMatches.length === 0 &&
-          addedPyWithoutRename.length === 1 &&
-          unmatchedDeletedPy.length === 1
-        ) {
-          recoveredSource = unmatchedDeletedPy[0];
-        }
-        if (recoveredSource === undefined) continue;
-
-        try {
-          const baseline = await execGitShow(
-            gitService,
-            resolvedGitDir,
-            `${expectedHeadSha}:${recoveredSource}`
-          );
-          pyBeforeObjects.push({ path: pyFile.path, content: baseline });
-        } catch {
-          // Recovered baseline unreadable => empty baseline.
+          // Absent at expectedHeadSha => brand-new file with an empty baseline.
         }
       }
       pyGateResult = await checkPythonCandidateGate(

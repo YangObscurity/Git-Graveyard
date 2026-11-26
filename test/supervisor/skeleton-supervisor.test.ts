@@ -3,6 +3,9 @@
 
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { PassThrough } from "node:stream";
 import { test } from "node:test";
 import {
@@ -13,6 +16,7 @@ import {
 import {
   createSkeletonSupervisor,
   SkeletonSupervisor,
+  SkeletonSupervisorError,
 } from "../../lib/supervisor/skeleton-supervisor";
 import { spawnSkeletonProcess } from "../../lib/supervisor/acp-client";
 import type {
@@ -990,29 +994,48 @@ test("Requirement 16.18: ACP login request triggers onAdmissionHalt and fails sp
   await supervisor.finish();
 });
 
-test("Requirement 17.1, 17.2, 17.3, 17.4: Headless Fallback channel activates on P1 failure, runs turns and corrections, and writes raw stream to disk", async () => {
-  let capturedCommands: Array<{ command: string; args: readonly string[]; options: any }> = [];
+test("Requirement 17.1, 17.2, 17.3, 17.4: Headless Fallback channel activates on P1 failure, runs turns and corrections, and writes the raw stream outside the worktree", async () => {
+  const capturedCommands: Array<{ command: string; args: readonly string[]; options: any }> = [];
+  const cliSessionId = "cli-headless-sess-1";
 
   const mockSpawn: SpawnFunction = (command, args, options) => {
     capturedCommands.push({ command, args, options });
     const child = new MockChildProcess();
-    setTimeout(() => {
-      child.stdout.write('{"type":"turn_start"}\n{"type":"message","text":"Done"}\n');
-      child.simulateExit(0);
-    }, 10);
+    // Stream a valid session record matching the role tier and close cleanly,
+    // asynchronously, so the awaited prompt()/steer() observes the real result.
+    setImmediate(() => {
+      child.stdout.write(
+        JSON.stringify({
+          type: "session",
+          sessionId: cliSessionId,
+          model: CLAUDE_SONNET_5_5_MODEL_ID,
+        }) + "\n"
+      );
+      child.stdout.write(JSON.stringify({ type: "assistant", text: "Done" }) + "\n");
+      child.stdout.end();
+      setImmediate(() => {
+        child.exitCode = 0;
+        child.emit("close", 0);
+      });
+    });
     return child;
   };
+
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "gg-headless-ss-"));
 
   const supervisor = createSkeletonSupervisor({
     runId: "run-headless-test",
     skeletonId: "skel-headless-ss",
     role: "soul-stitcher",
-    cwd: "/data/runs/run-headless-test/wt",
-    quarantineDir: "/data/runs/run-headless-test/quarantine",
+    cwd: path.join(tmpBase, "wt"),
+    baseDir: tmpBase,
+    quarantineDir: path.join(tmpBase, "quarantine"),
     probeResults: {
       P1: { id: "P1", passed: false, outcome: "acp probe failed" },
+      P14: { id: "P14", passed: true },
     },
     gatewayToolIds: ["sandbox_exec", "report_task_result"],
+    onAskAutoDeny: () => {},
     spawnFn: mockSpawn,
     brokerOptions: getRequiredBrokerSettings(),
     cancelGracePeriodMs: 5000,
@@ -1025,8 +1048,11 @@ test("Requirement 17.1, 17.2, 17.3, 17.4: Headless Fallback channel activates on
   assert.equal(raised.kind, "skeleton.raised");
   assert.equal(raised.modelId, CLAUDE_SONNET_5_5_MODEL_ID);
 
-  // Requirement 17.2, 17.4: Runs turn with kiro-cli chat --v3 --no-interactive and writes raw output stream
-  await supervisor.prompt("Fix package.json dependencies");
+  // Requirement 17.2, 17.4: runs a turn with kiro-cli chat --v3 --no-interactive
+  const promptResult: any = await supervisor.prompt("Fix package.json dependencies");
+  assert.equal(promptResult.status, "complete");
+  assert.equal(promptResult.sessionId, cliSessionId);
+  assert.ok(promptResult.output.includes("Done"));
 
   assert.equal(capturedCommands.length, 1);
   const promptCmd = capturedCommands[0];
@@ -1043,14 +1069,278 @@ test("Requirement 17.1, 17.2, 17.3, 17.4: Headless Fallback channel activates on
   assert.ok(promptCmd.args.includes("sandbox_exec,report_task_result"));
   assert.ok(promptCmd.args.includes("--output-format"));
   assert.ok(promptCmd.args.includes("stream-json"));
+  // The first headless turn is never a resume.
+  assert.ok(!promptCmd.args.includes("--resume-id"));
 
-  // Requirement 17.3: Correction uses --resume-id
+  // The raw stream log lives under the sessions dir, never inside the worktree.
+  assert.equal(
+    promptResult.rawLogPath,
+    path.join(supervisor.getPaths().sessionsDir, "headless-stream.jsonl")
+  );
+  assert.ok(fs.existsSync(promptResult.rawLogPath));
+  assert.ok(!fs.existsSync(path.join(supervisor.cwd, "headless-stream.jsonl")));
+
+  // Requirement 17.3: Correction resumes with the REAL CLI session id.
   await supervisor.steer("Please revert the previous lockfile change");
 
   assert.equal(capturedCommands.length, 2);
   const steerCmd = capturedCommands[1];
   assert.equal(steerCmd.command, "kiro-cli");
-  assert.ok(steerCmd.args.includes("--resume-id"));
+  assert.equal(steerCmd.args[steerCmd.args.indexOf("--resume-id") + 1], cliSessionId);
 
   await supervisor.finish();
+  fs.rmSync(tmpBase, { recursive: true, force: true });
 });
+
+test("Requirement 17.4, 17.8: a failing headless turn propagates the real reason and fails the supervisor", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "gg-headless-fail-"));
+  let spawnCount = 0;
+
+  const supervisor = createSkeletonSupervisor({
+    runId: "run-headless-fail",
+    skeletonId: "skel-headless-fail",
+    role: "bonesetter",
+    cwd: path.join(tmpBase, "wt"),
+    baseDir: tmpBase,
+    quarantineDir: path.join(tmpBase, "quarantine"),
+    probeResults: {
+      P1: { id: "P1", passed: false },
+      P14: { id: "P14", passed: true },
+    },
+    onAskAutoDeny: () => {},
+    cancelGracePeriodMs: 1,
+    brokerOptions: getRequiredBrokerSettings(),
+    spawnFn: () => {
+      spawnCount += 1;
+      const child = new MockChildProcess();
+      setImmediate(() => {
+        child.stdout.write(
+          JSON.stringify({
+            type: "session",
+            sessionId: "cli-gw",
+            model: CLAUDE_SONNET_5_5_MODEL_ID,
+          }) + "\n"
+        );
+        child.stdout.end();
+        setImmediate(() => {
+          child.exitCode = 3; // gateway_missing
+          child.emit("close", 3);
+        });
+      });
+      return child;
+    },
+  });
+
+  await supervisor.raise();
+
+  await assert.rejects(
+    () => supervisor.prompt("do work"),
+    (err: any) => err instanceof SkeletonSupervisorError && err.reason === "gateway_missing"
+  );
+
+  assert.equal(spawnCount, 1);
+  assert.equal(supervisor.getState(), "failed");
+  assert.equal(supervisor.getFailureReason(), "gateway_missing");
+
+  await supervisor.finish();
+  fs.rmSync(tmpBase, { recursive: true, force: true });
+});
+
+test("Requirement 17.11: a headless turn fails closed before spawning when onAskAutoDeny is missing", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "gg-headless-nohook-"));
+  let spawned = false;
+
+  const supervisor = createSkeletonSupervisor({
+    runId: "run-headless-nohook",
+    skeletonId: "skel-headless-nohook",
+    role: "bonesetter",
+    cwd: path.join(tmpBase, "wt"),
+    baseDir: tmpBase,
+    quarantineDir: path.join(tmpBase, "quarantine"),
+    probeResults: {
+      P1: { id: "P1", passed: false },
+      P14: { id: "P14", passed: true },
+    },
+    cancelGracePeriodMs: 1,
+    brokerOptions: getRequiredBrokerSettings(),
+    spawnFn: () => {
+      spawned = true;
+      return new MockChildProcess();
+    },
+  });
+
+  await supervisor.raise();
+
+  await assert.rejects(
+    () => supervisor.prompt("do work"),
+    (err: any) => err instanceof SkeletonSupervisorError && err.reason === "ask_auto_deny_failed"
+  );
+
+  assert.equal(spawned, false);
+  assert.equal(supervisor.getState(), "failed");
+  assert.equal(supervisor.getFailureReason(), "ask_auto_deny_failed");
+
+  await supervisor.finish();
+  fs.rmSync(tmpBase, { recursive: true, force: true });
+});
+
+
+test("Requirement 17.1: a headless turn is refused when P14 did not pass", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "gg-headless-nop14-"));
+  let spawned = false;
+
+  const supervisor = createSkeletonSupervisor({
+    runId: "run-headless-nop14",
+    skeletonId: "skel-headless-nop14",
+    role: "bonesetter",
+    cwd: path.join(tmpBase, "wt"),
+    baseDir: tmpBase,
+    quarantineDir: path.join(tmpBase, "quarantine"),
+    probeResults: {
+      P1: { id: "P1", passed: false },
+      // P14 intentionally absent: the channel must NOT run.
+    },
+    onAskAutoDeny: () => {},
+    cancelGracePeriodMs: 1,
+    brokerOptions: getRequiredBrokerSettings(),
+    spawnFn: () => {
+      spawned = true;
+      return new MockChildProcess();
+    },
+  });
+
+  await supervisor.raise();
+
+  await assert.rejects(
+    () => supervisor.prompt("do work"),
+    (err: any) =>
+      err instanceof SkeletonSupervisorError && err.reason === "headless_fallback_disabled"
+  );
+
+  assert.equal(spawned, false);
+  assert.equal(supervisor.getFailureReason(), "headless_fallback_disabled");
+
+  await supervisor.finish();
+  fs.rmSync(tmpBase, { recursive: true, force: true });
+});
+
+test("Requirement 17.6, 17.7: a headless turn resumes with --resume-id after an approved interrupt", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "gg-headless-s2-"));
+  const capturedCommands: Array<{ command: string; args: readonly string[] }> = [];
+
+  const supervisor = createSkeletonSupervisor({
+    runId: "run-headless-s2",
+    skeletonId: "skel-headless-s2",
+    role: "soul-stitcher",
+    cwd: path.join(tmpBase, "wt"),
+    baseDir: tmpBase,
+    quarantineDir: path.join(tmpBase, "quarantine"),
+    probeResults: {
+      P1: { id: "P1", passed: false },
+      P14: { id: "P14", passed: true },
+      S2: { id: "S2", passed: true },
+    },
+    onApproval: () => "approve",
+    onAskAutoDeny: () => {},
+    cancelGracePeriodMs: 1,
+    brokerOptions: getRequiredBrokerSettings(),
+    spawnFn: (command, args) => {
+      capturedCommands.push({ command, args });
+      const callIndex = capturedCommands.length - 1;
+      const child = new MockChildProcess();
+      setImmediate(() => {
+        child.stdout.write(
+          JSON.stringify({
+            type: "session",
+            sessionId: "cli-s2",
+            model: CLAUDE_SONNET_5_5_MODEL_ID,
+          }) + "\n"
+        );
+        if (callIndex === 0) {
+          child.stdout.write(
+            JSON.stringify({ type: "approval_request", approvalId: "ap-1", tool: "shell" }) +
+              "\n"
+          );
+        } else {
+          child.stdout.write(JSON.stringify({ type: "assistant", text: "resumed" }) + "\n");
+        }
+        child.stdout.end();
+        setImmediate(() => {
+          child.exitCode = 0;
+          child.emit("close", 0);
+        });
+      });
+      return child;
+    },
+  });
+
+  await supervisor.raise();
+
+  const result: any = await supervisor.prompt("run a command");
+  assert.equal(result.status, "complete");
+  assert.equal(capturedCommands.length, 2);
+
+  const resumeArgs = capturedCommands[1].args;
+  const resumeIndex = resumeArgs.indexOf("--resume-id");
+  assert.ok(resumeIndex >= 0);
+  assert.equal(resumeArgs[resumeIndex + 1], "cli-s2");
+
+  await supervisor.finish();
+  fs.rmSync(tmpBase, { recursive: true, force: true });
+});
+
+test("Requirement 16.14, 17.8: cancel() kills the active headless channel", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "gg-headless-cancel-"));
+  let killed = false;
+  let activeChild: MockChildProcess | null = null;
+
+  const supervisor = createSkeletonSupervisor({
+    runId: "run-headless-cancel",
+    skeletonId: "skel-headless-cancel",
+    role: "bonesetter",
+    cwd: path.join(tmpBase, "wt"),
+    baseDir: tmpBase,
+    quarantineDir: path.join(tmpBase, "quarantine"),
+    probeResults: {
+      P1: { id: "P1", passed: false },
+      P14: { id: "P14", passed: true },
+    },
+    onAskAutoDeny: () => {},
+    cancelGracePeriodMs: 1,
+    cancelPromptTimeoutMs: 50,
+    brokerOptions: getRequiredBrokerSettings(),
+    spawnFn: () => {
+      const child = new MockChildProcess();
+      // Never closes on its own; kill() emits close with a SIGTERM signal.
+      child.kill = () => {
+        killed = true;
+        child.killed = true;
+        child.signalCode = "SIGTERM";
+        child.exitCode = null;
+        child.emit("close", null);
+        return true;
+      };
+      activeChild = child;
+      return child;
+    },
+  });
+
+  await supervisor.raise();
+
+  const pending = supervisor.prompt("long task");
+  const rejected = assert.rejects(
+    () => pending,
+    (err: any) => err instanceof SkeletonSupervisorError && err.reason === "cancelled"
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(activeChild);
+
+  await supervisor.cancel();
+
+  assert.equal(killed, true);
+  await rejected;
+
+  await supervisor.finish();
+  fs.rmSync(tmpBase, { recursive: true, force: true });
+});
+

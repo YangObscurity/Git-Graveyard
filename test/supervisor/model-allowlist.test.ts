@@ -759,7 +759,7 @@ describe("Task 9.7 (Property 17: P17) - Model Allowlist Property Tests", () => {
 
     for (const item of roles) {
       const capturedCommands: Array<{ command: string; args: string[] }> = [];
-      let activeChild: MockAcpChildProcess | null = null;
+      const cliSessionId = `cli-sess-${item.role}`;
 
       const supervisor = createSkeletonSupervisor({
         runId: `run-headless-${item.role}`,
@@ -772,14 +772,36 @@ describe("Task 9.7 (Property 17: P17) - Model Allowlist Property Tests", () => {
         channel: "Headless_Fallback",
         probeResults: {
           P1: { id: "P1", passed: false, reason: "headless API key verification failed" },
+          P14: { id: "P14", passed: true },
         },
         gatewayToolIds: ["sandbox_exec", "sandbox_log"],
         cancelGracePeriodMs: 1,
         brokerOptions: getRequiredBrokerSettings(),
+        // The required auto-deny hook must be present or the channel fails closed.
+        onAskAutoDeny: () => {},
         spawnFn: (cmd: string, args: readonly string[], options: SpawnOptions) => {
           capturedCommands.push({ command: cmd, args: [...args] });
-          activeChild = new MockAcpChildProcess();
-          return activeChild;
+          const child = new MockAcpChildProcess();
+          // Stream a valid session record matching the role tier and close cleanly,
+          // asynchronously, so the awaited prompt()/steer() observes the real result.
+          setImmediate(() => {
+            child.stdout.write(
+              JSON.stringify({
+                type: "session",
+                sessionId: cliSessionId,
+                model: item.expectedModel,
+              }) + "\n"
+            );
+            child.stdout.write(
+              JSON.stringify({ type: "assistant", text: "headless ok" }) + "\n"
+            );
+            child.stdout.end();
+            setImmediate(() => {
+              child.exitCode = 0;
+              child.emit("close", 0);
+            });
+          });
+          return child;
         },
       });
 
@@ -790,15 +812,11 @@ describe("Task 9.7 (Property 17: P17) - Model Allowlist Property Tests", () => {
       assert.equal(supervisor.getState(), "raised");
       assert.equal(raised.modelId, item.expectedModel);
 
-      // 2. Headless runTurn arguments (Requirement 17.2)
+      // 2. Await the headless turn and assert the real awaited result.
       const promptResult: any = await supervisor.prompt("Headless turn task");
       assert.equal(promptResult.status, "complete");
-
-      // Write chunk to stdout and allow data handler to persist to disk (Requirement 17.4)
-      if (activeChild) {
-        (activeChild as MockAcpChildProcess).stdout.write('{"type":"chunk","text":"headless ok"}\n');
-      }
-      await new Promise((resolve) => setTimeout(resolve, 15));
+      assert.equal(promptResult.sessionId, cliSessionId);
+      assert.ok(promptResult.output.includes("headless ok"));
 
       assert.equal(capturedCommands.length, 1);
       const promptCmd = capturedCommands[0];
@@ -816,18 +834,26 @@ describe("Task 9.7 (Property 17: P17) - Model Allowlist Property Tests", () => {
       assert.equal(promptCmd.args[promptCmd.args.indexOf("--output-format") + 1], "stream-json");
       assert.ok(promptCmd.args.includes("--trust-tools"));
       assert.equal(promptCmd.args[promptCmd.args.indexOf("--trust-tools") + 1], "sandbox_exec,sandbox_log");
+      // The first headless turn is never a resume.
+      assert.ok(!promptCmd.args.includes("--resume-id"));
 
-      // 3. Raw output written to disk before parsing (Requirement 17.4)
-      assert.ok(promptResult.rawLogPath);
+      // 3. Raw output written to disk OUTSIDE the worktree (Requirement 17.4)
+      const sessionsDir = supervisor.getPaths().sessionsDir;
+      assert.equal(
+        promptResult.rawLogPath,
+        path.join(sessionsDir, "headless-stream.jsonl")
+      );
       assert.ok(fs.existsSync(promptResult.rawLogPath));
+      assert.ok(!promptResult.rawLogPath.startsWith(`${supervisor.cwd}${path.sep}`));
+      assert.ok(!fs.existsSync(path.join(supervisor.cwd, "headless-stream.jsonl")));
 
-      // 4. Correction with --resume-id (Requirement 17.3)
+      // 4. Correction resumes with the REAL CLI session id (Requirement 17.3)
       await supervisor.steer("Correction via resume-id");
       assert.equal(capturedCommands.length, 2);
       const steerCmd = capturedCommands[1];
       assert.equal(steerCmd.command, "kiro-cli");
       assert.ok(steerCmd.args.includes("--resume-id"));
-      assert.equal(steerCmd.args[steerCmd.args.indexOf("--resume-id") + 1], raised.sessionId);
+      assert.equal(steerCmd.args[steerCmd.args.indexOf("--resume-id") + 1], cliSessionId);
       assert.ok(steerCmd.args.includes("--model"));
       assert.equal(steerCmd.args[steerCmd.args.indexOf("--model") + 1], item.expectedModel);
 

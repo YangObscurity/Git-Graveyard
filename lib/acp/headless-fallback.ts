@@ -195,11 +195,11 @@ export interface HeadlessFallbackChannelOptions {
   /**
    * Requirement 17.11: enforcement hook invoked as soon as an `ask` request is
    * observed, so the Gateway records the auto-denial and never enqueues or waits
-   * on a blocking ask while the Headless Fallback is active. REQUIRED: the
-   * channel never silently skips auto-denial. When the hook is missing or rejects,
-   * the turn fails closed and the child process is signalled.
+   * on a blocking ask while the Headless Fallback is active. Required for a turn
+   * to run: the channel never silently skips auto-denial. When the hook is
+   * missing or rejects, the turn fails closed and the child process is signalled.
    */
-  onAskAutoDeny: (ask: HeadlessAskRequest) => Promise<void> | void;
+  onAskAutoDeny?: (ask: HeadlessAskRequest) => Promise<void> | void;
   onLog?: (stream: "stdout" | "stderr", text: string) => void;
   maxResumeRounds?: number;
 }
@@ -391,7 +391,7 @@ export class HeadlessFallbackChannel {
       records: redactValue(input.records, redaction),
       activeModel: verification.activeModel,
       modelVerified: verification.ok,
-      // Requirement 17.12 / finding [6]: the extracted session id (and approval
+      // Requirement 17.12: the extracted session id (and approval
       // ids inside `approvals`) may embed a credential, so the RETURNED metadata
       // is redacted too. `runTurn` keeps resuming from the RAW `extractSessionId`
       // so `--resume-id` stays accurate while the returned value never leaks.
@@ -434,7 +434,7 @@ export class HeadlessFallbackChannel {
     }
 
     const modelId = options.modelId ?? this.options.modelId;
-    // Requirement 17.11 / findings [1] & [8]: auto-denial is REQUIRED and is
+    // Requirement 17.11: auto-denial is REQUIRED and is
     // enforced from live streaming. Production code never silently skips it: a
     // missing hook fails closed before any process is spawned.
     if (typeof this.options.onAskAutoDeny !== "function") {
@@ -495,6 +495,15 @@ export class HeadlessFallbackChannel {
       }
       output = combineRoundOutput(outputChunks);
 
+      // Requirement 17.9: exit code 4 (missing agent) invalidates the stream, so
+      // the output is discarded BEFORE any return path settles, including the
+      // auto-deny failure and cancellation paths handled below.
+      if (exitCode === 4) {
+        outputChunks = [];
+        output = "";
+        outputDiscarded = true;
+      }
+
       if (spawnResult.spawnError) {
         return this.finalize({
           base,
@@ -503,7 +512,7 @@ export class HeadlessFallbackChannel {
           reason: "spawn_failed",
           exitCode,
           output,
-          outputDiscarded: false,
+          outputDiscarded,
           records,
           approvals,
           autoDeniedAsks,
@@ -514,7 +523,7 @@ export class HeadlessFallbackChannel {
         });
       }
 
-      // Findings [1] & [8]: a rejected/thrown `onAskAutoDeny` (observed during
+      // A rejected/thrown `onAskAutoDeny` (observed during
       // live streaming) fails the turn closed. The child process was already
       // signalled inside `spawnTurn`; the ask is never treated as safely handled.
       if (spawnResult.askDenyError) {
@@ -654,7 +663,7 @@ export class HeadlessFallbackChannel {
         });
       }
 
-      // Requirement 17.6 / finding [7]: resume the session with --resume-id,
+      // Requirement 17.6: resume the session with --resume-id,
       // passing the approval decision/ID in the resumed prompt. A missing session
       // id must NEVER spawn a fresh process without --resume-id: fail closed.
       const nextResumeId =
@@ -752,7 +761,7 @@ export class HeadlessFallbackChannel {
       const records: StreamJsonRecord[] = [];
       let settled = false;
       let closing = false;
-      const observedAsks: HeadlessAskRequest[] = [];
+      const autoDeniedAsks: HeadlessAskRequest[] = [];
       const pendingAskDenies: Promise<void>[] = [];
       let askDenyError: Error | null = null;
       // Requirement 17.4: write the raw stream to disk before parsing it, with
@@ -766,7 +775,7 @@ export class HeadlessFallbackChannel {
           })
         : null;
 
-      // Findings [1] & [8]: fail closed the instant a required auto-deny hook
+      // Fail closed the instant a required auto-deny hook
       // rejects. The child process is signalled with SIGTERM and the turn never
       // reports the ask as safely handled.
       const settleAskDenyFailure = (err: Error): void => {
@@ -789,12 +798,17 @@ export class HeadlessFallbackChannel {
           spawnError: null,
           signal: null,
           logError,
-          autoDeniedAsks: observedAsks,
+          autoDeniedAsks,
           askDenyError: err,
         });
       };
 
       const consumeLine = (line: string): void => {
+        // Once the turn has settled (cancelled, denied, killed, or resolved) no
+        // further records are parsed and no further ask hook is invoked.
+        if (settled) {
+          return;
+        }
         if (line.trim().length === 0) {
           return;
         }
@@ -803,18 +817,29 @@ export class HeadlessFallbackChannel {
           records.push(record);
           // Requirement 17.11: auto-deny each `ask` the moment it arrives on the
           // live stream, BEFORE the process exits, so a blocking `ask` can never
-          // stall the turn (findings [1] & [8]).
+          // stall the turn. An ask is reported as auto-denied only AFTER the
+          // required hook resolves without error; a rejected/thrown hook fails the
+          // turn closed and the ask is never treated as handled.
           for (const ask of extractAskRequests([record])) {
-            observedAsks.push(ask);
+            if (settled) {
+              break;
+            }
             const hook = this.options.onAskAutoDeny;
             let denial: Promise<void>;
             try {
-              denial = Promise.resolve(hook(ask));
+              // `runTurn` refuses to spawn without the hook, so it is defined here.
+              denial = Promise.resolve(hook!(ask));
             } catch (err) {
               denial = Promise.reject(err);
             }
             const tracked = denial.then(
-              () => undefined,
+              () => {
+                // Never report an ask whose turn already failed or settled while
+                // its denial was still in flight.
+                if (!settled) {
+                  autoDeniedAsks.push(ask);
+                }
+              },
               (err: unknown) => {
                 const failure =
                   err instanceof Error ? err : new Error(String(err));
@@ -925,7 +950,7 @@ export class HeadlessFallbackChannel {
           consumeLine(buffer);
           buffer = "";
         }
-        // Findings [1] & [8]: serialize/await every pending auto-deny promise
+        // Serialize/await every pending auto-deny promise
         // BEFORE finalizing. A rejected hook that was observed while streaming
         // fails the turn closed instead of being silently swallowed.
         void Promise.all(pendingAskDenies).then(() => {
@@ -947,7 +972,7 @@ export class HeadlessFallbackChannel {
             spawnError: null,
             signal: proc.signalCode ?? null,
             logError,
-            autoDeniedAsks: observedAsks,
+            autoDeniedAsks,
             askDenyError: null,
           });
         });
@@ -963,10 +988,10 @@ export class HeadlessFallbackChannel {
           appendStdoutText(text);
         });
         proc.stdout.on("end", () => {
-          // Flush any held-back partial sequence, then fall back for mocks that
-          // never emit "close".
+          // Flush any held-back partial sequence. The turn settles strictly on the
+          // process "close" event, which fires after every stdout and stderr chunk
+          // has been drained.
           flushStdoutDecoder();
-          setTimeout(() => finish(proc.exitCode ?? null), 50);
         });
       }
       if (proc.stderr) {
@@ -1040,7 +1065,7 @@ export class HeadlessFallbackChannel {
           spawnError: err,
           signal: null,
           logError,
-          autoDeniedAsks: observedAsks,
+          autoDeniedAsks,
           askDenyError,
         });
       });

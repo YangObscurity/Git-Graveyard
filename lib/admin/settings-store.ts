@@ -18,9 +18,9 @@ import type { EventEnvelope, EventStore } from "../events/event-store";
 import type { RunStore } from "../runs/run-store";
 
 /**
- * FIND-003: sentinel written to `admin_settings.valueJson` for Required_Settings that ship without
- * a value. It is deliberately *not* valid JSON, so it can never collide with a real value — every
- * JSON value serializes to a different string (`null` -> `"null"`, the string "x" -> `"\"x\""`,
+ * Sentinel written to `admin_settings.valueJson` for Required_Settings that ship without a value.
+ * It is deliberately *not* valid JSON, so it can never collide with a real value — every JSON value
+ * serializes to a different string (`null` -> `"null"`, the string "x" -> `"\"x\""`,
  * numbers/booleans -> their literals). Reading it back yields `undefined` (unset), which keeps
  * `getSetting` / `getAllSettings` / `validateRequiredSettings` semantics intact while allowing an
  * explicit `setSetting(key, null, ...)` to round-trip as a real `null`.
@@ -192,9 +192,9 @@ const INTEGER_SETTING_KEYS = new Set<string>([
 ]);
 
 /**
- * FIND-9: every numeric setting. A numeric setting must never accept a string/boolean/array/object
- * value, even though the generic fallback in {@link assertValidSettingValue} still allows those
- * *types* for free-form settings. `assertValidSettingValue` checks this set before the generic
+ * Every numeric setting. A numeric setting must never accept a string/boolean/array/object value,
+ * even though the generic fallback in {@link assertValidSettingValue} still allows those *types*
+ * for free-form settings. `assertValidSettingValue` checks this set before the generic
  * string/boolean branch, so `setSetting("toolCallsPerRun", "300")` is rejected instead of being
  * stored as a string that would then (wrongly) satisfy `validateRequiredSettings()`.
  *
@@ -217,7 +217,7 @@ const NUMERIC_SETTING_KEYS = new Set<string>([
   "brokerWatchdogMs",
 ]);
 
-/** FIND-15: the live-run concurrency ceiling (Requirement 30.3: prod at most 5 under quota 10). */
+/** The live-run concurrency ceiling (Requirement 30.3: prod at most 5 under quota 10). */
 const MAX_CONCURRENT_LIVE_RUNS = 5;
 
 /**
@@ -226,9 +226,9 @@ const MAX_CONCURRENT_LIVE_RUNS = 5;
  * functions, symbols and exotic objects (`Map`/`Set`/`Date`/`RegExp`) are rejected, as are the
  * reserved prototype-pollution keys.
  *
- * FIND-9: numeric keys are validated *before* the generic string/boolean/plain-object branch, so a
- * string (or boolean/array/object) can never be stored against a numeric key. FIND-15: the
- * `concurrentLiveRuns` cap is enforced here.
+ * Numeric keys are validated *before* the generic string/boolean/plain-object branch, so a string
+ * (or boolean/array/object) can never be stored against a numeric key. The `concurrentLiveRuns` cap
+ * is enforced here.
  */
 function assertValidSettingValue(key: string, value: unknown): void {
   if (RESERVED_SETTING_KEYS.has(key)) {
@@ -256,7 +256,7 @@ function assertValidSettingValue(key: string, value: unknown): void {
         `Setting "${key}" must be a non-negative integer (received ${value})`
       );
     }
-    // FIND-15: the live-run concurrency setting is capped (Requirement 30.3).
+    // The live-run concurrency setting is capped (Requirement 30.3).
     if (key === "concurrentLiveRuns" && value > MAX_CONCURRENT_LIVE_RUNS) {
       throw new RangeError(
         `Setting "${key}" must be at most ${MAX_CONCURRENT_LIVE_RUNS} (received ${value})`
@@ -265,7 +265,7 @@ function assertValidSettingValue(key: string, value: unknown): void {
     return;
   }
 
-  // FIND-9: numeric/integer keys accept a number or null only — never a string/boolean/array/object.
+  // Numeric/integer keys accept a number or null only — never a string/boolean/array/object.
   if (isNumericKey) {
     throw new TypeError(
       `Setting "${key}" must be ${
@@ -313,8 +313,8 @@ function isDirectoryWritable(dirPath: string): boolean {
 /**
  * Resolves the default on-disk settings database path: an explicit `path` option wins, then the
  * `SETTINGS_STORE_PATH` environment variable, then `/data` when it is writable, and finally a
- * per-user temp directory. Exported so the calibration CLI (FIND-001) can open the same default
- * store when `--settings-db` is omitted.
+ * per-user temp directory. Exported so the calibration CLI can open the same default store when
+ * `--settings-db` is omitted.
  */
 export function resolveDefaultSettingsStorePath(options?: SettingsStoreOptions): string {
   if (options?.path) {
@@ -330,12 +330,10 @@ export function resolveDefaultSettingsStorePath(options?: SettingsStoreOptions):
 }
 
 /**
- * Parses a stored JSON value.
- *
- * FIND-003: a `raw` value that is not a string, is empty, or equals the {@link UNSET_VALUE_SENTINEL}
- * is treated as `undefined` (unset). A literal `"null"` is *not* special-cased here — it parses to
- * `null`, so an explicit `null` setting and an initial-creation SQL `NULL` audit `beforeJson` stay
- * distinguishable.
+ * Parses a stored JSON value. A `raw` value that is not a string, is empty, or equals the
+ * {@link UNSET_VALUE_SENTINEL} is treated as `undefined` (unset). A literal `"null"` is *not*
+ * special-cased: it parses to `null`, so an explicit `null` setting and an initial-creation SQL
+ * `NULL` audit `beforeJson` stay distinguishable.
  */
 function parseStoredValue(raw: unknown): unknown {
   if (typeof raw !== "string" || raw.length === 0 || raw === UNSET_VALUE_SENTINEL) {
@@ -346,25 +344,6 @@ function parseStoredValue(raw: unknown): unknown {
   } catch {
     return undefined;
   }
-}
-
-/**
- * FIND-003 backward compatibility: databases written before the sentinel existed seeded
- * Required_Settings with the literal string `"null"` and `updatedBy = "system:required"`. That
- * *combination* means "unset". An explicit `setSetting(key, null, { actor })` stores `"null"` with a
- * real actor, so it is preserved as a genuine `null`.
- */
-function isLegacyUnsetValue(valueJson: unknown, updatedBy: unknown): boolean {
-  return valueJson === "null" && updatedBy === REQUIRED_SEED_ACTOR;
-}
-
-/** Reads a setting value, applying the legacy-unset rule on top of {@link parseStoredValue}. */
-function readSettingValue(valueJson: unknown, updatedBy: unknown): unknown {
-  const value = parseStoredValue(valueJson);
-  if (value === null && isLegacyUnsetValue(valueJson, updatedBy)) {
-    return undefined;
-  }
-  return value;
 }
 
 function rowToAuditEntry(row: Record<string, unknown>): SettingsAuditEntry {
@@ -406,11 +385,12 @@ function detectStorageMode(db: DatabaseSync): "memory" | "file" {
 }
 
 /**
- * FIND-004 / WP-17-fix2: returns a run's latest `run.done` envelope — highest `seq`, tie-breaking in
- * favour of the later array index — matching `latestRunDoneEvent` in the calibration script so both
- * agree on what a run's terminal outcome is. Returns `null` when the run never concluded.
+ * Returns a run's latest `run.done` envelope — highest `seq`, tie-breaking in favour of the later
+ * array index. A run's terminal outcome is always taken from this single event so the settings store
+ * and the calibration script agree. Exported for the calibration CLI to reuse. Returns `null` when
+ * the run never concluded.
  */
-function pickLatestRunDoneEvent(events: EventEnvelope[]): EventEnvelope | null {
+export function pickLatestRunDoneEvent(events: EventEnvelope[]): EventEnvelope | null {
   let latest: EventEnvelope | null = null;
   for (const ev of events) {
     if (ev.kind !== "run.done") {
@@ -546,18 +526,16 @@ export class SettingsStore {
       insertIfAbsent.run(key, JSON.stringify(value), 0, now, "system:e11-defaults");
     }
     for (const key of REQUIRED_SETTING_KEYS) {
-      // FIND-003: use the non-JSON sentinel instead of the literal "null" so an explicit null set
-      // later is never confused with "unset".
+      // Use the non-JSON sentinel instead of the literal "null" so an explicit null set later is
+      // never confused with "unset".
       insertIfAbsent.run(key, UNSET_VALUE_SENTINEL, 1, now, REQUIRED_SEED_ACTOR);
     }
   }
 
   private prepareStatements(): void {
-    this.getSettingStmt = this.db.prepare(
-      "SELECT valueJson, updatedBy FROM admin_settings WHERE key = ?"
-    );
+    this.getSettingStmt = this.db.prepare("SELECT valueJson FROM admin_settings WHERE key = ?");
     this.getAllSettingsStmt = this.db.prepare(
-      "SELECT key, valueJson, updatedBy FROM admin_settings ORDER BY key ASC"
+      "SELECT key, valueJson FROM admin_settings ORDER BY key ASC"
     );
     this.upsertSettingStmt = this.db.prepare(`
       INSERT INTO admin_settings (key, valueJson, isRequired, updatedAt, updatedBy)
@@ -598,13 +576,11 @@ export class SettingsStore {
     if (!key || typeof key !== "string") {
       return undefined;
     }
-    const row = this.getSettingStmt.get(key) as
-      | { valueJson?: unknown; updatedBy?: unknown }
-      | undefined;
+    const row = this.getSettingStmt.get(key) as { valueJson?: unknown } | undefined;
     if (!row) {
       return undefined;
     }
-    const value = readSettingValue(row.valueJson, row.updatedBy);
+    const value = parseStoredValue(row.valueJson);
     return value === undefined ? undefined : (value as T);
   }
 
@@ -612,11 +588,10 @@ export class SettingsStore {
     const rows = this.getAllSettingsStmt.all() as Array<{
       key?: unknown;
       valueJson?: unknown;
-      updatedBy?: unknown;
     }>;
     const out: Record<string, unknown> = {};
     for (const row of rows) {
-      const value = readSettingValue(row.valueJson, row.updatedBy);
+      const value = parseStoredValue(row.valueJson);
       if (value === undefined) {
         continue;
       }
@@ -820,15 +795,15 @@ export class SettingsStore {
       }
       const eventStore = sources.eventStore;
       if (eventStore) {
-        // WP-17-fix2: always evaluate the EventStore's `run.done`, even when the RunStore already
-        // added the id. A run the RunStore records as `done`/non-error is still not a completed
-        // Recorded_Run when its latest `run.done` says `outcome === "error"` — that id is removed.
+        // Always evaluate the EventStore's `run.done`, even when the RunStore already added the id.
+        // A run the RunStore records as `done`/non-error is still not a completed Recorded_Run when
+        // its latest `run.done` says `outcome === "error"` — that id is removed.
         for (const runId of eventStore.getRunIds()) {
           const events = eventStore.getEvents(runId, { kind: "run.done" });
           if (events.length === 0) {
             continue;
           }
-          // FIND-004: only the *latest* run.done (by seq) decides the run's outcome.
+          // Only the *latest* run.done (by seq) decides the run's outcome.
           const latestDone = pickLatestRunDoneEvent(events);
           if (latestDone === null) {
             continue;
