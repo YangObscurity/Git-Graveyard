@@ -1093,8 +1093,25 @@ export function isPy2OnlySpecifier(specifier: string): boolean {
   const satisfiesAll = (v: number[]) =>
     parsed.every((clause) => versionMatchesClause(v, clause));
 
-  if (PY3_CANDIDATE_VERSIONS.some(satisfiesAll)) return false;
-  return PY2_CANDIDATE_VERSIONS.some(satisfiesAll);
+  // Sparsely sampling the fixed candidate arrays cannot represent every narrow
+  // pin (for example `==2.7.5`, `>=2.7.5, <=2.7.10`, or `==3.9.7`). Derive
+  // additional probes from the parsed clauses themselves so exact and narrow
+  // Python 2 or Python 3 specifiers are classified against real versions.
+  const py2Probes: number[][] = [...PY2_CANDIDATE_VERSIONS];
+  const py3Probes: number[][] = [...PY3_CANDIDATE_VERSIONS];
+  for (const clause of parsed) {
+    const p0 = clause.parts[0];
+    if (p0 !== 2 && p0 !== 3) continue;
+    const p1 = clause.parts[1] ?? 0;
+    const p2 = clause.parts[2] ?? 0;
+    const target = p0 === 2 ? py2Probes : py3Probes;
+    target.push([p0, p1, p2]);
+    target.push([p0, p1, p2 + 1]);
+    target.push([p0, p1, Math.max(0, p2 - 1)]);
+  }
+
+  if (py3Probes.some(satisfiesAll)) return false;
+  return py2Probes.some(satisfiesAll);
 }
 
 function extractSpecifier(content: string, keyword: string): string | undefined {
