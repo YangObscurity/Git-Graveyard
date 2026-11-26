@@ -59,9 +59,9 @@ function isDeniedSecretSegment(segment: string): boolean {
 /**
  * The exact set of manifest and lock file names the Bonesetter may write at the
  * cwd root. This is the authoritative, single-source write set shared by the
- * Bonesetter tool client and the PermissionBroker (finding [21]): a manifest or
- * lock name that is NOT one of these ten is never writable, even when the broader
- * broker `MANIFEST_LOCK_FILENAMES` list contains it.
+ * Bonesetter tool client and the PermissionBroker: a manifest or lock name that
+ * is NOT one of these ten is never writable, even when the broader broker
+ * `MANIFEST_LOCK_FILENAMES` list contains it.
  *
  * The ten names are exactly the intersection of the broker's
  * `MANIFEST_LOCK_FILENAMES` and the Bonesetter template allow patterns:
@@ -83,31 +83,25 @@ export const BONESETTER_WRITABLE_FILENAMES: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * Backwards-compatible alias for `BONESETTER_WRITABLE_FILENAMES` (the exact
- * cwd-root manifest/lock intersection). Kept so existing importers keep working.
- */
-export const BONESETTER_ROOT_MANIFEST_FILENAMES: ReadonlySet<string> =
-  BONESETTER_WRITABLE_FILENAMES;
-
-/**
  * Pure check that a path is writable by the Bonesetter: only a manifest or
  * lockfile name at the cwd root that is in `BONESETTER_WRITABLE_FILENAMES`.
  * Strictly rejects nested manifest paths (e.g. `packages/app/package.json`),
  * `.git/**`, `.kiro/**`, secret names (`.env*`, `*.pem`, `id_*`), `../`
- * traversal, absolute paths, leading/trailing whitespace (finding [11]), and any
+ * traversal, absolute paths, leading/trailing whitespace, and any
  * arbitrary source file such as `.ts`, `.js`, `.py`.
  *
- * This closes the review finding that a broker-only name (`cargo.toml`,
- * `setup.cfg`, `go.mod`, `Gemfile`, ...) or a template-only glob (`setup.py`,
- * `requirements*.txt` beyond `requirements.txt`) was writable even though the
- * other side forbade it; only the exact intersection is allowed.
+ * Only the exact intersection of the broker's manifest/lock names and the
+ * Bonesetter template allow patterns is writable: a broker-only name
+ * (`cargo.toml`, `setup.cfg`, `go.mod`, `Gemfile`, ...) or a template-only glob
+ * (`setup.py`, `requirements*.txt` beyond `requirements.txt`) is rejected even
+ * though one side alone would permit it.
  * Requirements: 14.5, 14.9, 14.10, 14.11.
  */
 export function isBonesetterWritablePath(filePath: string): boolean {
   if (typeof filePath !== "string") {
     return false;
   }
-  // Finding [11]: never silently `.trim()` a padded path into an allowed name.
+  // Never silently `.trim()` a padded path into an allowed name.
   if (filePath !== filePath.trim()) {
     return false;
   }
@@ -420,9 +414,9 @@ export function validateBonesetterTemplate(
     }
   }
 
-  // PR-Agent finding: the template must be configured with all eight tools the
-  // Bonesetter tool interface exposes. A missing tool would silently degrade the
-  // agent, so each missing entry is reported with a clear message.
+  // The template must be configured with all eight tools the Bonesetter tool
+  // interface exposes. A missing tool would silently degrade the agent, so each
+  // missing entry is reported with a clear message.
   for (const tool of [
     "read",
     "write",
@@ -509,8 +503,8 @@ export interface BundleBonesetterSteeringResourcesOptions {
   maxFiles?: number;
   maxTotalChars?: number;
   /**
-   * Trusted worktree root the steering target directory must stay strictly inside
-   * (finding [10]). When set, symlinked components (`.kiro`, `.kiro/steering`, …)
+   * Trusted worktree root the steering target directory must stay strictly inside.
+   * When set, symlinked components (`.kiro`, `.kiro/steering`, …)
    * and target files are refused and the resolved target must stay within the
    * resolved worktree root.
    */
@@ -587,7 +581,7 @@ function isPathInsideDirSync(base: string, target: string): boolean {
 /**
  * Realpath of the deepest existing ancestor of `target`, with the non-existent
  * tail rejoined, so a not-yet-created directory still resolves against its real
- * parent (finding [10]).
+ * parent.
  */
 function realpathOfExistingPrefixSync(target: string): string {
   let current = path.resolve(target);
