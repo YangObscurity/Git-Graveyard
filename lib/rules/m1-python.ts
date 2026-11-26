@@ -179,19 +179,9 @@ function resolveTreeSitterPythonWasm(): string {
   );
 }
 
-const GLOBAL_PYTHON_PARSE_SYNC_KEY = "__ggPythonParseSync";
-
-function registerGlobalPythonSync(): void {
-  (globalThis as Record<string, unknown>)[GLOBAL_PYTHON_PARSE_SYNC_KEY] = (
-    source: string,
-    file: string
-  ): PythonPlan | null => planPythonEdits(source, file);
-}
-
 /** Initializes and caches the Python parser (Language singleton loaded once). */
 export async function initPythonParser(): Promise<Parser> {
   if (pythonParser) {
-    registerGlobalPythonSync();
     return pythonParser;
   }
   if (!parserPromise) {
@@ -203,7 +193,6 @@ export async function initPythonParser(): Promise<Parser> {
       const parser = new Parser();
       parser.setLanguage(language);
       pythonParser = parser;
-      registerGlobalPythonSync();
       return parser;
     })().catch((err) => {
       parserPromise = null;
@@ -474,10 +463,12 @@ function classifyResidue(node: Node): string | null {
       const text = node.text;
       // Python 3 removed the legacy octal literal: a decimal run that starts
       // with `0` and contains at least one non-zero digit (`0755`, `0644`,
-      // `010`, `007`). All-zero integers (`0`, `00`, `000`) are valid Python 3
+      // `010`, `007`). Underscore digit separators do not make such a literal
+      // legal, so `0_75` (Python 2 style with a separator) is flagged too.
+      // All-zero integers (`0`, `00`, `000`, `0_0`, `00_0`) are valid Python 3
       // and must never be flagged. Hex/binary/`0o` literals carry a non-digit
       // right after the leading `0`, so they are excluded by construction.
-      if (/^0[0-9]*[1-9][0-9]*$/.test(text)) return "octal";
+      if (/^0[0-9_]*[1-9][0-9_]*$/.test(text)) return "octal";
       if (/[Ll]$/.test(text)) return "long";
       return null;
     }
@@ -1252,6 +1243,10 @@ function prefixMatches(version: number[], prefix: number[]): boolean {
  * padded), e.g. `3.11` and `3.11.0` or `3.11` and `3.11.post1`.
  */
 function sameRelease(a: ParsedVersion, b: ParsedVersion): boolean {
+  // A differing epoch means the two versions are never "of the same release"
+  // (PEP 440: `1!3.11` and `3.11` are distinct releases), so the exclusive
+  // ordered-comparison exclusions below must not apply across epochs.
+  if (a.epoch !== b.epoch) return false;
   const length = Math.max(a.release.length, b.release.length);
   for (let i = 0; i < length; i++) {
     if ((a.release[i] ?? 0) !== (b.release[i] ?? 0)) return false;
@@ -1374,9 +1369,27 @@ export function classifyVersionSpecifier(specifier: string): DeclaredPythonStatu
     const p2 = release[2] ?? 0;
     const target = p0 === 2 ? py2Probes : py3Probes;
     target.push(clause.version);
+    // Base release with any pre/post/dev suffix stripped.
     target.push(toParsedVersion([p0, p1, p2]));
     target.push(toParsedVersion([p0, p1, p2 + 1]));
     target.push(toParsedVersion([p0, p1, Math.max(0, p2 - 1)]));
+    // PEP 440 suffix neighbours: a `post`/`pre`/`dev` clause's adjacent
+    // suffix versions are the only probes that can satisfy a narrow range such
+    // as `>3.11.post1,<3.11.post3` (which admits `3.11.post2`); the bare
+    // release probes cannot.
+    if (clause.version.post !== null) {
+      target.push({ ...clause.version, post: clause.version.post + 1 });
+    }
+    if (clause.version.pre !== null) {
+      target.push({
+        ...clause.version,
+        pre: { stage: clause.version.pre.stage, num: clause.version.pre.num + 1 },
+      });
+    }
+    if (clause.version.dev !== null) {
+      target.push({ ...clause.version, dev: clause.version.dev + 1 });
+      target.push({ ...clause.version, dev: Math.max(0, clause.version.dev - 1) });
+    }
   }
 
   if (py3Probes.some(satisfiesAll)) return "py3_compatible";

@@ -533,37 +533,21 @@ describe("Python M1 signal detection", () => {
     assert.equal(detectPythonSignalsLexical([{ path: "exec3.py", content: py3Exec }]).length, 0);
   });
 
-  // The sync `detectSignals` uses the tree-sitter path once the parser is
-  // initialized; temporarily clear the registered sync parser so these cases
-  // exercise the comment/string-aware lexical fallback (where the `exec` regex
-  // lives) rather than the parser, which would mask a regex regression.
-  function withLexicalFallback<T>(fn: () => T): T {
-    const g = globalThis as Record<string, unknown>;
-    const key = "__ggPythonParseSync";
-    const saved = g[key];
-    delete g[key];
-    try {
-      return fn();
-    } finally {
-      if (saved !== undefined) g[key] = saved;
-    }
-  }
-
-  it("synchronous detectSignals lexical fallback ignores Py3 exec calls separated by wide whitespace", () => {
+  // `detectSignals` is synchronous and always runs the comment/string-aware
+  // lexical detector, independent of whether `initPythonParser()` /
+  // `detectPythonSignals()` has run. These cases exercise the `exec` regex
+  // directly through `detectSignals` (there is no global parser hook to clear).
+  it("synchronous detectSignals ignores Py3 exec calls separated by wide whitespace", () => {
     const py3 = ["exec (code)", "exec  (code)", "exec\t (code)", "exec(code)"].join("\n") + "\n";
-    const result = withLexicalFallback(() =>
-      detectSignals([{ path: "exec3.py", content: py3 }])
-    );
+    const result = detectSignals([{ path: "exec3.py", content: py3 }]);
     const execSignals = result.filter((s) => s.matched.includes("exec"));
     assert.equal(execSignals.length, 0, "Py3 exec call forms must not be flagged");
     assert.equal(result.length, 0);
   });
 
-  it("synchronous detectSignals lexical fallback flags Py2 exec statement forms as unhandled", () => {
+  it("synchronous detectSignals flags Py2 exec statement forms as unhandled", () => {
     const py2 = ['exec "x = 1"', "exec stmt in ns"].join("\n") + "\n";
-    const result = withLexicalFallback(() =>
-      detectSignals([{ path: "exec2.py", content: py2 }])
-    );
+    const result = detectSignals([{ path: "exec2.py", content: py2 }]);
     const execSignals = result.filter((s) => s.matched.includes("exec"));
     assert.equal(execSignals.length, 2, "both Py2 exec statement forms must be flagged");
     assert.deepEqual(
@@ -573,6 +557,23 @@ describe("Python M1 signal detection", () => {
     const py2Unknowns = result.unknowns.filter((u) => u.reason === "py2_residue");
     assert.equal(py2Unknowns.length, 2);
     assert.ok(py2Unknowns.every((u) => u.ruleId === "M1"));
+  });
+
+  it("synchronous detectSignals is deterministic and matches the lexical detector around parser init", async () => {
+    const files = [
+      { path: "det.py", content: "print x\ns = 'print y'\nexec code in ns\n" },
+    ];
+    const shape = (r: { signals: { ruleId: string; line: number; column: number; matched: string }[] }) =>
+      r.signals.map((s) => `${s.ruleId}:${s.line}:${s.column}:${s.matched}`);
+    const before = shape(detectSignals(files));
+    await initPythonParser();
+    await detectPythonSignals(files);
+    const after = shape(detectSignals(files));
+    const lexical = shape(detectPythonSignalsLexical(files));
+    // `detectSignals` never depends on the tree-sitter parser having run.
+    assert.deepEqual(after, before);
+    // and always agrees with the pure lexical detector for `.py` files.
+    assert.deepEqual(before, lexical);
   });
 
   it("lexical fallback detects ur/ru strings, old octals, long ints, tuple params, raise E, msg, and emits unknowns", () => {
@@ -842,5 +843,73 @@ describe("M1 remediation: all-zero integers, unicode splats, PEP 440 exclusives"
     assert.equal(classifyVersionSpecifier("<3.11"), "py3_compatible");
     // <3.11 excludes 3.11a1 / 3.11.dev0, so the range below is empty.
     assert.equal(classifyVersionSpecifier("<3.11,>3.11a1"), "unknown");
+  });
+
+  // The lexical `unicode(...)` check must flag keyword arguments (`k=v`, but not
+  // `==`/`!=`/`<=`/`>=`) and `*args` / `**kwargs` splats as ambiguous.
+  it("lexical fallback flags unicode(...) with keyword, splat, or multi-argument forms", () => {
+    const content = [
+      "a = unicode(x)",
+      'b = unicode(x, "utf-8")',
+      'c = unicode(encoding="utf-8")',
+      "d = unicode(*args)",
+      "e = unicode(**kwargs)",
+      "f = unicode(x == y)",
+      "g = unicode(x != y)",
+      "",
+    ].join("\n");
+    const result = detectPythonSignalsLexical([{ path: "uni.py", content }]);
+    const ambiguousLines = result.unknowns
+      .filter((u) => u.reason === "unicode_decoding_ambiguous")
+      .map((u) => Number(u.line))
+      .sort((a, b) => a - b);
+    assert.deepEqual(ambiguousLines, [2, 3, 4, 5]);
+    assert.ok(!ambiguousLines.includes(1), "single positional arg is unambiguous");
+    assert.ok(!ambiguousLines.includes(6), "== must not look like a keyword arg");
+    assert.ok(!ambiguousLines.includes(7), "!= must not look like a keyword arg");
+  });
+
+  // A digit run inside a Unicode identifier is not a Py2 octal literal.
+  it("lexical fallback does not flag octal digits inside a Unicode identifier", () => {
+    const content = ["\u53d8\u91cf0755 = 1", "x = 0755", ""].join("\n");
+    const result = detectPythonSignalsLexical([{ path: "uni_id.py", content }]);
+    assert.ok(!result.some((s) => s.line === 1), "\u53d8\u91cf0755 must not trigger a signal");
+    assert.ok(result.some((s) => s.line === 2), "0755 is still a Py2 octal");
+  });
+
+  // `0_75` is an illegal leading-zero decimal; `0_0` is valid Python 3.
+  it("flags `0_75` as an illegal leading-zero decimal but allows `0_0`", () => {
+    const content = ["a = 0_75", "b = 0_0", "c = 00_0", ""].join("\n");
+    const lexical = detectPythonSignalsLexical([{ path: "u.py", content }]);
+    assert.ok(lexical.some((s) => s.line === 1), "lexical must flag 0_75");
+    assert.ok(!lexical.some((s) => s.line === 2), "lexical must allow 0_0");
+    assert.ok(!lexical.some((s) => s.line === 3), "lexical must allow 00_0");
+
+    const tree = parsePython(content)!;
+    try {
+      const octalLines = collectResidue(tree)
+        .filter((item) => item.kind === "octal")
+        .map((item) => item.line);
+      assert.ok(octalLines.includes(1), "AST must flag 0_75");
+      assert.ok(!octalLines.includes(2), "AST must allow 0_0");
+      assert.ok(!octalLines.includes(3), "AST must allow 00_0");
+    } finally {
+      tree.delete?.();
+    }
+  });
+
+  // PEP 440 epochs are distinct releases; exclusive comparisons must not treat
+  // `1!3.11` as the same release as `3.11`.
+  it("keeps epochs distinct for PEP 440 exclusive comparisons", () => {
+    assert.equal(classifyVersionSpecifier(">3.11,==1!3.11.post1"), "py3_compatible");
+    assert.equal(classifyVersionSpecifier("<1!3.11,==3.11rc1"), "py3_compatible");
+    assert.equal(isPy2OnlySpecifier(">3.11,==1!3.11.post1"), false);
+    assert.equal(isPy2OnlySpecifier("<1!3.11,==3.11rc1"), false);
+  });
+
+  // A narrow post-release range admits the post-release probe between its ends.
+  it("generates post-release probes for narrow post-release ranges", () => {
+    assert.equal(classifyVersionSpecifier(">3.11.post1,<3.11.post3"), "py3_compatible");
+    assert.equal(isPy2OnlySpecifier(">3.11.post1,<3.11.post3"), false);
   });
 });
