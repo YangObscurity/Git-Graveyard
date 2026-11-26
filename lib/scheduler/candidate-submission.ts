@@ -10,7 +10,8 @@ import {
   VerifiedMerge,
   isVerifiedMerge,
 } from "../git/git-service";
-import { gateJs, type GateResult } from "../grimoire/gate-js";
+import { gateJs, isPythonFile, type GateResult } from "../grimoire/gate-js";
+import { checkPythonCandidateGate } from "../grimoire/python-gate";
 import { candidateSha256FromDiff } from "../merge/candidate-hash";
 import {
   scanCandidateDiff,
@@ -971,30 +972,96 @@ export async function onSubmit(
     }
 
     const deletedList = Array.from(deletedSet);
+    const jsFileObjects = changedFileObjects.filter((f) => !isPythonFile(f.path));
+    const pyAfterObjects = changedFileObjects.filter(
+      (f): f is { path: string; content: string } =>
+        isPythonFile(f.path) && typeof f.content === "string"
+    );
+    const pyDeletedFiles = deletedList.filter((p) => isPythonFile(p));
+    const pyChangedFiles = Array.from(
+      new Set([...pyAfterObjects.map((f) => f.path), ...pyDeletedFiles])
+    );
+    const jsDeletedList = deletedList.filter((p) => !isPythonFile(p));
+
     const gateOptions = {
-      files: changedFileObjects,
-      deletions: deletedList,
-      deletedFiles: deletedList,
-      deletedPaths: deletedList,
+      files: jsFileObjects,
+      deletions: jsDeletedList,
+      deletedFiles: jsDeletedList,
+      deletedPaths: jsDeletedList,
       tree: candidateTree,
       candidateTree,
       taskId,
       diff,
-      empty: !hasModifiedFiles,
-      allowEmpty: !hasModifiedFiles,
+      empty: jsFileObjects.length === 0,
+      allowEmpty: jsFileObjects.length === 0,
     };
 
     // Always run real gateJs (Requirement 1: gateRunner removed)
-    const rawGateResult = gateJs(changedFileObjects as any, gateOptions as any);
+    const rawGateResult = gateJs(jsFileObjects as any, gateOptions as any);
     const gateResultBase: GateResult =
       typeof (rawGateResult as any)?.then === "function"
         ? await rawGateResult
         : rawGateResult;
 
+    let pyGateResult: GateResult | null = null;
+    if (pyChangedFiles.length > 0) {
+      const pyBeforeObjects: Array<{ path: string; content: string }> = [];
+      for (const pyFile of pyAfterObjects) {
+        try {
+          const baseline = await execGitShow(
+            gitService,
+            resolvedGitDir,
+            `${expectedHeadSha}:${pyFile.path}`
+          );
+          pyBeforeObjects.push({ path: pyFile.path, content: baseline });
+        } catch {
+          // Absent in expectedHeadSha => new Python file with empty baseline.
+        }
+      }
+      pyGateResult = await checkPythonCandidateGate(
+        {
+          before: pyBeforeObjects,
+          after: pyAfterObjects,
+          files: pyAfterObjects,
+          changedFiles: pyChangedFiles,
+          deletions: pyDeletedFiles,
+          tree: candidateTree,
+          candidateTree,
+        },
+        {
+          runId,
+          taskId,
+          actor: "gate",
+          emit: () => {},
+        }
+      );
+    }
+
+    const jsOk = Boolean(gateResultBase.ok);
+    const pyOk = pyGateResult ? Boolean(pyGateResult.ok) : true;
+    const mergedFiles = Array.from(
+      new Set([
+        ...(Array.isArray(gateResultBase.files) ? gateResultBase.files : []),
+        ...(pyGateResult && Array.isArray(pyGateResult.files) ? pyGateResult.files : []),
+      ])
+    );
+    const mergedReasons = [
+      ...(jsOk ? [] : (gateResultBase.reasons ?? [])),
+      ...(pyGateResult && !pyOk ? (pyGateResult.reasons ?? []) : []),
+    ];
+    const mergedDetails = {
+      ...(gateResultBase.details ?? {}),
+      ...(pyGateResult?.details ?? {}),
+    };
+
     const gateResult: GateResult = {
       ...gateResultBase,
+      ok: jsOk && pyOk,
+      reasons: mergedReasons,
+      details: mergedDetails,
+      tree: candidateTree,
       deletions: deletedList,
-      files: changedFileObjects as any,
+      files: mergedFiles,
     } as any;
 
     // Append gate.result event from real gate computation (audit N-2 HIGH)

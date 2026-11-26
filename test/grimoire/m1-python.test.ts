@@ -117,10 +117,24 @@ describe("M1 rewrite rows (Requirement 6.4-6.12, R3-8.1)", () => {
     assert.equal(applyM1(src), src);
   });
 
-  it("row 7: rewrites `unicode(...)` to `str(...)`", () => {
+  it("row 7: rewrites `unicode(...)` to `str(...)` with bytes-vs-text review note", () => {
     const res = analyzePython("x = unicode(y)\n", "a.py");
     assert.equal(res.output, "x = str(y)\n");
     assert.equal(res.edits[0].confidence, "medium");
+    const expectedNote =
+      "Py2 bytes vs text unknown: verify argument is not a Py2 byte string decoded via unicode()";
+    assert.equal(res.edits[0].note, expectedNote);
+    assert.ok(res.behaviorNotes.some((n) => n.note === expectedNote));
+  });
+
+  it("row 7: does not rewrite multi-arg unicode(b, encoding) and records unicode_decoding_ambiguous", () => {
+    const src = 'x = unicode(b, "utf-8")\n';
+    const res = analyzePython(src, "a.py");
+    assert.equal(res.output, src);
+    assert.equal(res.edits.length, 0);
+    assert.ok(
+      res.unknowns.some((u) => u.reason === "unicode_decoding_ambiguous" && u.line === 1)
+    );
   });
 
   it("row 8: rewrites iteritems/iterkeys/itervalues", () => {
@@ -172,6 +186,29 @@ describe("M1 multi-line, nested and residue handling", () => {
         "unicode_rebound"
       )
     );
+  });
+
+  it("records unicode_rebound for parameter, lambda, for/with/global bindings of unicode", () => {
+    const paramSrc = "def f(unicode):\n    return unicode(x)\n";
+    const paramRes = analyzePython(paramSrc, "a.py");
+    assert.equal(paramRes.output, paramSrc);
+    assert.ok(paramRes.unknowns.some((u) => u.reason === "unicode_rebound"));
+
+    const lambdaSrc = "fn = lambda unicode: unicode(x)\n";
+    assert.equal(analyzePython(lambdaSrc, "a.py").output, lambdaSrc);
+    assert.ok(unknownReasons(lambdaSrc).includes("unicode_rebound"));
+
+    const forSrc = "for unicode in items:\n    z = unicode(1)\n";
+    assert.equal(analyzePython(forSrc, "a.py").output, forSrc);
+    assert.ok(unknownReasons(forSrc).includes("unicode_rebound"));
+
+    const withSrc = "with ctx() as unicode:\n    z = unicode(1)\n";
+    assert.equal(analyzePython(withSrc, "a.py").output, withSrc);
+    assert.ok(unknownReasons(withSrc).includes("unicode_rebound"));
+
+    const globalSrc = "def g():\n    global unicode\n    return unicode(1)\n";
+    assert.equal(analyzePython(globalSrc, "a.py").output, globalSrc);
+    assert.ok(unknownReasons(globalSrc).includes("unicode_rebound"));
   });
 
   it("records unicode_rebound for the attribute form obj.unicode(...)", () => {
@@ -229,14 +266,48 @@ describe("M1 multi-line, nested and residue handling", () => {
 });
 
 describe("Declared Python version (Requirement 6.19)", () => {
-  it("flags Python-2-only requires-python specs", () => {
+  it("flags Python-2-only requires-python specs including !=3.* exclusions", () => {
     assert.ok(isPy2OnlySpecifier("==2.*"));
     assert.ok(isPy2OnlySpecifier("<3"));
     assert.ok(isPy2OnlySpecifier("<=2.7"));
     assert.ok(isPy2OnlySpecifier(">=2.7,<3"));
+    assert.ok(isPy2OnlySpecifier(">=2.7,!=3.*,<4"));
+    assert.ok(!isPy2OnlySpecifier(">=2.7,!=3.13.*"));
     assert.ok(!isPy2OnlySpecifier(">=3.8"));
     assert.ok(!isPy2OnlySpecifier(">=2.7,<4"));
     assert.ok(!isPy2OnlySpecifier(">=3"));
+  });
+
+  it("ignores commented requires-python/python_requires lines and reads active declarations", () => {
+    const pyproject = checkDeclaredPythonVersion([
+      {
+        path: "pyproject.toml",
+        content: [
+          "[project]",
+          '# requires-python = "<3"',
+          'description = "requires-python = \'<3\'"',
+          'requires-python = ">=3.8" # previously <3',
+          "",
+        ].join("\n"),
+      },
+    ]);
+    assert.equal(pyproject.py2Only, false);
+    assert.equal(pyproject.declared, ">=3.8");
+
+    const setupPy = checkDeclaredPythonVersion([
+      {
+        path: "setup.py",
+        content: [
+          "setup(",
+          "    # python_requires='<3',",
+          "    python_requires='>=3.8',",
+          ")",
+          "",
+        ].join("\n"),
+      },
+    ]);
+    assert.equal(setupPy.py2Only, false);
+    assert.equal(setupPy.declared, ">=3.8");
   });
 
   it("reads requires-python from pyproject.toml and python_requires from setup.py", () => {
@@ -448,6 +519,51 @@ describe("Python M1 signal detection", () => {
     assert.ok(!lines.includes(2));
     assert.ok(!lines.includes(3));
     assert.ok(result.every((s) => s.ruleId === "M1"));
+  });
+
+  it("lexical fallback preserves string state across backslash-newline continuations and skips Py3 exec (code)", () => {
+    const lfString = 's = "hello \\\nd.iteritems()"\n';
+    const crlfString = 's = "hello \\\r\nd.iteritems()"\r\n';
+    assert.equal(detectPythonSignalsLexical([{ path: "lf.py", content: lfString }]).length, 0);
+    assert.equal(detectPythonSignalsLexical([{ path: "crlf.py", content: crlfString }]).length, 0);
+
+    const py3Exec = 'exec (code)\nexec(code)\n';
+    assert.equal(detectPythonSignalsLexical([{ path: "exec3.py", content: py3Exec }]).length, 0);
+  });
+
+  it("lexical fallback detects ur/ru strings, old octals, long ints, tuple params, raise E, msg, and emits unknowns", () => {
+    const content = [
+      'a = ur"raw"',
+      "b = 0777",
+      "c = 10L",
+      'raise ValueError, "bad"',
+      "def f((a, b)):",
+      "    pass",
+      'u = unicode(raw_bytes, "utf-8")',
+      "x = 1.07",
+      "def g(p=(1, 2)):",
+      '    raise ValueError("a", "b")',
+      "",
+    ].join("\n");
+    const result = detectPythonSignalsLexical([{ path: "legacy.py", content }]);
+    const lines = result.map((s) => s.line);
+    assert.ok(lines.includes(1), "expected ur string signal on line 1");
+    assert.ok(lines.includes(2), "expected octal signal on line 2");
+    assert.ok(lines.includes(3), "expected long literal signal on line 3");
+    assert.ok(lines.includes(4), "expected raise E, msg signal on line 4");
+    assert.ok(lines.includes(5), "expected tuple param signal on line 5");
+    assert.ok(lines.includes(7), "expected unicode call signal on line 7");
+    assert.ok(!lines.includes(8), "must not flag float 1.07");
+    assert.ok(!lines.includes(9), "must not flag default tuple value p=(1, 2)");
+    assert.ok(!lines.includes(10), "must not flag Py3 raise ValueError(\"a\", \"b\")");
+
+    const py2Unknowns = result.unknowns.filter((u) => u.reason === "py2_residue");
+    assert.equal(py2Unknowns.length, 5);
+    assert.ok(
+      result.unknowns.some(
+        (u) => u.reason === "unicode_decoding_ambiguous" && u.line === 7
+      )
+    );
   });
 });
 
