@@ -144,6 +144,42 @@ describe("validateBonesetterTemplate", () => {
       /missing YAML frontmatter/
     );
   });
+
+  it("rejects a template that drops one of the eight required tools", () => {
+    const tampered = readTemplate().replace("  - ack_message\n", "");
+    assert.notEqual(tampered, readTemplate());
+    assert.throws(
+      () => validateBonesetterTemplate(tampered),
+      /tools must contain "ack_message"/
+    );
+  });
+
+  it("rejects a template missing every required tool with a per-tool error", () => {
+    const tampered = readTemplate().replace(
+      /tools:\n(?:  - .*\n)+/,
+      "tools: []\n"
+    );
+    assert.notEqual(tampered, readTemplate());
+    assert.throws(() => validateBonesetterTemplate(tampered), (err: unknown) => {
+      const message = err instanceof Error ? err.message : String(err);
+      for (const tool of [
+        "read",
+        "write",
+        "sandbox_exec",
+        "sandbox_log",
+        "report_task_result",
+        "ask",
+        "report_blocker",
+        "ack_message",
+      ]) {
+        assert.ok(
+          message.includes(`tools must contain "${tool}"`),
+          `missing error for ${tool}`
+        );
+      }
+      return true;
+    });
+  });
 });
 
 describe("isBonesetterWritablePath", () => {
@@ -262,6 +298,17 @@ describe("isBonesetterWritablePath", () => {
     assert.equal(isBonesetterWritablePath("/etc/package.json"), false);
     assert.equal(isBonesetterWritablePath(""), false);
   });
+
+  it("rejects leading/trailing whitespace instead of trimming it into an allowed name (finding [11])", () => {
+    assert.equal(isBonesetterWritablePath("package.json "), false);
+    assert.equal(isBonesetterWritablePath(" package.json"), false);
+    assert.equal(isBonesetterWritablePath("\tpackage.json"), false);
+    assert.equal(isBonesetterWritablePath("package.json\n"), false);
+    assert.equal(isBonesetterWritablePath(" yarn.lock"), false);
+    // The exact, unpadded name is still allowed.
+    assert.equal(isBonesetterWritablePath("package.json"), true);
+    assert.equal(isBonesetterWritablePath("yarn.lock"), true);
+  });
 });
 
 describe("bundleBonesetterSteeringResources", () => {
@@ -335,6 +382,61 @@ describe("bundleBonesetterSteeringResources", () => {
       assert.equal(result.files[0].fileName, "escape.md");
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a symlinked steering directory that escapes the worktree (finding [10])", () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "gg-steering-link-"));
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "gg-steering-outside-"));
+    try {
+      const worktreeDir = path.join(base, "worktree");
+      fs.mkdirSync(worktreeDir, { recursive: true });
+      // worktree/.kiro -> outside (a symlinked intermediate component)
+      fs.symlinkSync(outside, path.join(worktreeDir, ".kiro"));
+      const targetDir = path.join(worktreeDir, ".kiro", "steering");
+
+      assert.throws(
+        () =>
+          bundleBonesetterSteeringResources({
+            targetDir,
+            worktreeDir,
+            grimoireGuidance: [{ fileName: "m.md", content: "x" }],
+          }),
+        /symlink/i
+      );
+      // Nothing was written through the escaping symlink.
+      assert.equal(fs.existsSync(path.join(outside, "steering", "m.md")), false);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses to write through a symlinked steering file (finding [10])", () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "gg-steering-file-"));
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "gg-steering-file-out-"));
+    try {
+      const worktreeDir = path.join(base, "worktree");
+      const targetDir = path.join(worktreeDir, ".kiro", "steering");
+      fs.mkdirSync(targetDir, { recursive: true });
+      fs.symlinkSync(
+        path.join(outside, "evil.md"),
+        path.join(targetDir, "m.md")
+      );
+
+      assert.throws(
+        () =>
+          bundleBonesetterSteeringResources({
+            targetDir,
+            worktreeDir,
+            grimoireGuidance: [{ fileName: "m.md", content: "x" }],
+          }),
+        /symlink/i
+      );
+      assert.equal(fs.existsSync(path.join(outside, "evil.md")), false);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+      fs.rmSync(outside, { recursive: true, force: true });
     }
   });
 });
@@ -612,6 +714,33 @@ describe("prepareBonesetterSession", () => {
       assert.ok(fs.existsSync(path.join(prepared.paths.homeAgentsDir, "bonesetter.md")));
     } finally {
       fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a symlinked .kiro/steering directory that escapes the worktree (finding [10])", () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "gg-bonesetter-link-"));
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "gg-bonesetter-out-"));
+    try {
+      const worktreeDir = path.join(base, "worktree");
+      fs.mkdirSync(worktreeDir, { recursive: true });
+      // worktree/.kiro -> outside
+      fs.symlinkSync(outside, path.join(worktreeDir, ".kiro"));
+
+      assert.throws(
+        () =>
+          prepareBonesetterSession({
+            runId: "run-symlink",
+            skeletonId: "skel-symlink",
+            worktreeDir,
+            baseDir: path.join(base, "runs"),
+            grimoireGuidance: [{ fileName: "m1.md", content: "escape" }],
+          }),
+        /symlink/i
+      );
+      assert.equal(fs.existsSync(path.join(outside, "steering", "m1.md")), false);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+      fs.rmSync(outside, { recursive: true, force: true });
     }
   });
 });
