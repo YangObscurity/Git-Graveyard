@@ -2006,8 +2006,8 @@ describe("Work package G01a: Rule 4 - Planner specs/ only (no spec/ prefix match
   });
 });
 
-describe("Work package G01a: Rule 5 - Bonesetter manifest/lock root only & setup.py removed", () => {
-  it("Bonesetter manifest and lock names are matched only at cwd root and setup.py is removed", () => {
+describe("Work package G01a / Wave-20A finding [21]: Bonesetter exact 10-file cwd-root scope", () => {
+  it("Bonesetter writes only the exact ten shared manifest/lock names at cwd root; broker-only names are rejected", () => {
     const cwd = "/workspace/repo";
 
     // setup.py is removed from write list: rejected at root
@@ -2025,17 +2025,19 @@ describe("Work package G01a: Rule 5 - Bonesetter manifest/lock root only & setup
     assert.equal(setupPy.rule, "reject_fs_write_outside_scope");
     assert.equal(MANIFEST_LOCK_FILENAMES.has("setup.py"), false);
 
-    // Other manifest and lock names at cwd root are allowed
+    // Only the exact ten-name intersection shared with the Bonesetter tool
+    // boundary is allowed at the cwd root.
     for (const validManifest of [
       "package.json",
       "package-lock.json",
-      "requirements.txt",
+      "npm-shrinkwrap.json",
+      "yarn.lock",
+      "pnpm-lock.yaml",
+      "poetry.lock",
+      "pipfile",
+      "pipfile.lock",
       "pyproject.toml",
-      "setup.cfg",
-      "cargo.toml",
-      "cargo.lock",
-      "go.mod",
-      "go.sum",
+      "requirements.txt",
     ]) {
       const res = decide({
         role: "Bonesetter",
@@ -2049,6 +2051,32 @@ describe("Work package G01a: Rule 5 - Bonesetter manifest/lock root only & setup
       });
       assert.equal(res.optionKind, "allow_once");
       assert.equal(res.rule, "allow_fs_write_scope");
+    }
+
+    // Broker-only names that are NOT part of the shared Bonesetter boundary are
+    // rejected even at the cwd root (finding [21]).
+    for (const brokerOnly of [
+      "setup.cfg",
+      "cargo.toml",
+      "cargo.lock",
+      "go.mod",
+      "go.sum",
+      "gemfile",
+      "gemfile.lock",
+      "requirements-dev.txt",
+    ]) {
+      const res = decide({
+        role: "Bonesetter",
+        cwd,
+        capability: "fs_write",
+        target: brokerOnly,
+        options: [
+          { optionId: "a", kind: "allow_once" },
+          { optionId: "r", kind: "reject_once" },
+        ],
+      });
+      assert.equal(res.optionKind, "reject_once", `${brokerOnly} must be rejected`);
+      assert.equal(res.rule, "reject_fs_write_outside_scope");
     }
 
     // Manifest files in subdirectories are rejected (root only)

@@ -208,6 +208,71 @@ export function parsePython(source: string): Tree | null {
 }
 
 // ---------------------------------------------------------------------------
+// Index units (byte offset vs UTF-16 code unit)
+// ---------------------------------------------------------------------------
+//
+// `web-tree-sitter` may report `Node.startIndex` / `Node.endIndex` either as
+// UTF-16 code-unit offsets (the values `String.prototype.slice` expects) or as
+// UTF-8 byte offsets, depending on the binding version. When the reported
+// offsets are bytes and the source contains multi-byte characters (Chinese
+// comments, emoji like 🐍, ...) a JS `String.slice` with them is corrupted.
+// `byteOffsetToUtf16` builds an O(N) lookup table so byte offsets can be mapped
+// back to the UTF-16 code-unit indices used by JavaScript strings.
+
+/** Builds an O(N) byte-offset -> UTF-16 code-unit index mapper for `source`. */
+export function byteOffsetToUtf16(source: string): (byteOffset: number) => number {
+  const byteLength = Buffer.byteLength(source, "utf8");
+  const table = new Int32Array(byteLength + 1);
+  let byte = 0;
+  let index = 0;
+  while (index < source.length) {
+    const code = source.charCodeAt(index);
+    let width = 1;
+    let units = 1;
+    if (code < 0x80) {
+      width = 1;
+    } else if (code < 0x800) {
+      width = 2;
+    } else if (code >= 0xd800 && code <= 0xdbff && index + 1 < source.length) {
+      // Surrogate pair (e.g. emoji): 4 UTF-8 bytes, 2 UTF-16 code units.
+      width = 4;
+      units = 2;
+    } else {
+      width = 3;
+    }
+    for (let b = 0; b < width; b++) {
+      table[byte + b] = index;
+    }
+    byte += width;
+    index += units;
+  }
+  table[byte] = source.length;
+  return (byteOffset: number): number => {
+    if (byteOffset <= 0) return 0;
+    if (byteOffset >= byteLength) return source.length;
+    return table[byteOffset];
+  };
+}
+
+/**
+ * Returns a mapper that normalizes the index unit reported by a parsed tree to
+ * UTF-16 code units. It is the identity function when the binding already
+ * reports UTF-16 offsets (the observed behavior for web-tree-sitter 0.27.1) or
+ * when the source is pure ASCII (both units agree).
+ */
+function makeIndexMapper(tree: Tree, source: string): (index: number) => number {
+  if (source.length === Buffer.byteLength(source, "utf8")) {
+    return (index) => index;
+  }
+  // The root node spans the whole document: in UTF-16 mode its end index equals
+  // the JS string length, whereas in byte mode it equals the UTF-8 byte length.
+  if (tree.rootNode.endIndex <= source.length) {
+    return (index) => index;
+  }
+  return byteOffsetToUtf16(source);
+}
+
+// ---------------------------------------------------------------------------
 // Generic AST helpers
 // ---------------------------------------------------------------------------
 
@@ -240,6 +305,15 @@ function exceptValueCount(node: Node): number {
     if (node.fieldNameForChild(i) === "value") count += 1;
   }
   return count;
+}
+
+/** Collects the `value` children of an `except_clause` in source order. */
+function exceptValues(node: Node): Node[] {
+  const values: Node[] = [];
+  for (let i = 0; i < node.childCount; i++) {
+    if (node.fieldNameForChild(i) === "value") values.push(node.child(i)!);
+  }
+  return values;
 }
 
 function positionalArgumentCount(call: Node): number {
@@ -294,6 +368,7 @@ const UNHANDLED_RESIDUE_KINDS = new Set([
   "long",
   "tuple_param",
   "raise_statement",
+  "except_target_unsupported",
 ]);
 
 // ---------------------------------------------------------------------------
@@ -346,8 +421,17 @@ function classifyResidue(node: Node): string | null {
       return "not_equal";
     case "raise_statement":
       return hasChildOfType(node, "expression_list") ? "raise_statement" : null;
-    case "except_clause":
-      return exceptValueCount(node) >= 2 ? "except_clause" : null;
+    case "except_clause": {
+      if (exceptValueCount(node) < 2) return null;
+      const values = exceptValues(node);
+      // `except E, e:` (identifier target) is the only form M1 rewrites to
+      // `except E as e:`. Tuple / attribute / subscript targets are valid in
+      // Python 2 but a SyntaxError under `except E as (<target>):` in Python 3,
+      // so they are left unrewritten and surfaced as unhandled residue.
+      return values[1] && values[1].type === "identifier"
+        ? "except_clause"
+        : "except_target_unsupported";
+    }
     case "expression_statement": {
       if (
         node.childCount === 1 &&
@@ -568,7 +652,8 @@ function hasFuturePrint(tree: Tree): boolean {
 
 function buildPrintStatementEdit(
   node: Node,
-  source: string
+  source: string,
+  toUtf16: (index: number) => number
 ): PythonPlannedEdit | null {
   const printKeyword = node.child(0);
   if (!printKeyword || printKeyword.type !== "print") return null;
@@ -587,8 +672,8 @@ function buildPrintStatementEdit(
   const fileTarget = chevron ? chevron.text.slice(2) : "";
 
   const head: PythonSplice = {
-    start: printKeyword.endIndex,
-    end: args[0].startIndex,
+    start: toUtf16(printKeyword.endIndex),
+    end: toUtf16(args[0].startIndex),
     replacement: "(",
   };
 
@@ -599,8 +684,8 @@ function buildPrintStatementEdit(
 
   if (trailingComma) {
     tail = {
-      start: lastChild!.startIndex,
-      end: node.endIndex,
+      start: toUtf16(lastChild!.startIndex),
+      end: toUtf16(node.endIndex),
       replacement: `, end=" "` + (chevron ? `, file=${fileTarget})` : ")"),
     };
     confidence = "medium";
@@ -608,8 +693,8 @@ function buildPrintStatementEdit(
     note = "Py2 softspace output is not identical";
   } else {
     tail = {
-      start: node.endIndex,
-      end: node.endIndex,
+      start: toUtf16(node.endIndex),
+      end: toUtf16(node.endIndex),
       replacement: chevron ? `, file=${fileTarget})` : ")",
     };
     confidence = "high";
@@ -704,13 +789,14 @@ export function planFromTree(
 ): PythonPlan {
   const hasFuture = hasFuturePrint(tree);
   const unicodeBound = collectBoundNames(tree).has("unicode");
+  const toUtf16 = makeIndexMapper(tree, source);
   const edits: PythonPlannedEdit[] = [];
   const unknowns: UnknownRecord[] = [];
   const behaviorNotes: PythonBehaviorNote[] = [];
 
   walkNodes(tree.rootNode, (node) => {
     if (node.type === "print_statement") {
-      const edit = buildPrintStatementEdit(node, source);
+      const edit = buildPrintStatementEdit(node, source, toUtf16);
       if (edit) {
         edits.push(edit);
         if (edit.note) {
@@ -730,41 +816,46 @@ export function planFromTree(
         node.child(0)?.type === "identifier" &&
         node.child(0)?.text === "print"
       ) {
+        const bareStart = toUtf16(node.startIndex);
+        const bareEnd = toUtf16(node.endIndex);
         edits.push({
           ruleId: "M1",
           ruleOrder: M1_ROW.BARE_PRINT,
           line: lineOf(node),
           confidence: "high",
           description: "bare print -> print()",
-          start: node.startIndex,
-          end: node.endIndex,
+          start: bareStart,
+          end: bareEnd,
           replacement: "print()",
           splices: [
-            { start: node.startIndex, end: node.endIndex, replacement: "print()" },
+            { start: bareStart, end: bareEnd, replacement: "print()" },
           ],
         });
       }
       return;
     }
     if (node.type === "except_clause") {
-      const values: Node[] = [];
-      for (let i = 0; i < node.childCount; i++) {
-        if (node.fieldNameForChild(i) === "value") values.push(node.child(i)!);
-      }
-      if (values.length >= 2) {
+      const values = exceptValues(node);
+      // Only `except E, e:` with an identifier target rewrites to `except E as e:`.
+      // Tuple / attribute / subscript targets produce a SyntaxError under
+      // `except E as (<target>):`, so they are left for manual review (and are
+      // recorded as unhandled `py2_residue` through the residue list).
+      if (values.length >= 2 && values[1].type === "identifier") {
         const first = values[0];
         const second = values[1];
+        const exceptStart = toUtf16(first.endIndex);
+        const exceptEnd = toUtf16(second.startIndex);
         edits.push({
           ruleId: "M1",
           ruleOrder: M1_ROW.EXCEPT,
           line: lineOf(node),
           confidence: "high",
           description: "except E, e: -> except E as e:",
-          start: first.endIndex,
-          end: second.startIndex,
+          start: exceptStart,
+          end: exceptEnd,
           replacement: " as ",
           splices: [
-            { start: first.endIndex, end: second.startIndex, replacement: " as " },
+            { start: exceptStart, end: exceptEnd, replacement: " as " },
           ],
         });
       }
@@ -796,7 +887,17 @@ export function planFromTree(
           });
           return;
         }
-        if (totalArgumentCount(node) >= 2) {
+        const argsNode = node.childForFieldName("arguments");
+        const hasKeywordArgument =
+          !!argsNode &&
+          argsNode.namedChildren.some(
+            (arg) => arg.type === "keyword_argument"
+          );
+        // `unicode(bytes, encoding, errors)` and `unicode(encoding="utf-8")`
+        // both change meaning/arity when rewritten to `str(...)`: Python 3
+        // `str()` takes no `encoding=` keyword (TypeError). Keep them
+        // unrewritten and flag the decoding as ambiguous.
+        if (totalArgumentCount(node) >= 2 || hasKeywordArgument) {
           unknowns.push({
             ruleId: "M1",
             reason: "unicode_decoding_ambiguous",
@@ -807,6 +908,8 @@ export function planFromTree(
         }
         const reviewNote =
           "Py2 bytes vs text unknown: verify argument is not a Py2 byte string decoded via unicode()";
+        const unicodeStart = toUtf16(fn.startIndex);
+        const unicodeEnd = toUtf16(fn.endIndex);
         edits.push({
           ruleId: "M1",
           ruleOrder: M1_ROW.UNICODE,
@@ -814,11 +917,11 @@ export function planFromTree(
           confidence: "medium",
           description: "unicode(...) -> str(...)",
           note: reviewNote,
-          start: fn.startIndex,
-          end: fn.endIndex,
+          start: unicodeStart,
+          end: unicodeEnd,
           replacement: "str",
           splices: [
-            { start: fn.startIndex, end: fn.endIndex, replacement: "str" },
+            { start: unicodeStart, end: unicodeEnd, replacement: "str" },
           ],
         });
         behaviorNotes.push({
@@ -852,19 +955,21 @@ export function planFromTree(
           return;
         }
         const attrNode = fn.childForFieldName("attribute")!;
+        const iterStart = toUtf16(attrNode.startIndex);
+        const iterEnd = toUtf16(attrNode.endIndex);
         edits.push({
           ruleId: "M1",
           ruleOrder: M1_ROW.ITERATOR,
           line: lineOf(node),
           confidence: "medium",
           description: `.${attr}() -> .${ITERATOR_MAP[attr]}()`,
-          start: attrNode.startIndex,
-          end: attrNode.endIndex,
+          start: iterStart,
+          end: iterEnd,
           replacement: ITERATOR_MAP[attr],
           splices: [
             {
-              start: attrNode.startIndex,
-              end: attrNode.endIndex,
+              start: iterStart,
+              end: iterEnd,
               replacement: ITERATOR_MAP[attr],
             },
           ],
@@ -910,7 +1015,11 @@ export function planPythonEdits(
 ): PythonPlan | null {
   const tree = parsePython(source);
   if (!tree) return null;
-  return planFromTree(tree, source, file);
+  try {
+    return planFromTree(tree, source, file);
+  } finally {
+    tree.delete?.();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -982,34 +1091,112 @@ export function createPythonDiff(
 // Declared Python version (halt M1 on Python-2-only declarations)
 // ---------------------------------------------------------------------------
 
+export type DeclaredPythonStatus = "py2_only" | "py3_compatible" | "unknown";
+
 export interface DeclaredPythonVersion {
   py2Only: boolean;
   declared?: string;
   path?: string;
   reason?: string;
+  /** The classified status of `declared` (see `classifyVersionSpecifier`). */
+  declaredStatus?: DeclaredPythonStatus;
 }
 
-function parseVersionParts(value: string): number[] {
-  return value
-    .split(".")
-    .map((part) => parseInt(part, 10))
-    .filter((part) => !Number.isNaN(part));
+interface ParsedVersion {
+  epoch: number;
+  release: number[];
+  pre: { stage: "a" | "b" | "rc"; num: number } | null;
+  post: number | null;
+  dev: number | null;
 }
 
-function compareVersions(a: number[], b: number[]): number {
-  const length = Math.max(a.length, b.length);
+/**
+ * Parses a PEP 440 version (or a plain dotted release) into comparable parts.
+ * Supports the epoch (`N!`), a release segment, pre-releases (`aN`, `bN`,
+ * `rcN`, `alpha`, `beta`, `pre`, `preview`), `.postN` (`rev`, `r`), and
+ * `.devN` suffixes. Returns null when the value is not a valid version.
+ */
+function parsePep440(value: string): ParsedVersion | null {
+  const match = value
+    .trim()
+    .match(
+      /^(?:(\d+)!)?(\d+(?:\.\d+)*)(?:[-_.]?(a|b|rc|alpha|beta|pre|preview)[-_.]?(\d*))?(?:[-_.]?(?:post|rev|r)[-_.]?(\d*))?(?:[-_.]?dev[-_.]?(\d*))?$/i
+    );
+  if (!match) return null;
+  const release = match[2].split(".").map((part) => parseInt(part, 10));
+  if (release.some((part) => Number.isNaN(part))) return null;
+  const stageRaw = match[3]?.toLowerCase();
+  const pre = stageRaw
+    ? {
+        stage: (stageRaw === "a" || stageRaw === "alpha"
+          ? "a"
+          : stageRaw === "b" || stageRaw === "beta"
+          ? "b"
+          : "rc") as "a" | "b" | "rc",
+        num: match[4] ? parseInt(match[4], 10) : 0,
+      }
+    : null;
+  return {
+    epoch: match[1] ? parseInt(match[1], 10) : 0,
+    release,
+    pre,
+    post: match[5] !== undefined ? parseInt(match[5] || "0", 10) : null,
+    dev: match[6] !== undefined ? parseInt(match[6] || "0", 10) : null,
+  };
+}
+
+/**
+ * PEP 440 suffix ordering: a `.devN`-only release sorts lowest, then `a` < `b`
+ * < `rc`, then the final release, then `.postN`.
+ */
+function pep440SuffixKey(version: ParsedVersion): number[] {
+  if (version.pre) {
+    const rank = version.pre.stage === "a" ? 0 : version.pre.stage === "b" ? 1 : 2;
+    return [rank, version.pre.num, version.dev !== null ? -1 : 0, version.post !== null ? 1 : 0];
+  }
+  if (version.post !== null) return [4, version.post, version.dev !== null ? -1 : 0, 0];
+  if (version.dev !== null) return [-1, version.dev, 0, 0];
+  return [3, 0, 0, 0];
+}
+
+function compareParsedVersions(a: ParsedVersion, b: ParsedVersion): number {
+  if (a.epoch !== b.epoch) return a.epoch < b.epoch ? -1 : 1;
+  const length = Math.max(a.release.length, b.release.length);
   for (let i = 0; i < length; i++) {
-    const left = a[i] ?? 0;
-    const right = b[i] ?? 0;
+    const left = a.release[i] ?? 0;
+    const right = b.release[i] ?? 0;
     if (left !== right) return left < right ? -1 : 1;
+  }
+  const keyA = pep440SuffixKey(a);
+  const keyB = pep440SuffixKey(b);
+  for (let i = 0; i < keyA.length; i++) {
+    if (keyA[i] !== keyB[i]) return keyA[i] < keyB[i] ? -1 : 1;
   }
   return 0;
 }
 
+function toParsedVersion(release: number[]): ParsedVersion {
+  return { epoch: 0, release, pre: null, post: null, dev: null };
+}
+
 interface ParsedClause {
   op: string;
-  parts: number[];
+  version: ParsedVersion;
   star: boolean;
+}
+
+function parseClause(clause: string): ParsedClause | null {
+  let text = clause.trim();
+  let star = false;
+  if (text.endsWith(".*")) {
+    star = true;
+    text = text.slice(0, -2);
+  }
+  const opMatch = text.match(/^(==|!=|>=|<=|~=|>|<)?\s*(.+)$/);
+  if (!opMatch) return null;
+  const version = parsePep440(opMatch[2]);
+  if (!version) return null;
+  return { op: opMatch[1] ?? "==", version, star };
 }
 
 function prefixMatches(version: number[], prefix: number[]): boolean {
@@ -1019,29 +1206,32 @@ function prefixMatches(version: number[], prefix: number[]): boolean {
   return true;
 }
 
-function versionMatchesClause(version: number[], clause: ParsedClause): boolean {
-  const { op, parts, star } = clause;
+function versionMatchesClause(version: ParsedVersion, clause: ParsedClause): boolean {
+  const { op, version: spec, star } = clause;
   switch (op) {
     case "==":
       return star
-        ? prefixMatches(version, parts)
-        : compareVersions(version, parts) === 0;
+        ? prefixMatches(version.release, spec.release)
+        : compareParsedVersions(version, spec) === 0;
     case "!=":
       return star
-        ? !prefixMatches(version, parts)
-        : compareVersions(version, parts) !== 0;
+        ? !prefixMatches(version.release, spec.release)
+        : compareParsedVersions(version, spec) !== 0;
     case ">=":
-      return compareVersions(version, parts) >= 0;
+      return compareParsedVersions(version, spec) >= 0;
     case ">":
-      return compareVersions(version, parts) > 0;
+      return compareParsedVersions(version, spec) > 0;
     case "<=":
-      return compareVersions(version, parts) <= 0;
+      return compareParsedVersions(version, spec) <= 0;
     case "<":
-      return compareVersions(version, parts) < 0;
+      return compareParsedVersions(version, spec) < 0;
     case "~=": {
-      if (compareVersions(version, parts) < 0) return false;
-      const prefix = parts.length > 1 ? parts.slice(0, parts.length - 1) : parts;
-      return prefixMatches(version, prefix);
+      if (compareParsedVersions(version, spec) < 0) return false;
+      const prefix =
+        spec.release.length > 1
+          ? spec.release.slice(0, spec.release.length - 1)
+          : spec.release;
+      return prefixMatches(version.release, prefix);
     }
     default:
       return false;
@@ -1065,53 +1255,61 @@ const PY3_CANDIDATE_VERSIONS: number[][] = (() => {
   return versions;
 })();
 
-/** Returns true when the specifier admits no Python 3 version (or cannot be safely evaluated). */
-export function isPy2OnlySpecifier(specifier: string): boolean {
+/**
+ * Classifies a `requires-python` / `python_requires` specifier:
+ * - `py2_only`: admits a Python 2 version and no Python 3 version.
+ * - `py3_compatible`: admits at least one Python 3 version.
+ * - `unknown`: the specifier cannot be parsed/evaluated (e.g. malformed), so
+ *   callers should stay conservative and halt M1.
+ */
+export function classifyVersionSpecifier(specifier: string): DeclaredPythonStatus {
   const clauses = specifier
     .split(",")
     .map((clause) => clause.trim())
     .filter((clause) => clause.length > 0);
-  if (clauses.length === 0) return false;
+  if (clauses.length === 0) return "unknown";
 
   const parsed: ParsedClause[] = [];
   for (const clause of clauses) {
-    const match = clause.match(
-      /^(==|!=|>=|<=|~=|>|<)?\s*([0-9]+(?:\.[0-9]+)*)(\.\*)?$/
-    );
-    if (!match) {
-      return true;
+    const parsedClause = parseClause(clause);
+    if (!parsedClause) return "unknown";
+    if (parsedClause.star && parsedClause.op !== "==" && parsedClause.op !== "!=") {
+      return "unknown";
     }
-    const op = match[1] ?? "==";
-    const version = match[2];
-    const star = !!match[3];
-    if (star && op !== "==" && op !== "!=") {
-      return true;
-    }
-    parsed.push({ op, parts: parseVersionParts(version), star });
+    parsed.push(parsedClause);
   }
 
-  const satisfiesAll = (v: number[]) =>
-    parsed.every((clause) => versionMatchesClause(v, clause));
+  const satisfiesAll = (version: ParsedVersion) =>
+    parsed.every((clause) => versionMatchesClause(version, clause));
 
   // Sparsely sampling the fixed candidate arrays cannot represent every narrow
-  // pin (for example `==2.7.5`, `>=2.7.5, <=2.7.10`, or `==3.9.7`). Derive
-  // additional probes from the parsed clauses themselves so exact and narrow
-  // Python 2 or Python 3 specifiers are classified against real versions.
-  const py2Probes: number[][] = [...PY2_CANDIDATE_VERSIONS];
-  const py3Probes: number[][] = [...PY3_CANDIDATE_VERSIONS];
+  // pin (for example `==2.7.5`, `>=2.7.5, <=2.7.10`, `==3.9.7`, or a
+  // pre-release pin such as `>=3.13.0rc1`). Derive additional probes from the
+  // parsed clauses themselves so exact, narrow, and PEP 440 pre-release
+  // specifiers are classified against real versions.
+  const py2Probes: ParsedVersion[] = PY2_CANDIDATE_VERSIONS.map(toParsedVersion);
+  const py3Probes: ParsedVersion[] = PY3_CANDIDATE_VERSIONS.map(toParsedVersion);
   for (const clause of parsed) {
-    const p0 = clause.parts[0];
+    const release = clause.version.release;
+    const p0 = release[0];
     if (p0 !== 2 && p0 !== 3) continue;
-    const p1 = clause.parts[1] ?? 0;
-    const p2 = clause.parts[2] ?? 0;
+    const p1 = release[1] ?? 0;
+    const p2 = release[2] ?? 0;
     const target = p0 === 2 ? py2Probes : py3Probes;
-    target.push([p0, p1, p2]);
-    target.push([p0, p1, p2 + 1]);
-    target.push([p0, p1, Math.max(0, p2 - 1)]);
+    target.push(clause.version);
+    target.push(toParsedVersion([p0, p1, p2]));
+    target.push(toParsedVersion([p0, p1, p2 + 1]));
+    target.push(toParsedVersion([p0, p1, Math.max(0, p2 - 1)]));
   }
 
-  if (py3Probes.some(satisfiesAll)) return false;
-  return py2Probes.some(satisfiesAll);
+  if (py3Probes.some(satisfiesAll)) return "py3_compatible";
+  if (py2Probes.some(satisfiesAll)) return "py2_only";
+  return "unknown";
+}
+
+/** Returns true when the specifier admits no Python 3 version (or cannot be safely evaluated). */
+export function isPy2OnlySpecifier(specifier: string): boolean {
+  return classifyVersionSpecifier(specifier) !== "py3_compatible";
 }
 
 function extractSpecifier(content: string, keyword: string): string | undefined {
@@ -1214,11 +1412,19 @@ export function checkDeclaredPythonVersion(
       spec = extractSpecifier(manifest.content, "python_requires");
     }
     if (spec) {
+      const declaredStatus = classifyVersionSpecifier(spec);
       return {
-        py2Only: isPy2OnlySpecifier(spec),
+        // `unknown` (unparseable) specifiers stay conservative and halt M1.
+        py2Only: declaredStatus !== "py3_compatible",
         declared: spec,
         path: normalizeFilePath(manifest.path),
-        reason: "py2_only_declared",
+        declaredStatus,
+        reason:
+          declaredStatus === "py2_only"
+            ? "py2_only_declared"
+            : declaredStatus === "unknown"
+            ? "version_specifier_unparseable"
+            : "py3_compatible_declared",
       };
     }
   }
@@ -1333,63 +1539,71 @@ export function analyzePython(
     return emptyResult(source, file, bom, newline, "parse_timeout", unknowns);
   }
 
-  const plan = planFromTree(tree, body, file);
-  for (const unknown of plan.unknowns) unknowns.push(unknown);
+  // The source tree and the re-parsed output tree both own WASM memory. Read
+  // everything needed into plain data, then release both trees in `finally`.
+  let outputTree: Tree | null = null;
+  try {
+    const plan = planFromTree(tree, body, file);
+    for (const unknown of plan.unknowns) unknowns.push(unknown);
 
-  const outputBody = applyEditsToOriginal(body, plan.edits);
-  const output = (bom ? "\uFEFF" : "") + outputBody;
-  const residueBefore = countPythonResidue(tree);
-  const outputTree = parsePython(outputBody);
-  const residueAfter = outputTree
-    ? countPythonResidue(outputTree)
-    : residueBefore;
-  const label: "m1-clean" | "m1-partial" =
-    residueAfter === 0 ? "m1-clean" : "m1-partial";
+    const outputBody = applyEditsToOriginal(body, plan.edits);
+    const output = (bom ? "\uFEFF" : "") + outputBody;
+    const residueBefore = countPythonResidue(tree);
+    outputTree = parsePython(outputBody);
+    const residueAfter = outputTree
+      ? countPythonResidue(outputTree)
+      : residueBefore;
+    const label: "m1-clean" | "m1-partial" =
+      residueAfter === 0 ? "m1-clean" : "m1-partial";
 
-  const planned = [...plan.edits, ...plan.conflicts];
-  const reverted = planned.length > 0 && plan.edits.length === 0;
-  const diff =
-    plan.edits.length > 0 ? createPythonDiff(source, output, file) : "";
-  const notes = plan.behaviorNotes.map((item) => item.note).join("; ");
+    const planned = [...plan.edits, ...plan.conflicts];
+    const reverted = planned.length > 0 && plan.edits.length === 0;
+    const diff =
+      plan.edits.length > 0 ? createPythonDiff(source, output, file) : "";
+    const notes = plan.behaviorNotes.map((item) => item.note).join("; ");
 
-  const step: PatchStep = {
-    id: `M1:${file}`,
-    ruleId: "M1",
-    file,
-    diff,
-    hunks: countHunks(diff),
-    compat: false,
-    behavior: notes ? "changed" : "preserved",
-    notes: notes || undefined,
-    reverted,
-    revertReason: reverted ? "all_edits_rejected" : undefined,
-    acceptedEdits: plan.edits.length,
-    acceptedEditsCount: plan.edits.length,
-    edits: planned,
-    plannedEdits: planned,
-  };
+    const step: PatchStep = {
+      id: `M1:${file}`,
+      ruleId: "M1",
+      file,
+      diff,
+      hunks: countHunks(diff),
+      compat: false,
+      behavior: notes ? "changed" : "preserved",
+      notes: notes || undefined,
+      reverted,
+      revertReason: reverted ? "all_edits_rejected" : undefined,
+      acceptedEdits: plan.edits.length,
+      acceptedEditsCount: plan.edits.length,
+      edits: planned,
+      plannedEdits: planned,
+    };
 
-  return {
-    file,
-    source,
-    output,
-    bom,
-    newline,
-    edits: planned,
-    acceptedEdits: plan.edits,
-    conflicts: plan.conflicts,
-    unknowns,
-    behaviorNotes: plan.behaviorNotes,
-    residueBefore,
-    residueAfter,
-    label,
-    reverted,
-    revertReason: reverted ? "all_edits_rejected" : undefined,
-    compat: false,
-    notes,
-    diff,
-    step,
-  };
+    return {
+      file,
+      source,
+      output,
+      bom,
+      newline,
+      edits: planned,
+      acceptedEdits: plan.edits,
+      conflicts: plan.conflicts,
+      unknowns,
+      behaviorNotes: plan.behaviorNotes,
+      residueBefore,
+      residueAfter,
+      label,
+      reverted,
+      revertReason: reverted ? "all_edits_rejected" : undefined,
+      compat: false,
+      notes,
+      diff,
+      step,
+    };
+  } finally {
+    tree.delete?.();
+    outputTree?.delete?.();
+  }
 }
 
 export function transformPython(

@@ -509,6 +509,15 @@ export interface StreamDiskLoggerOptions {
    * arbitrary value). Merged with any `redactionOptions.secrets`.
    */
   secrets?: readonly string[];
+  /**
+   * Trusted base directory the log path must stay strictly inside (finding [5]).
+   * When set, `createStreamDiskLogger` refuses a symlink at the log path or at any
+   * intermediate component between this base and the log path, and asserts the
+   * resolved parent directory stays within the base's realpath. Nothing outside
+   * the boundary is ever opened or written. `baseDir` is accepted as an alias.
+   */
+  trustedBaseDir?: string;
+  baseDir?: string;
 }
 
 export interface StreamDiskLogger {
@@ -523,6 +532,46 @@ export interface StreamDiskLogger {
   readonly ok: boolean;
   /** Returns the first/last disk write failure, or null when logging succeeded. */
   getLastError(): Error | null;
+}
+
+/** True when the path exists and is itself a symlink (never follows the link). */
+function isSymlinkPath(target: string): boolean {
+  try {
+    return fs.lstatSync(target).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+/** True when target is inside base or equal to it (lexical, after resolving). */
+function isInsideDir(base: string, target: string): boolean {
+  const rel = path.relative(base, target);
+  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+}
+
+/**
+ * Realpath of the deepest existing ancestor of `target`, with the non-existent
+ * tail rejoined, so a not-yet-created log directory still yields a real absolute
+ * path that can be compared against a trusted base.
+ */
+function realpathOfExistingPrefix(target: string): string {
+  let current = path.resolve(target);
+  const tail: string[] = [];
+  while (!fs.existsSync(current)) {
+    const parent = path.dirname(current);
+    if (parent === current) {
+      break;
+    }
+    tail.unshift(path.basename(current));
+    current = parent;
+  }
+  let real: string;
+  try {
+    real = fs.realpathSync(current);
+  } catch {
+    real = current;
+  }
+  return tail.length > 0 ? path.join(real, ...tail) : real;
 }
 
 /**
@@ -544,8 +593,69 @@ export function createStreamDiskLogger(
     if (fd !== null) {
       return;
     }
-    fs.mkdirSync(path.dirname(logFilePath), { recursive: true });
+    const dir = path.dirname(logFilePath);
+    const trustedBase = options?.trustedBaseDir ?? options?.baseDir;
+
+    // Finding [5]: refuse a symlink at the log file itself. `openSync` follows
+    // symlinks, so this check must happen BEFORE anything is opened.
+    if (isSymlinkPath(logFilePath)) {
+      throw new Error(
+        `refusing to write the headless stream log through the symlink at ${logFilePath}`
+      );
+    }
+
+    if (trustedBase && trustedBase.length > 0) {
+      const base = path.resolve(trustedBase);
+      const target = path.resolve(logFilePath);
+      if (!isInsideDir(base, target)) {
+        throw new Error(
+          `headless stream log path ${target} is outside the trusted base ${base}`
+        );
+      }
+      // Refuse a symlink at the base or at any intermediate component between the
+      // base and the log file, so a symlinked `.kiro`/worktree subdir cannot
+      // redirect the write outside the boundary.
+      let current = base;
+      if (isSymlinkPath(current)) {
+        throw new Error(`refusing a symlinked trusted base ${current}`);
+      }
+      const rel = path.relative(base, dir);
+      for (const segment of rel.split(path.sep).filter((s) => s.length > 0)) {
+        current = path.join(current, segment);
+        if (isSymlinkPath(current)) {
+          throw new Error(
+            `refusing to write the headless stream log through the symlink at ${current}`
+          );
+        }
+      }
+      fs.mkdirSync(dir, { recursive: true });
+      // Containment: the RESOLVED parent directory must stay strictly within the
+      // RESOLVED trusted base (a symlink swapped in after the checks is caught).
+      const realBase = realpathOfExistingPrefix(base);
+      const realDir = fs.realpathSync(dir);
+      if (!isInsideDir(realBase, realDir)) {
+        throw new Error(
+          `headless stream log directory ${realDir} escapes the trusted base ${realBase}`
+        );
+      }
+    } else {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+
     fd = fs.openSync(logFilePath, "a");
+    // Guard the open-to-use window: if the path became a symlink between the
+    // check above and `openSync`, close immediately instead of writing through it.
+    if (isSymlinkPath(logFilePath)) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // Ignore
+      }
+      fd = null;
+      throw new Error(
+        `refusing to write the headless stream log through the symlink at ${logFilePath}`
+      );
+    }
   };
 
   const write = (text: string): void => {

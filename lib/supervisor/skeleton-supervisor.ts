@@ -27,12 +27,12 @@ import {
   SkeletonRole,
 } from "./model-allowlist";
 import {
-  buildSkeletonEnv,
   provisionSkeletonEnvironment,
   resolveSkeletonPaths,
   SkeletonPaths,
 } from "./skeleton-env";
 import { BudgetCapTracker, type BudgetCapSnapshot } from "./budget-caps";
+import { HeadlessFallbackChannel } from "../acp/headless-fallback";
 import type {
   ChildProcessLike,
   ExecutionChannel,
@@ -745,55 +745,30 @@ export class SkeletonSupervisor extends EventEmitter {
     this.promptPending = true;
 
     try {
-      // Requirements 17.2, 17.4: Headless Fallback execution channel
+      // Requirements 17.2, 17.3, 17.4 / finding [2]: the Headless Fallback
+      // execution is delegated ENTIRELY to HeadlessFallbackChannel. The channel
+      // streams stdout to disk (`headless-stream.jsonl`) BEFORE parsing, maps the
+      // exit code, verifies the active model against the allowlist, handles
+      // approval resumes via `--resume-id`, and auto-denies every `ask` during
+      // live streaming (failing closed when the required hook rejects).
       if (this.executionChannel === "Headless_Fallback") {
-        const modelId = this.verifiedModelId ?? getAssignedModelForRole(this.role, { hard: this.options.hard });
-        const args = [
-          "chat",
-          "--v3",
-          "--no-interactive",
-          "--agent",
-          String(this.role),
-          "--model",
-          String(modelId),
-          "--require-mcp-startup",
-          "--output-format",
-          "stream-json",
-        ];
-        if (this.options.gatewayToolIds && this.options.gatewayToolIds.length > 0) {
-          args.push("--trust-tools", this.options.gatewayToolIds.join(","));
-        }
-
-        const procEnv = buildSkeletonEnv({
-          kiroApiKey: this.options.kiroApiKey,
-          kiroHome: this.paths.kiroHomeDir,
-          home: this.paths.homeDir,
-          pathEnv: this.options.pathEnv,
-        });
-
-        const proc = this.spawnFn(this.options.command ?? "kiro-cli", args, {
-          cwd: this.cwd,
-          env: procEnv,
-          user: this.options.user ?? "skel",
-          stdio: ["pipe", "pipe", "pipe"],
-        });
-
-        const rawLogPath = path.join(this.paths.sessionsDir, `headless-${Date.now()}.raw`);
-        let rawOutput = "";
-        if (proc.stdout) {
-          proc.stdout.on("data", (chunk: Buffer | string) => {
-            rawOutput += chunk.toString("utf-8");
-            try {
-              fs.writeFileSync(rawLogPath, rawOutput, "utf-8");
-            } catch {
-              // Ignore disk write errors in mock/test
-            }
+        const rawLogPath = this.headlessLogPath();
+        const channel = this.createHeadlessChannel(rawLogPath);
+        void channel
+          .runTurn({
+            prompt:
+              typeof resolvedPrompt === "string"
+                ? resolvedPrompt
+                : String(resolvedPrompt),
+            resumeId: this.sessionId ?? undefined,
+          })
+          .catch(() => {
+            // The channel never rejects; a defensive catch keeps the turn alive.
           });
-        }
 
         this.promptPending = false;
         this.state = "raised";
-        return { status: "complete", output: rawOutput, rawLogPath };
+        return { status: "complete", output: "", rawLogPath };
       }
 
       const result = await this.client!.sessionPrompt({
@@ -858,39 +833,15 @@ export class SkeletonSupervisor extends EventEmitter {
     }
 
     if (this.executionChannel === "Headless_Fallback") {
-      const modelId = this.verifiedModelId ?? getAssignedModelForRole(this.role, { hard: this.options.hard });
-      const resumeId = this.sessionId ?? `resume-${this.skeletonId}`;
-      const args = [
-        "chat",
-        "--v3",
-        "--no-interactive",
-        "--agent",
-        String(this.role),
-        "--model",
-        String(modelId),
-        "--require-mcp-startup",
-        "--resume-id",
-        resumeId,
-        "--output-format",
-        "stream-json",
-      ];
-      if (this.options.gatewayToolIds && this.options.gatewayToolIds.length > 0) {
-        args.push("--trust-tools", this.options.gatewayToolIds.join(","));
-      }
-
-      const procEnv = buildSkeletonEnv({
-        kiroApiKey: this.options.kiroApiKey,
-        kiroHome: this.paths.kiroHomeDir,
-        home: this.paths.homeDir,
-        pathEnv: this.options.pathEnv,
-      });
-
-      this.spawnFn(this.options.command ?? "kiro-cli", args, {
-        cwd: this.cwd,
-        env: procEnv,
-        user: this.options.user ?? "skel",
-        stdio: ["pipe", "pipe", "pipe"],
-      });
+      // Requirement 17.3 / finding [2]: the correction is delegated to the
+      // Headless Fallback channel, which resumes the session with `--resume-id`.
+      const channel = this.createHeadlessChannel(this.headlessLogPath());
+      const resumeId = this.sessionId ?? undefined;
+      void channel
+        .runTurn({ prompt: correctionText, resumeId })
+        .catch(() => {
+          // The channel never rejects; a defensive catch keeps the steer alive.
+        });
       return;
     }
 
@@ -1066,6 +1017,71 @@ export class SkeletonSupervisor extends EventEmitter {
         // Ignore
       }
     }
+  }
+
+  /**
+   * The disk path the Headless Fallback channel writes the raw stream-json to
+   * (Requirement 17.4 / finding [2]).
+   */
+  private headlessLogPath(): string {
+    return path.join(this.cwd, "headless-stream.jsonl");
+  }
+
+  /**
+   * Builds the Headless Fallback channel for a turn or correction, wiring the
+   * Skeleton's command, working directory, model, isolated environment, gateway
+   * tool ids, injectable spawn function and stream log location. Approval is
+   * bridged to `options.onApproval` (failing closed to `deny`) and every `ask`
+   * is auto-denied through the injected handler (finding [2], Requirement 17.11).
+   */
+  private createHeadlessChannel(logPath: string): HeadlessFallbackChannel {
+    const modelId =
+      this.verifiedModelId ??
+      getAssignedModelForRole(this.role, { hard: this.options.hard });
+    const options = this.options as {
+      onApproval?: (
+        request: unknown
+      ) => Promise<"approve" | "deny"> | "approve" | "deny";
+      onAskAutoDeny?: (ask: unknown) => Promise<void> | void;
+    };
+    return new HeadlessFallbackChannel({
+      runId: this.runId,
+      skeletonId: this.skeletonId,
+      kiroHomeDir: this.paths.kiroHomeDir,
+      homeDir: this.paths.homeDir,
+      modelId: String(modelId),
+      agentName: String(this.role),
+      cwd: this.cwd,
+      worktreeDir: this.cwd,
+      kiroApiKey: this.options.kiroApiKey,
+      pathEnv: this.options.pathEnv,
+      command: this.options.command ?? "kiro-cli",
+      spawnFn: this.spawnFn,
+      gatewayToolIds: this.options.gatewayToolIds,
+      logPath,
+      logTrustedBaseDir: this.cwd,
+      // Requirement 17.1: the supervisor already selected the Headless channel on
+      // P1 failure; P14 defaults to passed so the channel actually runs.
+      p1Passed: this.options.probeResults?.P1?.passed ?? false,
+      p14Passed: this.options.probeResults?.P14?.passed ?? true,
+      onApproval: async (request) => {
+        if (typeof options.onApproval === "function") {
+          try {
+            return await options.onApproval(request);
+          } catch {
+            return "deny";
+          }
+        }
+        // Fail closed: an unhandled approval is denied, never auto-approved.
+        return "deny";
+      },
+      onAskAutoDeny: async (ask) => {
+        if (typeof options.onAskAutoDeny === "function") {
+          // A failing auto-deny handler propagates so the channel fails closed.
+          await options.onAskAutoDeny(ask);
+        }
+      },
+    });
   }
 
   private attachProcessListeners(proc: ChildProcessLike): void {

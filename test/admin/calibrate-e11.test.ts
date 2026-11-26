@@ -35,6 +35,11 @@ import {
   runCalibration,
   type CalibrationSourceRun,
 } from "../../scripts/calibrate-e11";
+import {
+  POST as startRunRoute,
+  clearAdmissionQueue,
+  getQueueLength,
+} from "../../app/api/start-run/route";
 
 const tmpRoots: string[] = [];
 
@@ -720,13 +725,16 @@ describe("runCalibration — recorded runs directory and --apply", () => {
     assert.ok(audit[0].reason && audit[0].reason.includes("ev:11"));
 
     const state = settingsStore.getCalibrationState();
-    assert.equal(state.recalibrationRequired, false);
+    // FIND-16: `writeThreeRuns` also writes a fourth completed run (calib-run-d) that is outside
+    // the sampled window, so recalibration must stay required — the calibration only covered the
+    // first three runs.
+    assert.equal(state.recalibrationRequired, true);
     assert.equal(state.lastCalibratedAt, 12_345);
     assert.deepEqual(
       [...state.lastCalibratedRunIds].sort(),
       ["calib-run-a", "calib-run-b", "calib-run-c"]
     );
-    assert.equal(result.recalibrationRequired, false);
+    assert.equal(result.recalibrationRequired, true);
 
     settingsStore.close();
   });
@@ -825,7 +833,9 @@ describe("runCalibration — recorded runs directory and --apply", () => {
     const store = new SettingsStore(dbPath);
     assert.equal(store.getSetting("wardenRounds"), 5);
     assert.equal(store.getSetting("silentSkeletonMs"), 610_000);
-    assert.equal(store.isRecalibrationRequired(), false);
+    // FIND-16: the CLI applied against four completed runs (writeThreeRuns writes calib-run-a..d),
+    // so calib-run-d is still uncalibrated and recalibration stays required.
+    assert.equal(store.isRecalibrationRequired(), true);
 
     const audit = store.getAuditLog({ key: "wardenRounds" });
     assert.equal(audit.length, 1);
@@ -1284,4 +1294,290 @@ describe("WP-17-fix2 regressions — Cubic & PR-Agent findings", () => {
 
 
 
+
+
+/**
+ * WP-W1-17-fix — regressions for the seven PR #12 Cubic findings.
+ */
+describe("WP-W1-17-fix regressions — Cubic PR #12 findings", () => {
+  function writeRunDir(root: string, run: CalibrationSourceRun): void {
+    const runDir = path.join(root, run.runId);
+    fs.mkdirSync(runDir, { recursive: true });
+    const ndjson = `${run.events.map((ev) => JSON.stringify(ev)).join("\n")}\n`;
+    fs.writeFileSync(path.join(runDir, "events.ndjson"), ndjson, "utf8");
+  }
+
+  // --- Finding [4]: POST /api/start-run refuses when Required_Settings are unset -------
+
+  type InjectedStartRunRequest = Request & {
+    runStore?: RunStore;
+    eventStore?: EventStore;
+    settingsStore?: SettingsStore;
+  };
+
+  function makeStartRunRequest(inviteCode: string, runId: string): InjectedStartRunRequest {
+    return new Request("http://test/api/start-run", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        url: "https://github.com/example/legacy-repo",
+        sha: "a".repeat(40),
+        inviteCode,
+        runId,
+      }),
+    }) as InjectedStartRunRequest;
+  }
+
+  it("returns 503 and creates/queues no run when Required_Settings are unset (finding 4)", async () => {
+    const runStore = new RunStore(":memory:");
+    const eventStore = new EventStore(":memory:");
+    // A brand-new store: its Required_Settings are seeded with the `__UNSET__` sentinel.
+    const settingsStore = new SettingsStore();
+    runStore.createInviteCode({ code: "gate-invite-unset", allowedRunCount: 5 });
+
+    const runId = "gate-run-unset";
+    const req = makeStartRunRequest("gate-invite-unset", runId);
+    req.runStore = runStore;
+    req.eventStore = eventStore;
+    req.settingsStore = settingsStore;
+
+    clearAdmissionQueue();
+    const res = await startRunRoute(req);
+
+    assert.equal(res.status, 503);
+    const body = (await res.json()) as { code?: string; missing?: string[]; error?: string };
+    assert.equal(body.code, "REQUIRED_SETTINGS_MISSING");
+    const missing = body.missing ?? [];
+    assert.ok(missing.includes("toolCallsPerRun"));
+    assert.ok(missing.includes("approvalWaitMs"));
+
+    // No run was created, no event emitted, and nothing was queued.
+    assert.equal(runStore.getRun(runId), null);
+    assert.equal(eventStore.getEvents(runId).length, 0);
+    assert.equal(getQueueLength(), 0);
+
+    runStore.close();
+    eventStore.close();
+    settingsStore.close();
+  });
+
+  it("starts the run once every Required_Setting is configured (finding 4)", async () => {
+    const runStore = new RunStore(":memory:");
+    const eventStore = new EventStore(":memory:");
+    const settingsStore = new SettingsStore();
+    for (const key of ALWAYS_REQUIRED_SETTING_KEYS) {
+      settingsStore.setSetting(key, 1, { actor: "owner" });
+    }
+    assert.equal(settingsStore.validateRequiredSettings().ok, true);
+    runStore.createInviteCode({ code: "gate-invite-ok", allowedRunCount: 5 });
+
+    const runId = "gate-run-ok";
+    const req = makeStartRunRequest("gate-invite-ok", runId);
+    req.runStore = runStore;
+    req.eventStore = eventStore;
+    req.settingsStore = settingsStore;
+
+    clearAdmissionQueue();
+    const res = await startRunRoute(req);
+
+    assert.equal(res.status, 202);
+    const body = (await res.json()) as { ok?: boolean; runId?: string };
+    assert.equal(body.ok, true);
+    assert.equal(body.runId, runId);
+    const record = runStore.getRun(runId);
+    assert.ok(record);
+    assert.equal(record.phase, "queued");
+    assert.ok(eventStore.getEvents(runId).some((ev) => ev.kind === "run.queued"));
+    assert.equal(getQueueLength(), 1);
+
+    clearAdmissionQueue();
+    runStore.close();
+    eventStore.close();
+    settingsStore.close();
+  });
+});
+
+
+/**
+ * WP-W1-17-fix — settings validation, recalibration re-sync, event pairing and directory ordering
+ * regressions for the remaining PR #12 Cubic findings.
+ */
+describe("WP-W1-17-fix regressions — settings & calibration (Cubic PR #12)", () => {
+  function writeRunDir(root: string, run: CalibrationSourceRun): void {
+    const runDir = path.join(root, run.runId);
+    fs.mkdirSync(runDir, { recursive: true });
+    const ndjson = `${run.events.map((ev) => JSON.stringify(ev)).join("\n")}\n`;
+    fs.writeFileSync(path.join(runDir, "events.ndjson"), ndjson, "utf8");
+  }
+
+  // --- Finding [9]: numeric/integer settings reject non-number values ---------------
+
+  it("rejects a string (and other non-numbers) for an integer setting before the generic check (finding 9)", () => {
+    const store = new SettingsStore();
+    for (const bad of ["300", "abc", true, false, [1], { n: 1 }]) {
+      assert.throws(
+        () => store.setSetting("toolCallsPerRun", bad, { actor: "owner" }),
+        TypeError
+      );
+    }
+    for (const bad of [Number.NaN, Infinity, -Infinity]) {
+      assert.throws(
+        () => store.setSetting("toolCallsPerRun", bad, { actor: "owner" }),
+        RangeError
+      );
+    }
+
+    // Nothing invalid was stored, so the Required_Setting is still enumerated as missing.
+    assert.equal(store.getSetting("toolCallsPerRun"), undefined);
+    assert.ok(store.validateRequiredSettings().missing.includes("toolCallsPerRun"));
+
+    store.setSetting("toolCallsPerRun", 300, { actor: "owner" });
+    assert.equal(store.getSetting("toolCallsPerRun"), 300);
+    assert.ok(!store.validateRequiredSettings().missing.includes("toolCallsPerRun"));
+    store.close();
+  });
+
+  it("rejects strings for every other numeric key too (finding 9)", () => {
+    const store = new SettingsStore();
+    for (const key of ["promptWallClockMs", "silentSkeletonMs", "repoSizeCapKb", "boxCpu"]) {
+      assert.throws(() => store.setSetting(key, "600000", { actor: "owner" }), TypeError);
+    }
+    // A free-form (non-numeric) setting still accepts a string.
+    store.setSetting("customNote", "hello", { actor: "owner" });
+    assert.equal(store.getSetting("customNote"), "hello");
+    store.close();
+  });
+
+  // --- Finding [15]: concurrentLiveRuns <= 5 ---------------------------------------
+
+  it("caps concurrentLiveRuns at 5 and rejects 6+ with a RangeError (finding 15)", () => {
+    const store = new SettingsStore();
+    store.setSetting("concurrentLiveRuns", 5, { actor: "owner" });
+    assert.equal(store.getSetting("concurrentLiveRuns"), 5);
+
+    for (const over of [6, 10]) {
+      assert.throws(
+        () => store.setSetting("concurrentLiveRuns", over, { actor: "owner" }),
+        RangeError
+      );
+    }
+    // The rejected writes did not change the stored value.
+    assert.equal(store.getSetting("concurrentLiveRuns"), 5);
+    store.close();
+  });
+
+  // --- Finding [16]: --apply re-syncs every completed run id ------------------------
+
+  it("keeps recalibrationRequired when a fourth run completed before --apply (finding 16)", () => {
+    const root = makeTmpDir("gg-fix16-runs-");
+    writeRunDir(root, runA);
+    writeRunDir(root, runB);
+    writeRunDir(root, runC);
+    writeRunDir(root, runD); // a fourth completed run, present before the calibration
+    const settingsStore = new SettingsStore();
+
+    const result = runCalibration({
+      runsDir: root,
+      settingsStore,
+      apply: true,
+      actor: "owner",
+      ts: 42,
+    });
+
+    // Only the first three runs feed the distributions...
+    assert.deepEqual(result.runIds, ["calib-run-a", "calib-run-b", "calib-run-c"]);
+    // ...but the fourth is uncalibrated, so the flag must NOT be cleared prematurely.
+    assert.equal(result.recalibrationRequired, true);
+    assert.equal(settingsStore.isRecalibrationRequired(), true);
+    assert.equal(settingsStore.getCalibrationState().completedRecordedRuns, 4);
+
+    settingsStore.close();
+  });
+});
+
+
+/**
+ * WP-W1-17-fix — concurrent-activity pairing and directory ordering regressions (Cubic PR #12).
+ */
+describe("WP-W1-17-fix regressions — event pairing & ordering (Cubic PR #12)", () => {
+  function writeRunDir(root: string, run: CalibrationSourceRun): void {
+    const runDir = path.join(root, run.runId);
+    fs.mkdirSync(runDir, { recursive: true });
+    const ndjson = `${run.events.map((ev) => JSON.stringify(ev)).join("\n")}\n`;
+    fs.writeFileSync(path.join(runDir, "events.ndjson"), ndjson, "utf8");
+  }
+
+  // --- Finding [17]: pair concurrent commands by data.logRef ------------------------
+
+  it("pairs concurrent command events by data.logRef, not actor (finding 17)", () => {
+    const run = mkRun("cmd-logref", [
+      { seq: 1, ts: 0, kind: "command.started", actor: "soulstitcher", data: { logRef: "L1" } },
+      { seq: 2, ts: 0, kind: "command.started", actor: "soulstitcher", data: { logRef: "L2" } },
+      { seq: 3, ts: 500_000, kind: "command.result", actor: "soulstitcher", data: { logRef: "L1" } },
+      { seq: 4, ts: 600_000, kind: "command.result", actor: "soulstitcher", data: { logRef: "L2" } },
+      { seq: 5, ts: 1_000_000, kind: "run.done", data: { outcome: "resurrected" } },
+    ]);
+
+    const metric = analyzeRecordedRunsForCalibration([run]).silenceDurationsMs;
+    assert.equal(metric.status, "available");
+    // Both in-flight spans are recognised, so the 500_000..600_000 stretch is not silence.
+    assert.equal(metric.max, 0);
+    assert.deepEqual(metric.samples, [0]);
+  });
+
+  // --- Finding [18]: pair concurrent tool calls by data.toolCallId ------------------
+
+  it("pairs concurrent tool calls by data.toolCallId, not skeletonId (finding 18)", () => {
+    const run = mkRun("tool-callid", [
+      { seq: 1, ts: 0, kind: "skeleton.tool_call", skeletonId: "sk-x", data: { toolCallId: "T1" } },
+      { seq: 2, ts: 0, kind: "skeleton.tool_call", skeletonId: "sk-x", data: { toolCallId: "T2" } },
+      {
+        seq: 3,
+        ts: 500_000,
+        kind: "skeleton.tool_result",
+        skeletonId: "sk-x",
+        data: { toolCallId: "T1" },
+      },
+      {
+        seq: 4,
+        ts: 600_000,
+        kind: "skeleton.tool_result",
+        skeletonId: "sk-x",
+        data: { toolCallId: "T2" },
+      },
+      { seq: 5, ts: 1_000_000, kind: "run.done", data: { outcome: "resurrected" } },
+    ]);
+
+    const metric = analyzeRecordedRunsForCalibration([run]).silenceDurationsMs;
+    assert.equal(metric.status, "available");
+    assert.equal(metric.max, 0);
+    assert.deepEqual(metric.samples, [0]);
+  });
+
+  // --- Finding [22]: directory mode sorts runs by run.done ts -----------------------
+
+  it("sorts directory completed runs chronologically by run.done ts (finding 22)", () => {
+    const root = makeTmpDir("gg-fix22-runs-");
+    // Names sort opposite to completion order: "aaa-" completes last, "zzz-" completes first.
+    const late = mkRun("aaa-run-late", [
+      { seq: 1, ts: 0, kind: "run.started" },
+      { seq: 2, ts: 9_000, kind: "run.done", data: { outcome: "resurrected" } },
+    ]);
+    const early = mkRun("zzz-run-early", [
+      { seq: 1, ts: 0, kind: "run.started" },
+      { seq: 2, ts: 1_000, kind: "run.done", data: { outcome: "resurrected" } },
+    ]);
+    writeRunDir(root, late);
+    writeRunDir(root, early);
+
+    assert.deepEqual(
+      loadRecordedRunsFromDir(root, 2).map((r) => r.runId),
+      ["zzz-run-early", "aaa-run-late"]
+    );
+    assert.deepEqual(runCalibration({ runsDir: root, limit: 2 }).runIds, [
+      "zzz-run-early",
+      "aaa-run-late",
+    ]);
+  });
+});
 

@@ -100,6 +100,7 @@ function makeSpawn(
 function makeChannel(
   options: Partial<ConstructorParameters<typeof HeadlessFallbackChannel>[0]> = {}
 ) {
+  const { onAskAutoDeny, ...rest } = options;
   return new HeadlessFallbackChannel({
     runId: "run-1",
     skeletonId: "skel-1",
@@ -110,7 +111,10 @@ function makeChannel(
     worktreeDir: "/tmp/worktree",
     p1Passed: false,
     p14Passed: true,
-    ...options,
+    ...rest,
+    // The hook is required in production; tests default to a no-op and may
+    // override it (including with `undefined` to exercise the fail-closed path).
+    onAskAutoDeny: onAskAutoDeny ?? (() => {}),
   });
 }
 
@@ -1300,3 +1304,218 @@ describe("HeadlessFallbackChannel output accumulation", () => {
     }
   });
 });
+
+describe("HeadlessFallbackChannel auto-deny fail-closed (findings [1] & [8])", () => {
+  it("fails closed when onAskAutoDeny is missing and never spawns", async () => {
+    let spawned = false;
+    const channel = new HeadlessFallbackChannel({
+      runId: "run-1",
+      skeletonId: "skel-1",
+      kiroHomeDir: "/isolated/kiro-home",
+      homeDir: "/isolated/home",
+      modelId: "claude-sonnet-5.5",
+      agentName: "bonesetter",
+      worktreeDir: "/tmp/worktree",
+      p1Passed: false,
+      p14Passed: true,
+      spawnFn: ((() => {
+        spawned = true;
+        return new MockProcess() as unknown as ChildProcessLike;
+      }) as unknown) as SpawnFunction,
+    } as unknown as ConstructorParameters<typeof HeadlessFallbackChannel>[0]);
+
+    const result = await channel.runTurn({ prompt: "x" });
+    assert.equal(result.ok, false);
+    assert.equal(result.status, "failure");
+    assert.equal(result.reason, "ask_auto_deny_failed");
+    assert.equal(spawned, false);
+  });
+
+  it("auto-denies asks DURING live streaming, before the process closes", async () => {
+    const { logPath, cleanup } = tempLogPath("ask-streaming");
+    try {
+      let closed = false;
+      const observed: boolean[] = [];
+      const channel = makeChannel({
+        logPath,
+        onAskAutoDeny: () => {
+          observed.push(closed);
+        },
+        spawnFn: (command, args, options) => {
+          const proc = new MockProcess();
+          setImmediate(() => {
+            proc.stdout.write(
+              JSON.stringify({ type: "session", model: "claude-sonnet-5.5" }) + "\n"
+            );
+            proc.stdout.write(
+              JSON.stringify({ type: "ask_request", askId: "a-1", text: "q" }) + "\n"
+            );
+            // Only close AFTER the ask line has been streamed.
+            setImmediate(() => {
+              proc.stdout.end();
+              setImmediate(() => {
+                closed = true;
+                proc.exitCode = 0;
+                proc.emit("close", 0);
+              });
+            });
+          });
+          return proc as unknown as ChildProcessLike;
+        },
+      });
+
+      const result = await channel.runTurn({ prompt: "x" });
+      assert.equal(result.ok, true);
+      assert.deepEqual(observed, [false]);
+      assert.equal(result.autoDeniedAsks.length, 1);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("kills the child and fails closed when onAskAutoDeny throws", async () => {
+    const { logPath, cleanup } = tempLogPath("ask-throw");
+    try {
+      let killed = false;
+      const channel = makeChannel({
+        logPath,
+        onAskAutoDeny: () => {
+          throw new Error("deny boom");
+        },
+        spawnFn: (command, args, options) => {
+          const proc = new MockProcess();
+          proc.kill = () => {
+            killed = true;
+            return true;
+          };
+          setImmediate(() => {
+            proc.stdout.write(
+              JSON.stringify({ type: "session", model: "claude-sonnet-5.5" }) + "\n"
+            );
+            proc.stdout.write(
+              JSON.stringify({ type: "ask_request", askId: "a-1", text: "q" }) + "\n"
+            );
+            // Never closes on its own; the channel must settle on the hook failure.
+          });
+          return proc as unknown as ChildProcessLike;
+        },
+      });
+
+      const result = await channel.runTurn({ prompt: "x" });
+      assert.equal(result.ok, false);
+      assert.equal(result.status, "failure");
+      assert.equal(result.reason, "ask_auto_deny_failed");
+      assert.equal(killed, true);
+      assert.equal(result.spawnError, "deny boom");
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+
+describe("HeadlessFallbackChannel missing-resume-id fail-closed (finding [7])", () => {
+  it("refuses to resume when no session id is reported", async () => {
+    const { logPath, cleanup } = tempLogPath("missing-resume");
+    try {
+      const captured: Captured = { calls: 0 };
+      const channel = makeChannel({
+        logPath,
+        s2ResumeSupported: true,
+        onApproval: () => "approve",
+        spawnFn: makeSpawn(
+          () => ({
+            lines: [
+              { type: "session", model: "claude-sonnet-5.5" },
+              { type: "approval_request", approvalId: "ap-1", tool: "shell" },
+            ],
+            code: 0,
+          }),
+          captured
+        ),
+      });
+      const result = await channel.runTurn({ prompt: "run" });
+      assert.equal(result.ok, false);
+      assert.equal(result.status, "failure");
+      assert.equal(result.reason, "missing_resume_id");
+      // No resume process was spawned without --resume-id.
+      assert.equal(captured.calls, 1);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe("HeadlessFallbackChannel returned sessionId redaction (finding [6])", () => {
+  it("redacts a credential embedded in the returned sessionId", async () => {
+    const { logPath, cleanup } = tempLogPath("session-redact");
+    try {
+      const leaked = sampleCredential;
+      const channel = makeChannel({
+        logPath,
+        kiroApiKey: leaked,
+        spawnFn: makeSpawn(
+          () => ({
+            lines: [
+              {
+                type: "session",
+                sessionId: `sess-${leaked}-tail`,
+                model: "claude-sonnet-5.5",
+              },
+            ],
+            code: 0,
+          }),
+          { calls: 0 }
+        ),
+      });
+      const result = await channel.runTurn({ prompt: "x" });
+      assert.equal(result.ok, true);
+      assert.ok(
+        !(result.sessionId ?? "").includes(leaked),
+        "returned sessionId leaked the credential"
+      );
+      assert.ok((result.sessionId ?? "").includes("[REDACTED]"));
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe("createStreamDiskLogger symlink containment (finding [5])", () => {
+  it("refuses to write through a symlinked log file", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gg-headless-symlink-"));
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "gg-headless-outside-"));
+    try {
+      const linkPath = path.join(dir, "stream.jsonl");
+      fs.symlinkSync(path.join(outside, "target.jsonl"), linkPath);
+      const logger = createStreamDiskLogger(linkPath, { trustedBaseDir: dir });
+      logger.appendLine('{"type":"log"}');
+      assert.equal(logger.ok, false);
+      assert.ok(logger.getLastError() instanceof Error);
+      logger.close();
+      assert.equal(fs.existsSync(path.join(outside, "target.jsonl")), false);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses to write outside the trusted base through a symlinked subdirectory", () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "gg-headless-base-"));
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "gg-headless-escape-"));
+    try {
+      fs.symlinkSync(outside, path.join(base, "escape"));
+      const logPath = path.join(base, "escape", "stream.jsonl");
+      const logger = createStreamDiskLogger(logPath, { trustedBaseDir: base });
+      logger.appendLine('{"type":"log"}');
+      assert.equal(logger.ok, false);
+      assert.ok(logger.getLastError() instanceof Error);
+      logger.close();
+      assert.equal(fs.existsSync(path.join(outside, "stream.jsonl")), false);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+});
+
