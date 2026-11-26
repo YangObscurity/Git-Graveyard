@@ -1,0 +1,453 @@
+import test, { describe, it, before } from "node:test";
+import assert from "node:assert/strict";
+import {
+  analyzePython,
+  applyM1,
+  checkDeclaredPythonVersion,
+  collectResidue,
+  initPythonParser,
+  isPy2OnlySpecifier,
+  parsePython,
+  planPythonEdits,
+  resolveEditConflicts,
+  type PythonPlannedEdit,
+  type PythonSplice,
+} from "../../lib/rules/m1-python";
+import {
+  detectPythonSignals,
+  detectPythonSignalsLexical,
+  detectSignals,
+} from "../../lib/grimoire/signals";
+
+before(async () => {
+  await initPythonParser();
+});
+
+function makeEdit(
+  splices: PythonSplice[],
+  ruleOrder = 1,
+  line = 1
+): PythonPlannedEdit {
+  const primary = splices[0];
+  return {
+    ruleId: "M1",
+    ruleOrder,
+    line,
+    confidence: "high",
+    description: "test edit",
+    start: primary.start,
+    end: primary.end,
+    replacement: primary.replacement,
+    splices,
+  };
+}
+
+function unknownReasons(source: string, file = "a.py"): string[] {
+  return analyzePython(source, file).unknowns.map((u) => u.reason);
+}
+
+describe("M1 rewrite rows (Requirement 6.4-6.12, R3-8.1)", () => {
+  it("row 1: rewrites `print x, y` to a print() call", () => {
+    assert.equal(applyM1("print x, y\n"), "print(x, y)\n");
+  });
+
+  it("row 2: rewrites `print x,` with end=\" \" and a softspace behavior note", () => {
+    const res = analyzePython("print x,\n", "a.py");
+    assert.equal(res.output, 'print(x, end=" ")\n');
+    assert.equal(res.edits[0].confidence, "medium");
+    assert.ok(
+      res.behaviorNotes.some(
+        (n) => n.note === "Py2 softspace output is not identical"
+      )
+    );
+  });
+
+  it("row 3: rewrites `print >>f, x` and keeps the chevron target", () => {
+    assert.equal(applyM1("print >>f, x\n"), "print(x, file=f)\n");
+    assert.equal(applyM1("print >>sys.stderr, x\n"), "print(x, file=sys.stderr)\n");
+  });
+
+  it("row 3: rewrites `print >>f, x,` with end and file", () => {
+    const res = analyzePython("print >>f, x,\n", "a.py");
+    assert.equal(res.output, 'print(x, end=" ", file=f)\n');
+    assert.equal(res.edits[0].confidence, "medium");
+  });
+
+  it("row 4: rewrites a bare `print` to `print()`", () => {
+    assert.equal(applyM1("print\n"), "print()\n");
+  });
+
+  it("row 5: leaves a two-argument `print(a, b)` call unchanged with a behavior note", () => {
+    const res = analyzePython("print(a, b)\n", "a.py");
+    assert.equal(res.output, "print(a, b)\n");
+    assert.equal(res.edits.length, 0);
+    assert.ok(res.behaviorNotes.some((n) => n.note === "Py2 prints a tuple"));
+  });
+
+  it("row 5: does not add the tuple note when print_function is imported", () => {
+    const res = analyzePython(
+      "from __future__ import print_function\nprint(a, b)\n",
+      "a.py"
+    );
+    assert.equal(res.output, "from __future__ import print_function\nprint(a, b)\n");
+    assert.equal(res.behaviorNotes.length, 0);
+  });
+
+  it("row 5: leaves a single-argument `print(x)` call unchanged", () => {
+    const res = analyzePython("print(x)\n", "a.py");
+    assert.equal(res.output, "print(x)\n");
+    assert.equal(res.edits.length, 0);
+    assert.equal(res.behaviorNotes.length, 0);
+  });
+
+  it("row 6: rewrites `except E, e:` to `except E as e:`", () => {
+    const res = analyzePython(
+      "try:\n    pass\nexcept E, e:\n    pass\n",
+      "a.py"
+    );
+    assert.equal(
+      res.output,
+      "try:\n    pass\nexcept E as e:\n    pass\n"
+    );
+    assert.equal(res.edits[0].confidence, "high");
+  });
+
+  it("row 6: does not rewrite the Python 3 `except (E, e):` tuple form", () => {
+    const src = "try:\n    pass\nexcept (E, e):\n    pass\n";
+    assert.equal(applyM1(src), src);
+  });
+
+  it("row 7: rewrites `unicode(...)` to `str(...)`", () => {
+    const res = analyzePython("x = unicode(y)\n", "a.py");
+    assert.equal(res.output, "x = str(y)\n");
+    assert.equal(res.edits[0].confidence, "medium");
+  });
+
+  it("row 8: rewrites iteritems/iterkeys/itervalues", () => {
+    assert.equal(applyM1("a = d.iteritems()\n"), "a = d.items()\n");
+    assert.equal(applyM1("a = d.iterkeys()\n"), "a = d.keys()\n");
+    assert.equal(applyM1("a = d.itervalues()\n"), "a = d.values()\n");
+  });
+});
+
+describe("M1 multi-line, nested and residue handling", () => {
+  it("handles multi-line print statements through node ranges (R3-8.1)", () => {
+    assert.equal(
+      applyM1("print x, \\\n    y\n"),
+      "print(x, \\\n    y)\n"
+    );
+  });
+
+  it("applies nested edits to `print unicode(x)` (both splices)", () => {
+    assert.equal(applyM1("print unicode(x)\n"), "print(str(x))\n");
+    assert.equal(
+      applyM1("print unicode(d.iteritems())\n"),
+      "print(str(d.items()))\n"
+    );
+    assert.equal(
+      applyM1("print >>f, unicode(d.itervalues())\n"),
+      "print(str(d.values()), file=f)\n"
+    );
+  });
+
+  it("leaves a chevron print without arguments unchanged", () => {
+    assert.equal(applyM1("print >>f\n"), "print >>f\n");
+  });
+
+  it("records unicode_rebound for an assignment and leaves code unchanged", () => {
+    const src = "unicode = str\nx = unicode(y)\n";
+    const res = analyzePython(src, "a.py");
+    assert.equal(res.output, src);
+    assert.ok(res.unknowns.some((u) => u.reason === "unicode_rebound"));
+  });
+
+  it("records unicode_rebound for `def unicode` and an import", () => {
+    assert.ok(
+      unknownReasons("def unicode(x):\n    return x\ny = unicode(1)\n").includes(
+        "unicode_rebound"
+      )
+    );
+    assert.ok(
+      unknownReasons("import unicode\nx = unicode(y)\n").includes(
+        "unicode_rebound"
+      )
+    );
+  });
+
+  it("records unicode_rebound for the attribute form obj.unicode(...)", () => {
+    const src = "x = obj.unicode(y)\n";
+    const res = analyzePython(src, "a.py");
+    assert.equal(res.output, src);
+    assert.ok(res.unknowns.some((u) => u.reason === "unicode_rebound"));
+  });
+
+  it("records iterator_use for next(d.iteritems())", () => {
+    const src = "x = next(d.iteritems())\n";
+    const res = analyzePython(src, "a.py");
+    assert.equal(res.output, src);
+    assert.ok(res.unknowns.some((u) => u.reason === "iterator_use"));
+  });
+
+  it("records iterator_use for d.iterkeys().next()", () => {
+    const src = "x = d.iterkeys().next()\n";
+    const res = analyzePython(src, "a.py");
+    assert.equal(res.output, src);
+    assert.ok(res.unknowns.some((u) => u.reason === "iterator_use"));
+  });
+
+  it("preserves a UTF-8 BOM and CRLF line endings (Requirement 6.17)", () => {
+    const src = "\uFEFFprint x\r\nprint y\r\n";
+    const out = applyM1(src);
+    assert.equal(out, "\uFEFFprint(x)\r\nprint(y)\r\n");
+    assert.equal(out.charCodeAt(0), 0xfeff);
+    assert.ok(out.includes("\r\n"));
+  });
+
+  it("makes no edit for invalid UTF-8 bytes (Requirement 6.18)", () => {
+    const res = analyzePython("print x\n", "a.py", {
+      rawBytes: Uint8Array.from([0x70, 0x72, 0xff, 0xfe]),
+    });
+    assert.equal(res.output, "print x\n");
+    assert.equal(res.edits.length, 0);
+    assert.ok(res.unknowns.some((u) => u.reason === "encoding_unsupported"));
+  });
+
+  it("makes no edit for a lone surrogate (Requirement 6.18)", () => {
+    const src = "print x\n\uD800";
+    const res = analyzePython(src, "a.py");
+    assert.equal(res.output, src);
+    assert.ok(res.unknowns.some((u) => u.reason === "encoding_unsupported"));
+  });
+
+  it("makes no edit when a non-UTF-8 coding cookie accompanies broken bytes", () => {
+    const src = "# -*- coding: latin-1 -*-\nprint x \uFFFD\n";
+    const res = analyzePython(src, "a.py");
+    assert.equal(res.output, src);
+    assert.equal(res.edits.length, 0);
+    assert.ok(res.unknowns.some((u) => u.reason === "encoding_unsupported"));
+  });
+});
+
+describe("Declared Python version (Requirement 6.19)", () => {
+  it("flags Python-2-only requires-python specs", () => {
+    assert.ok(isPy2OnlySpecifier("==2.*"));
+    assert.ok(isPy2OnlySpecifier("<3"));
+    assert.ok(isPy2OnlySpecifier("<=2.7"));
+    assert.ok(isPy2OnlySpecifier(">=2.7,<3"));
+    assert.ok(!isPy2OnlySpecifier(">=3.8"));
+    assert.ok(!isPy2OnlySpecifier(">=2.7,<4"));
+    assert.ok(!isPy2OnlySpecifier(">=3"));
+  });
+
+  it("reads requires-python from pyproject.toml and python_requires from setup.py", () => {
+    const pyproject = checkDeclaredPythonVersion([
+      { path: "pyproject.toml", content: '[project]\nrequires-python = "==2.*"\n' },
+    ]);
+    assert.equal(pyproject.py2Only, true);
+    assert.equal(pyproject.declared, "==2.*");
+
+    const setup = checkDeclaredPythonVersion([
+      { path: "setup.py", content: "setup(python_requires='<=2.7')\n" },
+    ]);
+    assert.equal(setup.py2Only, true);
+
+    const ok = checkDeclaredPythonVersion([
+      { path: "pyproject.toml", content: '[project]\nrequires-python = ">=3.9"\n' },
+    ]);
+    assert.equal(ok.py2Only, false);
+  });
+
+  it("halts M1 edits when the repo declares Python 2 only", () => {
+    const src = "print x\n";
+    const res = analyzePython(src, "a.py", { py2Only: true });
+    assert.equal(res.output, src);
+    assert.equal(res.edits.length, 0);
+    assert.ok(res.unknowns.some((u) => u.reason === "py2_only_declared"));
+  });
+});
+
+
+describe("Python 2 residue (Requirement 6.14, R3-9)", () => {
+  const unhandledSrc = [
+    "exec code in ns",
+    "if a <> b:",
+    "    pass",
+    "x = `a`",
+    "y = ur'z'",
+    "o = 0777",
+    "l = 10L",
+    "def f((a, b)):",
+    "    pass",
+    "raise E, msg",
+    "",
+  ].join("\n");
+
+  it("counts all unhandled residue kinds and records py2_residue", () => {
+    const tree = parsePython(unhandledSrc);
+    assert.ok(tree);
+    const kinds = collectResidue(tree!).map((item) => item.kind);
+    for (const kind of [
+      "exec_statement",
+      "not_equal",
+      "backtick_string",
+      "ur_prefix",
+      "octal",
+      "long",
+      "tuple_param",
+      "raise_statement",
+    ]) {
+      assert.ok(kinds.includes(kind), `expected residue kind ${kind}`);
+    }
+    const res = analyzePython(unhandledSrc, "r.py");
+    const py2res = res.unknowns.filter((u) => u.reason === "py2_residue");
+    assert.equal(py2res.length, 8);
+    assert.ok(
+      py2res.every((u) => u.ruleId === "M1" && typeof u.line === "number")
+    );
+  });
+
+  it("counts handled residue kinds (print, chevron, bare print, except, unicode, iterator)", () => {
+    const src = [
+      "print z",
+      "print >>g, q",
+      "print",
+      "try:",
+      "    pass",
+      "except E, e:",
+      "    pass",
+      "u = unicode(w)",
+      "it = d.iteritems()",
+      "",
+    ].join("\n");
+    const tree = parsePython(src)!;
+    const kinds = collectResidue(tree).map((item) => item.kind);
+    assert.ok(kinds.includes("print_statement"));
+    assert.ok(kinds.includes("chevron"));
+    assert.ok(kinds.includes("bare_print"));
+    assert.ok(kinds.includes("except_clause"));
+    assert.ok(kinds.includes("unicode_call"));
+    assert.ok(kinds.includes("iterator_call"));
+    const res = analyzePython(src, "r.py");
+    assert.equal(res.unknowns.filter((u) => u.reason === "py2_residue").length, 0);
+  });
+
+  it("does not treat 0, 0x10, 0b1, 0o7 as residue", () => {
+    const tree = parsePython("a = 0\nb = 0x10\nc = 0b1\nd = 0o7\n")!;
+    assert.equal(collectResidue(tree).length, 0);
+  });
+});
+
+describe("Edit conflicts (Requirement 6.16)", () => {
+  it("skips the later overlapping edit and records edit_conflict", () => {
+    const first = makeEdit([{ start: 0, end: 5, replacement: "aaaaa" }], 1, 1);
+    const second = makeEdit([{ start: 3, end: 8, replacement: "bbbbb" }], 2, 1);
+    const resolution = resolveEditConflicts([first, second], "a.py");
+    assert.equal(resolution.edits.length, 1);
+    assert.equal(resolution.conflicts.length, 1);
+    assert.equal(resolution.conflicts[0], second);
+    assert.ok(resolution.unknowns.some((u) => u.reason === "edit_conflict"));
+  });
+
+  it("keeps non-overlapping edits and maps offsets through applied splices", () => {
+    const head = makeEdit([{ start: 5, end: 6, replacement: "(" }], 1, 1);
+    const tail = makeEdit([{ start: 16, end: 16, replacement: ")" }], 1, 1);
+    const inner = makeEdit([{ start: 6, end: 13, replacement: "str" }], 7, 1);
+    const resolution = resolveEditConflicts([head, tail, inner], "a.py");
+    assert.equal(resolution.conflicts.length, 0);
+    assert.equal(resolution.edits.length, 3);
+    assert.equal(applyM1("print unicode(x)\n"), "print(str(x))\n");
+  });
+});
+
+describe("M1 idempotence (Requirement 6.15)", () => {
+  const sources = [
+    "print x, y\n",
+    "print x,\n",
+    "print >>f, unicode(d.iteritems())\n",
+    "print\n",
+    "try:\n    pass\nexcept E, e:\n    pass\n",
+    "u = unicode(v)\nit = d.iterkeys()\n",
+    "\uFEFFprint a\r\n",
+    "exec code in ns\n",
+    "print(a, b)\n",
+  ];
+  for (const src of sources) {
+    it(`applyM1(applyM1(f)) === applyM1(f) for ${JSON.stringify(src)}`, () => {
+      const once = applyM1(src);
+      assert.equal(applyM1(once), once);
+    });
+  }
+});
+
+
+describe("PatchStep and labels (Requirement 6.1, 9.3)", () => {
+  it("emits a PatchStep with ruleId M1, a unified diff, and m1-clean label", () => {
+    const res = analyzePython("print x\n", "tools/a.py");
+    assert.equal(res.step.ruleId, "M1");
+    assert.equal(res.step.file, "tools/a.py");
+    assert.equal(res.step.reverted, false);
+    assert.ok(typeof res.step.diff === "string");
+    assert.ok(res.step.diff!.includes("-print x"));
+    assert.ok(res.step.diff!.includes("+print(x)"));
+    assert.equal(res.label, "m1-clean");
+    assert.equal(res.residueAfter, 0);
+  });
+
+  it("labels a file with remaining residue m1-partial", () => {
+    const res = analyzePython("exec code in ns\n", "b.py");
+    assert.equal(res.label, "m1-partial");
+    assert.equal(res.residueBefore, 1);
+    assert.equal(res.residueAfter, 1);
+  });
+
+  it("returns the plan with rule M1 citations", () => {
+    const plan = planPythonEdits("print x\n", "a.py");
+    assert.ok(plan);
+    assert.ok(plan!.edits.every((edit) => edit.ruleId === "M1"));
+  });
+});
+
+describe("Python M1 signal detection", () => {
+  it("detects .py files in synchronous detectSignals", () => {
+    const signals = detectSignals([
+      { path: "p.py", content: "# print z\nprint x\ns = 'print y'\n" },
+    ]);
+    assert.ok(signals.some((s) => s.ruleId === "M1" && s.line === 2));
+    assert.equal(signals.filter((s) => s.line === 1 || s.line === 3).length, 0);
+  });
+
+  it("detectPythonSignals suppresses comments and strings", async () => {
+    const result = await detectPythonSignals([
+      {
+        path: "p.py",
+        content: 'print x\ns = "unicode(z)"\n# print z\nu = unicode(w)\n',
+      },
+    ]);
+    assert.ok(result.some((s) => s.ruleId === "M1" && s.line === 1));
+    assert.ok(result.some((s) => s.ruleId === "M1" && s.line === 4));
+    assert.equal(result.filter((s) => s.line === 2 || s.line === 3).length, 0);
+  });
+
+  it("lexical fallback detects M1 patterns outside comments and strings", () => {
+    const content = [
+      "print x",
+      's = "print y"',
+      "# print z",
+      "if a <> b:",
+      "    pass",
+      "e = d.iteritems()",
+      "u = unicode(v)",
+      "",
+    ].join("\n");
+    const result = detectPythonSignalsLexical([{ path: "p.py", content }]);
+    const lines = result.map((s) => s.line).sort((a, b) => a - b);
+    assert.ok(lines.includes(1));
+    assert.ok(lines.includes(4));
+    assert.ok(lines.includes(6));
+    assert.ok(lines.includes(7));
+    assert.ok(!lines.includes(2));
+    assert.ok(!lines.includes(3));
+    assert.ok(result.every((s) => s.ruleId === "M1"));
+  });
+});
+

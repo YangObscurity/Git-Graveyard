@@ -1,6 +1,12 @@
 import { readFileSync } from "node:fs";
 import { parse, type ParserPlugin } from "@babel/parser";
 import type { Signal, RuleId, Confidence, UnknownRecord } from "./types";
+import { isPythonFile } from "./gate-js";
+import {
+  initPythonParser,
+  isPythonParserReady,
+  planPythonEdits,
+} from "../rules/m1-python";
 
 export type DetectSignalsInputFile = {
   path: string;
@@ -168,11 +174,8 @@ function walk(node: unknown, visitor: (node: any) => void): void {
   }
 }
 
-export function detectSignals(
-  input: DetectSignalsInput,
-  options?: DetectSignalsOptions
-): DetectSignalsResult {
-  const rawList: DetectSignalsInputFile[] = Array.isArray(input)
+function toFileList(input: DetectSignalsInput): DetectSignalsInputFile[] {
+  return Array.isArray(input)
     ? input
     : input && typeof input === "object" && "files" in input && Array.isArray((input as any).files)
     ? (input as any).files
@@ -183,6 +186,215 @@ export function detectSignals(
     : input && typeof input === "object" && typeof (input as any).path === "string"
     ? [input as DetectSignalsInputFile]
     : [];
+}
+
+function finalizeSignals(
+  signals: Signal[],
+  unknowns: UnknownRecord[],
+  options?: DetectSignalsOptions
+): DetectSignalsResult {
+  const seenSignals = new Set<string>();
+  const uniqueSignals: Signal[] = [];
+  for (const s of signals) {
+    const key = `${s.file}:${s.line}:${s.column}:${s.ruleId}:${s.matched}`;
+    if (!seenSignals.has(key)) {
+      seenSignals.add(key);
+      uniqueSignals.push(s);
+    }
+  }
+
+  uniqueSignals.sort((a, b) => {
+    if (a.file !== b.file) return a.file < b.file ? -1 : 1;
+    if (a.line !== b.line) return a.line - b.line;
+    if (a.column !== b.column) return a.column - b.column;
+    if (a.ruleId !== b.ruleId) return a.ruleId < b.ruleId ? -1 : 1;
+    return 0;
+  });
+
+  if (options?.unknowns) {
+    for (const u of unknowns) {
+      options.unknowns.push(u);
+    }
+  }
+
+  return Object.assign(uniqueSignals, {
+    signals: uniqueSignals,
+    unknowns,
+    parseErrors: unknowns.filter((u) => u.reason === "parse_error"),
+  }) as DetectSignalsResult;
+}
+
+function residueConfidenceFor(kind: string): Confidence {
+  switch (kind) {
+    case "unicode_call":
+    case "iterator_call":
+      return "medium";
+    default:
+      return "high";
+  }
+}
+
+/** Masks Python comments and string literals (newlines preserved). */
+function maskPython(source: string): string {
+  const chars = source.split("");
+  const n = source.length;
+  let i = 0;
+  let quote: string | null = null;
+  let triple = false;
+
+  while (i < n) {
+    const ch = source[i];
+    if (quote !== null) {
+      if (ch === "\n" || ch === "\r") {
+        if (!triple) quote = null;
+        i++;
+        continue;
+      }
+      if (ch === "\\") {
+        chars[i] = " ";
+        if (i + 1 < n && source[i + 1] !== "\n") {
+          chars[i + 1] = " ";
+          i += 2;
+        } else {
+          i += 1;
+        }
+        continue;
+      }
+      if (triple) {
+        if (source.startsWith(quote.repeat(3), i)) {
+          chars[i] = " ";
+          chars[i + 1] = " ";
+          chars[i + 2] = " ";
+          i += 3;
+          quote = null;
+          triple = false;
+          continue;
+        }
+        chars[i] = " ";
+        i++;
+        continue;
+      }
+      if (ch === quote) {
+        chars[i] = " ";
+        i++;
+        quote = null;
+        continue;
+      }
+      chars[i] = " ";
+      i++;
+      continue;
+    }
+    if (ch === "#") {
+      while (i < n && source[i] !== "\n" && source[i] !== "\r") {
+        chars[i] = " ";
+        i++;
+      }
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      triple = source.startsWith(ch.repeat(3), i);
+      chars[i] = " ";
+      if (triple) {
+        chars[i + 1] = " ";
+        chars[i + 2] = " ";
+        i += 3;
+        quote = ch;
+      } else {
+        i += 1;
+        quote = ch;
+      }
+      continue;
+    }
+    i++;
+  }
+  return chars.join("");
+}
+
+function lineColumnAt(source: string, index: number): { line: number; column: number } {
+  let line = 1;
+  let last = 0;
+  for (let i = 0; i < index; i++) {
+    if (source[i] === "\n") {
+      line += 1;
+      last = i + 1;
+    }
+  }
+  return { line, column: index - last };
+}
+
+/** Comment/string-aware lexical fallback for synchronous Python detection. */
+function lexicalPythonSignals(
+  source: string,
+  file: string,
+  manifestDir: string
+): { signals: Signal[]; unknowns: UnknownRecord[] } {
+  const masked = maskPython(source);
+  const patterns: Array<{ re: RegExp; confidence: Confidence }> = [
+    { re: /(?<![\w.])print(?![A-Za-z0-9_])(?!\s*\()/g, confidence: "high" },
+    { re: /(?<![\w.])exec\s+/g, confidence: "high" },
+    { re: /(?<![\w.])unicode\s*\(/g, confidence: "medium" },
+    { re: /\.(?:iteritems|iterkeys|itervalues)\s*\(/g, confidence: "medium" },
+    { re: /<>/g, confidence: "high" },
+    { re: /`/g, confidence: "high" },
+    { re: /except\s+[^:,\n()]+\s*,\s*[A-Za-z_]\w*\s*:/g, confidence: "high" },
+  ];
+  const signals: Signal[] = [];
+  for (const { re, confidence } of patterns) {
+    re.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = re.exec(masked)) !== null) {
+      const index = match.index;
+      const { line, column } = lineColumnAt(source, index);
+      signals.push({
+        ruleId: "M1",
+        file,
+        line,
+        column,
+        matched: source.slice(index, index + match[0].length),
+        confidence,
+        manifestDir,
+      });
+      if (match[0].length === 0) re.lastIndex += 1;
+    }
+  }
+  return { signals, unknowns: [] };
+}
+
+function collectPythonSignals(
+  source: string,
+  file: string,
+  manifestDir: string,
+  signals: Signal[],
+  unknowns: UnknownRecord[]
+): void {
+  if (isPythonParserReady()) {
+    const plan = planPythonEdits(source, file);
+    if (plan) {
+      for (const item of plan.residue) {
+        signals.push({
+          ruleId: "M1",
+          file,
+          line: item.line,
+          column: item.column,
+          matched: item.text,
+          confidence: residueConfidenceFor(item.kind),
+          manifestDir,
+        });
+      }
+      for (const unknown of plan.unknowns) unknowns.push(unknown);
+      return;
+    }
+  }
+  const fallback = lexicalPythonSignals(source, file, manifestDir);
+  for (const signal of fallback.signals) signals.push(signal);
+  for (const unknown of fallback.unknowns) unknowns.push(unknown);
+}
+
+export function detectSignals(
+  input: DetectSignalsInput,
+  options?: DetectSignalsOptions
+): DetectSignalsResult {
+  const rawList: DetectSignalsInputFile[] = toFileList(input);
 
   const signals: Signal[] = [];
   const unknowns: UnknownRecord[] = [];
@@ -193,7 +405,8 @@ export function detectSignals(
     }
 
     const filePath = normalizePath(file.path);
-    if (!isBabelParseable(filePath)) {
+    const isPython = isPythonFile(filePath);
+    if (!isBabelParseable(filePath) && !isPython) {
       continue;
     }
 
@@ -214,6 +427,11 @@ export function detectSignals(
         file: filePath,
       };
       unknowns.push(errRecord);
+      continue;
+    }
+
+    if (isPython) {
+      collectPythonSignals(source, filePath, manifestDir, signals, unknowns);
       continue;
     }
 
@@ -469,45 +687,104 @@ export function detectSignals(
     });
   }
 
-  // Deduplicate signals that have identical (file, line, column, ruleId, matched)
-  const seenSignals = new Set<string>();
-  const uniqueSignals: Signal[] = [];
-  for (const s of signals) {
-    const key = `${s.file}:${s.line}:${s.column}:${s.ruleId}:${s.matched}`;
-    if (!seenSignals.has(key)) {
-      seenSignals.add(key);
-      uniqueSignals.push(s);
-    }
-  }
-
-  // Sort deterministically by (file, line, column, ruleId)
-  uniqueSignals.sort((a, b) => {
-    if (a.file !== b.file) {
-      return a.file < b.file ? -1 : 1;
-    }
-    if (a.line !== b.line) {
-      return a.line - b.line;
-    }
-    if (a.column !== b.column) {
-      return a.column - b.column;
-    }
-    if (a.ruleId !== b.ruleId) {
-      return a.ruleId < b.ruleId ? -1 : 1;
-    }
-    return 0;
-  });
-
-  if (options?.unknowns) {
-    for (const u of unknowns) {
-      options.unknowns.push(u);
-    }
-  }
-
-  const result = Object.assign(uniqueSignals, {
-    signals: uniqueSignals,
-    unknowns,
-    parseErrors: unknowns.filter((u) => u.reason === "parse_error"),
-  });
-
-  return result as DetectSignalsResult;
+  return finalizeSignals(signals, unknowns, options);
 }
+
+/**
+ * Synchronous Python-only detector that always uses the comment/string-aware
+ * lexical fallback (no tree-sitter dependency). Deterministic entry point for
+ * the fallback path used by `detectSignals` before the parser is initialized.
+ */
+export function detectPythonSignalsLexical(
+  input: DetectSignalsInput,
+  options?: DetectSignalsOptions
+): DetectSignalsResult {
+  const rawList = toFileList(input);
+  const signals: Signal[] = [];
+  const unknowns: UnknownRecord[] = [];
+
+  for (const file of rawList) {
+    if (!file || typeof file.path !== "string") continue;
+
+    const filePath = normalizePath(file.path);
+    if (!isPythonFile(filePath)) continue;
+
+    const manifestDir = getManifestDir(file);
+    let source = file.content ?? file.text ?? (file as any).source;
+    if (typeof source !== "string") {
+      try {
+        source = readFileSync(file.path, "utf-8");
+      } catch {
+        source = undefined;
+      }
+    }
+    if (typeof source !== "string") {
+      unknowns.push({ ruleId: "M1", reason: "parse_error", file: filePath });
+      continue;
+    }
+
+    const fallback = lexicalPythonSignals(source, filePath, manifestDir);
+    for (const signal of fallback.signals) signals.push(signal);
+    for (const unknown of fallback.unknowns) unknowns.push(unknown);
+  }
+
+  return finalizeSignals(signals, unknowns, options);
+}
+
+/**
+ * Asynchronous Python-only detector. Uses the tree-sitter analyzer so comments
+ * and string literals are suppressed automatically.
+ */
+export async function detectPythonSignals(
+  input: DetectSignalsInput,
+  options?: DetectSignalsOptions
+): Promise<DetectSignalsResult> {
+  await initPythonParser();
+
+  const rawList = toFileList(input);
+  const signals: Signal[] = [];
+  const unknowns: UnknownRecord[] = [];
+
+  for (const file of rawList) {
+    if (!file || typeof file.path !== "string") continue;
+
+    const filePath = normalizePath(file.path);
+    if (!isPythonFile(filePath)) continue;
+
+    const manifestDir = getManifestDir(file);
+    let source = file.content ?? file.text ?? (file as any).source;
+    if (typeof source !== "string") {
+      try {
+        source = readFileSync(file.path, "utf-8");
+      } catch {
+        source = undefined;
+      }
+    }
+
+    if (typeof source !== "string") {
+      unknowns.push({ ruleId: "M1", reason: "parse_error", file: filePath });
+      continue;
+    }
+
+    const plan = planPythonEdits(source, filePath);
+    if (!plan) {
+      unknowns.push({ ruleId: "M1", reason: "parse_error", file: filePath });
+      continue;
+    }
+    for (const item of plan.residue) {
+      signals.push({
+        ruleId: "M1",
+        file: filePath,
+        line: item.line,
+        column: item.column,
+        matched: item.text,
+        confidence: residueConfidenceFor(item.kind),
+        manifestDir,
+      });
+    }
+    for (const unknown of plan.unknowns) unknowns.push(unknown);
+  }
+
+  return finalizeSignals(signals, unknowns, options);
+}
+
