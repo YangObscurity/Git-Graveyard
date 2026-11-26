@@ -566,20 +566,20 @@ Implementation plan for the resurrection engine (design Revision 4). It follows 
 
 - [x] 16. Checkpoint - one real recorded run end to end, replayable. Run npm run test:props, npm run test:golden, and npm run test:e2e, ask the user if questions arise.
 
-- [ ] 17. [Teammate — Pure Code & Fixture Tests] Calibration support for the E11 defaults
-  - [ ] 17.1 Implement Admin settings storage for E11 defaults and audit tracking
+- [x] 17. [Teammate — Pure Code & Fixture Tests] Calibration support for the E11 defaults
+  - [x] 17.1 Implement Admin settings storage for E11 defaults and audit tracking
     - Implement SettingsStore in lib/admin/settings-store.ts initializing E11 starting values including Warden rejection rounds, prompt wall-clock cap, run wall-clock cap, silent-Skeleton limit, approval wait, and queue idle limit
     - Enforce required settings validation refusing run startup if any required setting lacks a value
     - Record audit trail entries for all setting changes capturing timestamp, actor identity, and before and after values
     - Track recorded run completion count from EventStore and toggle recalibrationRequired flag when three recorded runs conclude
     - _Requirements: 30.1, 30.2, 30.3, 30.18, 30.20_
-  - [ ] 17.2 Implement calibration summary script for recorded runs
+  - [x] 17.2 Implement calibration summary script for recorded runs
     - Query EventStore in scripts/calibrate-e11.ts to aggregate execution metrics across the first three completed recorded runs
     - Compute empirical distributions for observed Warden rejection rounds per task, prompt durations, run wall-clock durations excluding Pact waits, approval response wait times, and silence durations
     - Generate calibrated parameter proposals formatted as JSON and Markdown comparison against initial defaults with event ID citations
     - Provide CLI flags to commit updated calibrated values into SettingsStore with an audit entry
     - _Requirements: 30.20_
-  - [ ] 17.3 Write unit and integration tests for E11 calibration analysis and settings storage
+  - [x] 17.3 Write unit and integration tests for E11 calibration analysis and settings storage
     - Test SettingsStore initialization, missing required setting rejection, and audit log generation in test/admin/calibrate-e11.test.ts
     - Test scripts/calibrate-e11.ts across fixture runs verifying extraction of rejection rounds, duration calculations excluding Pact wait times, and proposed setting adjustments
     - Verify recalibrationRequired flag toggles to true upon the third recorded run conclusion
@@ -588,13 +588,13 @@ Implementation plan for the resurrection engine (design Revision 4). It follows 
 - [ ] 18. [Owner — Kiro CLI + Docker Sandbox Live Runs] Checkpoint - Three recorded runs and calibrated settings. Run npm run test:props and npm run test:golden, ask the user if questions arise.
 
 - [ ] 19. [Teammate — Pure Code, Local Python 3 AST & Property Tests] Grimoire Python: M1 rules, Python gate, CPython oracle, Grimoire bundle and deterministic output
-  - [ ] 19.1 Implement M1 Python 2 to 3 rewrite rules and AST transform engine
+  - [x] 19.1 Implement M1 Python 2 to 3 rewrite rules and AST transform engine
     - Implement AST transforms and token rewrites in lib/rules/m1-python.ts for print statements, except clauses, unicode conversions, and dictionary iterator methods citing rule M1
     - Detect unhandled Python 2 residue constructs including exec, <>, backticks, ur prefixes, octals, L suffixes, tuple params, and raise E, msg, recording unknown with reason py2_residue
     - Implement edit range splicing in lib/rules/m1-python.ts skipping overlapping edits with reason edit_conflict while preserving BOM and line endings
     - Validate input UTF-8 encoding and verify repository declared Python version compatibility, halting on Python 2 only declarations
     - _Requirements: 6.1, 6.3, 6.4, 6.5, 6.6, 6.7, 6.8, 6.9, 6.10, 6.11, 6.12, 6.13, 6.14, 6.16, 6.17, 6.18, 6.19_
-  - [ ] 19.2 Implement Grimoire Python syntax gate and Candidate verification
+  - [x] 19.2 Implement Grimoire Python syntax gate and Candidate verification
     - Implement Python gate evaluator in lib/grimoire/python-gate.ts measuring syntax error count and py2 residue count before and after edits
     - Reject M1 edits that increase parse errors or fail to decrease residue, recording unknown with gate_errors_rose, gate_residue_not_reduced, or parse_timeout
     - Assign m1-clean label when residue is zero and m1-partial otherwise, marking patch steps reverted when all edits are rejected
@@ -638,13 +638,13 @@ Implementation plan for the resurrection engine (design Revision 4). It follows 
     - **Validates: Requirements 10.8, 10.10**
 
 - [ ] 20. [Teammate — Code & Mocked/Worktree Tests; Owner — Live Multi-Skeleton Sandbox Verification] Bonesetter, parallel Soul-stitchers and the headless fallback
-  - [ ] 20.1 Implement Bonesetter agent template and lifecycle manager
+  - [x] 20.1 Implement Bonesetter agent template and lifecycle manager
     - Create committed Bonesetter agent template in lib/agents/templates/bonesetter.md with read-workspace preset and allow rules restricted to package manifests and lockfiles
     - Enforce agent tool restrictions denying shell, web, subagent, and configure fs_read and fs_write denials for .env, credentials, .git, and .kiro
     - Implement Bonesetter initialization in lib/agents/bonesetter.ts configuring pinned Claude Sonnet 5.5 model and bundling task Grimoire guidance into steering resources
     - Wire typed tool interfaces for read, write, sandbox_exec, sandbox_log, report_task_result, ask, report_blocker, and ack_message
     - _Requirements: 14.1, 14.2, 14.5, 14.9, 14.10, 14.11, 14.12, 14.13, 14.14, 14.15, 14.18_
-  - [ ] 20.2 Implement Headless Fallback execution channel and stream-json parser
+  - [x] 20.2 Implement Headless Fallback execution channel and stream-json parser
     - Implement HeadlessFallbackChannel in lib/acp/headless-fallback.ts spawning kiro-cli chat --v3 --no-interactive with stream-json output and trusted gateway tools
     - Implement stream logger and JSON event parser in lib/acp/stream-parser.ts reading stdout stream to disk and verifying active model reporting per probe P14
     - Map process exit codes with 0 to success, 1 to failure, 3 to gateway_missing, and 4 to missing agent with output discard
