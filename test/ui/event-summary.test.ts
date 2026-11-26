@@ -235,6 +235,8 @@ describe("summarizeEvent: other kinds the run model handles", () => {
       "Run stopped by admin (stuck)"
     );
     assert.equal(summarizeEvent(ev("admin.redaction", { refs: [] })), "Redacted by the owner");
+    assert.equal(summarizeEvent(ev("pact.revised", { pactVersion: 2, refs: [] })), "Pact v2 revised");
+    assert.equal(summarizeEvent(ev("pact.revision", { pactVersion: 2, refs: [] })), "Pact v2 revised");
   });
 
   it("summarizes skeleton kinds", () => {

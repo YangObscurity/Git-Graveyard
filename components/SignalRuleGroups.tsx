@@ -109,7 +109,7 @@ function RuleSection({ group, sha, onOpenReceipt }: RuleSectionProps) {
       <ul className="divide-y divide-white/5">
         {group.files.map((fileGroup) => (
           <FileRow
-            key={fileGroup.file || "(no file)"}
+            key={fileGroup.hasFile ? `file:${fileGroup.file}` : "no-file"}
             ruleId={group.ruleId}
             group={fileGroup}
             sha={sha}

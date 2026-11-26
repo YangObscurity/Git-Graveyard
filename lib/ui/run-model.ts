@@ -143,6 +143,7 @@ export interface RunChannelEntry {
   options?: string[];
   answered?: boolean;
   askId?: string;
+  approvalId?: string;
 }
 
 export interface RunArtifact {
@@ -288,7 +289,12 @@ function toDraft(view: RunView): Draft {
   };
 }
 
-function setPhase(draft: Draft, phase: RunPhaseView, ts: number | undefined) {
+function setPhase(
+  draft: Draft,
+  phase: RunPhaseView,
+  ts: number | undefined,
+  promoteStoppedOnSuccess = false
+) {
   draft.phase = phase;
   if (phase !== "queued" && phase !== "unknown" && draft.startedAt === null) {
     draft.startedAt = ts ?? null;
@@ -297,26 +303,51 @@ function setPhase(draft: Draft, phase: RunPhaseView, ts: number | undefined) {
     draft.endedAt = ts ?? null;
   }
   if (phase === "done") {
-    settleActiveSkeletons(draft);
+    settleActiveSkeletons(draft, promoteStoppedOnSuccess);
   }
 }
 
-/** Skeleton states that mean "still working"; failed and laid-to-rest states are kept. */
+/** Skeleton states that mean "still waiting or working"; failed and laid-to-rest states are kept. */
 const ACTIVE_SKELETON_STATES = new Set([
   "starting",
   "running",
   "working",
   "auditing",
   "recovering",
+  "awaiting_approval",
+  "blocked",
 ]);
 
-/** A concluded run has no live Skeletons: mark the ones still active as completed. */
-function settleActiveSkeletons(draft: Draft) {
+const SUCCESSFUL_RUN_OUTCOMES = new Set([
+  "resurrected",
+  "resurrected_build_only",
+  "healthy_already",
+]);
+
+function hasAllTasksMerged(draft: Draft, skeleton: RunSkeleton): boolean {
+  return (
+    skeleton.taskIds.length > 0 &&
+    skeleton.taskIds.every(
+      (id) => draft.tasks.find((t) => t.taskId === id)?.state === "merged"
+    )
+  );
+}
+
+/**
+ * A concluded run has no live Skeletons: settle still-active ones according
+ * to the run outcome (completed on success, stopped on failure/cancellation).
+ */
+function settleActiveSkeletons(draft: Draft, promoteStoppedOnSuccess = false) {
+  const outcome = draft.outcome?.toLowerCase() ?? null;
+  const succeeded = outcome !== null && SUCCESSFUL_RUN_OUTCOMES.has(outcome);
+  const isPartial = outcome === "partial";
   for (const skeleton of draft.skeletons) {
-    if (ACTIVE_SKELETON_STATES.has(skeleton.state.toLowerCase())) {
-      skeleton.state = "completed";
-      skeleton.currentToolCall = null;
-    }
+    const state = skeleton.state.toLowerCase();
+    const shouldComplete = succeeded || (isPartial && hasAllTasksMerged(draft, skeleton));
+    const canPromoteStopped = promoteStoppedOnSuccess && state === "stopped" && shouldComplete;
+    if (!ACTIVE_SKELETON_STATES.has(state) && !canPromoteStopped) continue;
+    skeleton.state = shouldComplete ? "completed" : "stopped";
+    skeleton.currentToolCall = null;
   }
 }
 
@@ -422,8 +453,9 @@ function applyOne(draft: Draft, event: RunEvent) {
 
     case "run.phase": {
       const phase = asPhase(data.phase) ?? asPhase(data.to);
-      if (phase) setPhase(draft, phase, ts);
+      const hadNoOutcome = draft.outcome === null;
       setOutcome(draft, data);
+      if (phase) setPhase(draft, phase, ts, hadNoOutcome && draft.outcome !== null);
       break;
     }
 
@@ -435,15 +467,16 @@ function applyOne(draft: Draft, event: RunEvent) {
     }
 
     case "run.done": {
-      setPhase(draft, "done", ts);
+      const hadNoOutcome = draft.outcome === null;
       setOutcome(draft, data);
+      setPhase(draft, "done", ts, hadNoOutcome && draft.outcome !== null);
       draft.paused = false;
       break;
     }
 
     case "admin.kill": {
-      setPhase(draft, "done", ts);
       draft.outcome = "killed";
+      setPhase(draft, "done", ts);
       break;
     }
 
@@ -594,6 +627,8 @@ function applyOne(draft: Draft, event: RunEvent) {
     case "approval.requested": {
       const approvalId = str(data.approvalId);
       if (!approvalId) break;
+      const existing = draft.approvals.find((a) => a.approvalId === approvalId);
+      if (existing?.status === "resolved") break;
       const approval: RunApproval = {
         approvalId,
         seq: event.seq,
@@ -608,12 +643,11 @@ function applyOne(draft: Draft, event: RunEvent) {
       };
       // approvalId is unique per request; a second record of the same request
       // refreshes the approval but must not add a second channel entry.
-      const alreadyKnown = draft.approvals.some((a) => a.approvalId === approvalId);
       draft.approvals = [
         ...draft.approvals.filter((a) => a.approvalId !== approvalId),
         approval,
       ];
-      if (alreadyKnown) break;
+      if (existing !== undefined) break;
       draft.channel.push({
         id: `chan-${event.seq}`,
         seq: event.seq,
@@ -624,6 +658,7 @@ function applyOne(draft: Draft, event: RunEvent) {
         text: `Command needs approval: ${approval.command}`,
         actor: event.actor,
         skeletonId,
+        approvalId,
       });
       break;
     }
@@ -633,10 +668,16 @@ function applyOne(draft: Draft, event: RunEvent) {
       if (!approvalId) break;
       const decision = str(data.decision) ?? "resolved";
       const approval = draft.approvals.find((a) => a.approvalId === approvalId);
+      const alreadyResolved =
+        approval?.status === "resolved" ||
+        draft.channel.some(
+          (c) => c.kind === "approval.resolved" && c.approvalId === approvalId
+        );
       if (approval) {
         approval.status = "resolved";
         approval.resolution = decision;
       }
+      if (alreadyResolved) break;
       draft.channel.push({
         id: `chan-${event.seq}`,
         seq: event.seq,
@@ -647,6 +688,7 @@ function applyOne(draft: Draft, event: RunEvent) {
         text: `${approval?.command ?? approvalId}: ${decision}`,
         actor: event.actor,
         skeletonId,
+        approvalId,
       });
       break;
     }

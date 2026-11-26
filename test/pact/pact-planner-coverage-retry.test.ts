@@ -3,14 +3,19 @@
  * failure, the live session is asked once to fix it. The final coverage gate stays fail-closed.
  */
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { describe, it } from "node:test";
 
+import { RunOrchestrator } from "../../lib/orchestrator/run-orchestrator";
 import {
   buildCoverageRetryPrompt,
   buildPlannerPrompt,
   generatePactWithPlanner,
   PactPlannerCoverageError,
 } from "../../lib/pact/pact-planner";
+import { validateCandidateFiles } from "../../lib/security/scope-check";
 
 const TEST_FAILURE_REF = "cmd:exhume-run-retry-test-1700000000000";
 
@@ -55,7 +60,7 @@ const COVERED_PACT = `# Tasks
 - [ ] T1. Fix failing test run
   - role: soul-stitcher
   - depends:
-  - files: ${TEST_FAILURE_REF}
+  - files: package.json, test/index.js
   - accept: npm test
   - hard: no
   - rules: M2
@@ -75,33 +80,38 @@ function createRecordingClient(replies: string[]) {
 }
 
 describe("buildPlannerPrompt: failure references", () => {
-  it("tells the planner to copy the exact reference of a failure without a ruleId", () => {
+  it("guides matching by step keyword without telling the planner to put only cmd: refs in files:", () => {
     const prompt = buildPlannerPrompt({
       runId: "run-retry-01",
       deathCertificate: createDeathCertificate(),
     });
 
-    assert.match(prompt, /copy the exact reference/i);
+    assert.match(prompt, /step keyword/i);
+    assert.match(prompt, /never list only a `cmd:` reference/i);
+    assert.ok(prompt.includes("(test)"));
     assert.ok(prompt.includes(TEST_FAILURE_REF));
   });
 });
 
 describe("buildCoverageRetryPrompt", () => {
-  it("lists each uncovered failure by its reference and asks for the full Pact again", () => {
+  it("lists each uncovered failure, explains step matching, and preserves real files: paths", () => {
     const prompt = buildCoverageRetryPrompt([
-      { file: TEST_FAILURE_REF, message: "npm test exited with code 1" },
+      { file: TEST_FAILURE_REF, stage: "test", message: "npm test exited with code 1" },
       { ruleId: "M4" },
     ]);
 
+    assert.ok(prompt.includes('step "test"'));
     assert.ok(prompt.includes(TEST_FAILURE_REF));
     assert.ok(prompt.includes("M4"));
+    assert.match(prompt, /step keyword/i);
     assert.match(prompt, /files:/);
+    assert.match(prompt, /never replace them with only a `cmd:` reference/i);
     assert.match(prompt, /complete Pact/i);
   });
 });
 
 describe("generatePactWithPlanner: coverage retry", () => {
-  it("asks once more and accepts the corrected Pact", async () => {
+  it("asks once more and accepts the corrected Pact without breaking filesInScope", async () => {
     const { client, prompts } = createRecordingClient([UNCOVERED_PACT, COVERED_PACT]);
 
     const result = await generatePactWithPlanner({
@@ -113,6 +123,12 @@ describe("generatePactWithPlanner: coverage retry", () => {
     assert.equal(result.ok, true);
     assert.equal(prompts.length, 2);
     assert.ok(prompts[1].includes(TEST_FAILURE_REF), "retry prompt names the uncovered failure");
+    assert.equal(
+      validateCandidateFiles(["package.json", "test/index.js"], {
+        filesInScope: result.tasks[0].files,
+      }).passed,
+      true
+    );
   });
 
   it("does not retry when the first Pact already covers every failure", async () => {
@@ -139,5 +155,49 @@ describe("generatePactWithPlanner: coverage retry", () => {
       (err: unknown) => err instanceof PactPlannerCoverageError
     );
     assert.equal(prompts.length, 2, "exactly one retry, never more");
+  });
+
+  it("live session client does not re-read stale spec/tasks.md on retry when chunks provide the updated Pact", async () => {
+    const plannerCwd = fs.mkdtempSync(path.join(os.tmpdir(), "gg-planner-retry-cwd-"));
+    try {
+      const orchestrator = new RunOrchestrator({
+        host: {} as any,
+        runsDir: plannerCwd,
+      });
+      const chunks: string[] = [];
+      let dispatches = 0;
+      const mockSupervisor = {
+        async dispatchTask() {
+          dispatches += 1;
+          if (dispatches === 1) {
+            const specDir = path.join(plannerCwd, "spec");
+            fs.mkdirSync(specDir, { recursive: true });
+            fs.writeFileSync(path.join(specDir, "tasks.md"), UNCOVERED_PACT, "utf-8");
+          } else {
+            chunks.push(`\`\`\`markdown\n${COVERED_PACT}\`\`\``);
+          }
+          return { status: "completed" };
+        },
+      };
+
+      const sessionClient = (orchestrator as any).createLivePlannerSessionClient(
+        mockSupervisor,
+        plannerCwd,
+        chunks,
+        createDeathCertificate()
+      );
+
+      const result = await generatePactWithPlanner({
+        runId: "run-retry-01",
+        deathCertificate: createDeathCertificate(),
+        sessionClient,
+      });
+
+      assert.equal(result.ok, true);
+      assert.equal(dispatches, 2);
+      assert.equal(result.tasks[0].title, "Fix failing test run");
+    } finally {
+      fs.rmSync(plannerCwd, { recursive: true, force: true });
+    }
   });
 });

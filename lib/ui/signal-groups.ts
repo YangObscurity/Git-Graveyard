@@ -75,7 +75,12 @@ export function groupSignalsByFile<T extends SignalReceiptLike>(
   const byFile = new Map<string, T[]>();
   for (const signal of signals) {
     const key = signal.file || "";
-    byFile.set(key, [...(byFile.get(key) ?? []), signal]);
+    const bucket = byFile.get(key);
+    if (bucket) {
+      bucket.push(signal);
+    } else {
+      byFile.set(key, [signal]);
+    }
   }
 
   return [...byFile.keys()].sort(compareFileKeys).map((file) => {

@@ -55,6 +55,35 @@ describe("duplicate approval events", () => {
     assert.equal(view.approvals.length, 2);
     assert.equal(approvalEntries(view).length, 2);
   });
+
+  it("shows one resolved entry when the same approval.resolved is recorded twice", () => {
+    seq = 0;
+    const view = buildRunView([
+      ev("run.phase", { phase: "legion" }),
+      ev("approval.requested", { approvalId: "ap-1", argv: ["npm", "test"] }),
+      ev("approval.resolved", { approvalId: "ap-1", decision: "approved" }),
+      ev("approval.resolved", { approvalId: "ap-1", decision: "approved" }),
+    ]);
+
+    assert.equal(view.approvals[0].status, "resolved");
+    const entries = approvalEntries(view);
+    assert.equal(entries.filter((e) => e.kind === "approval.requested").length, 1);
+    assert.equal(entries.filter((e) => e.kind === "approval.resolved").length, 1);
+  });
+
+  it("ignores a late duplicate approval.requested after the approval is already resolved", () => {
+    seq = 0;
+    const requested = { approvalId: "ap-1", argv: ["npm", "test"], cwd: "/w" };
+    const view = buildRunView([
+      ev("run.phase", { phase: "legion" }),
+      ev("approval.requested", requested),
+      ev("approval.resolved", { approvalId: "ap-1", decision: "approved" }),
+      ev("approval.requested", requested),
+    ]);
+
+    assert.equal(view.approvals[0].status, "resolved");
+    assert.equal(approvalEntries(view).length, 2);
+  });
 });
 
 describe("duplicate command events", () => {

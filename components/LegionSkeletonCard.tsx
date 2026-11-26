@@ -67,7 +67,13 @@ function resolveUiState(state: string): CanonicalSkeletonUiState {
   if (state === "awaiting_approval" || state === "blocked") return "awaiting_approval";
   if (state === "merged" || state === "completed" || state === "done") return "merged";
   if (state === "rejected") return "rejected";
-  if (state === "failed" || state === "error" || state === "laid_to_rest" || state === "abandoned") {
+  if (
+    state === "failed" ||
+    state === "error" ||
+    state === "laid_to_rest" ||
+    state === "abandoned" ||
+    state === "stopped"
+  ) {
     return "failed";
   }
   if (state === "queued") return "queued";
@@ -100,6 +106,7 @@ export function LegionSkeletonCard({
   const isCompleted = state === "completed" || state === "done" || state === "merged";
   const isRejected = state === "rejected";
   const isFailed = state === "failed" || state === "error";
+  const isStopped = state === "stopped";
   const isRecovering = state === "recovering";
 
   const uiState = resolveUiState(state);
@@ -149,6 +156,11 @@ export function LegionSkeletonCard({
     stateTone = "crimson";
     cardAuraClass = "border-rose-500/30 border-t-rose-500/60";
     skullClass = "text-rose-400/80";
+  } else if (isStopped) {
+    stateIcon = "[STOP]";
+    stateTone = "neutral";
+    cardAuraClass = "border-white/15 border-t-neutral-500";
+    skullClass = "text-ash";
   }
 
   // Current tool call running time — compute only after mount to avoid SSR hydration clock drift.
@@ -196,21 +208,26 @@ export function LegionSkeletonCard({
       : "No active tool call to interrupt"
     : "";
 
-  const reraiseDisabled = runDone || isCompleted || ((isRunning || isAuditing) && !isFailed);
+  const reraiseDisabled =
+    runDone || isCompleted || isStopped || ((isRunning || isAuditing) && !isFailed);
   const reraiseDisabledReason = reraiseDisabled
     ? runDone
       ? "Run has concluded"
       : isCompleted
       ? "Skeleton has already finished"
+      : isStopped
+      ? "Skeleton has stopped"
       : "Skeleton is already running"
     : "";
 
-  const layToRestDisabled = runDone || isLaidToRest || isCompleted;
+  const layToRestDisabled = runDone || isLaidToRest || isCompleted || isStopped;
   const layToRestDisabledReason = layToRestDisabled
     ? runDone
       ? "Run has concluded"
       : isCompleted
       ? "Skeleton has already finished"
+      : isStopped
+      ? "Skeleton has stopped"
       : "Skeleton has already been laid to rest"
     : "";
 
@@ -218,20 +235,25 @@ export function LegionSkeletonCard({
     ? skeleton.candidateSha256.slice(0, 12)
     : null;
 
+  const roleLower = role.toLowerCase();
+  const isBuilder = roleLower === "bonesetter" || roleLower === "soul-stitcher";
+
   const verdictLabel =
     skeleton.verdict ||
-    (isCompleted
+    (isCompleted && isBuilder
       ? "approved"
       : isRejected
       ? "rejected"
       : isFailed
       ? "failed"
+      : isStopped || runDone || !isBuilder
+      ? "not reported"
       : "awaiting review");
 
   const verdictTone: "emerald" | "amber" | "crimson" | "neutral" =
-    verdictLabel === "approved" || verdictLabel === "pass"
+    verdictLabel === "approve" || verdictLabel === "approved" || verdictLabel === "pass"
       ? "emerald"
-      : verdictLabel === "rejected" || verdictLabel === "failed"
+      : verdictLabel === "reject" || verdictLabel === "rejected" || verdictLabel === "failed"
       ? "crimson"
       : verdictLabel === "awaiting review"
       ? "amber"
