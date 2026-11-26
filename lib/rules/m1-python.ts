@@ -418,7 +418,10 @@ export function codingCookieName(source: string): string | null {
 // Residue list (design R3-9)
 // ---------------------------------------------------------------------------
 
-function classifyResidue(node: Node): string | null {
+function classifyResidue(
+  node: Node,
+  hasFuturePrint = false
+): string | null {
   switch (node.type) {
     case "print_statement":
       return "print_statement";
@@ -442,7 +445,11 @@ function classifyResidue(node: Node): string | null {
         : "except_target_unsupported";
     }
     case "expression_statement": {
+      // With `from __future__ import print_function` active, a bare `print`
+      // is a Python 3 expression that evaluates to the `print` built-in
+      // function and prints nothing; it is not Py2 residue.
       if (
+        !hasFuturePrint &&
         node.childCount === 1 &&
         node.child(0)?.type === "identifier" &&
         node.child(0)?.text === "print"
@@ -499,9 +506,13 @@ function classifyResidue(node: Node): string | null {
 
 /** Collects every residue occurrence with its position (design R3-9). */
 export function collectResidue(tree: Tree): PythonResidueItem[] {
+  // Keep residue classification in lock-step with `planFromTree`: a bare
+  // `print` is not residue when `from __future__ import print_function`
+  // is active.
+  const hasFuture = hasFuturePrint(tree);
   const items: PythonResidueItem[] = [];
   walkNodes(tree.rootNode, (node) => {
-    const kind = classifyResidue(node);
+    const kind = classifyResidue(node, hasFuture);
     if (kind === null) return;
     items.push({
       kind,
@@ -827,7 +838,11 @@ export function planFromTree(
       return;
     }
     if (node.type === "expression_statement") {
+      // Under `from __future__ import print_function`, a bare `print` is a
+      // harmless Python 3 expression evaluating to the built-in; rewriting it
+      // to `print()` would change behavior by emitting a newline.
       if (
+        !hasFuture &&
         node.childCount === 1 &&
         node.child(0)?.type === "identifier" &&
         node.child(0)?.text === "print"
