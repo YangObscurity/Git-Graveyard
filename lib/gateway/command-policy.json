@@ -1,0 +1,272 @@
+{
+  "version": "1.0.0",
+  "name": "git-graveyard-command-policy",
+  "description": "Committed Command Policy for sandbox_exec execution classification",
+  "egressAllowlist": [
+    "registry.npmjs.org",
+    "pypi.org",
+    "files.pythonhosted.org",
+    "github.com",
+    "codeload.github.com"
+  ],
+  "allowedCommands": [
+    {
+      "id": "git-status",
+      "name": "git status",
+      "argvPrefix": ["git", "status"],
+      "description": "Allowed git status inside caller worktree"
+    },
+    {
+      "id": "git-diff",
+      "name": "git diff",
+      "argvPrefix": ["git", "diff"],
+      "description": "Allowed git diff inside caller worktree"
+    },
+    {
+      "id": "git-log",
+      "name": "git log",
+      "argvPrefix": ["git", "log"],
+      "description": "Allowed git log inside caller worktree"
+    },
+    {
+      "id": "git-add",
+      "name": "git add",
+      "argvPrefix": ["git", "add"],
+      "description": "Allowed git add inside caller worktree"
+    },
+    {
+      "id": "git-commit",
+      "name": "git commit",
+      "argvPrefix": ["git", "commit"],
+      "description": "Allowed git commit inside caller worktree"
+    },
+    {
+      "id": "git-checkout-b",
+      "name": "git checkout -b",
+      "argvPrefix": ["git", "checkout", "-b"],
+      "description": "Allowed git checkout -b inside caller worktree"
+    },
+    {
+      "id": "npm-ci",
+      "name": "npm ci",
+      "argvPrefix": ["npm", "ci"],
+      "description": "npm clean install against allowlisted registry"
+    },
+    {
+      "id": "npm-install",
+      "name": "npm install",
+      "argvPrefix": ["npm", "install"],
+      "description": "npm install against allowlisted registry"
+    },
+    {
+      "id": "npm-i",
+      "name": "npm i",
+      "argvPrefix": ["npm", "i"],
+      "description": "npm install shorthand against allowlisted registry"
+    },
+    {
+      "id": "pip-install-r",
+      "name": "pip install -r",
+      "argvPrefix": ["pip", "install", "-r"],
+      "description": "pip install -r requirements against allowlisted PyPI index"
+    },
+    {
+      "id": "pip3-install-r",
+      "name": "pip3 install -r",
+      "argvPrefix": ["pip3", "install", "-r"],
+      "description": "pip3 install -r requirements against allowlisted PyPI index"
+    },
+    {
+      "id": "poetry-install",
+      "name": "poetry install",
+      "argvPrefix": ["poetry", "install"],
+      "description": "poetry install against allowlisted PyPI index"
+    },
+    {
+      "id": "npm-run-build",
+      "name": "npm run build",
+      "argvPrefix": ["npm", "run", "build"],
+      "description": "npm run build inside caller worktree"
+    },
+    {
+      "id": "npm-run-test",
+      "name": "npm run test",
+      "argvPrefix": ["npm", "run", "test"],
+      "description": "npm run test inside caller worktree"
+    },
+    {
+      "id": "npm-test",
+      "name": "npm test",
+      "argvPrefix": ["npm", "test"],
+      "description": "npm test alias inside caller worktree"
+    },
+    {
+      "id": "npm-t",
+      "name": "npm t",
+      "argvPrefix": ["npm", "t"],
+      "description": "npm test alias shorthand inside caller worktree"
+    },
+    {
+      "id": "npm-run-lint",
+      "name": "npm run lint",
+      "argvPrefix": ["npm", "run", "lint"],
+      "description": "npm run lint inside caller worktree"
+    },
+    {
+      "id": "npm-run-typecheck",
+      "name": "npm run typecheck",
+      "argvPrefix": ["npm", "run", "typecheck"],
+      "description": "npm run typecheck inside caller worktree"
+    },
+    {
+      "id": "pytest",
+      "name": "pytest",
+      "argvPrefix": ["pytest"],
+      "description": "pytest execution inside caller worktree"
+    },
+    {
+      "id": "python-pytest",
+      "name": "python -m pytest",
+      "argvPrefix": ["python", "-m", "pytest"],
+      "description": "python -m pytest execution inside caller worktree"
+    },
+    {
+      "id": "python3-pytest",
+      "name": "python3 -m pytest",
+      "argvPrefix": ["python3", "-m", "pytest"],
+      "description": "python3 -m pytest execution inside caller worktree"
+    },
+    {
+      "id": "python-unittest",
+      "name": "python -m unittest",
+      "argvPrefix": ["python", "-m", "unittest"],
+      "description": "python -m unittest inside caller worktree"
+    },
+    {
+      "id": "python3-unittest",
+      "name": "python3 -m unittest",
+      "argvPrefix": ["python3", "-m", "unittest"],
+      "description": "python3 -m unittest inside caller worktree"
+    },
+    {
+      "id": "version-commands",
+      "name": "version commands",
+      "description": "Version query commands for toolchain binaries",
+      "binaries": [
+        "node",
+        "npm",
+        "python",
+        "python3",
+        "pip",
+        "pip3",
+        "poetry",
+        "git",
+        "npx",
+        "tsc"
+      ],
+      "flags": [
+        "-v",
+        "--version",
+        "-V"
+      ]
+    }
+  ],
+  "hardBlockRules": [
+    {
+      "id": "hard-block-kiro-key",
+      "name": "Kiro API Key",
+      "description": "Classify as blocked every argv naming the Kiro API key",
+      "keywords": [
+        "KIRO_API_KEY",
+        "kiro_api_key",
+        "kiro-api-key",
+        "kiro_key"
+      ]
+    },
+    {
+      "id": "hard-block-github-token",
+      "name": "GitHub Token",
+      "description": "Classify as blocked every argv naming a GitHub token",
+      "keywords": [
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+        "ghp_",
+        "github_pat_"
+      ]
+    },
+    {
+      "id": "hard-block-env-dump",
+      "name": "Environment Dump",
+      "description": "Classify as blocked every argv attempting an environment dump",
+      "keywords": [
+        "env",
+        "printenv",
+        "export",
+        "/proc/self/environ",
+        "/proc/1/environ"
+      ]
+    },
+    {
+      "id": "hard-block-ssh",
+      "name": "SSH Credentials",
+      "description": "Classify as blocked every argv targeting ~/.ssh or sensitive SSH keys",
+      "keywords": [
+        "~/.ssh",
+        "/.ssh",
+        ".ssh/",
+        "id_rsa",
+        "id_ed25519",
+        "authorized_keys",
+        "known_hosts"
+      ]
+    },
+    {
+      "id": "hard-block-cloud-metadata",
+      "name": "Cloud Metadata Address",
+      "description": "Classify as blocked every argv targeting cloud metadata IP 169.254.169.254",
+      "keywords": [
+        "169.254.169.254",
+        "metadata.google.internal",
+        "metadata.google",
+        "fd00:ec2::254"
+      ]
+    },
+    {
+      "id": "hard-block-sudo",
+      "name": "Sudo Privilege Escalation",
+      "description": "Classify as blocked every sudo command or privilege escalation command",
+      "keywords": [
+        "sudo",
+        "doas",
+        "su"
+      ]
+    },
+    {
+      "id": "hard-block-container-socket",
+      "name": "Container Socket",
+      "description": "Classify as blocked every command naming a container socket",
+      "keywords": [
+        "docker.sock",
+        "containerd.sock",
+        "podman.sock",
+        "/var/run/docker.sock",
+        "/run/containerd/containerd.sock"
+      ]
+    },
+    {
+      "id": "hard-block-host-mount",
+      "name": "Host Mount",
+      "description": "Classify as blocked every command naming a container host mount or root mount",
+      "keywords": [
+        "/host",
+        "/proc",
+        "/sys",
+        "/dev",
+        "--mount",
+        "--volume",
+        "-v /:"
+      ]
+    }
+  ],
+  "defaultClassification": "needs_approval"
+}

@@ -1,0 +1,313 @@
+@import "tailwindcss";
+
+:root {
+  color-scheme: dark;
+
+  /* Core Surfaces — Obsidian Basalt Hierarchy */
+  --bg-abyss: #060709;          /* Page backdrop */
+  --bg-crypt: #0b0d11;          /* Primary container / slab */
+  --bg-slab: #10131a;           /* Card / elevated panel */
+  --bg-slab-hover: #151922;     /* Interactive row / card hover */
+  --bg-recessed: #050608;       /* Code blocks, logs, inputs, terminal wells */
+  --bg-glass: rgba(11, 13, 17, 0.84); /* Sticky nav & HUD backdrop */
+
+  /* Foregrounds — Bone Ivory & Ash */
+  --fg-bone: #f5f5f4;           /* Primary headings & high-emphasis values */
+  --fg-parchment: #d6d3d1;      /* Primary body copy */
+  --fg-ash: #9ca3af;            /* Secondary metadata & labels */
+  --fg-dust: #6b7280;           /* Muted timestamps, SHA prefixes, hints */
+
+  /* Borders & Hairlines */
+  --border-hairline: rgba(245, 245, 244, 0.09);
+  --border-engraved: rgba(245, 245, 244, 0.16);
+  --border-focus: rgba(52, 211, 153, 0.55);
+
+  /* Semantic Necromantic Accents */
+  --necromancy-emerald: #10b981;
+  --necromancy-emerald-bright: #34d399;
+  --necromancy-emerald-dim: rgba(16, 185, 129, 0.12);
+  --necromancy-emerald-border: rgba(16, 185, 129, 0.35);
+
+  --arcane-amber: #f59e0b;
+  --arcane-amber-bright: #fbbf24;
+  --arcane-amber-dim: rgba(245, 158, 11, 0.12);
+  --arcane-amber-border: rgba(245, 158, 11, 0.35);
+
+  --crimson-seal: #f43f5e;
+  --crimson-seal-bright: #fb7185;
+  --crimson-seal-dim: rgba(244, 63, 94, 0.12);
+  --crimson-seal-border: rgba(244, 63, 94, 0.35);
+
+  --spectral-violet: #a78bfa;
+  --spectral-violet-dim: rgba(167, 139, 250, 0.12);
+  --spectral-violet-border: rgba(167, 139, 250, 0.35);
+
+  /* Elevation & Spectral Glows */
+  --shadow-slab: 0 1px 0 0 rgba(255, 255, 255, 0.04) inset, 0 12px 32px -12px rgba(0, 0, 0, 0.75);
+  --glow-emerald: 0 0 24px -4px rgba(16, 185, 129, 0.28);
+  --glow-amber: 0 0 24px -4px rgba(245, 158, 11, 0.24);
+  --glow-crimson: 0 0 24px -4px rgba(244, 63, 94, 0.26);
+
+  /* Typography Stacks */
+  --font-mono-stack: ui-monospace, "JetBrains Mono", "Cascadia Code", "Fira Code", Menlo, Monaco, Consolas, monospace;
+  --font-display-stack: Georgia, "Times New Roman", ui-serif, serif;
+}
+
+@theme inline {
+  --color-abyss: var(--bg-abyss);
+  --color-crypt: var(--bg-crypt);
+  --color-slab: var(--bg-slab);
+  --color-slab-hover: var(--bg-slab-hover);
+  --color-recessed: var(--bg-recessed);
+  --color-bone: var(--fg-bone);
+  --color-parchment: var(--fg-parchment);
+  --color-ash: var(--fg-ash);
+  --color-dust: var(--fg-dust);
+  --font-serif-ritual: var(--font-display-stack);
+}
+
+/* Global thin dark scrollbars */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #262b38 #060709;
+}
+
+*::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+*::-webkit-scrollbar-track {
+  background: #060709;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: #262b38;
+  border-radius: 9999px;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: #374151;
+}
+
+/* Cryptic Gothic Terminal Surface & Atmosphere Utilities */
+.crypt-bg-atmosphere {
+  background-color: var(--bg-abyss);
+  background-image:
+    radial-gradient(ellipse 80% 45% at 50% -10%, rgba(16, 185, 129, 0.08), transparent 70%),
+    radial-gradient(rgba(245, 245, 244, 0.035) 1px, transparent 1px);
+  background-size: 100% 100%, 24px 24px;
+  background-position: 0 0, 0 0;
+  background-attachment: fixed, scroll;
+}
+
+.crypt-panel {
+  background: linear-gradient(180deg, rgba(16, 19, 26, 0.95) 0%, rgba(11, 13, 17, 0.98) 100%);
+  border: 1px solid var(--border-hairline);
+  box-shadow: var(--shadow-slab);
+  border-radius: 0.5rem;
+  position: relative;
+}
+
+.crypt-panel-engraved {
+  background: linear-gradient(180deg, rgba(16, 19, 26, 0.95) 0%, rgba(11, 13, 17, 0.98) 100%);
+  border: 1px solid var(--border-engraved);
+  box-shadow: var(--shadow-slab);
+  border-radius: 0.5rem;
+  position: relative;
+}
+
+.crypt-panel-engraved::before {
+  content: "";
+  position: absolute;
+  inset: -1px;
+  pointer-events: none;
+  border-radius: inherit;
+  background-image:
+    linear-gradient(to right, rgba(245, 245, 244, 0.35), rgba(245, 245, 244, 0.35)),
+    linear-gradient(to bottom, rgba(245, 245, 244, 0.35), rgba(245, 245, 244, 0.35)),
+    linear-gradient(to left, rgba(245, 245, 244, 0.35), rgba(245, 245, 244, 0.35)),
+    linear-gradient(to bottom, rgba(245, 245, 244, 0.35), rgba(245, 245, 244, 0.35)),
+    linear-gradient(to right, rgba(245, 245, 244, 0.35), rgba(245, 245, 244, 0.35)),
+    linear-gradient(to top, rgba(245, 245, 244, 0.35), rgba(245, 245, 244, 0.35)),
+    linear-gradient(to left, rgba(245, 245, 244, 0.35), rgba(245, 245, 244, 0.35)),
+    linear-gradient(to top, rgba(245, 245, 244, 0.35), rgba(245, 245, 244, 0.35));
+  background-size:
+    8px 1px, 1px 8px,
+    8px 1px, 1px 8px,
+    8px 1px, 1px 8px,
+    8px 1px, 1px 8px;
+  background-position:
+    top left, top left,
+    top right, top right,
+    bottom left, bottom left,
+    bottom right, bottom right;
+  background-repeat: no-repeat;
+}
+
+.crypt-well {
+  background: var(--bg-recessed);
+  border: 1px solid var(--border-hairline);
+  box-shadow: inset 0 2px 6px rgba(0, 0, 0, 0.6);
+  border-radius: 0.375rem;
+}
+
+.crypt-btn-primary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  background-color: rgba(16, 185, 129, 0.9);
+  color: #060709;
+  font-weight: 600;
+  border: 1px solid rgba(110, 231, 183, 0.4);
+  box-shadow: 0 0 20px -4px rgba(16, 185, 129, 0.45);
+  transition: all 150ms cubic-bezier(0.4, 0, 0.2, 1);
+  cursor: pointer;
+}
+
+.crypt-btn-primary:hover:not(:disabled) {
+  background-color: #34d399;
+}
+
+.crypt-btn-primary:focus-visible {
+  outline: 2px solid #34d399;
+  outline-offset: 2px;
+}
+
+.crypt-btn-primary:disabled {
+  opacity: 0.5;
+  box-shadow: none;
+  cursor: not-allowed;
+}
+
+.crypt-btn-ghost {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  background-color: rgba(23, 23, 23, 0.8);
+  color: #e5e5e5;
+  border: 1px solid rgba(64, 64, 64, 0.8);
+  transition: color 150ms cubic-bezier(0.4, 0, 0.2, 1),
+    background-color 150ms cubic-bezier(0.4, 0, 0.2, 1),
+    border-color 150ms cubic-bezier(0.4, 0, 0.2, 1);
+  cursor: pointer;
+}
+
+.crypt-btn-ghost:hover:not(:disabled) {
+  background-color: rgba(38, 38, 38, 0.9);
+  border-color: rgba(115, 115, 115, 0.8);
+}
+
+.crypt-btn-ghost:focus-visible {
+  outline: 2px solid rgba(245, 245, 244, 0.45);
+  outline-offset: 2px;
+}
+
+.crypt-btn-ghost:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.crypt-btn-danger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  background-color: rgba(76, 5, 25, 0.7);
+  color: #fecdd3;
+  border: 1px solid rgba(190, 18, 60, 0.6);
+  transition: color 150ms cubic-bezier(0.4, 0, 0.2, 1),
+    background-color 150ms cubic-bezier(0.4, 0, 0.2, 1),
+    border-color 150ms cubic-bezier(0.4, 0, 0.2, 1);
+  cursor: pointer;
+}
+
+.crypt-btn-danger:hover:not(:disabled) {
+  background-color: rgba(136, 19, 55, 0.8);
+}
+
+.crypt-btn-danger:focus-visible {
+  outline: 2px solid rgba(251, 113, 133, 0.65);
+  outline-offset: 2px;
+}
+
+.crypt-btn-danger:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.crypt-kbd {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.125rem 0.375rem;
+  font-size: 10px;
+  line-height: 1.2;
+  font-family: var(--font-mono-stack);
+  color: #a3a3a3;
+  background-color: #171717;
+  border: 1px solid rgba(64, 64, 64, 0.8);
+  border-radius: 0.25rem;
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.08);
+}
+
+/* Motion Primitives */
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes cryptPulse {
+    0%, 100% {
+      opacity: 1;
+      transform: scale(1);
+    }
+    50% {
+      opacity: 0.55;
+      transform: scale(0.96);
+    }
+  }
+
+  @keyframes cryptShimmer {
+    0% {
+      background-position: -200% 0;
+    }
+    100% {
+      background-position: 200% 0;
+    }
+  }
+
+  .crypt-pulse-emerald {
+    animation: cryptPulse 2.4s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  }
+
+  .crypt-shimmer {
+    background-image: linear-gradient(
+      90deg,
+      rgba(16, 185, 129, 0) 0%,
+      rgba(16, 185, 129, 0.12) 50%,
+      rgba(16, 185, 129, 0) 100%
+    );
+    background-size: 200% 100%;
+    animation: cryptShimmer 2.2s linear infinite;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+html[data-ui-reduced-motion="true"] *,
+html[data-ui-reduced-motion="true"] *::before,
+html[data-ui-reduced-motion="true"] *::after {
+  animation: none !important;
+  transition-duration: 0.01ms !important;
+}
+
+/* Reserved Element Debug Outline Mode (?uiDebug=1) */
+html[data-ui-debug-outline="true"] [data-ui-element] {
+  outline: 1px dashed rgba(52, 211, 153, 0.45);
+  outline-offset: 2px;
+}

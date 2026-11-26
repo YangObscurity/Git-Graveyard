@@ -1,0 +1,18 @@
+[
+  {
+    "owner": "graveyard-fixtures",
+    "repo": "F-node-cjs-request",
+    "sha": "146a63be0cedb9f8f3bac97520f1b29df3734a548085358acb0ca9cf969a87a0",
+    "asOf": "2026-11-08T00:00:00Z",
+    "license": "MIT",
+    "path": "graveyard-fixtures-F-node-cjs-request@146a63be0cedb9f8f3bac97520f1b29df3734a548085358acb0ca9cf969a87a0"
+  },
+  {
+    "owner": "graveyard-fixtures",
+    "repo": "F-node-webpack2",
+    "sha": "9d6aced4c347e4067e420cc46b19f0bcf84966934fd8c79e2dee6fbb2f59a631",
+    "asOf": "2026-11-08T00:00:00Z",
+    "license": "MIT",
+    "path": "graveyard-fixtures-F-node-webpack2@9d6aced4c347e4067e420cc46b19f0bcf84966934fd8c79e2dee6fbb2f59a631"
+  }
+]

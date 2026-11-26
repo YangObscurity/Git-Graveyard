@@ -1,0 +1,9 @@
+# Default owner for all files; requires owner review when main-ruleset enables CODEOWNERS.
+* @YangObscurity
+
+# Security, merge gates, and CI workflows
+/.github/ @YangObscurity
+/lib/security/ @YangObscurity
+/lib/grimoire/ @YangObscurity
+/lib/runtime/ @YangObscurity
+/AGENTS.md @YangObscurity

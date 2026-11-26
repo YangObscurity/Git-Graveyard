@@ -1,0 +1,9 @@
+{
+  "schemaVersion": "v1",
+  "runId": "live-gulp-plumber-t40",
+  "files": {
+    "requirements.md": "",
+    "design.md": "",
+    "tasks.md": "- [ ] T1. Fix npm test crash (primordials is not defined) by forcing graceful-fs@4 under gulp 3\n  - role: soul-stitcher\n  - depends:\n  - files: package.json, package-lock.json, test/errorHandling.js, test/passThrough.js, test/pipePatching.js, test/pipeUnpatching.js\n  - accept: npm test\n  - hard: yes\n  - rules: M1, M2, M3\n"
+  }
+}
