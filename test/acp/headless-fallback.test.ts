@@ -1708,3 +1708,88 @@ describe("createStreamDiskLogger symlink containment", () => {
   });
 });
 
+
+describe("HeadlessFallbackChannel per-round model verification on resume", () => {
+  it("fails closed when a resumed --resume-id round reports a different model", async () => {
+    const { logPath, cleanup } = tempLogPath("resume-wrong-model");
+    try {
+      const captured: Captured = { calls: 0 };
+      const channel = makeChannel({
+        logPath,
+        s2ResumeSupported: true,
+        onApproval: () => "approve",
+        spawnFn: makeSpawn(
+          (callIndex) =>
+            callIndex === 0
+              ? {
+                  lines: [
+                    { type: "session", sessionId: "sess-a", model: "claude-sonnet-5.5" },
+                    { type: "approval_request", approvalId: "ap-1", tool: "shell" },
+                  ],
+                  code: 0,
+                }
+              : {
+                  lines: [
+                    { type: "session", sessionId: "sess-a", model: "claude-haiku-5.5" },
+                    { type: "assistant", text: "continued" },
+                  ],
+                  code: 0,
+                },
+          captured
+        ),
+      });
+
+      const result = await channel.runTurn({ prompt: "run a command" });
+
+      assert.equal(result.ok, false);
+      assert.equal(result.status, "model_mismatch");
+      assert.equal(result.reason, "model_mismatch");
+      // The offending resumed round's model is reported, not round 1's.
+      assert.equal(result.activeModel, "claude-haiku-5.5");
+      assert.equal(result.modelVerified, false);
+      assert.equal(captured.calls, 2);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("fails closed when a resumed --resume-id round omits the model", async () => {
+    const { logPath, cleanup } = tempLogPath("resume-missing-model");
+    try {
+      const captured: Captured = { calls: 0 };
+      const channel = makeChannel({
+        logPath,
+        s2ResumeSupported: true,
+        onApproval: () => "approve",
+        spawnFn: makeSpawn(
+          (callIndex) =>
+            callIndex === 0
+              ? {
+                  lines: [
+                    { type: "session", sessionId: "sess-b", model: "claude-sonnet-5.5" },
+                    { type: "approval_request", approvalId: "ap-2", tool: "shell" },
+                  ],
+                  code: 0,
+                }
+              : {
+                  lines: [{ type: "assistant", text: "continued without a model" }],
+                  code: 0,
+                },
+          captured
+        ),
+      });
+
+      const result = await channel.runTurn({ prompt: "run a command" });
+
+      assert.equal(result.ok, false);
+      assert.equal(result.status, "model_mismatch");
+      assert.equal(result.reason, "model_mismatch");
+      assert.equal(result.activeModel, null);
+      assert.equal(result.modelVerified, false);
+      assert.equal(captured.calls, 2);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
