@@ -1,0 +1,22 @@
+{
+  "strictness": 2,
+  "commentTypes": [
+    "logic",
+    "syntax"
+  ],
+  "autoReview": [
+    "open"
+  ],
+  "effort": "base",
+  "statusCheck": true,
+  "ignorePatterns": ".agent-ws/\nmemory/\n01_evidence/\n**/package-lock.json\npublic/monaco/\n.next/",
+  "instructions": "请全部使用简体中文提供审查意见，尽量给出可直接采纳的最小修复方案。请遵守根目录 AGENTS.md 的安全、隐私与沙箱隔离规范：不要建议把 .agent-ws/、memory/、01_evidence/ 或真实密钥写入版本库，不要绕过 Grimoire gate 或 Warden 合并闸门，也不要引入对上游源仓库的写操作。",
+  "customContext": {
+    "files": [
+      {
+        "path": "AGENTS.md",
+        "description": "Repository engineering rules covering sandbox isolation, Warden merge gates, and privacy invariants."
+      }
+    ]
+  }
+}

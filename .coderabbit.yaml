@@ -1,0 +1,92 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+
+language: "zh-CN"
+enable_free_tier: true
+
+reviews:
+  profile: "chill"
+  high_level_summary: true
+  review_status: true
+  commit_status: true
+  collapse_walkthrough: false
+  changed_files_summary: true
+  sequence_diagrams: true
+  estimate_code_review_effort: true
+  enable_prompt_for_ai_agents: true
+
+  auto_approvals:
+    enabled: false
+
+  auto_review:
+    enabled: true
+    auto_incremental_review: true
+    auto_pause_after_reviewed_commits: 5
+    drafts: false
+
+  finishing_touches:
+    autofix:
+      enabled: false
+    fix_ci:
+      enabled: false
+    resolve_merge_conflict:
+      enabled: false
+    unit_tests:
+      enabled: false
+    simplify:
+      enabled: false
+
+  slop_detection:
+    enabled: true
+
+  path_filters:
+    - "!**/.agent-ws/**"
+    - "!**/memory/**"
+    - "!**/01_evidence/**"
+    - "!**/package-lock.json"
+    - "!**/public/monaco/**"
+    - "!**/.next/**"
+
+  path_instructions:
+    - path: ".github/workflows/**"
+      instructions: "检查最小权限（permissions）、Fork PR 与评论门控隔离、Action SHA 固定以及避免脚本注入和密钥泄露。"
+    - path: "lib/security/**"
+      instructions: "重点审查凭据隔离（Kiro key / GitHub token / SSH 地址不得进容器）、脱敏幂等性、路径穿越防护与沙箱边界。"
+    - path: "lib/grimoire/**"
+      instructions: "重点审查 M1–M6 静态规则门禁逻辑、AST 解析边界与不可绕过性。"
+    - path: "lib/runtime/**"
+      instructions: "重点审查任务调度、Warden 合并闸门（Grimoire gate + Warden approve + candidateSha256 一致性）、事件单写与并发安全。"
+    - path: "app/api/**"
+      instructions: "重点审查路由鉴权（邀请码 / Admin 会话校验，禁止信任可伪造 header）、Zod 输入校验、错误处理与状态码。"
+    - path: "app/**"
+      instructions: "重点审查 Next.js 16 App Router / React 19 契约、客户端边界与可访问性；不要在前端暴露服务端凭据。"
+    - path: "components/**"
+      instructions: "重点审查 React 19 组件状态一致性、XSS 防护（如 Diff 展示）与可访问性。"
+    - path: "scripts/**"
+      instructions: "重点审查路径边界校验、Windows/Linux 跨平台兼容性及沙箱探针安全性。"
+
+  tools:
+    opengrep:
+      enabled: true
+    gitleaks:
+      enabled: true
+    trivy:
+      enabled: true
+    actionlint:
+      enabled: true
+
+chat:
+  auto_reply: true
+
+knowledge_base:
+  opt_out: false
+  code_guidelines:
+    enabled: true
+    filePatterns:
+      - "AGENTS.md"
+      - ".kiro/steering/**"
+  learnings:
+    scope: "local"
+  issues:
+    scope: "local"
+  pull_requests:
+    scope: "local"
