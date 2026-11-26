@@ -315,6 +315,9 @@ describe("candidate-submission: renamed Python baseline mapping", () => {
     runGit(["config", "user.name", "Test Runner"]);
     runGit(["config", "user.email", "runner@example.test"]);
 
+    fs.mkdirSync(path.dirname(path.join(gitDir, originalPath)), {
+      recursive: true,
+    });
     fs.writeFileSync(path.join(gitDir, originalPath), originalContent);
     runGit(["add", originalPath]);
     runGit(["commit", "-m", "init"]);
@@ -323,6 +326,9 @@ describe("candidate-submission: renamed Python baseline mapping", () => {
     const runId = "run-py-rename";
     runGit(["branch", `graveyard/${runId}`, baseSha]);
 
+    fs.mkdirSync(path.dirname(path.join(gitDir, renamedPath)), {
+      recursive: true,
+    });
     runGit(["mv", originalPath, renamedPath]);
     fs.writeFileSync(path.join(gitDir, renamedPath), candidateContent);
     runGit(["add", renamedPath]);
@@ -513,5 +519,92 @@ describe("candidate-submission: renamed Python baseline mapping", () => {
       repo.cleanup();
     }
   });
+  it("recovers the baseline of a heavily rewritten renamed .py via -M20 (>=50% rewrite)", async () => {
+    const oldContent = [
+      'print "a"',
+      'print "b"',
+      'print "c"',
+      'print "d"',
+      'print "e"',
+      'print "f"',
+      'print "g"',
+      'print "h"',
+      'print "i"',
+      'print "j"',
+      'print "k"',
+      'print "l"',
+      "aa = 1",
+      "bb = 2",
+      "cc = 3",
+      "dd = 4",
+      "ee = 5",
+      "ff = 6",
+      "gg = 7",
+      "hh = 8",
+      "",
+    ].join("\n");
+    // More than 50% of the file is rewritten (git similarity ~38%), so a plain
+    // `git diff --name-status` reports D + A. `-M20` still reports it as R, so
+    // the gate uses the pre-rename content as the true baseline instead of an
+    // empty one (which would falsely fail as gate_residue_not_reduced).
+    const newContent = [
+      'print "a"',
+      'print "b"',
+      'print "c"',
+      'print "d"',
+      'print "e"',
+      'print "f"',
+      'print "g"',
+      'print "h"',
+      "import os",
+      "import sys",
+      'MODE = "prod"',
+      "LIMIT = 100",
+      'NAME = "service"',
+      'PATH = "/tmp"',
+      "DEBUG = False",
+      "RETRY = 3",
+      "TIMEOUT = 30",
+      "WORKERS = 4",
+      "",
+    ].join("\n");
+
+    const repo = setupRenameRepo(
+      "old_name.py",
+      oldContent,
+      "sub/new_name.py",
+      newContent
+    );
+    try {
+      const scheduler = new Scheduler(repo.tasks, { runId: repo.runId });
+      scheduler.dispatchTask("T1");
+      const candidateSha256 = candidateSha256FromDiff(repo.diff);
+      const res = await onSubmit({
+        scheduler,
+        taskId: "T1",
+        runId: repo.runId,
+        diff: repo.diff,
+        allowList: ["old_name.py", "sub/new_name.py"],
+        candidateSha: repo.candidateSha,
+        candidateSha256,
+        tree: repo.tree,
+        gitDir: repo.gitDir,
+        expectedIntegrationHeadSha: repo.baseSha,
+        currentHeadSha: repo.baseSha,
+        eventStore: new EventStore(),
+        gitService: new GitService(),
+        wardenReview: approveWarden(repo, candidateSha256),
+      });
+      assert.ok(
+        !res.reasons.some((r) => r.includes("gate_residue_not_reduced")),
+        `heavily rewritten rename must recover its baseline: ${res.reasons.join(", ")}`
+      );
+      assert.equal(res.ok, true);
+      assert.equal(res.merged, true);
+    } finally {
+      repo.cleanup();
+    }
+  });
+
 });
 
