@@ -1,6 +1,8 @@
 import { readFileSync } from "node:fs";
 import { parse, type ParserPlugin } from "@babel/parser";
 import type { Signal, RuleId, Confidence, UnknownRecord } from "./types";
+import { isPythonFile } from "./gate-js";
+import type { PythonPlan } from "../rules/m1-python";
 
 export type DetectSignalsInputFile = {
   path: string;
@@ -168,11 +170,8 @@ function walk(node: unknown, visitor: (node: any) => void): void {
   }
 }
 
-export function detectSignals(
-  input: DetectSignalsInput,
-  options?: DetectSignalsOptions
-): DetectSignalsResult {
-  const rawList: DetectSignalsInputFile[] = Array.isArray(input)
+function toFileList(input: DetectSignalsInput): DetectSignalsInputFile[] {
+  return Array.isArray(input)
     ? input
     : input && typeof input === "object" && "files" in input && Array.isArray((input as any).files)
     ? (input as any).files
@@ -183,6 +182,379 @@ export function detectSignals(
     : input && typeof input === "object" && typeof (input as any).path === "string"
     ? [input as DetectSignalsInputFile]
     : [];
+}
+
+function finalizeSignals(
+  signals: Signal[],
+  unknowns: UnknownRecord[],
+  options?: DetectSignalsOptions
+): DetectSignalsResult {
+  const seenSignals = new Set<string>();
+  const uniqueSignals: Signal[] = [];
+  for (const s of signals) {
+    const key = `${s.file}:${s.line}:${s.column}:${s.ruleId}:${s.matched}`;
+    if (!seenSignals.has(key)) {
+      seenSignals.add(key);
+      uniqueSignals.push(s);
+    }
+  }
+
+  uniqueSignals.sort((a, b) => {
+    if (a.file !== b.file) return a.file < b.file ? -1 : 1;
+    if (a.line !== b.line) return a.line - b.line;
+    if (a.column !== b.column) return a.column - b.column;
+    if (a.ruleId !== b.ruleId) return a.ruleId < b.ruleId ? -1 : 1;
+    return 0;
+  });
+
+  if (options?.unknowns) {
+    for (const u of unknowns) {
+      options.unknowns.push(u);
+    }
+  }
+
+  return Object.assign(uniqueSignals, {
+    signals: uniqueSignals,
+    unknowns,
+    parseErrors: unknowns.filter((u) => u.reason === "parse_error"),
+  }) as DetectSignalsResult;
+}
+
+function residueConfidenceFor(kind: string): Confidence {
+  switch (kind) {
+    case "unicode_call":
+    case "iterator_call":
+      return "medium";
+    default:
+      return "high";
+  }
+}
+
+/** Masks Python comments and string literals (newlines preserved). */
+function maskPython(source: string): string {
+  const chars = source.split("");
+  const n = source.length;
+  let i = 0;
+  let quote: string | null = null;
+  let triple = false;
+
+  while (i < n) {
+    const ch = source[i];
+    if (quote !== null) {
+      if (ch === "\n" || ch === "\r") {
+        if (!triple) quote = null;
+        i++;
+        continue;
+      }
+      if (ch === "\\") {
+        chars[i] = " ";
+        // Preserve quote state across backslash line-continuations (\\\n and \\\r\n).
+        if (i + 1 < n && source[i + 1] === "\n") {
+          i += 2;
+        } else if (i + 2 < n && source[i + 1] === "\r" && source[i + 2] === "\n") {
+          i += 3;
+        } else if (i + 1 < n) {
+          chars[i + 1] = " ";
+          i += 2;
+        } else {
+          i += 1;
+        }
+        continue;
+      }
+      if (triple) {
+        if (source.startsWith(quote.repeat(3), i)) {
+          chars[i] = " ";
+          chars[i + 1] = " ";
+          chars[i + 2] = " ";
+          i += 3;
+          quote = null;
+          triple = false;
+          continue;
+        }
+        chars[i] = " ";
+        i++;
+        continue;
+      }
+      if (ch === quote) {
+        chars[i] = " ";
+        i++;
+        quote = null;
+        continue;
+      }
+      chars[i] = " ";
+      i++;
+      continue;
+    }
+    if (ch === "#") {
+      while (i < n && source[i] !== "\n" && source[i] !== "\r") {
+        chars[i] = " ";
+        i++;
+      }
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      triple = source.startsWith(ch.repeat(3), i);
+      chars[i] = " ";
+      if (triple) {
+        chars[i + 1] = " ";
+        chars[i + 2] = " ";
+        i += 3;
+        quote = ch;
+      } else {
+        i += 1;
+        quote = ch;
+      }
+      continue;
+    }
+    i++;
+  }
+  return chars.join("");
+}
+
+function lineColumnAt(source: string, index: number): { line: number; column: number } {
+  let line = 1;
+  let last = 0;
+  for (let i = 0; i < index; i++) {
+    if (source[i] === "\n") {
+      line += 1;
+      last = i + 1;
+    }
+  }
+  return { line, column: index - last };
+}
+
+function hasTopLevelCommaInCall(masked: string, openParenIndex: number): boolean {
+  let parenDepth = 0;
+  let bracketDepth = 0;
+  let braceDepth = 0;
+  for (let i = openParenIndex + 1; i < masked.length; i++) {
+    const ch = masked[i];
+    if (ch === "(") parenDepth += 1;
+    else if (ch === ")") {
+      if (parenDepth === 0) return false;
+      parenDepth -= 1;
+    } else if (ch === "[") bracketDepth += 1;
+    else if (ch === "]") {
+      if (bracketDepth > 0) bracketDepth -= 1;
+    } else if (ch === "{") braceDepth += 1;
+    else if (ch === "}") {
+      if (braceDepth > 0) braceDepth -= 1;
+    } else if (
+      ch === "," &&
+      parenDepth === 0 &&
+      bracketDepth === 0 &&
+      braceDepth === 0
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function findTopLevelCommaIndex(text: string): number {
+  let parenDepth = 0;
+  let bracketDepth = 0;
+  let braceDepth = 0;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === "(") parenDepth += 1;
+    else if (ch === ")") {
+      if (parenDepth > 0) parenDepth -= 1;
+    } else if (ch === "[") bracketDepth += 1;
+    else if (ch === "]") {
+      if (bracketDepth > 0) bracketDepth -= 1;
+    } else if (ch === "{") braceDepth += 1;
+    else if (ch === "}") {
+      if (braceDepth > 0) braceDepth -= 1;
+    } else if (
+      ch === "," &&
+      parenDepth === 0 &&
+      bracketDepth === 0 &&
+      braceDepth === 0
+    ) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+/** Comment/string-aware lexical fallback for synchronous Python detection. */
+function lexicalPythonSignals(
+  source: string,
+  file: string,
+  manifestDir: string
+): { signals: Signal[]; unknowns: UnknownRecord[] } {
+  const masked = maskPython(source);
+  const patterns: Array<{
+    re: RegExp;
+    confidence: Confidence;
+    unhandled?: boolean;
+  }> = [
+    { re: /(?<![\w.])print(?![A-Za-z0-9_])(?!\s*\()/g, confidence: "high" },
+    // `exec` Py2 statement: require horizontal whitespace after `exec` and rule
+    // out a following call. `[ \t]+(?![ \t]*\()` avoids the `\s+(?!\()` backtrack
+    // where `exec  (code)` / `exec\t (code)` matched as Py2 because `\s+` gave
+    // back a whitespace char, letting the lookahead see whitespace instead of `(`.
+    // `[ \t]+` (not `\s+`) also keeps `exec\n(x)` from matching across statements.
+    { re: /(?<![\w.])exec[ \t]+(?![ \t]*\()/g, confidence: "high", unhandled: true },
+    { re: /(?<![\w.])unicode\s*\(/g, confidence: "medium" },
+    { re: /\.(?:iteritems|iterkeys|itervalues)\s*\(/g, confidence: "medium" },
+    { re: /<>/g, confidence: "high", unhandled: true },
+    { re: /`[^`\r\n]*`?/g, confidence: "high", unhandled: true },
+    { re: /except\s+[^:,\n()]+\s*,\s*[A-Za-z_]\w*\s*:/g, confidence: "high" },
+    { re: /(?<!\.)\b0[0-9]+\b/g, confidence: "high", unhandled: true },
+    {
+      re: /(?<!\.)\b(?:0[xX][0-9a-fA-F]+|0[bB][01]+|0[oO][0-7]+|\d+)[Ll]\b/g,
+      confidence: "high",
+      unhandled: true,
+    },
+    {
+      re: /(?<![\w.])(?:def\s+[A-Za-z_]\w*\s*\([^()\n=]*|lambda\s+[^:\n=]*)\([^()\n]+\)/g,
+      confidence: "high",
+      unhandled: true,
+    },
+  ];
+  const signals: Signal[] = [];
+  const unknowns: UnknownRecord[] = [];
+
+  for (const { re, confidence, unhandled } of patterns) {
+    re.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = re.exec(masked)) !== null) {
+      const index = match.index;
+      const { line, column } = lineColumnAt(source, index);
+      signals.push({
+        ruleId: "M1",
+        file,
+        line,
+        column,
+        matched: source.slice(index, index + match[0].length),
+        confidence,
+        manifestDir,
+      });
+      if (unhandled) {
+        unknowns.push({
+          ruleId: "M1",
+          reason: "py2_residue",
+          file,
+          line,
+        });
+      }
+      if (match[0].length >= 7 && /^unicode\s*\($/.test(match[0])) {
+        const openParenIndex = index + match[0].length - 1;
+        if (hasTopLevelCommaInCall(masked, openParenIndex)) {
+          unknowns.push({
+            ruleId: "M1",
+            reason: "unicode_decoding_ambiguous",
+            file,
+            line,
+          });
+        }
+      }
+      if (match[0].length === 0) re.lastIndex += 1;
+    }
+  }
+
+  // Raw+unicode string prefixes (`ur"..."` / `ru"..."`) where quotes were masked.
+  const urRe = /(?<![A-Za-z0-9_])(?:ur|ru)/gi;
+  let urMatch: RegExpExecArray | null;
+  while ((urMatch = urRe.exec(masked)) !== null) {
+    const index = urMatch.index;
+    const nextChar = source[index + urMatch[0].length];
+    if (nextChar !== "'" && nextChar !== '"') continue;
+    const { line, column } = lineColumnAt(source, index);
+    signals.push({
+      ruleId: "M1",
+      file,
+      line,
+      column,
+      matched: source.slice(index, index + urMatch[0].length + 1),
+      confidence: "high",
+      manifestDir,
+    });
+    unknowns.push({
+      ruleId: "M1",
+      reason: "py2_residue",
+      file,
+      line,
+    });
+  }
+
+  // Python 2 `raise E, msg` (top-level comma outside call/bracketed expressions).
+  const raiseRe = /(?<![\w.])raise\s+([^\n;#]+)/g;
+  let raiseMatch: RegExpExecArray | null;
+  while ((raiseMatch = raiseRe.exec(masked)) !== null) {
+    const body = raiseMatch[1];
+    const commaOffset = findTopLevelCommaIndex(body);
+    if (commaOffset === -1) continue;
+    const bodyStart = raiseMatch.index + raiseMatch[0].length - body.length;
+    const afterCommaSource = source.slice(
+      bodyStart + commaOffset + 1,
+      bodyStart + body.length
+    );
+    if (!/\S/.test(afterCommaSource)) continue;
+    const index = raiseMatch.index;
+    const { line, column } = lineColumnAt(source, index);
+    signals.push({
+      ruleId: "M1",
+      file,
+      line,
+      column,
+      matched: source.slice(index, index + raiseMatch[0].length).trimEnd(),
+      confidence: "high",
+      manifestDir,
+    });
+    unknowns.push({
+      ruleId: "M1",
+      reason: "py2_residue",
+      file,
+      line,
+    });
+  }
+
+  return { signals, unknowns };
+}
+
+const GLOBAL_PYTHON_PARSE_SYNC_KEY = "__ggPythonParseSync";
+
+function collectPythonSignals(
+  source: string,
+  file: string,
+  manifestDir: string,
+  signals: Signal[],
+  unknowns: UnknownRecord[]
+): void {
+  const parseSync = (globalThis as Record<string, unknown>)[
+    GLOBAL_PYTHON_PARSE_SYNC_KEY
+  ] as ((source: string, file: string) => PythonPlan | null) | undefined;
+  if (typeof parseSync === "function") {
+    const plan = parseSync(source, file);
+    if (plan) {
+      for (const item of plan.residue) {
+        signals.push({
+          ruleId: "M1",
+          file,
+          line: item.line,
+          column: item.column,
+          matched: item.text,
+          confidence: residueConfidenceFor(item.kind),
+          manifestDir,
+        });
+      }
+      for (const unknown of plan.unknowns) unknowns.push(unknown);
+      return;
+    }
+  }
+  const fallback = lexicalPythonSignals(source, file, manifestDir);
+  for (const signal of fallback.signals) signals.push(signal);
+  for (const unknown of fallback.unknowns) unknowns.push(unknown);
+}
+
+export function detectSignals(
+  input: DetectSignalsInput,
+  options?: DetectSignalsOptions
+): DetectSignalsResult {
+  const rawList: DetectSignalsInputFile[] = toFileList(input);
 
   const signals: Signal[] = [];
   const unknowns: UnknownRecord[] = [];
@@ -193,7 +565,8 @@ export function detectSignals(
     }
 
     const filePath = normalizePath(file.path);
-    if (!isBabelParseable(filePath)) {
+    const isPython = isPythonFile(filePath);
+    if (!isBabelParseable(filePath) && !isPython) {
       continue;
     }
 
@@ -214,6 +587,11 @@ export function detectSignals(
         file: filePath,
       };
       unknowns.push(errRecord);
+      continue;
+    }
+
+    if (isPython) {
+      collectPythonSignals(source, filePath, manifestDir, signals, unknowns);
       continue;
     }
 
@@ -469,45 +847,105 @@ export function detectSignals(
     });
   }
 
-  // Deduplicate signals that have identical (file, line, column, ruleId, matched)
-  const seenSignals = new Set<string>();
-  const uniqueSignals: Signal[] = [];
-  for (const s of signals) {
-    const key = `${s.file}:${s.line}:${s.column}:${s.ruleId}:${s.matched}`;
-    if (!seenSignals.has(key)) {
-      seenSignals.add(key);
-      uniqueSignals.push(s);
-    }
-  }
-
-  // Sort deterministically by (file, line, column, ruleId)
-  uniqueSignals.sort((a, b) => {
-    if (a.file !== b.file) {
-      return a.file < b.file ? -1 : 1;
-    }
-    if (a.line !== b.line) {
-      return a.line - b.line;
-    }
-    if (a.column !== b.column) {
-      return a.column - b.column;
-    }
-    if (a.ruleId !== b.ruleId) {
-      return a.ruleId < b.ruleId ? -1 : 1;
-    }
-    return 0;
-  });
-
-  if (options?.unknowns) {
-    for (const u of unknowns) {
-      options.unknowns.push(u);
-    }
-  }
-
-  const result = Object.assign(uniqueSignals, {
-    signals: uniqueSignals,
-    unknowns,
-    parseErrors: unknowns.filter((u) => u.reason === "parse_error"),
-  });
-
-  return result as DetectSignalsResult;
+  return finalizeSignals(signals, unknowns, options);
 }
+
+/**
+ * Synchronous Python-only detector that always uses the comment/string-aware
+ * lexical fallback (no tree-sitter dependency). Deterministic entry point for
+ * the fallback path used by `detectSignals` before the parser is initialized.
+ */
+export function detectPythonSignalsLexical(
+  input: DetectSignalsInput,
+  options?: DetectSignalsOptions
+): DetectSignalsResult {
+  const rawList = toFileList(input);
+  const signals: Signal[] = [];
+  const unknowns: UnknownRecord[] = [];
+
+  for (const file of rawList) {
+    if (!file || typeof file.path !== "string") continue;
+
+    const filePath = normalizePath(file.path);
+    if (!isPythonFile(filePath)) continue;
+
+    const manifestDir = getManifestDir(file);
+    let source = file.content ?? file.text ?? (file as any).source;
+    if (typeof source !== "string") {
+      try {
+        source = readFileSync(file.path, "utf-8");
+      } catch {
+        source = undefined;
+      }
+    }
+    if (typeof source !== "string") {
+      unknowns.push({ ruleId: "M1", reason: "parse_error", file: filePath });
+      continue;
+    }
+
+    const fallback = lexicalPythonSignals(source, filePath, manifestDir);
+    for (const signal of fallback.signals) signals.push(signal);
+    for (const unknown of fallback.unknowns) unknowns.push(unknown);
+  }
+
+  return finalizeSignals(signals, unknowns, options);
+}
+
+/**
+ * Asynchronous Python-only detector. Uses the tree-sitter analyzer so comments
+ * and string literals are suppressed automatically.
+ */
+export async function detectPythonSignals(
+  input: DetectSignalsInput,
+  options?: DetectSignalsOptions
+): Promise<DetectSignalsResult> {
+  const { initPythonParser, planPythonEdits } = await import("../rules/m1-python");
+  await initPythonParser();
+
+  const rawList = toFileList(input);
+  const signals: Signal[] = [];
+  const unknowns: UnknownRecord[] = [];
+
+  for (const file of rawList) {
+    if (!file || typeof file.path !== "string") continue;
+
+    const filePath = normalizePath(file.path);
+    if (!isPythonFile(filePath)) continue;
+
+    const manifestDir = getManifestDir(file);
+    let source = file.content ?? file.text ?? (file as any).source;
+    if (typeof source !== "string") {
+      try {
+        source = readFileSync(file.path, "utf-8");
+      } catch {
+        source = undefined;
+      }
+    }
+
+    if (typeof source !== "string") {
+      unknowns.push({ ruleId: "M1", reason: "parse_error", file: filePath });
+      continue;
+    }
+
+    const plan = planPythonEdits(source, filePath);
+    if (!plan) {
+      unknowns.push({ ruleId: "M1", reason: "parse_error", file: filePath });
+      continue;
+    }
+    for (const item of plan.residue) {
+      signals.push({
+        ruleId: "M1",
+        file: filePath,
+        line: item.line,
+        column: item.column,
+        matched: item.text,
+        confidence: residueConfidenceFor(item.kind),
+        manifestDir,
+      });
+    }
+    for (const unknown of plan.unknowns) unknowns.push(unknown);
+  }
+
+  return finalizeSignals(signals, unknowns, options);
+}
+

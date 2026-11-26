@@ -292,3 +292,226 @@ describe("candidate-submission: scan wiring before gate (WP F15)", () => {
     assert.equal(res.redactorResult?.hasSecrets, true);
   });
 });
+describe("candidate-submission: renamed Python baseline mapping", () => {
+  function setupRenameRepo(
+    originalPath: string,
+    originalContent: string,
+    renamedPath: string,
+    candidateContent: string
+  ) {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "py-rename-sub-"));
+    const gitDir = path.join(tmpDir, "git");
+    fs.mkdirSync(gitDir, { recursive: true });
+    const runGit = (args: string[]) =>
+      childProcess
+        .execFileSync("git", args, {
+          cwd: gitDir,
+          encoding: "utf8",
+          env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_TERMINAL_PROMPT: "0" },
+        })
+        .trim();
+
+    runGit(["init", "--initial-branch=main", "."]);
+    runGit(["config", "user.name", "Test Runner"]);
+    runGit(["config", "user.email", "runner@example.test"]);
+
+    fs.writeFileSync(path.join(gitDir, originalPath), originalContent);
+    runGit(["add", originalPath]);
+    runGit(["commit", "-m", "init"]);
+    const baseSha = runGit(["rev-parse", "HEAD"]);
+
+    const runId = "run-py-rename";
+    runGit(["branch", `graveyard/${runId}`, baseSha]);
+
+    runGit(["mv", originalPath, renamedPath]);
+    fs.writeFileSync(path.join(gitDir, renamedPath), candidateContent);
+    runGit(["add", renamedPath]);
+    runGit(["commit", "-m", "candidate"]);
+    const candidateSha = runGit(["rev-parse", "HEAD"]);
+    const tree = runGit(["rev-parse", `${candidateSha}^{tree}`]);
+    runGit(["branch", "task/T1", candidateSha]);
+
+    const diff = childProcess.execFileSync(
+      "git",
+      ["diff", "--binary", "--no-color", baseSha, candidateSha],
+      {
+        cwd: gitDir,
+        encoding: "utf8",
+        env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_TERMINAL_PROMPT: "0" },
+      }
+    );
+
+    const tasks: PactTask[] = [
+      {
+        id: "T1",
+        title: "Py Rename Task",
+        role: "bonesetter",
+        dependencies: [],
+        depends: [],
+        dependsOn: [],
+        files: [originalPath, renamedPath],
+        filesInScope: [originalPath, renamedPath],
+        acceptanceCommand: "pytest",
+        accept: "pytest",
+        hard: false,
+        hardFlag: false,
+        hardRaw: "no",
+        rules: ["M1"],
+        ruleIds: ["M1"],
+        line: 1,
+      },
+    ];
+
+    return {
+      tmpDir,
+      gitDir,
+      baseSha,
+      candidateSha,
+      tree,
+      runId,
+      diff,
+      tasks,
+      cleanup: () => fs.rmSync(tmpDir, { recursive: true, force: true }),
+    };
+  }
+
+  function approveWarden(
+    repo: ReturnType<typeof setupRenameRepo>,
+    candidateSha256: string
+  ) {
+    return async () => ({
+      verdict: "approve" as const,
+      candidateSha: repo.candidateSha,
+      candidateSha256,
+      tree: repo.tree,
+      reasons: [{ text: "ok", refs: ["cmd:test"] }],
+      checks: {
+        install: { ok: true },
+        build: { ok: true },
+        accept: { ok: true },
+        tests: { ok: true },
+        noTestWeakening: { ok: true },
+      },
+    });
+  }
+
+  it("accepts a rename of a legacy Python 2 file whose residue is unchanged", async () => {
+    const repo = setupRenameRepo(
+      "legacy_a.py",
+      'print "hi"\n',
+      "legacy_b.py",
+      'print "hi"\n'
+    );
+    try {
+      const scheduler = new Scheduler(repo.tasks, { runId: repo.runId });
+      scheduler.dispatchTask("T1");
+      const candidateSha256 = candidateSha256FromDiff(repo.diff);
+      const res = await onSubmit({
+        scheduler,
+        taskId: "T1",
+        runId: repo.runId,
+        diff: repo.diff,
+        allowList: ["legacy_a.py", "legacy_b.py"],
+        candidateSha: repo.candidateSha,
+        candidateSha256,
+        tree: repo.tree,
+        gitDir: repo.gitDir,
+        expectedIntegrationHeadSha: repo.baseSha,
+        currentHeadSha: repo.baseSha,
+        eventStore: new EventStore(),
+        gitService: new GitService(),
+        wardenReview: approveWarden(repo, candidateSha256),
+      });
+      assert.ok(
+        !res.reasons.some((r) => r.includes("gate_residue_not_reduced")),
+        `rename baseline should not be treated as new residue: ${res.reasons.join(", ")}`
+      );
+      assert.equal(res.ok, true);
+      assert.equal(res.merged, true);
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it("rejects a rename that adds new Python 2 residue to the renamed file", async () => {
+    const repo = setupRenameRepo(
+      "legacy_a.py",
+      'print "hi"\n',
+      "legacy_b.py",
+      'print "hi"\nprint "yo"\n'
+    );
+    try {
+      const scheduler = new Scheduler(repo.tasks, { runId: repo.runId });
+      scheduler.dispatchTask("T1");
+      const candidateSha256 = candidateSha256FromDiff(repo.diff);
+      let wardenCalled = false;
+      const res = await onSubmit({
+        scheduler,
+        taskId: "T1",
+        runId: repo.runId,
+        diff: repo.diff,
+        allowList: ["legacy_a.py", "legacy_b.py"],
+        candidateSha: repo.candidateSha,
+        candidateSha256,
+        tree: repo.tree,
+        gitDir: repo.gitDir,
+        expectedIntegrationHeadSha: repo.baseSha,
+        currentHeadSha: repo.baseSha,
+        eventStore: new EventStore(),
+        gitService: new GitService(),
+        wardenReview: async () => {
+          wardenCalled = true;
+          return { verdict: "approve" };
+        },
+      });
+      assert.equal(res.ok, false);
+      assert.equal(res.merged, false);
+      assert.equal(res.state, "rejected");
+      assert.equal(wardenCalled, false, "gate must reject before Warden review");
+      assert.ok(
+        res.reasons.some((r) => r.includes("gate_residue_not_reduced")),
+        `expected residue rejection: ${res.reasons.join(", ")}`
+      );
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it("keeps an empty Python baseline when a non-Python file is renamed to .py", async () => {
+    const repo = setupRenameRepo(
+      "notes.txt",
+      'print "hi"\n',
+      "legacy.py",
+      'print "hi"\n'
+    );
+    try {
+      const scheduler = new Scheduler(repo.tasks, { runId: repo.runId });
+      scheduler.dispatchTask("T1");
+      const candidateSha256 = candidateSha256FromDiff(repo.diff);
+      const res = await onSubmit({
+        scheduler,
+        taskId: "T1",
+        runId: repo.runId,
+        diff: repo.diff,
+        allowList: ["notes.txt", "legacy.py"],
+        candidateSha: repo.candidateSha,
+        candidateSha256,
+        tree: repo.tree,
+        gitDir: repo.gitDir,
+        expectedIntegrationHeadSha: repo.baseSha,
+        currentHeadSha: repo.baseSha,
+        eventStore: new EventStore(),
+        gitService: new GitService(),
+        wardenReview: async () => ({ verdict: "approve" }),
+      });
+      assert.equal(res.ok, false);
+      assert.ok(
+        res.reasons.some((r) => r.includes("gate_residue_not_reduced")),
+        `non-Python rename must not supply a Python baseline: ${res.reasons.join(", ")}`
+      );
+    } finally {
+      repo.cleanup();
+    }
+  });
+});
+

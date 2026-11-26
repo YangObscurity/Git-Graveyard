@@ -10,7 +10,8 @@ import {
   VerifiedMerge,
   isVerifiedMerge,
 } from "../git/git-service";
-import { gateJs, type GateResult } from "../grimoire/gate-js";
+import { gateJs, isPythonFile, type GateResult } from "../grimoire/gate-js";
+import { checkPythonCandidateGate } from "../grimoire/python-gate";
 import { candidateSha256FromDiff } from "../merge/candidate-hash";
 import {
   scanCandidateDiff,
@@ -899,6 +900,10 @@ export async function onSubmit(
 
     const deletedSet = new Set<string>();
     const modifiedFromDiff = new Set<string>();
+    // Maps a rename destination path to its pre-rename source path so the
+    // Python gate uses the source content at expectedHeadSha as the true
+    // baseline for the renamed destination file.
+    const renameSourceByDest = new Map<string, string>();
 
     for (const rawLine of diffNameStatusRaw.split("\n")) {
       const line = rawLine.trim();
@@ -909,8 +914,11 @@ export async function onSubmit(
         const p = parts[1]?.trim();
         if (p) deletedSet.add(p);
       } else if (statusCode.startsWith("R")) {
-        if (parts[1]?.trim()) deletedSet.add(parts[1].trim());
-        if (parts[2]?.trim()) modifiedFromDiff.add(parts[2].trim());
+        const oldPath = parts[1]?.trim();
+        const newPath = parts[2]?.trim();
+        if (oldPath) deletedSet.add(oldPath);
+        if (newPath) modifiedFromDiff.add(newPath);
+        if (oldPath && newPath) renameSourceByDest.set(newPath, oldPath);
       } else if (statusCode.startsWith("C")) {
         if (parts[2]?.trim()) modifiedFromDiff.add(parts[2].trim());
       } else {
@@ -971,30 +979,110 @@ export async function onSubmit(
     }
 
     const deletedList = Array.from(deletedSet);
+    const jsFileObjects = changedFileObjects.filter((f) => !isPythonFile(f.path));
+    const pyAfterObjects = changedFileObjects.filter(
+      (f): f is { path: string; content: string } =>
+        isPythonFile(f.path) && typeof f.content === "string"
+    );
+    const pyDeletedFiles = deletedList.filter((p) => isPythonFile(p));
+    const pyChangedFiles = Array.from(
+      new Set([...pyAfterObjects.map((f) => f.path), ...pyDeletedFiles])
+    );
+    const jsDeletedList = deletedList.filter((p) => !isPythonFile(p));
+
     const gateOptions = {
-      files: changedFileObjects,
-      deletions: deletedList,
-      deletedFiles: deletedList,
-      deletedPaths: deletedList,
+      files: jsFileObjects,
+      deletions: jsDeletedList,
+      deletedFiles: jsDeletedList,
+      deletedPaths: jsDeletedList,
       tree: candidateTree,
       candidateTree,
       taskId,
       diff,
-      empty: !hasModifiedFiles,
-      allowEmpty: !hasModifiedFiles,
+      empty: jsFileObjects.length === 0,
+      allowEmpty: jsFileObjects.length === 0,
     };
 
     // Always run real gateJs (Requirement 1: gateRunner removed)
-    const rawGateResult = gateJs(changedFileObjects as any, gateOptions as any);
+    const rawGateResult = gateJs(jsFileObjects as any, gateOptions as any);
     const gateResultBase: GateResult =
       typeof (rawGateResult as any)?.then === "function"
         ? await rawGateResult
         : rawGateResult;
 
+    let pyGateResult: GateResult | null = null;
+    if (pyChangedFiles.length > 0) {
+      const pyBeforeObjects: Array<{ path: string; content: string }> = [];
+      for (const pyFile of pyAfterObjects) {
+        // For a rename, the true baseline of the destination path is the
+        // pre-rename source content, but only when the source was itself a
+        // Python file. A non-Python source renamed to a .py destination has no
+        // Python baseline (fall back to an empty baseline).
+        const mappedSource = renameSourceByDest.get(pyFile.path);
+        const baselineRef =
+          mappedSource === undefined
+            ? pyFile.path
+            : isPythonFile(mappedSource)
+              ? mappedSource
+              : undefined;
+        if (baselineRef === undefined) {
+          continue;
+        }
+        try {
+          const baseline = await execGitShow(
+            gitService,
+            resolvedGitDir,
+            `${expectedHeadSha}:${baselineRef}`
+          );
+          pyBeforeObjects.push({ path: pyFile.path, content: baseline });
+        } catch {
+          // Absent in expectedHeadSha => new Python file with empty baseline.
+        }
+      }
+      pyGateResult = await checkPythonCandidateGate(
+        {
+          before: pyBeforeObjects,
+          after: pyAfterObjects,
+          files: pyAfterObjects,
+          changedFiles: pyChangedFiles,
+          deletions: pyDeletedFiles,
+          tree: candidateTree,
+          candidateTree,
+        },
+        {
+          runId,
+          taskId,
+          actor: "gate",
+          emit: () => {},
+        }
+      );
+    }
+
+    const jsOk = Boolean(gateResultBase.ok);
+    const pyOk = pyGateResult ? Boolean(pyGateResult.ok) : true;
+    const mergedFiles = Array.from(
+      new Set([
+        ...(Array.isArray(gateResultBase.files) ? gateResultBase.files : []),
+        ...(pyGateResult && Array.isArray(pyGateResult.files) ? pyGateResult.files : []),
+      ])
+    );
+    const mergedReasons = [
+      ...(jsOk ? [] : (gateResultBase.reasons ?? [])),
+      ...(pyGateResult && !pyOk ? (pyGateResult.reasons ?? []) : []),
+    ];
+    const mergedDetails = {
+      ...(gateResultBase.details ?? {}),
+      ...(pyGateResult?.details ?? {}),
+    };
+
     const gateResult: GateResult = {
       ...gateResultBase,
+      ok: jsOk && pyOk,
+      reasons: mergedReasons,
+      details: mergedDetails,
+      tree: candidateTree,
       deletions: deletedList,
-      files: changedFileObjects as any,
+      files: mergedFiles,
     } as any;
 
     // Append gate.result event from real gate computation (audit N-2 HIGH)
