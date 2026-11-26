@@ -12,6 +12,7 @@ import type {
   RequestPermissionResponse,
 } from "../broker/permission-broker";
 import type { BudgetCapLimits } from "./budget-caps";
+import type { HeadlessApprovalRequest, HeadlessAskRequest } from "../acp/stream-parser";
 
 export type { AllowedModelId, ModelTier, SkeletonRole };
 
@@ -246,6 +247,20 @@ export interface SkeletonSupervisorOptions {
   onEvent?: (event: SkeletonSupervisorEvent) => void | Promise<void>;
   onUpdate?: (update: unknown) => void | Promise<void>;
   onLog?: (stream: string, text: string) => void | Promise<void>;
+  /**
+   * Bridges the Headless Fallback approval prompt to the caller. When absent (or
+   * when it rejects) the channel fails closed and denies the approval. After a
+   * cancellation or termination it is never asked to resume.
+   */
+  onApproval?: (
+    request: HeadlessApprovalRequest
+  ) => "approve" | "deny" | Promise<"approve" | "deny">;
+  /**
+   * Requirement 17.11: invoked as soon as a headless `ask` is observed so the
+   * Gateway records the auto-denial. Required for headless turns: a missing hook
+   * fails the turn closed with `ask_auto_deny_failed` before any process spawns.
+   */
+  onAskAutoDeny?: (ask: HeadlessAskRequest) => Promise<void> | void;
   onRequestPermission?: (
     request: PermissionBrokerRequest
   ) => Promise<RequestPermissionResponse> | RequestPermissionResponse;
