@@ -2,7 +2,6 @@ import { readFileSync } from "node:fs";
 import { parse, type ParserPlugin } from "@babel/parser";
 import type { Signal, RuleId, Confidence, UnknownRecord } from "./types";
 import { isPythonFile } from "./gate-js";
-import type { PythonPlan } from "../rules/m1-python";
 
 export type DetectSignalsInputFile = {
   path: string;
@@ -342,7 +341,12 @@ function lineColumnAt(source: string, index: number): { line: number; column: nu
   return { line, column: index - last };
 }
 
-function hasTopLevelCommaInCall(masked: string, openParenIndex: number): boolean {
+/**
+ * Returns the top-level argument text inside the parentheses that open at
+ * `openParenIndex` (balanced across nested `()`/`[]`/`{}`), or null when the
+ * parentheses never close.
+ */
+function topLevelArgumentText(masked: string, openParenIndex: number): string | null {
   let parenDepth = 0;
   let bracketDepth = 0;
   let braceDepth = 0;
@@ -350,21 +354,57 @@ function hasTopLevelCommaInCall(masked: string, openParenIndex: number): boolean
     const ch = masked[i];
     if (ch === "(") parenDepth += 1;
     else if (ch === ")") {
-      if (parenDepth === 0) return false;
-      parenDepth -= 1;
+      if (parenDepth === 0 && bracketDepth === 0 && braceDepth === 0) {
+        return masked.slice(openParenIndex + 1, i);
+      }
+      if (parenDepth > 0) parenDepth -= 1;
     } else if (ch === "[") bracketDepth += 1;
     else if (ch === "]") {
       if (bracketDepth > 0) bracketDepth -= 1;
     } else if (ch === "{") braceDepth += 1;
     else if (ch === "}") {
       if (braceDepth > 0) braceDepth -= 1;
-    } else if (
-      ch === "," &&
-      parenDepth === 0 &&
-      bracketDepth === 0 &&
-      braceDepth === 0
-    ) {
-      return true;
+    }
+  }
+  return null;
+}
+
+/**
+ * True when a `unicode(...)` call has arguments that make rewriting it to
+ * `str(...)` change meaning or arity: multiple positional arguments (a
+ * top-level comma), a keyword argument (`k=v`, but not the comparison
+ * operators `==`/`!=`/`<=`/`>=` or the walrus `:=`), or a `*args` / `**kwargs`
+ * splat.
+ */
+function hasAmbiguousUnicodeArguments(masked: string, openParenIndex: number): boolean {
+  const args = topLevelArgumentText(masked, openParenIndex);
+  if (args === null || args.trim().length === 0) return false;
+
+  let parenDepth = 0;
+  let bracketDepth = 0;
+  let braceDepth = 0;
+  for (let i = 0; i < args.length; i++) {
+    const ch = args[i];
+    if (ch === "(") parenDepth += 1;
+    else if (ch === ")") {
+      if (parenDepth > 0) parenDepth -= 1;
+    } else if (ch === "[") bracketDepth += 1;
+    else if (ch === "]") {
+      if (bracketDepth > 0) bracketDepth -= 1;
+    } else if (ch === "{") braceDepth += 1;
+    else if (ch === "}") {
+      if (braceDepth > 0) braceDepth -= 1;
+    } else if (parenDepth === 0 && bracketDepth === 0 && braceDepth === 0) {
+      if (ch === ",") return true;
+      // `*args` / `**kwargs` splat forwards an arbitrary Py2 arity.
+      if (ch === "*") return true;
+      if (ch === "=") {
+        const prev = args[i - 1];
+        const next = args[i + 1];
+        const isComparison = prev === "=" || prev === "!" || prev === "<" || prev === ">";
+        const isWalrus = prev === ":" || next === "=";
+        if (!isComparison && !isWalrus) return true;
+      }
     }
   }
   return false;
@@ -425,10 +465,13 @@ function lexicalPythonSignals(
     { re: /`[^`\r\n]*`?/g, kind: "backtick_string", unhandled: true },
     { re: /except\s+[^:,\n()]+\s*,\s*[A-Za-z_]\w*\s*:/g, kind: "except_clause" },
     // Legacy Py2 octal literal: a decimal run starting with `0` that contains at
-    // least one non-zero digit. `00`/`000` (valid Python 3) are excluded, as are
+    // least one non-zero digit, optionally using `_` digit separators (`0_75`).
+    // `00`/`000`/`0_0`/`00_0` (valid Python 3) are excluded, as are
     // `0`/`0x10`/`0b10`/`0o755` (a non-digit follows the leading zero) and the
-    // float forms `00.5`/`.005` (guarded by the `.` lookarounds).
-    { re: /(?<!\.)\b0[0-9]*[1-9][0-9]*\b(?!\.)/g, kind: "octal", unhandled: true },
+    // float forms `00.5`/`.005` (guarded by the `.` lookarounds). The Unicode-aware
+    // identifier lookarounds keep `变量0755` (a digit run inside a Unicode
+    // identifier) from matching.
+    { re: /(?<![\p{L}\p{N}_.])0[0-9_]*[1-9][0-9_]*(?![\p{L}\p{N}_.])/gu, kind: "octal", unhandled: true },
     {
       re: /(?<!\.)\b(?:0[xX][0-9a-fA-F]+|0[bB][01]+|0[oO][0-7]+|\d+)[Ll]\b/g,
       kind: "long",
@@ -468,7 +511,7 @@ function lexicalPythonSignals(
       }
       if (match[0].length >= 7 && /^unicode\s*\($/.test(match[0])) {
         const openParenIndex = index + match[0].length - 1;
-        if (hasTopLevelCommaInCall(masked, openParenIndex)) {
+        if (hasAmbiguousUnicodeArguments(masked, openParenIndex)) {
           unknowns.push({
             ruleId: "M1",
             reason: "unicode_decoding_ambiguous",
@@ -541,8 +584,6 @@ function lexicalPythonSignals(
   return { signals, unknowns };
 }
 
-const GLOBAL_PYTHON_PARSE_SYNC_KEY = "__ggPythonParseSync";
-
 function collectPythonSignals(
   source: string,
   file: string,
@@ -550,32 +591,11 @@ function collectPythonSignals(
   signals: Signal[],
   unknowns: UnknownRecord[]
 ): void {
-  const parseSync = (globalThis as Record<string, unknown>)[
-    GLOBAL_PYTHON_PARSE_SYNC_KEY
-  ] as ((source: string, file: string) => PythonPlan | null) | undefined;
-  if (typeof parseSync === "function") {
-    const plan = parseSync(source, file);
-    if (plan) {
-      for (const item of plan.residue) {
-        signals.push({
-          ruleId: "M1",
-          file,
-          line: item.line,
-          column: item.column,
-          matched: item.text,
-          confidence: signalConfidenceFor(item.kind),
-          manifestDir,
-        });
-      }
-      for (const unknown of plan.unknowns) unknowns.push(unknown);
-      return;
-    }
-  }
-  // The tree-sitter parser is loaded asynchronously (WASM) and registers a
-  // synchronous hook on `globalThis` only once ready. `detectSignals` itself is
-  // synchronous, so before the parser is initialized it must fall back to the
-  // comment/string-aware lexical detector; the two paths share
-  // `signalConfidenceFor` so their confidences never diverge.
+  // `detectSignals` is synchronous and must stay deterministic regardless of
+  // whether `initPythonParser()` or `detectPythonSignals()` has already run in
+  // this process, so it always uses the comment/string-aware lexical detector.
+  // Callers that want the tree-sitter AST must use the asynchronous
+  // `detectPythonSignals` (or `detectPythonSignalsLexical` for the sync path).
   const fallback = lexicalPythonSignals(source, file, manifestDir);
   for (const signal of fallback.signals) signals.push(signal);
   for (const unknown of fallback.unknowns) unknowns.push(unknown);
