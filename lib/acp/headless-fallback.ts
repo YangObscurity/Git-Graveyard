@@ -14,6 +14,7 @@ import {
 } from "../supervisor/skeleton-env";
 import type { ChildProcessLike, SpawnFunction } from "../supervisor/types";
 import {
+  DEFAULT_REDACTION_MASK,
   redactText,
   redactValue,
   type RedactionOptions,
@@ -697,6 +698,39 @@ export class HeadlessFallbackChannel {
         }
       };
 
+      // Requirement 17.12: a StringDecoder keeps a multi-byte UTF-8 sequence that is
+      // split across two `data` chunks intact. Decoding each chunk with
+      // `chunk.toString("utf-8")` instead corrupts the split character into
+      // `\uFFFD` in the raw output, the disk log and every parsed record.
+      const stdoutDecoder = new StringDecoder("utf-8");
+      let stdoutDecoderFlushed = false;
+      const appendStdoutText = (text: string): void => {
+        if (text.length === 0) {
+          return;
+        }
+        rawOutput += text;
+        buffer += text;
+        let newlineIndex = buffer.indexOf("\n");
+        while (newlineIndex >= 0) {
+          const line = buffer.slice(0, newlineIndex);
+          buffer = buffer.slice(newlineIndex + 1);
+          logger?.appendLine(line);
+          consumeLine(line);
+          newlineIndex = buffer.indexOf("\n");
+        }
+      };
+
+      // Flush the decoder's held-back partial sequence exactly once, before the turn
+      // resolves, so a trailing multi-byte character is neither dropped nor emitted
+      // as `\uFFFD`.
+      const flushStdoutDecoder = (): void => {
+        if (stdoutDecoderFlushed) {
+          return;
+        }
+        stdoutDecoderFlushed = true;
+        appendStdoutText(stdoutDecoder.end());
+      };
+
       // Requirement 17.12: stderr is assembled across `data` chunks BEFORE it is
       // matched, so a credential split across two chunks can never slip through as
       // two individually-unmatchable halves. A StringDecoder keeps a multi-byte
@@ -705,14 +739,16 @@ export class HeadlessFallbackChannel {
       let stderrBuffer = "";
       let stderrFlushed = false;
       const stderrSecrets = this.explicitSecretLiterals();
-      // Overlap retained when a newline-free stream exceeds the memory cap, sized to
-      // the longest explicit secret so any token spanning the flush boundary is held
-      // back whole rather than split before it can be matched.
-      const stderrOverlapLen = Math.max(
-        128,
-        ...stderrSecrets.map((secret) => secret.length)
+      const maxSecretLen = stderrSecrets.reduce(
+        (max, secret) => Math.max(max, secret.length),
+        0
       );
+      // Overlap retained when a newline-free stream exceeds the memory cap, sized to
+      // exceed the longest secret so any token spanning the flush boundary is held
+      // back whole rather than split into two individually-unmatchable halves.
+      const overlapLen = Math.max(256, maxSecretLen + 32);
       const STDERR_BUFFER_LIMIT = 65536;
+      const REDACTION_MARKER = DEFAULT_REDACTION_MASK;
 
       const emitStderr = (text: string): void => {
         if (text.length === 0) {
@@ -746,6 +782,10 @@ export class HeadlessFallbackChannel {
           return;
         }
         settled = true;
+        // Flush any multi-byte sequence the stdout decoder is still holding BEFORE
+        // draining the residual buffer, so a split character is reconstructed rather
+        // than dropped or replaced with `\uFFFD`.
+        flushStdoutDecoder();
         // Requirement 17.12: flush any buffered stderr BEFORE resolving the turn so
         // a credential split across the final chunks is still redacted, not dropped.
         flushStderr();
@@ -769,20 +809,17 @@ export class HeadlessFallbackChannel {
 
       if (proc.stdout) {
         proc.stdout.on("data", (chunk: Buffer | string) => {
-          const text = chunk.toString("utf-8");
-          rawOutput += text;
-          buffer += text;
-          let newlineIndex = buffer.indexOf("\n");
-          while (newlineIndex >= 0) {
-            const line = buffer.slice(0, newlineIndex);
-            buffer = buffer.slice(newlineIndex + 1);
-            logger?.appendLine(line);
-            consumeLine(line);
-            newlineIndex = buffer.indexOf("\n");
-          }
+          // Decode through the shared StringDecoder so a multi-byte UTF-8 character
+          // split across two `data` chunks is reassembled intact instead of becoming
+          // `\uFFFD`.
+          const text =
+            typeof chunk === "string" ? chunk : stdoutDecoder.write(chunk);
+          appendStdoutText(text);
         });
         proc.stdout.on("end", () => {
-          // Fallback for mocks that never emit "close".
+          // Flush any held-back partial sequence, then fall back for mocks that
+          // never emit "close".
+          flushStdoutDecoder();
           setTimeout(() => finish(proc.exitCode ?? null), 50);
         });
       }
@@ -807,10 +844,33 @@ export class HeadlessFallbackChannel {
           // overlap tail so any secret spanning the flush boundary is not split before
           // it can be matched.
           if (stderrBuffer.length > STDERR_BUFFER_LIMIT) {
-            const cut = stderrBuffer.length - stderrOverlapLen;
-            const prefix = stderrBuffer.slice(0, cut);
-            stderrBuffer = stderrBuffer.slice(cut);
-            emitStderr(prefix);
+            // Redact the WHOLE buffer FIRST so a secret spanning the eventual cut is
+            // matched and replaced before any slice is emitted. Slicing first would
+            // split a straddling secret into two incomplete halves, neither of which
+            // matches on its own, leaking the leading fragment unredacted.
+            const redacted = redactText(stderrBuffer, this.redactionOptions());
+            let safeCut = Math.max(0, redacted.length - overlapLen);
+            // Never slice through a "[REDACTED]" marker: if the boundary lands
+            // strictly inside one, advance to just past its end so every emitted
+            // segment carries only whole markers.
+            const markerStart = redacted.lastIndexOf(
+              REDACTION_MARKER,
+              safeCut + 10
+            );
+            if (
+              markerStart >= 0 &&
+              markerStart < safeCut &&
+              safeCut < markerStart + REDACTION_MARKER.length
+            ) {
+              safeCut = markerStart + REDACTION_MARKER.length;
+            }
+            const prefix = redacted.slice(0, safeCut);
+            stderrBuffer = redacted.slice(safeCut);
+            // `prefix` is already fully redacted; emit it directly instead of
+            // re-running the redactor over the whole segment a second time.
+            if (prefix.length > 0) {
+              this.options.onLog?.("stderr", prefix);
+            }
           }
         });
         proc.stderr.on("end", () => {

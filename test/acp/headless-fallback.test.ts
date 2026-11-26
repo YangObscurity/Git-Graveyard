@@ -1094,6 +1094,137 @@ describe("HeadlessFallbackChannel secret redaction", () => {
       cleanup();
     }
   });
+
+  it("does not split a secret when evicting a >64KB newline-free stderr stream", async () => {
+    const { logPath, cleanup } = tempLogPath("stderr-evict-split");
+    try {
+      // A dynamically constructed credential so gitleaks never sees a contiguous
+      // literal. It must straddle the eviction cut so the old slice-then-redact
+      // order split it into two individually-unmatchable halves.
+      const secret = ["ghp_", "Q".repeat(30)].join("");
+      const stdoutLine = JSON.stringify({
+        type: "session",
+        model: "claude-sonnet-5.5",
+      });
+      const stderrChunks: string[] = [];
+      const channel = makeChannel({
+        logPath,
+        kiroApiKey: KIRO_KEY,
+        onLog: (stream, text) => {
+          if (stream === "stderr") {
+            stderrChunks.push(text);
+          }
+        },
+        spawnFn: (command, args, options) => {
+          const proc = new MockProcess();
+          proc.stdout.write(stdoutLine + "\n");
+          proc.stdout.end();
+          // One newline-free chunk just over the 64KB cap, with the credential
+          // centred on the 128-char-overlap cut the previous implementation used so
+          // a naive `slice(cut)` would emit its leading half unredacted.
+          const total = 65536 + 64;
+          const secretStart = total - 128 - Math.floor(secret.length / 2);
+          const payload =
+            "x".repeat(secretStart) +
+            secret +
+            "y".repeat(total - secretStart - secret.length);
+          assert.ok(payload.length > 65536);
+          setImmediate(() => {
+            proc.stderr.write(payload);
+            setImmediate(() => {
+              proc.stderr.end();
+              setImmediate(() => {
+                proc.exitCode = 0;
+                proc.emit("close", 0);
+              });
+            });
+          });
+          return proc as unknown as ChildProcessLike;
+        },
+      });
+
+      const result = await channel.runTurn({ prompt: "x" });
+      assert.equal(result.ok, true);
+
+      const joined = stderrChunks.join("");
+      assert.ok(joined.length > 0, "onLog never received stderr");
+      assert.ok(joined.includes("[REDACTED]"), "no redaction marker emitted");
+      // Neither the whole credential nor any fragment of it may leak.
+      assert.ok(!joined.includes(secret), "onLog leaked the whole credential");
+      assert.ok(!joined.includes("ghp_"), "onLog leaked the raw token prefix");
+      assert.ok(
+        !joined.includes(secret.slice(0, 17)),
+        "onLog leaked the leading half of the credential"
+      );
+      assert.ok(
+        !joined.includes(secret.slice(17)),
+        "onLog leaked the trailing half of the credential"
+      );
+      // Every individual chunk passed to onLog is clean on its own too.
+      for (const chunk of stderrChunks) {
+        assert.ok(!chunk.includes("ghp_"), "a stderr chunk leaked the token prefix");
+        assert.ok(!chunk.includes(secret), "a stderr chunk leaked the credential");
+      }
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("reassembles a multi-byte UTF-8 stdout line split across chunks", async () => {
+    const { logPath, cleanup } = tempLogPath("stdout-utf8-split");
+    try {
+      const sessionLine =
+        JSON.stringify({ type: "session", model: "claude-sonnet-5.5" }) + "\n";
+      const cjkLine = JSON.stringify({ type: "assistant", text: "你好世界" }) + "\n";
+      const cjkBytes = Buffer.from(cjkLine, "utf-8");
+      // Split one byte into the first 3-byte CJK character so the sequence is torn
+      // across two `data` events.
+      const splitAt = cjkBytes.indexOf(Buffer.from("你", "utf-8")) + 1;
+      assert.ok(splitAt > 0 && splitAt < cjkBytes.length);
+
+      const channel = makeChannel({
+        logPath,
+        spawnFn: (command, args, options) => {
+          const proc = new MockProcess();
+          setImmediate(() => {
+            proc.stdout.write(sessionLine);
+            setImmediate(() => {
+              proc.stdout.write(cjkBytes.subarray(0, splitAt));
+              setImmediate(() => {
+                proc.stdout.write(cjkBytes.subarray(splitAt));
+                setImmediate(() => {
+                  proc.stdout.end();
+                  setImmediate(() => {
+                    proc.exitCode = 0;
+                    proc.emit("close", 0);
+                  });
+                });
+              });
+            });
+          });
+          return proc as unknown as ChildProcessLike;
+        },
+      });
+
+      const result = await channel.runTurn({ prompt: "x" });
+      assert.equal(result.ok, true);
+      assert.ok(result.output.includes("你好世界"), `output: ${result.output}`);
+      assert.ok(!result.output.includes("\uFFFD"), "output corrupted to U+FFFD");
+      assert.ok(
+        JSON.stringify(result.records).includes("你好世界"),
+        "records lost the multi-byte text"
+      );
+      assert.ok(
+        !JSON.stringify(result.records).includes("\uFFFD"),
+        "records corrupted to U+FFFD"
+      );
+      const written = fs.readFileSync(logPath, "utf-8");
+      assert.ok(written.includes("你好世界"), "disk log lost the multi-byte text");
+      assert.ok(!written.includes("\uFFFD"), "disk log corrupted to U+FFFD");
+    } finally {
+      cleanup();
+    }
+  });
 });
 
 describe("HeadlessFallbackChannel output accumulation", () => {
