@@ -402,7 +402,7 @@ function lexicalPythonSignals(
     { re: /<>/g, confidence: "high", unhandled: true },
     { re: /`[^`\r\n]*`?/g, confidence: "high", unhandled: true },
     { re: /except\s+[^:,\n()]+\s*,\s*[A-Za-z_]\w*\s*:/g, confidence: "high" },
-    { re: /(?<!\.)\b0[0-9]+\b/g, confidence: "high", unhandled: true },
+    { re: /(?<!\.)\b0[0-9]+\b(?!\.)/g, confidence: "high", unhandled: true },
     {
       re: /(?<!\.)\b(?:0[xX][0-9a-fA-F]+|0[bB][01]+|0[oO][0-7]+|\d+)[Ll]\b/g,
       confidence: "high",

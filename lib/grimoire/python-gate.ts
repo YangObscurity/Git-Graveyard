@@ -133,72 +133,80 @@ function runGate(
     };
   }
 
-  const errorsBefore = errorCount(t0);
-  const residueBefore = countPythonResidue(t0);
-  let err = errorsBefore;
-  let res = residueBefore;
-  const accepted: PythonPlannedEdit[] = [];
-  const rejected: PythonRejectedEdit[] = [];
+  try {
+    const errorsBefore = errorCount(t0);
+    const residueBefore = countPythonResidue(t0);
+    let err = errorsBefore;
+    let res = residueBefore;
+    const accepted: PythonPlannedEdit[] = [];
+    const rejected: PythonRejectedEdit[] = [];
 
-  for (const edit of ordered) {
-    const candidateText = applyEditsToOriginal(original, [...accepted, edit]);
-    const tree = parse(candidateText);
-    if (!tree) {
-      rejected.push({ edit, reason: "parse_timeout" });
-      unknowns.push({
-        ruleId: M1_RULE_ID,
-        reason: "parse_timeout",
-        file,
-        line: edit.line,
-      });
-      continue;
+    for (const edit of ordered) {
+      const candidateText = applyEditsToOriginal(original, [...accepted, edit]);
+      const tree = parse(candidateText);
+      if (!tree) {
+        rejected.push({ edit, reason: "parse_timeout" });
+        unknowns.push({
+          ruleId: M1_RULE_ID,
+          reason: "parse_timeout",
+          file,
+          line: edit.line,
+        });
+        continue;
+      }
+      try {
+        const nextErrors = errorCount(tree);
+        const nextResidue = countPythonResidue(tree);
+        if (nextErrors <= err && nextResidue < res) {
+          accepted.push(edit);
+          err = nextErrors;
+          res = nextResidue;
+        } else {
+          const reason: PythonRejectReason =
+            nextErrors > err ? "gate_errors_rose" : "gate_residue_not_reduced";
+          rejected.push({ edit, reason });
+          unknowns.push({
+            ruleId: M1_RULE_ID,
+            reason,
+            file,
+            line: edit.line,
+          });
+        }
+      } finally {
+        tree.delete?.();
+      }
     }
-    const nextErrors = errorCount(tree);
-    const nextResidue = countPythonResidue(tree);
-    if (nextErrors <= err && nextResidue < res) {
-      accepted.push(edit);
-      err = nextErrors;
-      res = nextResidue;
-    } else {
-      const reason: PythonRejectReason =
-        nextErrors > err ? "gate_errors_rose" : "gate_residue_not_reduced";
-      rejected.push({ edit, reason });
-      unknowns.push({
-        ruleId: M1_RULE_ID,
-        reason,
-        file,
-        line: edit.line,
-      });
-    }
-  }
 
-  const text = applyEditsToOriginal(original, accepted);
-  const reverted = ordered.length > 0 && accepted.length === 0;
+    const text = applyEditsToOriginal(original, accepted);
+    const reverted = ordered.length > 0 && accepted.length === 0;
 
-  return {
-    file,
-    original,
-    text,
-    label: res === 0 ? "m1-clean" : "m1-partial",
-    accepted,
-    rejected,
-    errorsBefore,
-    errorsAfter: err,
-    residueBefore,
-    residueAfter: res,
-    reverted,
-    revertReason: reverted ? "all_edits_rejected" : undefined,
-    unknowns,
-    step: buildStep(
+    return {
       file,
       original,
       text,
+      label: res === 0 ? "m1-clean" : "m1-partial",
       accepted,
-      ordered,
+      rejected,
+      errorsBefore,
+      errorsAfter: err,
+      residueBefore,
+      residueAfter: res,
       reverted,
-      reverted ? "all_edits_rejected" : undefined
-    ),
-  };
+      revertReason: reverted ? "all_edits_rejected" : undefined,
+      unknowns,
+      step: buildStep(
+        file,
+        original,
+        text,
+        accepted,
+        ordered,
+        reverted,
+        reverted ? "all_edits_rejected" : undefined
+      ),
+    };
+  } finally {
+    t0.delete?.();
+  }
 }
 
 /** Synchronous gate; requires the Python parser to be initialized. */
@@ -378,23 +386,29 @@ export async function checkPythonCandidateGate(
     const beforeTree = parsePython(beforeContent);
     const afterTree = parsePython(afterContent);
     if (!afterTree) {
+      beforeTree?.delete?.();
       reasons.push(`${file}: parse_timeout`);
       details[file] = { ok: false, error: "parse_timeout" };
       continue;
     }
-    const errorsBefore = beforeTree ? errorCount(beforeTree) : 0;
-    const residueBefore = beforeTree ? countPythonResidue(beforeTree) : 0;
-    const errorsAfter = errorCount(afterTree);
-    const residueAfter = countPythonResidue(afterTree);
+    try {
+      const errorsBefore = beforeTree ? errorCount(beforeTree) : 0;
+      const residueBefore = beforeTree ? countPythonResidue(beforeTree) : 0;
+      const errorsAfter = errorCount(afterTree);
+      const residueAfter = countPythonResidue(afterTree);
 
-    if (errorsAfter > errorsBefore) {
-      reasons.push(`${file}: gate_errors_rose`);
-      details[file] = { ok: false, error: "gate_errors_rose" };
-    } else if (residueAfter > residueBefore) {
-      reasons.push(`${file}: gate_residue_not_reduced`);
-      details[file] = { ok: false, error: "gate_residue_not_reduced" };
-    } else {
-      details[file] = { ok: true };
+      if (errorsAfter > errorsBefore) {
+        reasons.push(`${file}: gate_errors_rose`);
+        details[file] = { ok: false, error: "gate_errors_rose" };
+      } else if (residueAfter > residueBefore) {
+        reasons.push(`${file}: gate_residue_not_reduced`);
+        details[file] = { ok: false, error: "gate_residue_not_reduced" };
+      } else {
+        details[file] = { ok: true };
+      }
+    } finally {
+      beforeTree?.delete?.();
+      afterTree.delete?.();
     }
   }
 
