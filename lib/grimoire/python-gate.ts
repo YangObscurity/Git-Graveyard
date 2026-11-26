@@ -231,6 +231,10 @@ export interface PythonCandidateGateInput {
   candidate?: PythonFileCollection;
   files?: PythonFileCollection;
   changedFiles?: string[];
+  deletions?: string[];
+  deletedFiles?: string[];
+  tree?: string;
+  candidateTree?: string;
 }
 
 export interface PythonCandidateGateOptions {
@@ -238,6 +242,11 @@ export interface PythonCandidateGateOptions {
   taskId?: string;
   actor?: string;
   refs?: EvidenceRef[];
+  head?: PythonFileCollection;
+  deletions?: string[];
+  deletedFiles?: string[];
+  tree?: string;
+  candidateTree?: string;
   eventStore?: {
     append(input: EventInput): EventEnvelope;
     [key: string]: unknown;
@@ -282,13 +291,19 @@ function collectFiles(collection: PythonFileCollection): Map<string, string> {
 function changedPythonFiles(
   before: Map<string, string>,
   after: Map<string, string>,
-  explicit?: string[]
+  explicit?: string[],
+  deletions?: Set<string>
 ): string[] {
   const changed = new Set<string>();
   if (Array.isArray(explicit)) {
     for (const path of explicit) {
       const norm = normalizeFilePath(path);
       if (isPythonFile(norm)) changed.add(norm);
+    }
+  }
+  if (deletions) {
+    for (const path of deletions) {
+      if (isPythonFile(path)) changed.add(path);
     }
   }
   for (const [path, content] of after.entries()) {
@@ -309,14 +324,28 @@ export async function checkPythonCandidateGate(
 ): Promise<GateResult> {
   await initPythonParser();
 
+  // Never fall back `before` to `input.files`: missing baseline means empty
+  // baseline so new Py2-residue files cannot pass via self-comparison.
   const before = collectFiles(
-    input?.before ?? input?.head ?? (input as PythonCandidateGateInput).files
+    input?.before ?? input?.head ?? options?.head
   );
   const after = collectFiles(
-    input?.after ?? input?.candidate ?? (input as PythonCandidateGateInput).files
+    input?.after ?? input?.candidate ?? input?.files
   );
 
-  const files = changedPythonFiles(before, after, input?.changedFiles);
+  const deletionSet = new Set<string>();
+  const rawDeletions = [
+    ...(Array.isArray(input?.deletions) ? input.deletions : []),
+    ...(Array.isArray(input?.deletedFiles) ? input.deletedFiles : []),
+    ...(Array.isArray(options?.deletions) ? options.deletions : []),
+    ...(Array.isArray(options?.deletedFiles) ? options.deletedFiles : []),
+  ];
+  for (const p of rawDeletions) {
+    const norm = normalizeFilePath(p);
+    if (isPythonFile(norm)) deletionSet.add(norm);
+  }
+
+  const files = changedPythonFiles(before, after, input?.changedFiles, deletionSet);
   const reasons: string[] = [];
   const details: Record<
     string,
@@ -326,8 +355,14 @@ export async function checkPythonCandidateGate(
   for (const file of files) {
     const afterContent = after.get(file);
     if (afterContent === undefined) {
-      // Deleted file: nothing to parse.
-      details[file] = { ok: true };
+      if (before.has(file) || deletionSet.has(file)) {
+        // Valid deleted file: nothing to parse.
+        details[file] = { ok: true };
+      } else {
+        const errMsg = "content not supplied";
+        reasons.push(`${file}: ${errMsg}`);
+        details[file] = { ok: false, error: errMsg };
+      }
       continue;
     }
     const beforeContent = before.get(file) ?? "";
@@ -355,6 +390,11 @@ export async function checkPythonCandidateGate(
   }
 
   const ok = reasons.length === 0;
+  const tree =
+    input?.tree ??
+    input?.candidateTree ??
+    options?.tree ??
+    options?.candidateTree;
   const result: GateResult = {
     ok,
     files,
@@ -362,6 +402,7 @@ export async function checkPythonCandidateGate(
     gate: "syntax",
     kind: "gate.result",
     details,
+    ...(tree !== undefined ? { tree } : {}),
   };
 
   const actor = options?.actor ?? "grimoire";

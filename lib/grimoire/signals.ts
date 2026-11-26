@@ -2,11 +2,7 @@ import { readFileSync } from "node:fs";
 import { parse, type ParserPlugin } from "@babel/parser";
 import type { Signal, RuleId, Confidence, UnknownRecord } from "./types";
 import { isPythonFile } from "./gate-js";
-import {
-  initPythonParser,
-  isPythonParserReady,
-  planPythonEdits,
-} from "../rules/m1-python";
+import type { PythonPlan } from "../rules/m1-python";
 
 export type DetectSignalsInputFile = {
   path: string;
@@ -252,7 +248,12 @@ function maskPython(source: string): string {
       }
       if (ch === "\\") {
         chars[i] = " ";
-        if (i + 1 < n && source[i + 1] !== "\n") {
+        // Preserve quote state across backslash line-continuations (\\\n and \\\r\n).
+        if (i + 1 < n && source[i + 1] === "\n") {
+          i += 2;
+        } else if (i + 2 < n && source[i + 1] === "\r" && source[i + 2] === "\n") {
+          i += 3;
+        } else if (i + 1 < n) {
           chars[i + 1] = " ";
           i += 2;
         } else {
@@ -322,6 +323,61 @@ function lineColumnAt(source: string, index: number): { line: number; column: nu
   return { line, column: index - last };
 }
 
+function hasTopLevelCommaInCall(masked: string, openParenIndex: number): boolean {
+  let parenDepth = 0;
+  let bracketDepth = 0;
+  let braceDepth = 0;
+  for (let i = openParenIndex + 1; i < masked.length; i++) {
+    const ch = masked[i];
+    if (ch === "(") parenDepth += 1;
+    else if (ch === ")") {
+      if (parenDepth === 0) return false;
+      parenDepth -= 1;
+    } else if (ch === "[") bracketDepth += 1;
+    else if (ch === "]") {
+      if (bracketDepth > 0) bracketDepth -= 1;
+    } else if (ch === "{") braceDepth += 1;
+    else if (ch === "}") {
+      if (braceDepth > 0) braceDepth -= 1;
+    } else if (
+      ch === "," &&
+      parenDepth === 0 &&
+      bracketDepth === 0 &&
+      braceDepth === 0
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function findTopLevelCommaIndex(text: string): number {
+  let parenDepth = 0;
+  let bracketDepth = 0;
+  let braceDepth = 0;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === "(") parenDepth += 1;
+    else if (ch === ")") {
+      if (parenDepth > 0) parenDepth -= 1;
+    } else if (ch === "[") bracketDepth += 1;
+    else if (ch === "]") {
+      if (bracketDepth > 0) bracketDepth -= 1;
+    } else if (ch === "{") braceDepth += 1;
+    else if (ch === "}") {
+      if (braceDepth > 0) braceDepth -= 1;
+    } else if (
+      ch === "," &&
+      parenDepth === 0 &&
+      bracketDepth === 0 &&
+      braceDepth === 0
+    ) {
+      return i;
+    }
+  }
+  return -1;
+}
+
 /** Comment/string-aware lexical fallback for synchronous Python detection. */
 function lexicalPythonSignals(
   source: string,
@@ -329,17 +385,34 @@ function lexicalPythonSignals(
   manifestDir: string
 ): { signals: Signal[]; unknowns: UnknownRecord[] } {
   const masked = maskPython(source);
-  const patterns: Array<{ re: RegExp; confidence: Confidence }> = [
+  const patterns: Array<{
+    re: RegExp;
+    confidence: Confidence;
+    unhandled?: boolean;
+  }> = [
     { re: /(?<![\w.])print(?![A-Za-z0-9_])(?!\s*\()/g, confidence: "high" },
-    { re: /(?<![\w.])exec\s+/g, confidence: "high" },
+    { re: /(?<![\w.])exec\s+(?!\()/g, confidence: "high", unhandled: true },
     { re: /(?<![\w.])unicode\s*\(/g, confidence: "medium" },
     { re: /\.(?:iteritems|iterkeys|itervalues)\s*\(/g, confidence: "medium" },
-    { re: /<>/g, confidence: "high" },
-    { re: /`/g, confidence: "high" },
+    { re: /<>/g, confidence: "high", unhandled: true },
+    { re: /`[^`\r\n]*`?/g, confidence: "high", unhandled: true },
     { re: /except\s+[^:,\n()]+\s*,\s*[A-Za-z_]\w*\s*:/g, confidence: "high" },
+    { re: /(?<!\.)\b0[0-9]+\b/g, confidence: "high", unhandled: true },
+    {
+      re: /(?<!\.)\b(?:0[xX][0-9a-fA-F]+|0[bB][01]+|0[oO][0-7]+|\d+)[Ll]\b/g,
+      confidence: "high",
+      unhandled: true,
+    },
+    {
+      re: /(?<![\w.])(?:def\s+[A-Za-z_]\w*\s*\([^()\n=]*|lambda\s+[^:\n=]*)\([^()\n]+\)/g,
+      confidence: "high",
+      unhandled: true,
+    },
   ];
   const signals: Signal[] = [];
-  for (const { re, confidence } of patterns) {
+  const unknowns: UnknownRecord[] = [];
+
+  for (const { re, confidence, unhandled } of patterns) {
     re.lastIndex = 0;
     let match: RegExpExecArray | null;
     while ((match = re.exec(masked)) !== null) {
@@ -354,11 +427,90 @@ function lexicalPythonSignals(
         confidence,
         manifestDir,
       });
+      if (unhandled) {
+        unknowns.push({
+          ruleId: "M1",
+          reason: "py2_residue",
+          file,
+          line,
+        });
+      }
+      if (match[0].length >= 7 && /^unicode\s*\($/.test(match[0])) {
+        const openParenIndex = index + match[0].length - 1;
+        if (hasTopLevelCommaInCall(masked, openParenIndex)) {
+          unknowns.push({
+            ruleId: "M1",
+            reason: "unicode_decoding_ambiguous",
+            file,
+            line,
+          });
+        }
+      }
       if (match[0].length === 0) re.lastIndex += 1;
     }
   }
-  return { signals, unknowns: [] };
+
+  // Raw+unicode string prefixes (`ur"..."` / `ru"..."`) where quotes were masked.
+  const urRe = /(?<![A-Za-z0-9_])(?:ur|ru)/gi;
+  let urMatch: RegExpExecArray | null;
+  while ((urMatch = urRe.exec(masked)) !== null) {
+    const index = urMatch.index;
+    const nextChar = source[index + urMatch[0].length];
+    if (nextChar !== "'" && nextChar !== '"') continue;
+    const { line, column } = lineColumnAt(source, index);
+    signals.push({
+      ruleId: "M1",
+      file,
+      line,
+      column,
+      matched: source.slice(index, index + urMatch[0].length + 1),
+      confidence: "high",
+      manifestDir,
+    });
+    unknowns.push({
+      ruleId: "M1",
+      reason: "py2_residue",
+      file,
+      line,
+    });
+  }
+
+  // Python 2 `raise E, msg` (top-level comma outside call/bracketed expressions).
+  const raiseRe = /(?<![\w.])raise\s+([^\n;#]+)/g;
+  let raiseMatch: RegExpExecArray | null;
+  while ((raiseMatch = raiseRe.exec(masked)) !== null) {
+    const body = raiseMatch[1];
+    const commaOffset = findTopLevelCommaIndex(body);
+    if (commaOffset === -1) continue;
+    const bodyStart = raiseMatch.index + raiseMatch[0].length - body.length;
+    const afterCommaSource = source.slice(
+      bodyStart + commaOffset + 1,
+      bodyStart + body.length
+    );
+    if (!/\S/.test(afterCommaSource)) continue;
+    const index = raiseMatch.index;
+    const { line, column } = lineColumnAt(source, index);
+    signals.push({
+      ruleId: "M1",
+      file,
+      line,
+      column,
+      matched: source.slice(index, index + raiseMatch[0].length).trimEnd(),
+      confidence: "high",
+      manifestDir,
+    });
+    unknowns.push({
+      ruleId: "M1",
+      reason: "py2_residue",
+      file,
+      line,
+    });
+  }
+
+  return { signals, unknowns };
 }
+
+const GLOBAL_PYTHON_PARSE_SYNC_KEY = "__ggPythonParseSync";
 
 function collectPythonSignals(
   source: string,
@@ -367,8 +519,11 @@ function collectPythonSignals(
   signals: Signal[],
   unknowns: UnknownRecord[]
 ): void {
-  if (isPythonParserReady()) {
-    const plan = planPythonEdits(source, file);
+  const parseSync = (globalThis as Record<string, unknown>)[
+    GLOBAL_PYTHON_PARSE_SYNC_KEY
+  ] as ((source: string, file: string) => PythonPlan | null) | undefined;
+  if (typeof parseSync === "function") {
+    const plan = parseSync(source, file);
     if (plan) {
       for (const item of plan.residue) {
         signals.push({
@@ -739,6 +894,7 @@ export async function detectPythonSignals(
   input: DetectSignalsInput,
   options?: DetectSignalsOptions
 ): Promise<DetectSignalsResult> {
+  const { initPythonParser, planPythonEdits } = await import("../rules/m1-python");
   await initPythonParser();
 
   const rawList = toFileList(input);

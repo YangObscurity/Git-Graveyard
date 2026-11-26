@@ -3,7 +3,9 @@
 //
 // Deterministic Python 2 -> 3 analysis and rewrite engine built on web-tree-sitter
 // plus the tree-sitter-python grammar. Every edit cites ruleId "M1".
-import { Parser, Language, type Tree, type Node } from "web-tree-sitter";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import type { Parser, Tree, Node } from "web-tree-sitter";
 import { createRequire } from "node:module";
 import * as Diff from "diff";
 import type { Confidence, UnknownRecord } from "../grimoire/types";
@@ -134,20 +136,54 @@ function makeRequire(): NodeRequire {
   }
 }
 
+const GLOBAL_PYTHON_PARSE_SYNC_KEY = "__ggPythonParseSync";
+
+function registerGlobalPythonSync(): void {
+  (globalThis as Record<string, unknown>)[GLOBAL_PYTHON_PARSE_SYNC_KEY] = (
+    source: string,
+    file: string
+  ): PythonPlan | null => planPythonEdits(source, file);
+}
+
 /** Initializes and caches the Python parser (Language singleton loaded once). */
 export async function initPythonParser(): Promise<Parser> {
-  if (pythonParser) return pythonParser;
+  if (pythonParser) {
+    registerGlobalPythonSync();
+    return pythonParser;
+  }
   if (!parserPromise) {
     parserPromise = (async () => {
+      const { Parser, Language } = await import("web-tree-sitter");
       await Parser.init();
-      const require = makeRequire();
-      const wasmPath = require.resolve(
-        "tree-sitter-python/tree-sitter-python.wasm"
-      );
+      const req = makeRequire();
+      let wasmPath = "";
+      try {
+        const pyPkgDir = path.dirname(
+          req.resolve(["tree-sitter-python", "package.json"].join("/"))
+        );
+        const candidate = path.join(
+          pyPkgDir,
+          ["tree-sitter-python", "wasm"].join(".")
+        );
+        if (fs.existsSync(candidate)) {
+          wasmPath = candidate;
+        }
+      } catch {
+        // Fallback below for bundled runtimes.
+      }
+      if (!wasmPath) {
+        wasmPath = path.join(
+          process.cwd(),
+          "node_modules",
+          "tree-sitter-python",
+          ["tree-sitter-python", "wasm"].join(".")
+        );
+      }
       const language = await Language.load(wasmPath);
       const parser = new Parser();
       parser.setLanguage(language);
       pythonParser = parser;
+      registerGlobalPythonSync();
       return parser;
     })().catch((err) => {
       parserPromise = null;
@@ -212,6 +248,17 @@ function positionalArgumentCount(call: Node): number {
   let count = 0;
   for (const child of args.namedChildren) {
     if (child.type === "keyword_argument") continue;
+    if (child.type === "comment") continue;
+    count += 1;
+  }
+  return count;
+}
+
+function totalArgumentCount(call: Node): number {
+  const args = call.childForFieldName("arguments");
+  if (!args) return 0;
+  let count = 0;
+  for (const child of args.namedChildren) {
     if (child.type === "comment") continue;
     count += 1;
   }
@@ -387,9 +434,49 @@ function collectTargetNames(node: Node, out: Set<string>): void {
     node.type === "pattern_list" ||
     node.type === "tuple_pattern" ||
     node.type === "list_pattern" ||
-    node.type === "parenthesized_expression"
+    node.type === "parenthesized_expression" ||
+    node.type === "list_splat_pattern" ||
+    node.type === "dictionary_splat_pattern" ||
+    node.type === "as_pattern_target"
   ) {
     for (const child of node.namedChildren) collectTargetNames(child, out);
+  }
+}
+
+function collectParameterNames(node: Node, out: Set<string>): void {
+  switch (node.type) {
+    case "identifier":
+      out.add(node.text);
+      return;
+    case "default_parameter":
+    case "typed_default_parameter": {
+      const name = node.childForFieldName("name");
+      if (name) collectTargetNames(name, out);
+      return;
+    }
+    case "typed_parameter": {
+      for (let i = 0; i < node.childCount; i++) {
+        if (node.fieldNameForChild(i) === "type") continue;
+        const child = node.child(i);
+        if (child && child.type !== "type" && child.isNamed) {
+          collectParameterNames(child, out);
+        }
+      }
+      return;
+    }
+    case "list_splat_pattern":
+    case "dictionary_splat_pattern":
+    case "tuple_pattern":
+    case "list_pattern":
+    case "pattern_list":
+    case "parenthesized_expression": {
+      for (const child of node.namedChildren) {
+        collectParameterNames(child, out);
+      }
+      return;
+    }
+    default:
+      return;
   }
 }
 
@@ -403,10 +490,49 @@ function collectBoundNames(tree: Tree): Set<string> {
         if (left) collectTargetNames(left, bound);
         break;
       }
+      case "named_expression": {
+        const name = node.childForFieldName("name");
+        if (name) collectTargetNames(name, bound);
+        break;
+      }
       case "function_definition":
       case "class_definition": {
         const name = node.childForFieldName("name");
         if (name && name.type === "identifier") bound.add(name.text);
+        break;
+      }
+      case "parameters":
+      case "lambda_parameters": {
+        for (const child of node.namedChildren) {
+          collectParameterNames(child, bound);
+        }
+        break;
+      }
+      case "for_statement":
+      case "for_in_clause": {
+        const left = node.childForFieldName("left");
+        if (left) collectTargetNames(left, bound);
+        break;
+      }
+      case "as_pattern_target": {
+        collectTargetNames(node, bound);
+        break;
+      }
+      case "except_clause": {
+        const values: Node[] = [];
+        for (let i = 0; i < node.childCount; i++) {
+          if (node.fieldNameForChild(i) === "value") values.push(node.child(i)!);
+        }
+        if (values.length >= 2) {
+          collectTargetNames(values[1], bound);
+        }
+        break;
+      }
+      case "global_statement":
+      case "nonlocal_statement": {
+        for (const child of node.namedChildren) {
+          if (child.type === "identifier") bound.add(child.text);
+        }
         break;
       }
       case "import_statement":
@@ -670,18 +796,36 @@ export function planFromTree(
           });
           return;
         }
+        if (totalArgumentCount(node) >= 2) {
+          unknowns.push({
+            ruleId: "M1",
+            reason: "unicode_decoding_ambiguous",
+            file,
+            line: lineOf(node),
+          });
+          return;
+        }
+        const reviewNote =
+          "Py2 bytes vs text unknown: verify argument is not a Py2 byte string decoded via unicode()";
         edits.push({
           ruleId: "M1",
           ruleOrder: M1_ROW.UNICODE,
           line: lineOf(node),
           confidence: "medium",
           description: "unicode(...) -> str(...)",
+          note: reviewNote,
           start: fn.startIndex,
           end: fn.endIndex,
           replacement: "str",
           splices: [
             { start: fn.startIndex, end: fn.endIndex, replacement: "str" },
           ],
+        });
+        behaviorNotes.push({
+          ruleId: "M1",
+          file,
+          line: lineOf(node),
+          note: reviewNote,
         });
         return;
       }
@@ -862,7 +1006,66 @@ function compareVersions(a: number[], b: number[]): number {
   return 0;
 }
 
-/** Returns true when the specifier admits no Python 3 version. */
+interface ParsedClause {
+  op: string;
+  parts: number[];
+  star: boolean;
+}
+
+function prefixMatches(version: number[], prefix: number[]): boolean {
+  for (let i = 0; i < prefix.length; i++) {
+    if ((version[i] ?? 0) !== prefix[i]) return false;
+  }
+  return true;
+}
+
+function versionMatchesClause(version: number[], clause: ParsedClause): boolean {
+  const { op, parts, star } = clause;
+  switch (op) {
+    case "==":
+      return star
+        ? prefixMatches(version, parts)
+        : compareVersions(version, parts) === 0;
+    case "!=":
+      return star
+        ? !prefixMatches(version, parts)
+        : compareVersions(version, parts) !== 0;
+    case ">=":
+      return compareVersions(version, parts) >= 0;
+    case ">":
+      return compareVersions(version, parts) > 0;
+    case "<=":
+      return compareVersions(version, parts) <= 0;
+    case "<":
+      return compareVersions(version, parts) < 0;
+    case "~=": {
+      if (compareVersions(version, parts) < 0) return false;
+      const prefix = parts.length > 1 ? parts.slice(0, parts.length - 1) : parts;
+      return prefixMatches(version, prefix);
+    }
+    default:
+      return false;
+  }
+}
+
+const PY2_CANDIDATE_VERSIONS: number[][] = [
+  [2, 0, 0],
+  [2, 5, 0],
+  [2, 6, 0],
+  [2, 7, 0],
+  [2, 7, 18],
+];
+
+const PY3_CANDIDATE_VERSIONS: number[][] = (() => {
+  const versions: number[][] = [];
+  for (let minor = 0; minor <= 15; minor++) {
+    versions.push([3, minor, 0]);
+    versions.push([3, minor, 1]);
+  }
+  return versions;
+})();
+
+/** Returns true when the specifier admits no Python 3 version (or cannot be safely evaluated). */
 export function isPy2OnlySpecifier(specifier: string): boolean {
   const clauses = specifier
     .split(",")
@@ -870,75 +1073,116 @@ export function isPy2OnlySpecifier(specifier: string): boolean {
     .filter((clause) => clause.length > 0);
   if (clauses.length === 0) return false;
 
-  let lower: number[] | null = null;
-  let lowerInclusive = true;
-  let upper: number[] | null = null;
-  let upperInclusive = true;
-
+  const parsed: ParsedClause[] = [];
   for (const clause of clauses) {
-    const match = clause.match(/^(==|>=|<=|~=|>|<|!=)?\s*([0-9]+(?:\.[0-9]+)*)(\.\*)?$/);
-    if (!match) continue;
+    const match = clause.match(
+      /^(==|!=|>=|<=|~=|>|<)?\s*([0-9]+(?:\.[0-9]+)*)(\.\*)?$/
+    );
+    if (!match) {
+      return true;
+    }
     const op = match[1] ?? "==";
     const version = match[2];
     const star = !!match[3];
-    if (op === "!=") continue;
-    const parts = parseVersionParts(version);
-
-    if (star && (op === "==" || op === "~=")) {
-      const next = parts.slice();
-      next[Math.max(0, next.length - 1)] += 1;
-      if (lower === null || compareVersions(parts, lower) > 0) {
-        lower = parts;
-        lowerInclusive = true;
-      }
-      if (upper === null || compareVersions(next, upper) < 0) {
-        upper = next;
-        upperInclusive = false;
-      }
-      continue;
+    if (star && op !== "==" && op !== "!=") {
+      return true;
     }
-
-    if (op === ">=" || op === ">") {
-      if (lower === null || compareVersions(parts, lower) > 0) {
-        lower = parts;
-        lowerInclusive = op === ">=";
-      }
-      continue;
-    }
-    if (op === "<=" || op === "<") {
-      if (upper === null || compareVersions(parts, upper) < 0) {
-        upper = parts;
-        upperInclusive = op === "<=";
-      }
-      continue;
-    }
-    // == and ~=
-    if (lower === null || compareVersions(parts, lower) > 0) {
-      lower = parts;
-      lowerInclusive = true;
-    }
-    const cap = op === "~=" ? [parts[0] + 1] : parts;
-    if (upper === null || compareVersions(cap, upper) < 0) {
-      upper = cap;
-      upperInclusive = op !== "~=";
-    }
+    parsed.push({ op, parts: parseVersionParts(version), star });
   }
 
-  const py3 = [3, 0];
-  // A lower bound at or above 3.0 admits Python 3.
-  if (lower && compareVersions(lower, py3) >= 0) return false;
-  if (upper === null) return false;
-  const cmp = compareVersions(upper, py3);
-  if (cmp > 0) return false;
-  if (cmp === 0) return !upperInclusive;
-  return true;
+  const satisfiesAll = (v: number[]) =>
+    parsed.every((clause) => versionMatchesClause(v, clause));
+
+  if (PY3_CANDIDATE_VERSIONS.some(satisfiesAll)) return false;
+  return PY2_CANDIDATE_VERSIONS.some(satisfiesAll);
 }
 
 function extractSpecifier(content: string, keyword: string): string | undefined {
-  const match = content.match(
-    new RegExp(`${keyword}\\s*=\\s*["']([^"']+)["']`)
-  );
-  return match ? match[1].trim() : undefined;
+  const isToml = keyword === "requires-python";
+  const n = content.length;
+  let i = 0;
+  let quote: "'" | '"' | null = null;
+  let triple = false;
+  let lineStart = true;
+
+  while (i < n) {
+    const ch = content[i];
+
+    if (quote !== null) {
+      const supportsEscape = !isToml || quote === '"';
+      if (supportsEscape && ch === "\\") {
+        i += i + 1 < n ? 2 : 1;
+        continue;
+      }
+      if (triple) {
+        if (content.startsWith(quote.repeat(3), i)) {
+          i += 3;
+          quote = null;
+          triple = false;
+          continue;
+        }
+        i += 1;
+        continue;
+      }
+      if (ch === "\n") {
+        quote = null;
+        lineStart = true;
+        i += 1;
+        continue;
+      }
+      if (ch === quote) {
+        i += 1;
+        quote = null;
+        continue;
+      }
+      i += 1;
+      continue;
+    }
+
+    if (ch === "#") {
+      while (i < n && content[i] !== "\n") {
+        i += 1;
+      }
+      continue;
+    }
+
+    if (ch === "\n") {
+      lineStart = true;
+      i += 1;
+      continue;
+    }
+
+    if (ch === "'" || ch === '"') {
+      triple = content.startsWith(ch.repeat(3), i);
+      quote = ch;
+      i += triple ? 3 : 1;
+      lineStart = false;
+      continue;
+    }
+
+    if (content.startsWith(keyword, i)) {
+      const prevChar = i > 0 ? content[i - 1] : "";
+      const boundaryOk = isToml
+        ? lineStart
+        : i === 0 || /[\s(,]/.test(prevChar);
+      if (boundaryOk) {
+        const after = content.slice(i + keyword.length);
+        const match = after.match(
+          /^[ \t]*=[ \t]*(?:"([^"\r\n]+)"|'([^'\r\n]+)')/
+        );
+        if (match) {
+          return (match[1] ?? match[2] ?? "").trim();
+        }
+      }
+    }
+
+    if (ch !== " " && ch !== "\t" && ch !== "\r") {
+      lineStart = false;
+    }
+    i += 1;
+  }
+
+  return undefined;
 }
 
 export function checkDeclaredPythonVersion(

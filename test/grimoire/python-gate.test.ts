@@ -1,5 +1,9 @@
 import test, { describe, it, before } from "node:test";
 import assert from "node:assert/strict";
+import * as childProcess from "node:child_process";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import {
   initPythonParser,
   planPythonEdits,
@@ -13,6 +17,12 @@ import {
   gatePythonSync,
 } from "../../lib/grimoire/python-gate";
 import { parsePython } from "../../lib/rules/m1-python";
+import { GitService } from "../../lib/git/git-service";
+import { EventStore } from "../../lib/events/event-store";
+import { Scheduler } from "../../lib/scheduler/scheduler";
+import { candidateSha256FromDiff } from "../../lib/merge/candidate-hash";
+import { onSubmit } from "../../lib/scheduler/candidate-submission";
+import type { PactTask } from "../../lib/pact/pact-parser";
 
 before(async () => {
   await initPythonParser();
@@ -96,7 +106,7 @@ describe("gatePython monotone acceptance (Requirement 9.1-9.4)", () => {
 
   it("rejects an edit that does not reduce residue (gate_residue_not_reduced)", async () => {
     const src = "print x\n";
-    const noop = makeEdit(1, 0, 0, " ", 1);
+    const noop = makeEdit(1, 7, 7, " ", 1);
     const result = await gatePython(src, [noop], { file: "a.py" });
     assert.equal(result.rejected[0].reason, "gate_residue_not_reduced");
     assert.equal(result.reverted, true);
@@ -214,6 +224,224 @@ describe("checkPythonCandidateGate (Requirement 9.10, 9.11, 9.13)", () => {
     const result = await checkPythonCandidateGate({ before, after }, {});
     assert.equal(result.ok, true);
     assert.deepEqual(result.files, ["a.py"]);
+  });
+
+  it("rejects Py2-residue files when before/head is absent (no self-comparison)", async () => {
+    const result = await checkPythonCandidateGate(
+      { files: [{ path: "legacy.py", content: "print x\n" }] },
+      {}
+    );
+    assert.equal(result.ok, false);
+    assert.ok(result.reasons.some((r) => r.includes("gate_residue_not_reduced")));
+  });
+
+  it("passes clean Py3 new files when before/head is absent", async () => {
+    const result = await checkPythonCandidateGate(
+      { files: [{ path: "clean.py", content: "print(x)\n" }] },
+      {}
+    );
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.files, ["clean.py"]);
+  });
+
+  it("rejects missing afterContent on new files without baseline", async () => {
+    const result = await checkPythonCandidateGate(
+      { changedFiles: ["new_missing.py"] },
+      {}
+    );
+    assert.equal(result.ok, false);
+    assert.ok(result.reasons.some((r) => r.includes("content not supplied")));
+    assert.equal(result.details?.["new_missing.py"]?.error, "content not supplied");
+  });
+
+  it("accepts valid deletion when present in before or listed in deletions", async () => {
+    const fromBefore = await checkPythonCandidateGate(
+      {
+        before: [{ path: "old.py", content: "print x\n" }],
+        after: [],
+        changedFiles: ["old.py"],
+      },
+      {}
+    );
+    assert.equal(fromBefore.ok, true);
+    assert.equal(fromBefore.details?.["old.py"]?.ok, true);
+
+    const fromDeletions = await checkPythonCandidateGate(
+      {
+        deletions: ["removed.py"],
+        changedFiles: ["removed.py"],
+      },
+      {}
+    );
+    assert.equal(fromDeletions.ok, true);
+    assert.equal(fromDeletions.details?.["removed.py"]?.ok, true);
+  });
+});
+
+describe("candidate-submission Python gate wiring", () => {
+  function setupPyRepo(initialContent: string, nextContent: string) {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "py-cand-sub-"));
+    const gitDir = path.join(tmpDir, "git");
+    fs.mkdirSync(gitDir, { recursive: true });
+    const runGit = (args: string[]) =>
+      childProcess
+        .execFileSync("git", args, {
+          cwd: gitDir,
+          encoding: "utf8",
+          env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_TERMINAL_PROMPT: "0" },
+        })
+        .trim();
+
+    runGit(["init", "--initial-branch=main", "."]);
+    runGit(["config", "user.name", "Test Runner"]);
+    runGit(["config", "user.email", "runner@example.test"]);
+
+    fs.writeFileSync(path.join(gitDir, "app.py"), initialContent);
+    runGit(["add", "app.py"]);
+    runGit(["commit", "-m", "init"]);
+    const baseSha = runGit(["rev-parse", "HEAD"]);
+    const runId = "run-py-gate";
+    runGit(["branch", `graveyard/${runId}`, baseSha]);
+
+    fs.writeFileSync(path.join(gitDir, "app.py"), nextContent);
+    runGit(["add", "app.py"]);
+    runGit(["commit", "-m", "candidate"]);
+    const candidateSha = runGit(["rev-parse", "HEAD"]);
+    const tree = runGit(["rev-parse", `${candidateSha}^{tree}`]);
+    runGit(["branch", "task/T1", candidateSha]);
+
+    const diff = childProcess.execFileSync(
+      "git",
+      ["diff", "--binary", "--no-color", baseSha, candidateSha],
+      {
+        cwd: gitDir,
+        encoding: "utf8",
+        env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_TERMINAL_PROMPT: "0" },
+      }
+    );
+
+    const tasks: PactTask[] = [
+      {
+        id: "T1",
+        title: "Py Task",
+        role: "bonesetter",
+        dependencies: [],
+        depends: [],
+        dependsOn: [],
+        files: ["app.py"],
+        filesInScope: ["app.py"],
+        acceptanceCommand: "pytest",
+        accept: "pytest",
+        hard: false,
+        hardFlag: false,
+        hardRaw: "no",
+        rules: ["M1"],
+        ruleIds: ["M1"],
+        line: 1,
+      },
+    ];
+
+    return {
+      tmpDir,
+      gitDir,
+      baseSha,
+      candidateSha,
+      tree,
+      runId,
+      diff,
+      tasks,
+      cleanup: () => fs.rmSync(tmpDir, { recursive: true, force: true }),
+    };
+  }
+
+  it("accepts and merges Python-only candidate that reduces residue with single gate.result event", async () => {
+    const repo = setupPyRepo("print x\n", "print(x)\n");
+    try {
+      const scheduler = new Scheduler(repo.tasks, { runId: repo.runId });
+      scheduler.dispatchTask("T1");
+      const eventStore = new EventStore();
+      const candidateSha256 = candidateSha256FromDiff(repo.diff);
+
+      const res = await onSubmit({
+        scheduler,
+        taskId: "T1",
+        runId: repo.runId,
+        diff: repo.diff,
+        allowList: ["app.py"],
+        candidateSha: repo.candidateSha,
+        candidateSha256,
+        tree: repo.tree,
+        gitDir: repo.gitDir,
+        expectedIntegrationHeadSha: repo.baseSha,
+        currentHeadSha: repo.baseSha,
+        eventStore,
+        gitService: new GitService(),
+        wardenReview: async () => ({
+          verdict: "approve",
+          candidateSha: repo.candidateSha,
+          candidateSha256,
+          tree: repo.tree,
+          reasons: [{ text: "ok", refs: ["cmd:test"] }],
+          checks: {
+            install: { ok: true },
+            build: { ok: true },
+            accept: { ok: true },
+            tests: { ok: true },
+            noTestWeakening: { ok: true },
+          },
+        }),
+      });
+
+      assert.equal(res.ok, true);
+      assert.equal(res.merged, true);
+      const gateEvents = eventStore.getEvents(repo.runId, { kind: "gate.result" });
+      assert.equal(gateEvents.length, 1);
+      assert.equal(gateEvents[0].data?.ok, true);
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it("rejects Python candidate that introduces residue or syntax errors before Warden", async () => {
+    const repo = setupPyRepo("print(x)\n", "print(x)\nprint y\n");
+    try {
+      const scheduler = new Scheduler(repo.tasks, { runId: repo.runId });
+      scheduler.dispatchTask("T1");
+      const eventStore = new EventStore();
+      const candidateSha256 = candidateSha256FromDiff(repo.diff);
+      let wardenCalled = false;
+
+      const res = await onSubmit({
+        scheduler,
+        taskId: "T1",
+        runId: repo.runId,
+        diff: repo.diff,
+        allowList: ["app.py"],
+        candidateSha: repo.candidateSha,
+        candidateSha256,
+        tree: repo.tree,
+        gitDir: repo.gitDir,
+        expectedIntegrationHeadSha: repo.baseSha,
+        currentHeadSha: repo.baseSha,
+        eventStore,
+        gitService: new GitService(),
+        wardenReview: async () => {
+          wardenCalled = true;
+          return { verdict: "approve" };
+        },
+      });
+
+      assert.equal(res.ok, false);
+      assert.equal(res.merged, false);
+      assert.equal(res.state, "rejected");
+      assert.equal(wardenCalled, false);
+      assert.ok(res.reasons.some((r) => r.includes("gate_residue_not_reduced")));
+      const gateEvents = eventStore.getEvents(repo.runId, { kind: "gate.result" });
+      assert.equal(gateEvents.length, 1);
+      assert.equal(gateEvents[0].data?.ok, false);
+    } finally {
+      repo.cleanup();
+    }
   });
 });
 
