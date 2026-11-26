@@ -12,7 +12,7 @@ import {
   BONESETTER_MANIFEST_ALLOW_PATTERNS,
   BONESETTER_MAX_STEERING_CHARS,
   BONESETTER_MAX_STEERING_FILES,
-  BONESETTER_ROOT_MANIFEST_FILENAMES,
+  BONESETTER_WRITABLE_FILENAMES,
   BonesetterWriteDeniedError,
   bundleBonesetterSteeringResources,
   createBonesetterToolClient,
@@ -199,7 +199,7 @@ describe("isBonesetterWritablePath", () => {
       "requirements.txt",
     ];
     assert.deepEqual(
-      [...BONESETTER_ROOT_MANIFEST_FILENAMES].sort(),
+      [...BONESETTER_WRITABLE_FILENAMES].sort(),
       [...expected].sort()
     );
     for (const name of [
@@ -299,7 +299,7 @@ describe("isBonesetterWritablePath", () => {
     assert.equal(isBonesetterWritablePath(""), false);
   });
 
-  it("rejects leading/trailing whitespace instead of trimming it into an allowed name (finding [11])", () => {
+  it("rejects leading/trailing whitespace instead of trimming it into an allowed name", () => {
     assert.equal(isBonesetterWritablePath("package.json "), false);
     assert.equal(isBonesetterWritablePath(" package.json"), false);
     assert.equal(isBonesetterWritablePath("\tpackage.json"), false);
@@ -385,7 +385,7 @@ describe("bundleBonesetterSteeringResources", () => {
     }
   });
 
-  it("refuses a symlinked steering directory that escapes the worktree (finding [10])", () => {
+  it("refuses a symlinked steering directory that escapes the worktree", () => {
     const base = fs.mkdtempSync(path.join(os.tmpdir(), "gg-steering-link-"));
     const outside = fs.mkdtempSync(path.join(os.tmpdir(), "gg-steering-outside-"));
     try {
@@ -412,7 +412,7 @@ describe("bundleBonesetterSteeringResources", () => {
     }
   });
 
-  it("refuses to write through a symlinked steering file (finding [10])", () => {
+  it("refuses to write through a symlinked steering file", () => {
     const base = fs.mkdtempSync(path.join(os.tmpdir(), "gg-steering-file-"));
     const outside = fs.mkdtempSync(path.join(os.tmpdir(), "gg-steering-file-out-"));
     try {
@@ -717,7 +717,7 @@ describe("prepareBonesetterSession", () => {
     }
   });
 
-  it("rejects a symlinked .kiro/steering directory that escapes the worktree (finding [10])", () => {
+  it("rejects a symlinked .kiro/steering directory that escapes the worktree", () => {
     const base = fs.mkdtempSync(path.join(os.tmpdir(), "gg-bonesetter-link-"));
     const outside = fs.mkdtempSync(path.join(os.tmpdir(), "gg-bonesetter-out-"));
     try {
