@@ -510,12 +510,23 @@ function pendingActivityIntervals(
     }
   };
 
-  pair("command.started", "command.result", (ev) => `command:${ev.actor}`);
-  pair(
-    "skeleton.tool_call",
-    "skeleton.tool_result",
-    (ev) => `tool:${ev.skeletonId ?? `actor:${ev.actor}`}`
-  );
+  // FIND-17: concurrent tasks with the same role share `ev.actor`, so pair `command.started` /
+  // `command.result` spans by the recorded `data.logRef` (falling back to the skeleton id, then the
+  // actor). Pairing by actor alone merged two simultaneous commands into a single span and dropped
+  // the second, wrongly counting in-flight work as silence.
+  pair("command.started", "command.result", (ev) => {
+    const data = ev.data as Record<string, unknown> | undefined;
+    return `command:${String(data?.logRef ?? ev.skeletonId ?? ev.actor)}`;
+  });
+  // FIND-18: concurrent tool calls on one skeleton share `skeletonId`, so pair
+  // `skeleton.tool_call` / `skeleton.tool_result` spans by the recorded `data.toolCallId`.
+  pair("skeleton.tool_call", "skeleton.tool_result", (ev) => {
+    const data = ev.data as Record<string, unknown> | undefined;
+    const toolCallId = data?.toolCallId;
+    return `tool:${
+      typeof toolCallId === "string" ? toolCallId : ev.skeletonId ?? `actor:${ev.actor}`
+    }`;
+  });
   return intervals;
 }
 
@@ -864,10 +875,14 @@ export function loadRecordedRunsFromDir(dir: string, limit = DEFAULT_LIMIT): Cal
 }
 
 /**
- * WP-17-fix2: every *completed, non-error* run in a directory, in directory-name order. Kept
- * separate from {@link loadRecordedRunsFromDir} (which slices to `limit` samples) so the full
- * completed-run id set can feed `recalibrationRequired` while only the first `limit` runs feed the
- * distributions.
+ * WP-17-fix2: every *completed, non-error* run in a directory, ordered chronologically by the
+ * run's `run.done` timestamp (ties broken by run id). Kept separate from
+ * {@link loadRecordedRunsFromDir} (which slices to `limit` samples) so the full completed-run id set
+ * can feed `recalibrationRequired` while only the first `limit` runs feed the distributions.
+ *
+ * FIND-22: sorting by directory name made the sample order depend on a custom `--run-id` naming
+ * scheme, so directory mode could pick different "first three" runs than EventStore mode. Ordering
+ * by the run's `run.done` ts matches {@link collectCompletedRunsFromEventStore} exactly.
  */
 function collectCompletedRunsFromDir(dir: string): CalibrationSourceRun[] {
   if (!fs.existsSync(dir)) {
@@ -894,6 +909,12 @@ function collectCompletedRunsFromDir(dir: string): CalibrationSourceRun[] {
     }
     runs.push({ runId, events });
   }
+
+  runs.sort(
+    (a, b) =>
+      (latestRunDoneEvent(a.events)?.ts ?? 0) - (latestRunDoneEvent(b.events)?.ts ?? 0) ||
+      a.runId.localeCompare(b.runId)
+  );
   return runs;
 }
 
@@ -985,6 +1006,10 @@ export function runCalibration(options?: RunCalibrationOptions): RunCalibrationR
       runIds: analysis.runIds,
       ts: options.ts,
     });
+    // FIND-16: `markCalibrated` clears `recalibrationRequired` using only the sampled run ids. When
+    // runs 4+ had already completed before this `--apply`, re-sync against *every* completed run id
+    // so the flag is not cleared prematurely; runs outside the sample window keep it armed.
+    settingsStore.syncRecordedRunCount({ recordedRunIds: allCompletedRunIds });
     recalibrationRequired = settingsStore.isRecalibrationRequired();
   }
 

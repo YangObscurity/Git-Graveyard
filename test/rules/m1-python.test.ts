@@ -3,7 +3,9 @@ import assert from "node:assert/strict";
 import {
   analyzePython,
   applyM1,
+  byteOffsetToUtf16,
   checkDeclaredPythonVersion,
+  classifyVersionSpecifier,
   collectResidue,
   initPythonParser,
   isPy2OnlySpecifier,
@@ -623,4 +625,155 @@ describe("Declared Python version: exact and narrow specifiers", () => {
   });
 });
 
+
+
+describe("Wave-19A remediation regressions", () => {
+  // Finding 3 / [3]: web-tree-sitter reports UTF-16 code-unit offsets for the
+  // installed binding (verified against node.startIndex/node.endIndex), so JS
+  // String.slice is already correct for multi-byte source. These tests lock in
+  // that behavior and the byte-offset -> UTF-16 helper used defensively.
+  const cjkEmoji = "# \u4e2d\u6587\u6ce8\u91ca \ud83d\udc0d\n";
+
+  it("rewrites a statement preceded by multi-byte UTF-8 text at the correct range", () => {
+    const src = cjkEmoji + 'print "hi"\n';
+    assert.equal(applyM1(src), cjkEmoji + 'print("hi")\n');
+    const res = analyzePython(src, "unicode_before.py");
+    assert.equal(res.edits.length, 1);
+    assert.equal(res.residueAfter, 0);
+  });
+
+  it("keeps multi-byte characters that appear inside a rewritten statement intact", () => {
+    assert.equal(
+      applyM1('x = "\u4e2d\u6587"\nprint x\n'),
+      'x = "\u4e2d\u6587"\nprint(x)\n'
+    );
+    assert.equal(applyM1('print "\ud83d\udc0d"\n'), 'print("\ud83d\udc0d")\n');
+    const nested = analyzePython('print unicode("\u4e2d\u6587")\n', "unicode_inside.py");
+    assert.equal(nested.output, 'print(str("\u4e2d\u6587"))\n');
+  });
+
+  it("byteOffsetToUtf16 maps UTF-8 byte offsets to UTF-16 code-unit indices", () => {
+    const src = cjkEmoji + 'print "hi"\n';
+    const map = byteOffsetToUtf16(src);
+    assert.equal(map(0), 0);
+    assert.equal(map(Buffer.byteLength(cjkEmoji, "utf8")), cjkEmoji.length);
+    assert.equal(map(Buffer.byteLength(src, "utf8")), src.length);
+    // A pure-ASCII source maps identically.
+    const asciiMap = byteOffsetToUtf16('print "hi"\n');
+    assert.equal(asciiMap(6), 6);
+  });
+
+  // Finding 14 / [14]: a leading-zero float is not a Py2 octal.
+  it("does not classify Python 3 floats such as 00.5 / .005 as Py2 octals", () => {
+    const content = [
+      "a = 00.5",
+      "b = .005",
+      "c = 0755",
+      "d = 0644",
+      "e = 007",
+      "f = 1.07",
+      "",
+    ].join("\n");
+    const result = detectPythonSignalsLexical([{ path: "octal.py", content }]);
+    const lines = result.map((s) => s.line);
+    assert.ok(!lines.includes(1), "00.5 must not be flagged as an octal");
+    assert.ok(!lines.includes(2), ".005 must not be flagged as an octal");
+    assert.ok(lines.includes(3), "0755 is a Py2 octal");
+    assert.ok(lines.includes(4), "0644 is a Py2 octal");
+    assert.ok(lines.includes(5), "007 is a Py2 octal");
+    assert.ok(!lines.includes(6), "1.07 must not be flagged as an octal");
+  });
+
+  // Finding 19 / [19]: `except E as (a, b):` is a Python 3 SyntaxError.
+  it("leaves tuple/attribute/subscript except targets unrewritten as Py2 residue", () => {
+    const tupleSrc = "try:\n    pass\nexcept E, (a, b):\n    pass\n";
+    const res = analyzePython(tupleSrc, "a.py");
+    assert.equal(res.output, tupleSrc);
+    assert.equal(res.edits.length, 0);
+    assert.ok(res.unknowns.some((u) => u.reason === "py2_residue"));
+    const tree = parsePython(tupleSrc)!;
+    try {
+      const kinds = collectResidue(tree).map((item) => item.kind);
+      assert.ok(kinds.includes("except_target_unsupported"));
+    } finally {
+      tree.delete?.();
+    }
+
+    for (const target of ["obj.attr", "d[k]"]) {
+      const src = `try:\n    pass\nexcept E, ${target}:\n    pass\n`;
+      assert.equal(applyM1(src), src);
+    }
+
+    // The identifier form still rewrites.
+    assert.equal(
+      applyM1("try:\n    pass\nexcept E, e:\n    pass\n"),
+      "try:\n    pass\nexcept E as e:\n    pass\n"
+    );
+  });
+
+  // Finding 20 / [20]: `str(encoding=...)` is a Python 3 TypeError.
+  it("does not rewrite unicode(...) when a keyword argument is present", () => {
+    for (const src of [
+      'x = unicode(encoding="utf-8")\n',
+      'x = unicode(y, errors="strict")\n',
+    ]) {
+      const res = analyzePython(src, "a.py");
+      assert.equal(res.output, src);
+      assert.equal(res.edits.length, 0);
+      assert.ok(
+        res.unknowns.some((u) => u.reason === "unicode_decoding_ambiguous")
+      );
+    }
+  });
+
+  // CodeRabbit / [7]: PEP 440 pre/post/dev specifiers.
+  it("classifies PEP 440 pre/post/dev specifiers as Python 3 compatible", () => {
+    for (const spec of [
+      ">=3.13.0rc1",
+      "==3.12.0a1",
+      ">=3.11.0b2",
+      "~=3.11.0",
+      ">=3.10.0.post1",
+      ">=3.11.0.dev1",
+    ]) {
+      assert.equal(classifyVersionSpecifier(spec), "py3_compatible", spec);
+      assert.equal(isPy2OnlySpecifier(spec), false, spec);
+    }
+  });
+
+  it("keeps pre-release Python 2 pins py2-only and clearly flags unparseable specifiers", () => {
+    assert.ok(isPy2OnlySpecifier(">=2.7.0rc1, <3"));
+    assert.equal(classifyVersionSpecifier(">=2.7.0rc1, <3"), "py2_only");
+    assert.equal(classifyVersionSpecifier("not-a-version"), "unknown");
+    // Unparseable specs stay conservative (halt M1) but are distinguishable.
+    assert.equal(isPy2OnlySpecifier("not-a-version"), true);
+
+    const py3 = checkDeclaredPythonVersion([
+      {
+        path: "pyproject.toml",
+        content: '[project]\nrequires-python = ">=3.13.0rc1"\n',
+      },
+    ]);
+    assert.equal(py3.py2Only, false);
+    assert.equal(py3.declaredStatus, "py3_compatible");
+    assert.equal(py3.reason, "py3_compatible_declared");
+
+    const malformed = checkDeclaredPythonVersion([
+      {
+        path: "pyproject.toml",
+        content: '[project]\nrequires-python = "not-a-version"\n',
+      },
+    ]);
+    assert.equal(malformed.py2Only, true);
+    assert.equal(malformed.declaredStatus, "unknown");
+    assert.equal(malformed.reason, "version_specifier_unparseable");
+
+    const py2 = checkDeclaredPythonVersion([
+      { path: "setup.py", content: "setup(python_requires='>=2.7, <3')\n" },
+    ]);
+    assert.equal(py2.py2Only, true);
+    assert.equal(py2.declaredStatus, "py2_only");
+    assert.equal(py2.reason, "py2_only_declared");
+  });
+});
 
