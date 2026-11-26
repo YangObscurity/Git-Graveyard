@@ -1,0 +1,1146 @@
+// lib/rules/m1-python.ts
+// Requirement 6.1, 6.3-6.19; design R3-8.1 (M1 rows) and R3-9 (residue list).
+//
+// Deterministic Python 2 -> 3 analysis and rewrite engine built on web-tree-sitter
+// plus the tree-sitter-python grammar. Every edit cites ruleId "M1".
+import { Parser, Language, type Tree, type Node } from "web-tree-sitter";
+import { createRequire } from "node:module";
+import * as Diff from "diff";
+import type { Confidence, UnknownRecord } from "../grimoire/types";
+import type { PatchStep } from "../grimoire/gate-js";
+import { normalizeFilePath } from "../grimoire/gate-js";
+
+export const M1_RULE_ID = "M1" as const;
+
+/** Fixed row order for the eight R3-8.1 rewrite rows. */
+export const M1_ROW = {
+  PRINT: 1,
+  PRINT_TRAILING: 2,
+  PRINT_CHEVRON: 3,
+  BARE_PRINT: 4,
+  PRINT_CALL: 5,
+  EXCEPT: 6,
+  UNICODE: 7,
+  ITERATOR: 8,
+} as const;
+
+export interface PythonSplice {
+  start: number;
+  end: number;
+  replacement: string;
+}
+
+export interface PythonPlannedEdit {
+  ruleId: "M1";
+  ruleOrder: number;
+  line: number;
+  confidence: Confidence;
+  description: string;
+  note?: string;
+  /** Primary splice (first), mirrored for callers that only read one range. */
+  start: number;
+  end: number;
+  replacement: string;
+  /** All splices of this atomic edit (head + tail/comma for print rows). */
+  splices?: PythonSplice[];
+  [key: string]: unknown;
+}
+
+/** Returns the splices of an edit, falling back to its primary range. */
+export function editSplices(edit: PythonPlannedEdit): PythonSplice[] {
+  if (Array.isArray(edit.splices) && edit.splices.length > 0) {
+    return edit.splices;
+  }
+  return [{ start: edit.start, end: edit.end, replacement: edit.replacement }];
+}
+
+export interface PythonBehaviorNote {
+  ruleId: "M1";
+  file: string;
+  line: number;
+  note: string;
+}
+
+export interface PythonResidueItem {
+  kind: string;
+  handled: boolean;
+  line: number;
+  column: number;
+  startIndex: number;
+  endIndex: number;
+  text: string;
+}
+
+export interface PythonPlan {
+  file: string;
+  edits: PythonPlannedEdit[];
+  conflicts: PythonPlannedEdit[];
+  unknowns: UnknownRecord[];
+  behaviorNotes: PythonBehaviorNote[];
+  residue: PythonResidueItem[];
+  hasFuturePrint: boolean;
+  unicodeBound: boolean;
+}
+
+export interface M1Result {
+  file: string;
+  source: string;
+  output: string;
+  bom: boolean;
+  newline: "\r\n" | "\n";
+  edits: PythonPlannedEdit[];
+  acceptedEdits: PythonPlannedEdit[];
+  conflicts: PythonPlannedEdit[];
+  unknowns: UnknownRecord[];
+  behaviorNotes: PythonBehaviorNote[];
+  residueBefore: number;
+  residueAfter: number;
+  label: "m1-clean" | "m1-partial";
+  reverted: boolean;
+  revertReason?: string;
+  compat: boolean;
+  notes: string;
+  diff: string;
+  step: PatchStep;
+}
+
+export interface AnalyzePythonOptions {
+  /** Raw bytes, when available, are validated as strict UTF-8 first. */
+  rawBytes?: Uint8Array;
+  /** When the repository declares Python 2 only, M1 must not edit anything. */
+  py2Only?: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Parser initialization and caching
+// ---------------------------------------------------------------------------
+
+let parserPromise: Promise<Parser> | null = null;
+let pythonParser: Parser | null = null;
+
+export function isPythonParserReady(): boolean {
+  return pythonParser !== null;
+}
+
+export function getPythonParser(): Parser | null {
+  return pythonParser;
+}
+
+function makeRequire(): NodeRequire {
+  try {
+    return createRequire(import.meta.url);
+  } catch {
+    return createRequire(process.cwd() + "/__m1_python__.js");
+  }
+}
+
+/** Initializes and caches the Python parser (Language singleton loaded once). */
+export async function initPythonParser(): Promise<Parser> {
+  if (pythonParser) return pythonParser;
+  if (!parserPromise) {
+    parserPromise = (async () => {
+      await Parser.init();
+      const require = makeRequire();
+      const wasmPath = require.resolve(
+        "tree-sitter-python/tree-sitter-python.wasm"
+      );
+      const language = await Language.load(wasmPath);
+      const parser = new Parser();
+      parser.setLanguage(language);
+      pythonParser = parser;
+      return parser;
+    })().catch((err) => {
+      parserPromise = null;
+      throw err;
+    });
+  }
+  return parserPromise;
+}
+
+/**
+ * Parses Python source with the cached parser. Returns null when the parser is
+ * not initialized yet or when parsing fails (safe timeout / null handling).
+ */
+export function parsePython(source: string): Tree | null {
+  if (!pythonParser) return null;
+  try {
+    const tree = pythonParser.parse(source);
+    return tree ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Generic AST helpers
+// ---------------------------------------------------------------------------
+
+function walkNodes(root: Node, visit: (node: Node) => void): void {
+  const stack: Node[] = [root];
+  while (stack.length > 0) {
+    const node = stack.pop()!;
+    visit(node);
+    for (let i = node.childCount - 1; i >= 0; i--) {
+      const child = node.child(i);
+      if (child) stack.push(child);
+    }
+  }
+}
+
+function lineOf(node: Node): number {
+  return node.startPosition.row + 1;
+}
+
+function hasChildOfType(node: Node, type: string): boolean {
+  for (let i = 0; i < node.childCount; i++) {
+    if (node.child(i)?.type === type) return true;
+  }
+  return false;
+}
+
+function exceptValueCount(node: Node): number {
+  let count = 0;
+  for (let i = 0; i < node.childCount; i++) {
+    if (node.fieldNameForChild(i) === "value") count += 1;
+  }
+  return count;
+}
+
+function positionalArgumentCount(call: Node): number {
+  const args = call.childForFieldName("arguments");
+  if (!args) return 0;
+  let count = 0;
+  for (const child of args.namedChildren) {
+    if (child.type === "keyword_argument") continue;
+    if (child.type === "comment") continue;
+    count += 1;
+  }
+  return count;
+}
+
+function hasEmptyArguments(call: Node): boolean {
+  const args = call.childForFieldName("arguments");
+  return !!args && args.namedChildren.length === 0;
+}
+
+function attributeName(attributeCall: Node): string | null {
+  const fn = attributeCall.childForFieldName("function");
+  if (!fn || fn.type !== "attribute") return null;
+  const attr = fn.childForFieldName("attribute");
+  if (!attr || attr.type !== "identifier") return null;
+  return attr.text;
+}
+
+const ITERATOR_NAMES = new Set(["iteritems", "iterkeys", "itervalues"]);
+const ITERATOR_MAP: Record<string, string> = {
+  iteritems: "items",
+  iterkeys: "keys",
+  itervalues: "values",
+};
+
+const UNHANDLED_RESIDUE_KINDS = new Set([
+  "exec_statement",
+  "not_equal",
+  "backtick_string",
+  "ur_prefix",
+  "octal",
+  "long",
+  "tuple_param",
+  "raise_statement",
+]);
+
+// ---------------------------------------------------------------------------
+// Encoding validation
+// ---------------------------------------------------------------------------
+
+export function hasLoneSurrogate(source: string): boolean {
+  for (let i = 0; i < source.length; i++) {
+    const code = source.charCodeAt(i);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = source.charCodeAt(i + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return true;
+      i += 1;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function isValidUtf8(bytes: Uint8Array): boolean {
+  try {
+    new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Reads a `# -*- coding: ... -*-` cookie from the first two lines, if any. */
+export function codingCookieName(source: string): string | null {
+  const firstTwoLines = source.split("\n").slice(0, 2).join("\n");
+  const match = firstTwoLines.match(/coding[:=]\s*([-\w.]+)/);
+  return match ? match[1].toLowerCase() : null;
+}
+
+// ---------------------------------------------------------------------------
+// Residue list (design R3-9)
+// ---------------------------------------------------------------------------
+
+function classifyResidue(node: Node): string | null {
+  switch (node.type) {
+    case "print_statement":
+      return "print_statement";
+    case "exec_statement":
+      return "exec_statement";
+    case "chevron":
+      return "chevron";
+    case "<>":
+      return "not_equal";
+    case "raise_statement":
+      return hasChildOfType(node, "expression_list") ? "raise_statement" : null;
+    case "except_clause":
+      return exceptValueCount(node) >= 2 ? "except_clause" : null;
+    case "expression_statement": {
+      if (
+        node.childCount === 1 &&
+        node.child(0)?.type === "identifier" &&
+        node.child(0)?.text === "print"
+      ) {
+        return "bare_print";
+      }
+      return null;
+    }
+    case "string": {
+      const start = node.child(0);
+      const prefix =
+        start && start.type === "string_start" ? start.text.toLowerCase() : "";
+      if (prefix.includes("`")) return "backtick_string";
+      if (prefix.includes("u") && prefix.includes("r")) return "ur_prefix";
+      return null;
+    }
+    case "integer": {
+      const text = node.text;
+      if (/^0[0-9]+$/.test(text)) return "octal";
+      if (/[Ll]$/.test(text)) return "long";
+      return null;
+    }
+    case "tuple_pattern": {
+      const parent = node.parent;
+      if (
+        parent &&
+        (parent.type === "parameters" || parent.type === "lambda_parameters")
+      ) {
+        return "tuple_param";
+      }
+      return null;
+    }
+    case "call": {
+      const fn = node.childForFieldName("function");
+      if (!fn) return null;
+      if (fn.type === "identifier" && fn.text === "unicode") {
+        return "unicode_call";
+      }
+      const attr = attributeName(node);
+      if (attr && ITERATOR_NAMES.has(attr)) return "iterator_call";
+      return null;
+    }
+    default:
+      return null;
+  }
+}
+
+/** Collects every residue occurrence with its position (design R3-9). */
+export function collectResidue(tree: Tree): PythonResidueItem[] {
+  const items: PythonResidueItem[] = [];
+  walkNodes(tree.rootNode, (node) => {
+    const kind = classifyResidue(node);
+    if (kind === null) return;
+    items.push({
+      kind,
+      handled: !UNHANDLED_RESIDUE_KINDS.has(kind),
+      line: lineOf(node),
+      column: node.startPosition.column,
+      startIndex: node.startIndex,
+      endIndex: node.endIndex,
+      text: node.text,
+    });
+  });
+  return items;
+}
+
+/** Total residue count of a tree (used by the monotone gate). */
+export function countPythonResidue(tree: Tree): number {
+  return collectResidue(tree).length;
+}
+
+// ---------------------------------------------------------------------------
+// Name binding detection (for the unicode row)
+// ---------------------------------------------------------------------------
+
+function collectTargetNames(node: Node, out: Set<string>): void {
+  if (node.type === "identifier") {
+    out.add(node.text);
+    return;
+  }
+  if (
+    node.type === "pattern_list" ||
+    node.type === "tuple_pattern" ||
+    node.type === "list_pattern" ||
+    node.type === "parenthesized_expression"
+  ) {
+    for (const child of node.namedChildren) collectTargetNames(child, out);
+  }
+}
+
+function collectBoundNames(tree: Tree): Set<string> {
+  const bound = new Set<string>();
+  walkNodes(tree.rootNode, (node) => {
+    switch (node.type) {
+      case "assignment":
+      case "augmented_assignment": {
+        const left = node.childForFieldName("left");
+        if (left) collectTargetNames(left, bound);
+        break;
+      }
+      case "function_definition":
+      case "class_definition": {
+        const name = node.childForFieldName("name");
+        if (name && name.type === "identifier") bound.add(name.text);
+        break;
+      }
+      case "import_statement":
+      case "import_from_statement": {
+        for (const part of node.text.match(/[A-Za-z_][A-Za-z0-9_]*/g) ?? []) {
+          if (part === "unicode") bound.add("unicode");
+        }
+        break;
+      }
+      default:
+        break;
+    }
+  });
+  return bound;
+}
+
+function hasFuturePrint(tree: Tree): boolean {
+  let found = false;
+  walkNodes(tree.rootNode, (node) => {
+    if (
+      node.type === "future_import_statement" &&
+      /\bprint_function\b/.test(node.text)
+    ) {
+      found = true;
+    }
+  });
+  return found;
+}
+
+// ---------------------------------------------------------------------------
+// Edit planning (the eight R3-8.1 rows)
+// ---------------------------------------------------------------------------
+
+function buildPrintStatementEdit(
+  node: Node,
+  source: string
+): PythonPlannedEdit | null {
+  const printKeyword = node.child(0);
+  if (!printKeyword || printKeyword.type !== "print") return null;
+
+  const args: Node[] = [];
+  let chevron: Node | null = null;
+  for (let i = 0; i < node.childCount; i++) {
+    const child = node.child(i)!;
+    if (node.fieldNameForChild(i) === "argument") args.push(child);
+    else if (child.type === "chevron") chevron = child;
+  }
+  if (args.length === 0) return null;
+
+  const lastChild = node.child(node.childCount - 1);
+  const trailingComma = !!lastChild && lastChild.type === ",";
+  const fileTarget = chevron ? chevron.text.slice(2) : "";
+
+  const head: PythonSplice = {
+    start: printKeyword.endIndex,
+    end: args[0].startIndex,
+    replacement: "(",
+  };
+
+  let tail: PythonSplice;
+  let confidence: Confidence;
+  let ruleOrder: number;
+  let note: string | undefined;
+
+  if (trailingComma) {
+    tail = {
+      start: lastChild!.startIndex,
+      end: node.endIndex,
+      replacement: `, end=" "` + (chevron ? `, file=${fileTarget})` : ")"),
+    };
+    confidence = "medium";
+    ruleOrder = chevron ? M1_ROW.PRINT_CHEVRON : M1_ROW.PRINT_TRAILING;
+    note = "Py2 softspace output is not identical";
+  } else {
+    tail = {
+      start: node.endIndex,
+      end: node.endIndex,
+      replacement: chevron ? `, file=${fileTarget})` : ")",
+    };
+    confidence = "high";
+    ruleOrder = chevron ? M1_ROW.PRINT_CHEVRON : M1_ROW.PRINT;
+  }
+
+  return {
+    ruleId: "M1",
+    ruleOrder,
+    line: lineOf(node),
+    confidence,
+    description: chevron
+      ? "print >>f statement -> print(..., file=f) call"
+      : "print statement -> print(...) call",
+    note,
+    start: head.start,
+    end: head.end,
+    replacement: head.replacement,
+    splices: [head, tail],
+  };
+}
+
+function isIteratorUse(call: Node): boolean {
+  const parent = call.parent;
+  if (!parent) return false;
+  if (parent.type === "attribute") {
+    const attr = parent.childForFieldName("attribute");
+    if (attr && attr.type === "identifier" && attr.text === "next") return true;
+  }
+  if (parent.type === "argument_list") {
+    const grandparent = parent.parent;
+    if (grandparent && grandparent.type === "call") {
+      const fn = grandparent.childForFieldName("function");
+      if (fn && fn.type === "identifier" && fn.text === "next") return true;
+    }
+  }
+  return false;
+}
+
+export interface ConflictResolution {
+  edits: PythonPlannedEdit[];
+  conflicts: PythonPlannedEdit[];
+  unknowns: UnknownRecord[];
+}
+
+/**
+ * Requirement 6.16: when two edits in one file have overlapping splices, keep
+ * the earlier edit (by start offset, then row order) and record the later one
+ * with reason `edit_conflict`.
+ */
+export function resolveEditConflicts(
+  edits: PythonPlannedEdit[],
+  file: string
+): ConflictResolution {
+  const sorted = [...edits].sort(
+    (a, b) => a.start - b.start || a.ruleOrder - b.ruleOrder
+  );
+  const accepted: PythonPlannedEdit[] = [];
+  const conflicts: PythonPlannedEdit[] = [];
+  const acceptedSplices: PythonSplice[] = [];
+  const unknowns: UnknownRecord[] = [];
+
+  for (const edit of sorted) {
+    const splices = editSplices(edit);
+    const overlaps = splices.some((splice) =>
+      acceptedSplices.some(
+        (accepted) => splice.start < accepted.end && accepted.start < splice.end
+      )
+    );
+    if (overlaps) {
+      conflicts.push(edit);
+      unknowns.push({
+        ruleId: "M1",
+        reason: "edit_conflict",
+        file,
+        line: edit.line,
+      });
+    } else {
+      accepted.push(edit);
+      for (const splice of splices) acceptedSplices.push(splice);
+    }
+  }
+
+  return { edits: accepted, conflicts, unknowns };
+}
+
+/** Builds the plan against an already parsed tree. */
+export function planFromTree(
+  tree: Tree,
+  source: string,
+  file: string
+): PythonPlan {
+  const hasFuture = hasFuturePrint(tree);
+  const unicodeBound = collectBoundNames(tree).has("unicode");
+  const edits: PythonPlannedEdit[] = [];
+  const unknowns: UnknownRecord[] = [];
+  const behaviorNotes: PythonBehaviorNote[] = [];
+
+  walkNodes(tree.rootNode, (node) => {
+    if (node.type === "print_statement") {
+      const edit = buildPrintStatementEdit(node, source);
+      if (edit) {
+        edits.push(edit);
+        if (edit.note) {
+          behaviorNotes.push({
+            ruleId: "M1",
+            file,
+            line: edit.line,
+            note: edit.note,
+          });
+        }
+      }
+      return;
+    }
+    if (node.type === "expression_statement") {
+      if (
+        node.childCount === 1 &&
+        node.child(0)?.type === "identifier" &&
+        node.child(0)?.text === "print"
+      ) {
+        edits.push({
+          ruleId: "M1",
+          ruleOrder: M1_ROW.BARE_PRINT,
+          line: lineOf(node),
+          confidence: "high",
+          description: "bare print -> print()",
+          start: node.startIndex,
+          end: node.endIndex,
+          replacement: "print()",
+          splices: [
+            { start: node.startIndex, end: node.endIndex, replacement: "print()" },
+          ],
+        });
+      }
+      return;
+    }
+    if (node.type === "except_clause") {
+      const values: Node[] = [];
+      for (let i = 0; i < node.childCount; i++) {
+        if (node.fieldNameForChild(i) === "value") values.push(node.child(i)!);
+      }
+      if (values.length >= 2) {
+        const first = values[0];
+        const second = values[1];
+        edits.push({
+          ruleId: "M1",
+          ruleOrder: M1_ROW.EXCEPT,
+          line: lineOf(node),
+          confidence: "high",
+          description: "except E, e: -> except E as e:",
+          start: first.endIndex,
+          end: second.startIndex,
+          replacement: " as ",
+          splices: [
+            { start: first.endIndex, end: second.startIndex, replacement: " as " },
+          ],
+        });
+      }
+      return;
+    }
+    if (node.type === "call") {
+      const fn = node.childForFieldName("function");
+      if (!fn) return;
+
+      if (fn.type === "identifier" && fn.text === "print") {
+        if (positionalArgumentCount(node) >= 2 && !hasFuture) {
+          behaviorNotes.push({
+            ruleId: "M1",
+            file,
+            line: lineOf(node),
+            note: "Py2 prints a tuple",
+          });
+        }
+        return;
+      }
+
+      if (fn.type === "identifier" && fn.text === "unicode") {
+        if (unicodeBound) {
+          unknowns.push({
+            ruleId: "M1",
+            reason: "unicode_rebound",
+            file,
+            line: lineOf(node),
+          });
+          return;
+        }
+        edits.push({
+          ruleId: "M1",
+          ruleOrder: M1_ROW.UNICODE,
+          line: lineOf(node),
+          confidence: "medium",
+          description: "unicode(...) -> str(...)",
+          start: fn.startIndex,
+          end: fn.endIndex,
+          replacement: "str",
+          splices: [
+            { start: fn.startIndex, end: fn.endIndex, replacement: "str" },
+          ],
+        });
+        return;
+      }
+
+      const attr = attributeName(node);
+      if (attr === "unicode") {
+        unknowns.push({
+          ruleId: "M1",
+          reason: "unicode_rebound",
+          file,
+          line: lineOf(node),
+        });
+        return;
+      }
+      if (attr && ITERATOR_NAMES.has(attr)) {
+        if (!hasEmptyArguments(node)) return;
+        if (isIteratorUse(node)) {
+          unknowns.push({
+            ruleId: "M1",
+            reason: "iterator_use",
+            file,
+            line: lineOf(node),
+          });
+          return;
+        }
+        const attrNode = fn.childForFieldName("attribute")!;
+        edits.push({
+          ruleId: "M1",
+          ruleOrder: M1_ROW.ITERATOR,
+          line: lineOf(node),
+          confidence: "medium",
+          description: `.${attr}() -> .${ITERATOR_MAP[attr]}()`,
+          start: attrNode.startIndex,
+          end: attrNode.endIndex,
+          replacement: ITERATOR_MAP[attr],
+          splices: [
+            {
+              start: attrNode.startIndex,
+              end: attrNode.endIndex,
+              replacement: ITERATOR_MAP[attr],
+            },
+          ],
+        });
+      }
+      return;
+    }
+  });
+
+  const residue = collectResidue(tree);
+  for (const item of residue) {
+    if (!item.handled) {
+      unknowns.push({
+        ruleId: "M1",
+        reason: "py2_residue",
+        file,
+        line: item.line,
+      });
+    }
+  }
+
+  // Overlapping edits: keep the earlier one (start offset, then row order).
+  const resolution = resolveEditConflicts(edits, file);
+  for (const unknown of resolution.unknowns) unknowns.push(unknown);
+
+  return {
+    file,
+    edits: resolution.edits,
+    conflicts: resolution.conflicts,
+    unknowns,
+    behaviorNotes,
+    residue,
+    hasFuturePrint: hasFuture,
+    unicodeBound,
+  };
+}
+
+
+/** Parses and plans M1 edits. Returns null when the parser is not ready. */
+export function planPythonEdits(
+  source: string,
+  file: string
+): PythonPlan | null {
+  const tree = parsePython(source);
+  if (!tree) return null;
+  return planFromTree(tree, source, file);
+}
+
+// ---------------------------------------------------------------------------
+// Atomic splice engine
+// ---------------------------------------------------------------------------
+
+interface IndexedSplice extends PythonSplice {
+  editIndex: number;
+  spliceIndex: number;
+}
+
+/**
+ * Applies a set of (non-overlapping) edits atomically. Positions of later
+ * splices are mapped through the splices already applied, so nested edits such
+ * as `print unicode(x)` both apply cleanly.
+ */
+export function applyEditsToOriginal(
+  original: string,
+  edits: PythonPlannedEdit[]
+): string {
+  const splices: IndexedSplice[] = [];
+  edits.forEach((edit, editIndex) => {
+    editSplices(edit).forEach((splice, spliceIndex) => {
+      splices.push({ ...splice, editIndex, spliceIndex });
+    });
+  });
+  splices.sort(
+    (a, b) =>
+      a.start - b.start ||
+      a.end - b.end ||
+      a.editIndex - b.editIndex ||
+      a.spliceIndex - b.spliceIndex
+  );
+
+  let text = original;
+  let delta = 0;
+  for (const splice of splices) {
+    const start = splice.start + delta;
+    const end = splice.end + delta;
+    text = text.slice(0, start) + splice.replacement + text.slice(end);
+    delta += splice.replacement.length - (splice.end - splice.start);
+  }
+  return text;
+}
+
+export function countHunks(diff: string): number {
+  const matches = diff.match(/^@@ /gm);
+  return matches ? matches.length : 0;
+}
+
+export function createPythonDiff(
+  original: string,
+  patched: string,
+  file: string
+): string {
+  return Diff.createTwoFilesPatch(
+    file,
+    file,
+    original,
+    patched,
+    undefined,
+    undefined,
+    { context: 3 }
+  );
+}
+
+
+// ---------------------------------------------------------------------------
+// Declared Python version (halt M1 on Python-2-only declarations)
+// ---------------------------------------------------------------------------
+
+export interface DeclaredPythonVersion {
+  py2Only: boolean;
+  declared?: string;
+  path?: string;
+  reason?: string;
+}
+
+function parseVersionParts(value: string): number[] {
+  return value
+    .split(".")
+    .map((part) => parseInt(part, 10))
+    .filter((part) => !Number.isNaN(part));
+}
+
+function compareVersions(a: number[], b: number[]): number {
+  const length = Math.max(a.length, b.length);
+  for (let i = 0; i < length; i++) {
+    const left = a[i] ?? 0;
+    const right = b[i] ?? 0;
+    if (left !== right) return left < right ? -1 : 1;
+  }
+  return 0;
+}
+
+/** Returns true when the specifier admits no Python 3 version. */
+export function isPy2OnlySpecifier(specifier: string): boolean {
+  const clauses = specifier
+    .split(",")
+    .map((clause) => clause.trim())
+    .filter((clause) => clause.length > 0);
+  if (clauses.length === 0) return false;
+
+  let lower: number[] | null = null;
+  let lowerInclusive = true;
+  let upper: number[] | null = null;
+  let upperInclusive = true;
+
+  for (const clause of clauses) {
+    const match = clause.match(/^(==|>=|<=|~=|>|<|!=)?\s*([0-9]+(?:\.[0-9]+)*)(\.\*)?$/);
+    if (!match) continue;
+    const op = match[1] ?? "==";
+    const version = match[2];
+    const star = !!match[3];
+    if (op === "!=") continue;
+    const parts = parseVersionParts(version);
+
+    if (star && (op === "==" || op === "~=")) {
+      const next = parts.slice();
+      next[Math.max(0, next.length - 1)] += 1;
+      if (lower === null || compareVersions(parts, lower) > 0) {
+        lower = parts;
+        lowerInclusive = true;
+      }
+      if (upper === null || compareVersions(next, upper) < 0) {
+        upper = next;
+        upperInclusive = false;
+      }
+      continue;
+    }
+
+    if (op === ">=" || op === ">") {
+      if (lower === null || compareVersions(parts, lower) > 0) {
+        lower = parts;
+        lowerInclusive = op === ">=";
+      }
+      continue;
+    }
+    if (op === "<=" || op === "<") {
+      if (upper === null || compareVersions(parts, upper) < 0) {
+        upper = parts;
+        upperInclusive = op === "<=";
+      }
+      continue;
+    }
+    // == and ~=
+    if (lower === null || compareVersions(parts, lower) > 0) {
+      lower = parts;
+      lowerInclusive = true;
+    }
+    const cap = op === "~=" ? [parts[0] + 1] : parts;
+    if (upper === null || compareVersions(cap, upper) < 0) {
+      upper = cap;
+      upperInclusive = op !== "~=";
+    }
+  }
+
+  const py3 = [3, 0];
+  // A lower bound at or above 3.0 admits Python 3.
+  if (lower && compareVersions(lower, py3) >= 0) return false;
+  if (upper === null) return false;
+  const cmp = compareVersions(upper, py3);
+  if (cmp > 0) return false;
+  if (cmp === 0) return !upperInclusive;
+  return true;
+}
+
+function extractSpecifier(content: string, keyword: string): string | undefined {
+  const match = content.match(
+    new RegExp(`${keyword}\\s*=\\s*["']([^"']+)["']`)
+  );
+  return match ? match[1].trim() : undefined;
+}
+
+export function checkDeclaredPythonVersion(
+  manifests: Array<{ path: string; content: string }>
+): DeclaredPythonVersion {
+  for (const manifest of manifests ?? []) {
+    const path = normalizeFilePath(manifest.path).toLowerCase();
+    let spec: string | undefined;
+    if (path.endsWith("pyproject.toml")) {
+      spec = extractSpecifier(manifest.content, "requires-python");
+    } else if (path.endsWith("setup.py")) {
+      spec = extractSpecifier(manifest.content, "python_requires");
+    }
+    if (spec) {
+      return {
+        py2Only: isPy2OnlySpecifier(spec),
+        declared: spec,
+        path: normalizeFilePath(manifest.path),
+        reason: "py2_only_declared",
+      };
+    }
+  }
+  return { py2Only: false };
+}
+
+// ---------------------------------------------------------------------------
+// Full analysis (transform + diff + PatchStep)
+// ---------------------------------------------------------------------------
+
+function emptyResult(
+  source: string,
+  file: string,
+  bom: boolean,
+  newline: "\r\n" | "\n",
+  reason: string,
+  unknowns: UnknownRecord[]
+): M1Result {
+  const step: PatchStep = {
+    id: `M1:${file}`,
+    ruleId: "M1",
+    file,
+    diff: "",
+    hunks: 0,
+    compat: false,
+    behavior: "preserved",
+    reverted: true,
+    revertReason: reason,
+    acceptedEdits: 0,
+    acceptedEditsCount: 0,
+    edits: [],
+    plannedEdits: [],
+  };
+  return {
+    file,
+    source,
+    output: source,
+    bom,
+    newline,
+    edits: [],
+    acceptedEdits: [],
+    conflicts: [],
+    unknowns,
+    behaviorNotes: [],
+    residueBefore: 0,
+    residueAfter: 0,
+    label: "m1-partial",
+    reverted: true,
+    revertReason: reason,
+    compat: false,
+    notes: "",
+    diff: "",
+    step,
+  };
+}
+
+export function analyzePython(
+  source: string,
+  fileOrOptions?: string | AnalyzePythonOptions,
+  maybeOptions?: AnalyzePythonOptions
+): M1Result {
+  const file =
+    typeof fileOrOptions === "string" && fileOrOptions.length > 0
+      ? normalizeFilePath(fileOrOptions)
+      : "file.py";
+  const options: AnalyzePythonOptions =
+    typeof fileOrOptions === "object" && fileOrOptions !== null
+      ? fileOrOptions
+      : maybeOptions ?? {};
+
+  const bom = source.length > 0 && source.charCodeAt(0) === 0xfeff;
+  const body = bom ? source.slice(1) : source;
+  const newline: "\r\n" | "\n" = source.includes("\r\n") ? "\r\n" : "\n";
+  const unknowns: UnknownRecord[] = [];
+
+  const encodingBad =
+    (options.rawBytes !== undefined && !isValidUtf8(options.rawBytes)) ||
+    hasLoneSurrogate(body) ||
+    (() => {
+      const cookie = codingCookieName(body);
+      const cookieNonUtf8 =
+        cookie !== null && cookie !== "utf-8" && cookie !== "utf8";
+      return cookieNonUtf8 && body.includes("\uFFFD");
+    })();
+
+  if (encodingBad) {
+    unknowns.push({ ruleId: "M1", reason: "encoding_unsupported", file });
+    return emptyResult(
+      source,
+      file,
+      bom,
+      newline,
+      "encoding_unsupported",
+      unknowns
+    );
+  }
+  if (options.py2Only) {
+    unknowns.push({ ruleId: "M1", reason: "py2_only_declared", file });
+    return emptyResult(
+      source,
+      file,
+      bom,
+      newline,
+      "py2_only_declared",
+      unknowns
+    );
+  }
+
+  const tree = parsePython(body);
+  if (!tree) {
+    unknowns.push({ ruleId: "M1", reason: "parse_timeout", file });
+    return emptyResult(source, file, bom, newline, "parse_timeout", unknowns);
+  }
+
+  const plan = planFromTree(tree, body, file);
+  for (const unknown of plan.unknowns) unknowns.push(unknown);
+
+  const outputBody = applyEditsToOriginal(body, plan.edits);
+  const output = (bom ? "\uFEFF" : "") + outputBody;
+  const residueBefore = countPythonResidue(tree);
+  const outputTree = parsePython(outputBody);
+  const residueAfter = outputTree
+    ? countPythonResidue(outputTree)
+    : residueBefore;
+  const label: "m1-clean" | "m1-partial" =
+    residueAfter === 0 ? "m1-clean" : "m1-partial";
+
+  const planned = [...plan.edits, ...plan.conflicts];
+  const reverted = planned.length > 0 && plan.edits.length === 0;
+  const diff =
+    plan.edits.length > 0 ? createPythonDiff(source, output, file) : "";
+  const notes = plan.behaviorNotes.map((item) => item.note).join("; ");
+
+  const step: PatchStep = {
+    id: `M1:${file}`,
+    ruleId: "M1",
+    file,
+    diff,
+    hunks: countHunks(diff),
+    compat: false,
+    behavior: notes ? "changed" : "preserved",
+    notes: notes || undefined,
+    reverted,
+    revertReason: reverted ? "all_edits_rejected" : undefined,
+    acceptedEdits: plan.edits.length,
+    acceptedEditsCount: plan.edits.length,
+    edits: planned,
+    plannedEdits: planned,
+  };
+
+  return {
+    file,
+    source,
+    output,
+    bom,
+    newline,
+    edits: planned,
+    acceptedEdits: plan.edits,
+    conflicts: plan.conflicts,
+    unknowns,
+    behaviorNotes: plan.behaviorNotes,
+    residueBefore,
+    residueAfter,
+    label,
+    reverted,
+    revertReason: reverted ? "all_edits_rejected" : undefined,
+    compat: false,
+    notes,
+    diff,
+    step,
+  };
+}
+
+export function transformPython(
+  source: string,
+  file: string,
+  options?: AnalyzePythonOptions
+): M1Result {
+  return analyzePython(source, file, options);
+}
+
+/** Requirement 6.15: `applyM1(applyM1(f)) === applyM1(f)`. */
+export function applyM1(source: string, file?: string): string {
+  return analyzePython(source, file ?? "file.py").output;
+}
+
