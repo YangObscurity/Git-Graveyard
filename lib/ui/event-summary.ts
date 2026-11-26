@@ -342,6 +342,7 @@ const SUMMARIZERS: ReadonlyMap<string, Summarizer> = new Map<string, Summarizer>
   ["exhume.certificate", summarizeCertificate],
   ["pact.drafted", summarizePactDrafted],
   ["pact.revision", (data) => `${pactLabel(data)} revised`],
+  ["pact.revised", (data) => `${pactLabel(data)} revised`],
   ["pact.edited", (data) => `${pactLabel(data)} edited`],
   ["pact.approved", summarizePactApproved],
   ["task.state", summarizeTaskState],

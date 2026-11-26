@@ -60,7 +60,8 @@ describe("model constants under override", () => {
     const out = runInChildProcess(
       `const m=require("./lib/agents/model-allowlist");
        const v=m.verifySessionModel({model:"claude-sonnet-4.5"},"planner");
-       console.log(JSON.stringify({roles:m.ROLE_DEFAULT_MODELS,allowed:m.isAllowedModelId("claude-sonnet-4.5"),oldAllowed:m.isAllowedModelId("claude-opus-5.5"),ok:v.ok}))`,
+       const b=m.verifySessionModel({model:"claude-sonnet-4.5"},"bonesetter");
+       console.log(JSON.stringify({roles:m.ROLE_DEFAULT_MODELS,allowed:m.isAllowedModelId("claude-sonnet-4.5"),oldAllowed:m.isAllowedModelId("claude-opus-5.5"),ok:v.ok,plannerTier:v.ok?v.tier:null,bonesetterTier:b.ok?b.tier:null}))`,
       {
         GG_MODEL_OPUS: "claude-sonnet-4.5",
         GG_MODEL_SONNET: "claude-sonnet-4.5",
@@ -74,6 +75,8 @@ describe("model constants under override", () => {
     assert.equal(parsed.allowed, true);
     assert.equal(parsed.oldAllowed, false);
     assert.equal(parsed.ok, true);
+    assert.equal(parsed.plannerTier, "Claude Opus 5.5");
+    assert.equal(parsed.bonesetterTier, "Claude Sonnet 5.5");
   });
 
   it("writes the overridden model into the generated Kiro agent file", () => {

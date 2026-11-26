@@ -237,8 +237,14 @@ export function getAssignedTierForRole(
   role: SkeletonRole | string,
   options?: RoleModelAssignmentOptions
 ): ModelTier {
-  const modelId = getAssignedModelForRole(role, options);
-  return MODEL_TIER_BY_ID[modelId];
+  const norm = normalizeRole(role);
+  if (!norm) {
+    throw new Error(`Unknown Skeleton role: "${role}"`);
+  }
+  if (norm === "soul-stitcher" && isHardTask(options?.hard)) {
+    return MODEL_TIER_OPUS;
+  }
+  return ROLE_DEFAULT_TIERS[norm];
 }
 
 /**
@@ -523,7 +529,7 @@ export function verifySessionModel(
     matchesTier: true,
     modelId: activeModel,
     expectedModelId,
-    tier: MODEL_TIER_BY_ID[activeModel],
+    tier: getAssignedTierForRole(normRole, options),
     role: normRole,
     canPrompt: true,
   };
