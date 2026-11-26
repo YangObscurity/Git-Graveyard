@@ -479,17 +479,23 @@ describe("analyzeRecordedRunsForCalibration — metrics from recorded events", (
     assert.equal(detailA.startCitation, "ev:1");
     assert.equal(detailA.endCitation, "ev:15");
     assert.equal(detailA.totalMs, 900_000);
-    // The naive sum of the two intervals is 120_000, but they overlap and must be merged to
-    // 90_000 (1_010_000..1_100_000).
-    assert.equal(detailA.pausedMs, 90_000);
-    assert.notEqual(detailA.pausedMs, 120_000);
-    assert.equal(detailA.activeMs, 810_000);
-    assert.equal(detailA.pauseIntervals.length, 2);
+    // The run.clock (80_000) and Pact (40_000) intervals overlap, so they must be merged to
+    // 90_000 (1_010_000..1_100_000). The approval wait (300_000) is a disjoint span, and run A's
+    // merged paused total is 90_000 + 300_000 = 390_000 (WP-17-fix2: approval waits are excluded).
+    assert.equal(detailA.pausedMs, 390_000);
+    assert.equal(detailA.activeMs, 510_000);
+    assert.equal(detailA.pauseIntervals.length, 3);
     assert.deepEqual(
       detailA.pauseIntervals.map((p) => p.source).sort(),
-      ["pact_review", "run.clock"]
+      ["approval_wait", "pact_review", "run.clock"]
     );
     assert.ok(detailA.pauseIntervals.every((p) => p.startCitation.startsWith("ev:")));
+
+    // The overlapping clock/Pact pair still merges exactly once: the naive sum of the two clamped
+    // (pre-merge) durations is 120_000, but only 90_000 of merged time is subtracted.
+    const clockAndPact = detailA.pauseIntervals.filter((p) => p.source !== "approval_wait");
+    assert.equal(clockAndPact.reduce((acc, p) => acc + p.durationMs, 0), 120_000);
+    assert.equal(detailA.pausedMs - 300_000, 90_000);
 
     const detailB = analysis.runWallClockDetails.find((d) => d.runId === "calib-run-b");
     assert.ok(detailB);
@@ -504,8 +510,8 @@ describe("analyzeRecordedRunsForCalibration — metrics from recorded events", (
 
     const metric = analysis.runWallClockExcludingPactMs;
     assert.equal(metric.status, "available");
-    assert.deepEqual([...metric.samples].sort((a, b) => a - b), [470_000, 600_000, 810_000]);
-    assert.equal(metric.max, 810_000);
+    assert.deepEqual([...metric.samples].sort((a, b) => a - b), [470_000, 510_000, 600_000]);
+    assert.equal(metric.max, 600_000);
   });
 
   it("measures approval request -> resolve wait times", () => {
@@ -515,10 +521,13 @@ describe("analyzeRecordedRunsForCalibration — metrics from recorded events", (
     assert.ok(metric.citations.includes("ev:9..ev:10"));
   });
 
-  it("measures the maximum skeleton silence gap per run", () => {
+  it("measures the maximum skeleton silence gap per run (excluding in-flight spans)", () => {
     const metric = analysis.silenceDurationsMs;
     assert.equal(metric.status, "available");
-    assert.deepEqual([...metric.samples].sort((a, b) => a - b), [100_000, 200_000, 488_000]);
+    // Run A keeps its 488_000 gap (its lone skeleton.tool_call has no result, so it is not an
+    // in-flight span); run C keeps 100_000. Run B's 200_000 command.started -> command.result span
+    // is in-flight work, not silence, so its maximum gap drops to 90_000 (Requirement 41.12).
+    assert.deepEqual([...metric.samples].sort((a, b) => a - b), [90_000, 100_000, 488_000]);
     assert.equal(metric.max, 488_000);
     assert.ok(metric.citations.includes("ev:7..ev:13"));
   });
@@ -939,4 +948,340 @@ describe("completed-run filtering — errored runs (FIND-004 regression)", () =>
     runStore.close();
   });
 });
+
+
+describe("WP-17-fix2 regressions — Cubic & PR-Agent findings", () => {
+  function writeRunDir(root: string, run: CalibrationSourceRun): void {
+    const runDir = path.join(root, run.runId);
+    fs.mkdirSync(runDir, { recursive: true });
+    const ndjson = `${run.events.map((ev) => JSON.stringify(ev)).join("\n")}\n`;
+    fs.writeFileSync(path.join(runDir, "events.ndjson"), ndjson, "utf8");
+  }
+
+  // --- Item 1: isPlainObject / prototype-pollution hardening -----------------
+
+  it("rejects Map/Set/Date/RegExp setting values with a TypeError (item 1)", () => {
+    const store = new SettingsStore();
+    for (const value of [new Map(), new Set(), new Date(), /re/]) {
+      assert.throws(
+        () => store.setSetting("customStructured", value, { actor: "owner" }),
+        TypeError
+      );
+    }
+    assert.equal(store.getSetting("customStructured"), undefined);
+    // A genuine plain object is still accepted.
+    store.setSetting("customStructured", { note: "ok" }, { actor: "owner" });
+    assert.deepEqual(store.getSetting("customStructured"), { note: "ok" });
+    store.close();
+  });
+
+  it("rejects reserved prototype-pollution setting keys (item 1)", () => {
+    const store = new SettingsStore();
+    for (const key of ["__proto__", "constructor", "prototype"]) {
+      assert.throws(() => store.setSetting(key, 1, { actor: "owner" }), TypeError);
+    }
+
+    // An own, enumerable `__proto__` property must also be rejected by the batch API.
+    const malicious: Record<string, unknown> = {};
+    Object.defineProperty(malicious, "__proto__", {
+      value: 1,
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
+    assert.throws(() => store.setSettingsBatch(malicious, { actor: "owner" }), TypeError);
+
+    // Nothing leaked onto the global Object prototype.
+    assert.equal(({} as Record<string, unknown>).polluted, undefined);
+    store.close();
+  });
+
+  it("getAllSettings assigns via defineProperty so a __proto__ row cannot pollute (item 1)", () => {
+    const store = new SettingsStore();
+    store.db
+      .prepare(
+        "INSERT INTO admin_settings (key, valueJson, isRequired, updatedAt, updatedBy) " +
+          "VALUES (?, ?, 0, 0, 'system:test')"
+      )
+      .run("__proto__", JSON.stringify({ polluted: true }));
+
+    const all = store.getAllSettings();
+    assert.ok(Object.prototype.hasOwnProperty.call(all, "__proto__"));
+    assert.equal(Object.getPrototypeOf(all), Object.prototype);
+    assert.equal(({} as Record<string, unknown>).polluted, undefined);
+    store.close();
+  });
+
+  // --- Item 2: concurrentLiveRuns -------------------------------------------
+
+  it("seeds an editable concurrentLiveRuns default of 1 and validates it (item 2)", () => {
+    const store = new SettingsStore();
+    assert.equal(E11_DEFAULT_SETTINGS.concurrentLiveRuns, 1);
+    assert.equal(store.getSetting("concurrentLiveRuns"), 1);
+
+    store.setSetting("concurrentLiveRuns", 5, { actor: "owner" });
+    assert.equal(store.getSetting("concurrentLiveRuns"), 5);
+
+    assert.throws(() => store.setSetting("concurrentLiveRuns", -1, { actor: "owner" }), RangeError);
+    assert.throws(() => store.setSetting("concurrentLiveRuns", 1.5, { actor: "owner" }), RangeError);
+    store.close();
+  });
+
+  // --- Item 3: EventStore run.done override & seq ordering -------------------
+
+  it("lets an errored eventStore run.done override a completed runStore row (item 3)", () => {
+    const store = new SettingsStore();
+    const eventStore = new EventStore(":memory:");
+    const runStore = new RunStore(":memory:");
+
+    for (const runId of ["e1", "e2", "e3"]) {
+      runStore.createRun({
+        runId,
+        url: `https://github.com/example/${runId}`,
+        sha: "0".repeat(40),
+        phase: "done",
+        outcome: "resurrected",
+      });
+      eventStore.append({
+        runId,
+        kind: "run.done",
+        actor: "necromancer",
+        data: { outcome: "resurrected" },
+      });
+    }
+
+    // The RunStore records run e4 as complete, but its latest run.done reports an error.
+    runStore.createRun({
+      runId: "e4",
+      url: "https://github.com/example/e4",
+      sha: "0".repeat(40),
+      phase: "done",
+      outcome: "resurrected",
+    });
+    eventStore.append({
+      runId: "e4",
+      kind: "run.done",
+      actor: "necromancer",
+      data: { outcome: "resurrected" },
+    });
+    eventStore.append({
+      runId: "e4",
+      kind: "run.done",
+      actor: "necromancer",
+      data: { outcome: "error" },
+    });
+
+    const sync = store.syncRecordedRunCount({ eventStore, runStore });
+    assert.equal(sync.completedRecordedRuns, 3);
+
+    store.close();
+    eventStore.close();
+    runStore.close();
+  });
+
+  it("picks the latest run.done by seq, tie-breaking on the later index (item 3)", () => {
+    const store = new SettingsStore();
+    const eventStore = new EventStore(":memory:");
+
+    for (const runId of ["s1", "s2", "s3"]) {
+      eventStore.append({
+        runId,
+        kind: "run.done",
+        actor: "necromancer",
+        data: { outcome: "resurrected" },
+      });
+    }
+    // error first, then resurrected -> the latest (by seq) outcome wins, so the run is completed.
+    eventStore.append({
+      runId: "s4",
+      kind: "run.done",
+      actor: "necromancer",
+      data: { outcome: "error" },
+    });
+    eventStore.append({
+      runId: "s4",
+      kind: "run.done",
+      actor: "necromancer",
+      data: { outcome: "resurrected" },
+    });
+
+    assert.equal(store.syncRecordedRunCount({ eventStore }).completedRecordedRuns, 4);
+    store.close();
+    eventStore.close();
+  });
+
+  // --- Item 4: directory loader completeness ---------------------------------
+
+  it("skips a run lacking run.done when loading from --runs-dir (item 4)", () => {
+    const root = makeTmpDir("gg-calib-incomplete-");
+    writeRunDir(root, runA);
+    writeRunDir(root, runB);
+    writeRunDir(root, runC);
+    // Sorts before the completed runs, so a broken filter would wrongly take the first slot.
+    writeRunDir(
+      root,
+      mkRun("0-calib-run-incomplete", [
+        { seq: 1, ts: 100, kind: "run.started" },
+        { seq: 2, ts: 200, kind: "skeleton.log", skeletonId: "sk-x" },
+      ])
+    );
+
+    const loaded = loadRecordedRunsFromDir(root, 4);
+    assert.ok(!loaded.some((r) => r.runId === "0-calib-run-incomplete"));
+    assert.deepEqual(
+      loaded.map((r) => r.runId),
+      ["calib-run-a", "calib-run-b", "calib-run-c"]
+    );
+
+    const result = runCalibration({ runsDir: root, limit: 3 });
+    assert.ok(!result.runIds.includes("0-calib-run-incomplete"));
+  });
+
+  // --- Item 5: refs normalization --------------------------------------------
+
+  it("normalizes non-string refs to strings and never lets data.refs win (item 5)", () => {
+    const root = makeTmpDir("gg-calib-refs-");
+    const runId = "calib-run-refs";
+    const dir = path.join(root, runId);
+    fs.mkdirSync(dir, { recursive: true });
+    const events = [
+      {
+        runId,
+        seq: 1,
+        ts: 1,
+        kind: "run.phase",
+        actor: "necromancer",
+        data: { refs: [1, null, "ev:9"], from: "queued", to: "exhume" },
+      },
+      {
+        runId,
+        seq: 2,
+        ts: 2,
+        kind: "run.done",
+        actor: "necromancer",
+        data: { refs: [], outcome: "resurrected" },
+      },
+    ];
+    fs.writeFileSync(
+      path.join(dir, "events.ndjson"),
+      `${events.map((ev) => JSON.stringify(ev)).join("\n")}\n`,
+      "utf8"
+    );
+
+    const loaded = loadRecordedRunsFromDir(root, 1);
+    assert.equal(loaded.length, 1);
+    assert.deepEqual(loaded[0].events[0].data.refs, ["1", "null", "ev:9"]);
+    // The rest of `data` is preserved; `refs` sits *after* the spread so it is always normalized.
+    assert.equal(loaded[0].events[0].data.to, "exhume");
+  });
+
+  // --- Item 6: approval wait exclusion ---------------------------------------
+
+  it("subtracts approval.requested -> approval.resolved waits exactly once (item 6)", () => {
+    const detail = analyzeRecordedRunsForCalibration([runA]).runWallClockDetails[0];
+    const approval = detail.pauseIntervals.filter((p) => p.source === "approval_wait");
+    assert.equal(approval.length, 1);
+    assert.equal(approval[0].durationMs, 300_000);
+    assert.equal(approval[0].startCitation, "ev:9");
+    assert.equal(approval[0].endCitation, "ev:10");
+    // 90_000 merged clock/pact + 300_000 disjoint approval -> 390_000, never double-counted.
+    assert.equal(detail.pausedMs, 390_000);
+
+    // An approval that overlaps a run.clock pause is merged once, not summed.
+    const overlapping = mkRun("calib-run-approval-overlap", [
+      { seq: 1, ts: 0, kind: "run.phase", data: { from: "queued", to: "exhume" } },
+      { seq: 2, ts: 100, kind: "run.clock", data: { action: "pause" } },
+      { seq: 3, ts: 200, kind: "approval.requested", data: { approvalId: "a1" } },
+      { seq: 4, ts: 500, kind: "approval.resolved", data: { approvalId: "a1" } },
+      { seq: 5, ts: 600, kind: "run.clock", data: { action: "resume" } },
+      { seq: 6, ts: 1000, kind: "run.done", data: { outcome: "resurrected" } },
+    ]);
+    const merged = analyzeRecordedRunsForCalibration([overlapping]).runWallClockDetails[0];
+    assert.equal(merged.totalMs, 1000);
+    // run.clock 100..600 and approval 200..500 overlap -> one merged 500 ms span, not 800 ms.
+    assert.equal(merged.pausedMs, 500);
+    assert.equal(merged.activeMs, 500);
+  });
+
+  // --- Item 7: silence excludes in-flight spans ------------------------------
+
+  it("excludes an in-flight command.started -> command.result from silence (item 7)", () => {
+    const inflight = mkRun("calib-run-inflight", [
+      { seq: 1, ts: 0, kind: "run.phase", data: { from: "queued", to: "exhume" } },
+      { seq: 2, ts: 10_000, kind: "command.started", actor: "soulstitcher" },
+      { seq: 3, ts: 510_000, kind: "command.result", actor: "soulstitcher" },
+      { seq: 4, ts: 520_000, kind: "run.done", data: { outcome: "resurrected" } },
+    ]);
+    const metric = analyzeRecordedRunsForCalibration([inflight]).silenceDurationsMs;
+    assert.equal(metric.status, "available");
+    // Naively the 500_000 command span looks like a gap; it is in-flight work, so silence is 0.
+    assert.equal(metric.max, 0);
+    assert.deepEqual(metric.samples, [0]);
+  });
+
+  // --- Item 8: run 4+ re-arms recalibration ----------------------------------
+
+  it("re-arms recalibrationRequired when a fourth completed run concludes (item 8)", () => {
+    const root = makeTmpDir("gg-calib-run4-");
+    writeRunDir(root, runA);
+    writeRunDir(root, runB);
+    writeRunDir(root, runC);
+    const settingsStore = new SettingsStore();
+
+    const first = runCalibration({
+      runsDir: root,
+      settingsStore,
+      apply: true,
+      actor: "owner",
+      ts: 1000,
+    });
+    assert.equal(first.recalibrationRequired, false);
+    assert.deepEqual(
+      [...settingsStore.getCalibrationState().lastCalibratedRunIds].sort(),
+      ["calib-run-a", "calib-run-b", "calib-run-c"]
+    );
+
+    // A fourth completed run concludes after the calibration.
+    writeRunDir(root, runD);
+    const second = runCalibration({ runsDir: root, settingsStore, limit: 3 });
+    // Only the first three runs feed the distributions...
+    assert.deepEqual(second.runIds, ["calib-run-a", "calib-run-b", "calib-run-c"]);
+    // ...but run 4 still re-arms recalibration.
+    assert.equal(second.recalibrationRequired, true);
+    assert.equal(settingsStore.getCalibrationState().completedRecordedRuns, 4);
+
+    settingsStore.close();
+  });
+
+  // --- Item 9: CLI flag validation -------------------------------------------
+
+  it("rejects value flags whose value is missing or another flag (item 9)", () => {
+    assert.throws(() => parseCalibrationArgs(["--db", "--json"]), /--db requires a path argument/);
+    assert.throws(() => parseCalibrationArgs(["--db"]), /--db requires a path argument/);
+    assert.throws(
+      () => parseCalibrationArgs(["--settings-db", "--json"]),
+      /--settings-db requires a path argument/
+    );
+    assert.throws(
+      () => parseCalibrationArgs(["--runs-dir", "--json"]),
+      /--runs-dir requires a path argument/
+    );
+    assert.throws(
+      () => parseCalibrationArgs(["--out", "--json"]),
+      /--out requires a path argument/
+    );
+    assert.throws(
+      () => parseCalibrationArgs(["--actor", "--json"]),
+      /--actor requires a value argument/
+    );
+
+    // A real value is still accepted and the following flag survives.
+    const ok = parseCalibrationArgs(["--db", "/tmp/events.db", "--json"]);
+    assert.equal(ok.db, "/tmp/events.db");
+    assert.equal(ok.json, true);
+  });
+});
+
+
+
 

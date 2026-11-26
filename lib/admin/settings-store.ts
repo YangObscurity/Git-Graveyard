@@ -14,7 +14,7 @@ import { DatabaseSync, type StatementSync } from "node:sqlite";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { EventStore } from "../events/event-store";
+import type { EventEnvelope, EventStore } from "../events/event-store";
 import type { RunStore } from "../runs/run-store";
 
 /**
@@ -105,6 +105,8 @@ export const E11_DEFAULT_SETTINGS: Readonly<Record<string, number>> = {
   liveKiroProcesses: 4,
   parallelSoulStitchers: 1,
   queueDepth: 5,
+  // Requirement 30.3: editable live-run concurrency limit (dev default 1, prod ceiling <= 5).
+  concurrentLiveRuns: 1,
 };
 
 /** Required_Settings that always need an Owner-set value before a run may start. */
@@ -147,15 +149,58 @@ export class RequiredSettingMissingError extends Error {
   }
 }
 
+/**
+ * Resolves only genuine `Object` literals (or null-prototype objects) to a plain record.
+ *
+ * It deliberately rejects every other exotic object (`Map`, `Set`, `Date`, `RegExp`, class
+ * instances, arrays, …) by checking the prototype chain, so a value that cannot round-trip through
+ * `JSON.stringify` / `JSON.parse` is never accepted as a setting value.
+ */
 function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
 }
 
 /**
- * Validates a setting value: numeric settings must be finite and non-negative; other settings
- * must be a string, boolean, null or a plain object. Arrays, functions and symbols are rejected.
+ * Reserved prototype-pollution keys. `Object.defineProperty` / `JSON.parse` can materialise these
+ * as own enumerable properties, so writing them would either silently mutate a prototype or shadow
+ * `Object` members. They are rejected in `setSetting` and `setSettingsBatch`.
+ */
+const RESERVED_SETTING_KEYS = new Set<string>(["__proto__", "constructor", "prototype"]);
+
+/**
+ * Count-like settings whose value must be a non-negative *integer*. The generic non-negative finite
+ * check below still applies first; this only tightens it for keys where a fractional value (e.g.
+ * `concurrentLiveRuns: 1.5`) is meaningless.
+ */
+const INTEGER_SETTING_KEYS = new Set<string>([
+  "concurrentLiveRuns",
+  "wardenRounds",
+  "promptsPerSkeleton",
+  "toolCallsPerTurn",
+  "toolCallsPerRun",
+  "creditsPerRun",
+  "creditsPerDay",
+  "contextPressurePercent",
+  "budgetWarningPercent",
+  "liveKiroProcesses",
+  "parallelSoulStitchers",
+  "queueDepth",
+]);
+
+/**
+ * Validates a setting value: numeric settings must be finite and non-negative (and, for count
+ * settings, integers); other settings must be a string, boolean, null or a plain object. Arrays,
+ * functions, symbols and exotic objects (`Map`/`Set`/`Date`/`RegExp`) are rejected, as are the
+ * reserved prototype-pollution keys.
  */
 function assertValidSettingValue(key: string, value: unknown): void {
+  if (RESERVED_SETTING_KEYS.has(key)) {
+    throw new TypeError(`Setting key "${key}" is reserved and cannot be set`);
+  }
   if (value === undefined) {
     throw new TypeError(`Setting "${key}" value must not be undefined`);
   }
@@ -168,6 +213,11 @@ function assertValidSettingValue(key: string, value: unknown): void {
     }
     if (value < 0) {
       throw new RangeError(`Setting "${key}" must not be negative (received ${value})`);
+    }
+    if (INTEGER_SETTING_KEYS.has(key) && !Number.isInteger(value)) {
+      throw new RangeError(
+        `Setting "${key}" must be a non-negative integer (received ${value})`
+      );
     }
     return;
   }
@@ -300,6 +350,24 @@ function detectStorageMode(db: DatabaseSync): "memory" | "file" {
     // ignore
   }
   return "memory";
+}
+
+/**
+ * FIND-004 / WP-17-fix2: returns a run's latest `run.done` envelope — highest `seq`, tie-breaking in
+ * favour of the later array index — matching `latestRunDoneEvent` in the calibration script so both
+ * agree on what a run's terminal outcome is. Returns `null` when the run never concluded.
+ */
+function pickLatestRunDoneEvent(events: EventEnvelope[]): EventEnvelope | null {
+  let latest: EventEnvelope | null = null;
+  for (const ev of events) {
+    if (ev.kind !== "run.done") {
+      continue;
+    }
+    if (latest === null || ev.seq >= latest.seq) {
+      latest = ev;
+    }
+  }
+  return latest;
 }
 
 export class SettingsStore {
@@ -499,7 +567,14 @@ export class SettingsStore {
       if (value === undefined) {
         continue;
       }
-      out[String(row.key)] = value;
+      // Assign via `Object.defineProperty` so a stored `__proto__` / `constructor` key is created as
+      // a plain own property and can never mutate the result's prototype (prototype pollution).
+      Object.defineProperty(out, String(row.key), {
+        value,
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
     }
     return out;
   }
@@ -507,6 +582,9 @@ export class SettingsStore {
   setSetting(key: string, value: unknown, options: SetSettingOptions): SettingsAuditEntry {
     if (!key || typeof key !== "string") {
       throw new TypeError("key must be a non-empty string");
+    }
+    if (RESERVED_SETTING_KEYS.has(key)) {
+      throw new TypeError(`Setting key "${key}" is reserved and cannot be set`);
     }
     const entries = this.setSettingsBatch({ [key]: value }, options);
     return entries[0];
@@ -689,18 +767,21 @@ export class SettingsStore {
       }
       const eventStore = sources.eventStore;
       if (eventStore) {
+        // WP-17-fix2: always evaluate the EventStore's `run.done`, even when the RunStore already
+        // added the id. A run the RunStore records as `done`/non-error is still not a completed
+        // Recorded_Run when its latest `run.done` says `outcome === "error"` — that id is removed.
         for (const runId of eventStore.getRunIds()) {
-          if (ids.has(runId)) {
-            continue;
-          }
           const events = eventStore.getEvents(runId, { kind: "run.done" });
           if (events.length === 0) {
             continue;
           }
-          // FIND-004: only the *latest* run.done decides the run's outcome, and an errored run is
-          // not a completed Recorded_Run — mirror the runStore branch above.
-          const latestDone = events[events.length - 1];
+          // FIND-004: only the *latest* run.done (by seq) decides the run's outcome.
+          const latestDone = pickLatestRunDoneEvent(events);
+          if (latestDone === null) {
+            continue;
+          }
           if (latestDone.data.outcome === "error") {
+            ids.delete(runId);
             continue;
           }
           ids.add(runId);
