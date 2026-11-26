@@ -950,19 +950,28 @@ export async function detectPythonSignals(
   input: DetectSignalsInput,
   options?: DetectSignalsOptions
 ): Promise<DetectSignalsResult> {
+  const rawList = toFileList(input);
+  const pythonFiles = rawList.filter(
+    (file): boolean =>
+      !!file &&
+      typeof file.path === "string" &&
+      isPythonFile(normalizePath(file.path))
+  );
+
+  // Nothing to analyze: skip loading the tree-sitter Python module and the WASM
+  // grammar entirely when no `.py` files are present.
+  if (pythonFiles.length === 0) {
+    return finalizeSignals([], [], options);
+  }
+
   const { initPythonParser, planPythonEdits } = await import("../rules/m1-python");
   await initPythonParser();
 
-  const rawList = toFileList(input);
   const signals: Signal[] = [];
   const unknowns: UnknownRecord[] = [];
 
-  for (const file of rawList) {
-    if (!file || typeof file.path !== "string") continue;
-
+  for (const file of pythonFiles) {
     const filePath = normalizePath(file.path);
-    if (!isPythonFile(filePath)) continue;
-
     const manifestDir = getManifestDir(file);
     let source = file.content ?? file.text ?? (file as any).source;
     if (typeof source !== "string") {
