@@ -100,6 +100,9 @@ describe("gatePython monotone acceptance (Requirement 9.1-9.4)", () => {
     assert.equal(result.label, "m1-partial");
     assert.equal(result.reverted, true);
     assert.equal(result.revertReason, "all_edits_rejected");
+    // buildStep must carry the same revertReason as the file result, not hardcode.
+    assert.equal(result.step.revertReason, result.revertReason);
+    assert.equal(result.step.revertReason, "all_edits_rejected");
     assert.ok(result.unknowns.some((u) => u.reason === "gate_errors_rose"));
     assert.ok(result.unknowns.every((u) => typeof u.line === "number"));
   });
@@ -111,6 +114,8 @@ describe("gatePython monotone acceptance (Requirement 9.1-9.4)", () => {
     assert.equal(result.rejected[0].reason, "gate_residue_not_reduced");
     assert.equal(result.reverted, true);
     assert.equal(result.revertReason, "all_edits_rejected");
+    assert.equal(result.step.revertReason, result.revertReason);
+    assert.equal(result.step.revertReason, "all_edits_rejected");
   });
 
   it("returns the original text unchanged on parse timeout", async () => {
@@ -123,6 +128,9 @@ describe("gatePython monotone acceptance (Requirement 9.1-9.4)", () => {
     assert.equal(result.text, src);
     assert.equal(result.reverted, true);
     assert.equal(result.revertReason, "parse_timeout");
+    // step.revertReason must not hardcode "all_edits_rejected" on parse timeout.
+    assert.equal(result.step.revertReason, result.revertReason);
+    assert.equal(result.step.revertReason, "parse_timeout");
     assert.ok(result.unknowns.some((u) => u.reason === "parse_timeout"));
   });
 
