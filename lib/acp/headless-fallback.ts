@@ -163,6 +163,8 @@ export interface HeadlessFallbackChannelOptions {
   cwd?: string;
   kiroApiKey?: string;
   pathEnv?: string;
+  /** Sandbox user the spawned headless process runs as. */
+  user?: string;
   command?: string;
   spawnFn?: SpawnFunction;
   /** Exact gateway MCP tool IDs passed through `--trust-tools`. */
@@ -246,6 +248,12 @@ export class HeadlessFallbackChannel {
   /** Set when `cancel()` aborts the in-flight turn (Requirement 17.8). */
   private turnCancelled = false;
   /**
+   * Wake-up callbacks registered while the turn awaits an approval decision.
+   * `cancel()` invokes every one of them so a stalled `onApproval` promise can
+   * never leave the turn waiting forever.
+   */
+  private cancelWaiters: Set<() => void> = new Set();
+  /**
    * The unredacted session id reported by the most recent turn. The PUBLIC
    * `HeadlessTurnResult.sessionId` is redacted (Requirement 17.12), but the
    * supervisor must resume `--resume-id` with the REAL CLI session id even when
@@ -299,6 +307,9 @@ export class HeadlessFallbackChannel {
     // cancelled so it finalizes as "cancelled" and never spawns a resume
     // process (Requirement 17.8).
     this.turnCancelled = true;
+    // Wake any turn blocked on an approval decision so it can finalize as
+    // "cancelled" immediately instead of waiting on an unresolved `onApproval`.
+    this.wakeCancelWaiters();
     const proc = this.currentProcess;
     if (!proc) {
       // The pending turn was latched as cancelled; there is no live process to
@@ -447,6 +458,50 @@ export class HeadlessFallbackChannel {
     } catch {
       return "deny";
     }
+  }
+
+  /**
+   * Removes and invokes every cancellation waiter registered by an in-flight
+   * approval await so a stalled `onApproval` promise can never block the turn.
+   */
+  private wakeCancelWaiters(): void {
+    if (this.cancelWaiters.size === 0) {
+      return;
+    }
+    const waiters = Array.from(this.cancelWaiters);
+    this.cancelWaiters.clear();
+    for (const wake of waiters) {
+      try {
+        wake();
+      } catch {
+        // A throwing waiter must not stop the remaining waiters.
+      }
+    }
+  }
+
+  /**
+   * Awaits the approval decision for `target`, but resolves the instant `cancel()`
+   * runs so an approval that never settles cannot hang the turn. The cancellation
+   * waiter is always removed in `finally`, and a cancellation still finalizes the
+   * turn as "cancelled" in `runTurn` without spawning a resume process.
+   */
+  private awaitApprovalOrCancel(
+    target: HeadlessApprovalRequest
+  ): Promise<HeadlessApprovalDecision["decision"]> {
+    let waiter: (() => void) | null = null;
+    const cancelled = new Promise<void>((resolve) => {
+      waiter = resolve;
+      this.cancelWaiters.add(resolve);
+    });
+    const approval = this.requestApproval(target);
+    return Promise.race([
+      approval,
+      cancelled.then(() => "deny" as const),
+    ]).finally(() => {
+      if (waiter) {
+        this.cancelWaiters.delete(waiter);
+      }
+    });
   }
 
 
@@ -673,7 +728,7 @@ export class HeadlessFallbackChannel {
       }
 
       const target = roundApprovals[0];
-      const decision = await this.requestApproval(target);
+      const decision = await this.awaitApprovalOrCancel(target);
 
       // Requirement 17.8: a cancel() issued while the approval decision was
       // pending must finalize as "cancelled" and must NEVER spawn a resume
@@ -789,6 +844,7 @@ export class HeadlessFallbackChannel {
           cwd: this.cwd,
           env,
           stdio: ["ignore", "pipe", "pipe"],
+          ...(this.options.user ? { user: this.options.user } : {}),
         });
       } catch (err) {
         resolve({
@@ -1127,3 +1183,39 @@ export class HeadlessFallbackChannel {
 
 
 }
+
+/**
+ * Event payload for an auto-denied headless `ask`. Reads only the REAL
+ * `HeadlessAskRequest` fields (`askId`, `text`) plus an `options` list taken
+ * safely from the raw stream record, so a caller never has to reach into a
+ * non-existent `question` property.
+ */
+export type AskAutoDeniedEventData = {
+  askId: string | null;
+  question: string | null;
+  text: string | null;
+  options: unknown;
+};
+
+/**
+ * Builds the `ask.auto_denied` event data from a real `HeadlessAskRequest`.
+ * The question text is the request's `text`; `options` is read defensively from
+ * `ask.raw` (only when the raw record actually carries an `options` field).
+ */
+export function buildAskAutoDeniedEventData(
+  ask: HeadlessAskRequest
+): AskAutoDeniedEventData {
+  let options: unknown = null;
+  const raw = ask.raw as unknown;
+  if (raw !== null && typeof raw === "object" && "options" in raw) {
+    options = (raw as Record<string, unknown>).options ?? null;
+  }
+  const text = ask.text ?? null;
+  return {
+    askId: ask.askId,
+    question: text,
+    text,
+    options,
+  };
+}
+
