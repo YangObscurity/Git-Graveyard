@@ -31,6 +31,7 @@ import {
   type HeadlessApprovalRequest,
   type HeadlessAskRequest,
   type HeadlessExitStatus,
+  type HeadlessModelVerification,
   type StreamDiskLogger,
   type StreamJsonRecord,
 } from "./stream-parser";
@@ -391,6 +392,13 @@ export class HeadlessFallbackChannel {
     modelId: string;
     spawnError?: string | null;
     logError?: string | null;
+    /**
+     * The verification of the SPECIFIC round that failed model verification.
+     * When present it is authoritative: a per-round `model_mismatch` must be
+     * reported with the offending round's `activeModel` instead of recomputing
+     * over the accumulated records, where round 1's model would otherwise win.
+     */
+    modelVerification?: HeadlessModelVerification;
   }): HeadlessTurnResult {
     const credits = extractHeadlessCredits(input.records);
     const sessionId = extractSessionId(input.records);
@@ -400,9 +408,14 @@ export class HeadlessFallbackChannel {
     if (sessionId !== null) {
       this.lastRawSessionId = sessionId;
     }
-    const verification = verifyHeadlessModel(input.records, input.modelId, {
-      modelCheckDisabled: this.options.p14ModelCheckDisabled === true,
-    });
+    // A caller-supplied per-round verification (the offending round) takes
+    // precedence; otherwise verify the accumulated records so a turn accepted as
+    // success is still defense-in-depth checked here.
+    const verification =
+      input.modelVerification ??
+      verifyHeadlessModel(input.records, input.modelId, {
+        modelCheckDisabled: this.options.p14ModelCheckDisabled === true,
+      });
     let ok = input.ok;
     let status = input.status;
     let reason = input.reason;
@@ -410,6 +423,14 @@ export class HeadlessFallbackChannel {
       ok = false;
       status = "model_mismatch";
       reason = "model_mismatch";
+    }
+    // Preserve an explicit per-round model_mismatch failure: never let the
+    // accumulated records (which still hold an earlier round's valid model) turn
+    // the turn back into a pass.
+    if (verification.ok === false && status === "model_mismatch") {
+      ok = false;
+      status = "model_mismatch";
+      reason = reason ?? "model_mismatch";
     }
 
     // Requirement 17.12: never return raw secrets from memory. The structural
@@ -687,6 +708,33 @@ export class HeadlessFallbackChannel {
           autoDeniedAsks,
           resumed,
           modelId,
+        });
+      }
+
+      // Verify the model reported by THIS round alone, before its output is
+      // accepted or its approval is acted upon (Requirement 17.10, 45.18). A
+      // resumed (`--resume-id`) round that reports a different model or omits
+      // model reporting must fail closed rather than inherit round 1's model.
+      // Only reached after `mapHeadlessExitCode` accepted exit code 0, so a
+      // non-zero exit keeps its existing exit-code failure behavior.
+      const roundVerification = verifyHeadlessModel(spawnResult.records, modelId, {
+        modelCheckDisabled: this.options.p14ModelCheckDisabled === true,
+      });
+      if (!roundVerification.ok) {
+        return this.finalize({
+          base,
+          ok: false,
+          status: "model_mismatch",
+          reason: "model_mismatch",
+          exitCode,
+          output,
+          outputDiscarded,
+          records,
+          approvals,
+          autoDeniedAsks,
+          resumed,
+          modelId,
+          modelVerification: roundVerification,
         });
       }
 
