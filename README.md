@@ -147,7 +147,7 @@ Git-Graveyard/
 
 ## Contest Checklist & Maintainer Docs
 
-- [ ] Public GitHub repository (currently private pending team credential rotation before submission)
+- [x] Public GitHub repository
 - [x] `.kiro/` directory at repository root (specs, steering docs, hooks)
 - [x] Open-source license ([MIT](LICENSE))
 - [ ] 2 to 3 minute demo video (`T7`)
@@ -155,5 +155,4 @@ Git-Graveyard/
 
 **Additional Documentation:**
 - [Demo, Replay & Live-State Inspector Guide](output/demo-and-inspector-guide-2026-11-17.md)
-- [Team Handoff & Continuation Plan (Increment 2–5)](output/handoff-increment2-5-2026-11-18.md)
 - [Architecture Overview (`PLAN.md`)](PLAN.md) · [Contest References (`REFERENCES.md`)](REFERENCES.md)

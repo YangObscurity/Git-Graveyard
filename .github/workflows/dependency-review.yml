@@ -1,0 +1,25 @@
+# dependency-review.yml —— PR 依赖变更审查
+#
+# 每个 PR 都会比对依赖图的前后差异：若新引入或升级的依赖含 high 及以上漏洞，
+# 或引入与 MIT 不兼容的强传染性许可证，则失败并阻止合并（配合分支规则要求此检查通过）。
+
+name: Dependency Review
+
+on:
+  pull_request:
+    branches: ['**']
+
+permissions:
+  contents: read
+
+jobs:
+  dependency-review:
+    name: 依赖变更审查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: 审查 PR 引入的依赖漏洞与许可证
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
