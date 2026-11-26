@@ -67,13 +67,21 @@ jobs:
       - name: Check CLINE_API_KEY secret
         id: check_key
         env:
-          OPENAI_KEY: ${{ secrets.CLINE_API_KEY }}
+          RAW_KEY: ${{ secrets.CLINE_API_KEY }}
         run: |
-          if [ -z "${OPENAI_KEY:-}" ]; then
+          if [ -z "${RAW_KEY:-}" ]; then
             echo "::notice::CLINE_API_KEY secret is not configured; skipping PR-Agent."
             echo "has_key=false" >> "$GITHUB_OUTPUT"
           else
-            echo "has_key=true" >> "$GITHUB_OUTPUT"
+            CLEAN_KEY="$(printf '%s' "$RAW_KEY" | sed '1s/^\xef\xbb\xbf//' | tr -d '\r\n')"
+            if [ -z "$CLEAN_KEY" ]; then
+              echo "::notice::CLINE_API_KEY secret is empty after sanitization; skipping PR-Agent."
+              echo "has_key=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "::add-mask::$CLEAN_KEY"
+              echo "OPENAI_KEY=$CLEAN_KEY" >> "$GITHUB_ENV"
+              echo "has_key=true" >> "$GITHUB_OUTPUT"
+            fi
           fi
 
       - name: Run PR-Agent
@@ -81,7 +89,6 @@ jobs:
         uses: qodo-ai/pr-agent@e673a02076ce09a4726c3d0c3cc85780e59ca52b # v0.50.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          OPENAI_KEY: ${{ secrets.CLINE_API_KEY }}
           OPENAI__API_BASE: https://api.cline.bot/api/v1
           LITELLM__EXTRA_HEADERS: '{"X-Response-Format": "openai"}'
           CONFIG__MODEL: openai/cline-pass/deepseek-v4.1-flash
