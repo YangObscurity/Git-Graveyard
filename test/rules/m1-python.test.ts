@@ -627,11 +627,11 @@ describe("Declared Python version: exact and narrow specifiers", () => {
 
 
 
-describe("Wave-19A remediation regressions", () => {
-  // Finding 3 / [3]: web-tree-sitter reports UTF-16 code-unit offsets for the
-  // installed binding (verified against node.startIndex/node.endIndex), so JS
-  // String.slice is already correct for multi-byte source. These tests lock in
-  // that behavior and the byte-offset -> UTF-16 helper used defensively.
+describe("M1 remediation regressions", () => {
+  // web-tree-sitter reports UTF-16 code-unit offsets for the installed binding
+  // (verified against node.startIndex/node.endIndex), so JS String.slice is
+  // already correct for multi-byte source. These tests lock in that behavior
+  // and the byte-offset -> UTF-16 helper used defensively.
   const cjkEmoji = "# \u4e2d\u6587\u6ce8\u91ca \ud83d\udc0d\n";
 
   it("rewrites a statement preceded by multi-byte UTF-8 text at the correct range", () => {
@@ -663,7 +663,7 @@ describe("Wave-19A remediation regressions", () => {
     assert.equal(asciiMap(6), 6);
   });
 
-  // Finding 14 / [14]: a leading-zero float is not a Py2 octal.
+  // A leading-zero float is not a Py2 octal.
   it("does not classify Python 3 floats such as 00.5 / .005 as Py2 octals", () => {
     const content = [
       "a = 00.5",
@@ -684,7 +684,7 @@ describe("Wave-19A remediation regressions", () => {
     assert.ok(!lines.includes(6), "1.07 must not be flagged as an octal");
   });
 
-  // Finding 19 / [19]: `except E as (a, b):` is a Python 3 SyntaxError.
+  // `except E as (a, b):` is a Python 3 SyntaxError.
   it("leaves tuple/attribute/subscript except targets unrewritten as Py2 residue", () => {
     const tupleSrc = "try:\n    pass\nexcept E, (a, b):\n    pass\n";
     const res = analyzePython(tupleSrc, "a.py");
@@ -711,7 +711,7 @@ describe("Wave-19A remediation regressions", () => {
     );
   });
 
-  // Finding 20 / [20]: `str(encoding=...)` is a Python 3 TypeError.
+  // `str(encoding=...)` is a Python 3 TypeError.
   it("does not rewrite unicode(...) when a keyword argument is present", () => {
     for (const src of [
       'x = unicode(encoding="utf-8")\n',
@@ -726,7 +726,7 @@ describe("Wave-19A remediation regressions", () => {
     }
   });
 
-  // CodeRabbit / [7]: PEP 440 pre/post/dev specifiers.
+  // PEP 440 pre/post/dev specifiers.
   it("classifies PEP 440 pre/post/dev specifiers as Python 3 compatible", () => {
     for (const spec of [
       ">=3.13.0rc1",
@@ -777,3 +777,85 @@ describe("Wave-19A remediation regressions", () => {
   });
 });
 
+
+describe("M1 remediation: all-zero integers, unicode splats, PEP 440 exclusives", () => {
+  // Valid Python 3 all-zero integers must never be flagged as Py2 octals.
+  it("does not flag 0, 00, 000, 0x00, 0b00 as Py2 octal residue", () => {
+    const content = [
+      "a = 0",
+      "b = 00",
+      "c = 000",
+      "d = 0x00",
+      "e = 0b00",
+      "f = 00.5",
+      "g = .005",
+      "h = 0755",
+      "i = 0644",
+      "j = 010",
+      "k = 007",
+      "",
+    ].join("\n");
+
+    const lexical = detectPythonSignalsLexical([{ path: "octal.py", content }]);
+    const lexicalLines = lexical.map((s) => s.line);
+    for (const line of [1, 2, 3, 4, 5, 6, 7]) {
+      assert.ok(!lexicalLines.includes(line), `line ${line} must not be an octal`);
+    }
+    for (const line of [8, 9, 10, 11]) {
+      assert.ok(lexicalLines.includes(line), `line ${line} is a Py2 octal`);
+    }
+
+    const tree = parsePython(content);
+    assert.ok(tree);
+    try {
+      const octalLines = collectResidue(tree!)
+        .filter((item) => item.kind === "octal")
+        .map((item) => item.line);
+      for (const line of [1, 2, 3, 4, 5, 6, 7]) {
+        assert.ok(!octalLines.includes(line), `AST line ${line} must not be an octal`);
+      }
+      for (const line of [8, 9, 10, 11]) {
+        assert.ok(octalLines.includes(line), `AST line ${line} is a Py2 octal`);
+      }
+    } finally {
+      tree!.delete?.();
+    }
+  });
+
+  // unicode(*args) / unicode(**kwargs) forward an arbitrary Py2 arity.
+  it("does not rewrite unicode(*args) or unicode(**kwargs) and flags them ambiguous", () => {
+    for (const src of [
+      "x = unicode(*args)\n",
+      "x = unicode(**kwargs)\n",
+      "x = unicode(*args, **kwargs)\n",
+    ]) {
+      const res = analyzePython(src, "a.py");
+      assert.equal(res.output, src, src);
+      assert.equal(res.edits.length, 0, src);
+      assert.ok(
+        res.unknowns.some((u) => u.reason === "unicode_decoding_ambiguous"),
+        src
+      );
+    }
+    // A plain single-argument call still rewrites.
+    assert.equal(applyM1("x = unicode(y)\n"), "x = str(y)\n");
+  });
+
+  // PEP 440 exclusive ordered comparisons.
+  it("applies PEP 440 exclusive > post-release and < pre/dev-release rules", () => {
+    // >3.11 must not match a post-release of 3.11, so >3.11,<=3.11.post1 is empty.
+    assert.equal(classifyVersionSpecifier(">3.11"), "py3_compatible");
+    assert.equal(classifyVersionSpecifier(">3.11,<=3.11.post1"), "unknown");
+    assert.ok(isPy2OnlySpecifier(">3.11,<=3.11.post1"));
+    // A pre-release pin stays Python 3 compatible.
+    assert.equal(classifyVersionSpecifier(">=3.13.0rc1"), "py3_compatible");
+    assert.equal(isPy2OnlySpecifier(">=3.13.0rc1"), false);
+  });
+
+  it("does not let <V match pre-/dev-releases of V", () => {
+    // <3.11 still admits 3.10 (a real Python 3 version).
+    assert.equal(classifyVersionSpecifier("<3.11"), "py3_compatible");
+    // <3.11 excludes 3.11a1 / 3.11.dev0, so the range below is empty.
+    assert.equal(classifyVersionSpecifier("<3.11,>3.11a1"), "unknown");
+  });
+});
