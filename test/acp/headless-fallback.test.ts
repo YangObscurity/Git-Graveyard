@@ -1012,6 +1012,88 @@ describe("HeadlessFallbackChannel secret redaction", () => {
       cleanup();
     }
   });
+
+  it("redacts credentials split across stderr chunk boundaries", async () => {
+    const { logPath, cleanup } = tempLogPath("stderr-chunk-split");
+    try {
+      const stderrChunks: string[] = [];
+      // Split each secret in half so neither `data` chunk contains a matchable
+      // token on its own. `ghp_` needs 20+ trailing chars and the KIRO_API_KEY
+      // literal is registered explicitly, so a half never matches in isolation.
+      const ghHalfA = `ghp_${"A".repeat(15)}`;
+      const ghHalfB = `${"A".repeat(15)}`;
+      const keyHalfA = sampleCredential.slice(0, 13);
+      const keyHalfB = sampleCredential.slice(13);
+
+      const channel = makeChannel({
+        logPath,
+        kiroApiKey: KIRO_KEY,
+        onLog: (stream, text) => {
+          if (stream === "stderr") {
+            stderrChunks.push(text);
+          }
+        },
+        spawnFn: (command, args, options) => {
+          const proc = new MockProcess();
+          proc.stdout.write(
+            JSON.stringify({ type: "session", model: "claude-sonnet-5.5" }) + "\n"
+          );
+          proc.stdout.end();
+          // Write the fragments on separate ticks so each is its own `data` event.
+          const fragments = [
+            // A newline-terminated line whose first token is split across chunks.
+            `newline line: ${ghHalfA}`,
+            `${ghHalfB} then ${keyHalfA}`,
+            `${keyHalfB}\n`,
+            // A trailing line with no newline, split again and flushed on end/close.
+            `tail ${keyHalfA}`,
+            `${keyHalfB}`,
+          ];
+          let index = 0;
+          const pump = (): void => {
+            if (index < fragments.length) {
+              proc.stderr.write(fragments[index]);
+              index += 1;
+              setImmediate(pump);
+              return;
+            }
+            proc.stderr.end();
+            setImmediate(() => {
+              proc.exitCode = 0;
+              proc.emit("close", 0);
+            });
+          };
+          setImmediate(pump);
+          return proc as unknown as ChildProcessLike;
+        },
+      });
+
+      const result = await channel.runTurn({ prompt: "x" });
+      assert.equal(result.ok, true);
+
+      const joined = stderrChunks.join("");
+      assert.ok(joined.length > 0, "onLog never received stderr");
+      assert.ok(joined.includes("[REDACTED]"), "no redaction marker emitted");
+      // No whole secret may survive reassembly.
+      assert.ok(!joined.includes(GENERIC_GH), "onLog leaked the whole github token");
+      assert.ok(
+        !joined.includes(sampleCredential),
+        "onLog leaked the whole kiro key"
+      );
+      // No half-token may leak unredacted either.
+      assert.ok(!joined.includes(ghHalfA), "onLog leaked a github token half");
+      assert.ok(!joined.includes(keyHalfA), "onLog leaked a kiro key half");
+      assert.ok(!joined.includes("ghp_"), "onLog leaked a raw token prefix");
+      // Every individual chunk passed to onLog is clean on its own.
+      for (const chunk of stderrChunks) {
+        assert.ok(!chunk.includes(GENERIC_GH), "a stderr chunk leaked the github token");
+        assert.ok(!chunk.includes(sampleCredential), "a stderr chunk leaked the kiro key");
+        assert.ok(!chunk.includes("ghp_"), "a stderr chunk leaked the token prefix");
+      }
+    } finally {
+      cleanup();
+    }
+  });
 });
 
 describe("HeadlessFallbackChannel output accumulation", () => {

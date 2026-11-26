@@ -8,6 +8,7 @@
 // the exit-code mapping, the model check, approval resume and auto-denied asks.
 
 import { spawn } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
 import {
   buildSkeletonEnv,
 } from "../supervisor/skeleton-env";
@@ -696,11 +697,58 @@ export class HeadlessFallbackChannel {
         }
       };
 
+      // Requirement 17.12: stderr is assembled across `data` chunks BEFORE it is
+      // matched, so a credential split across two chunks can never slip through as
+      // two individually-unmatchable halves. A StringDecoder keeps a multi-byte
+      // UTF-8 sequence that is split across chunks intact.
+      const stderrDecoder = new StringDecoder("utf-8");
+      let stderrBuffer = "";
+      let stderrFlushed = false;
+      const stderrSecrets = this.explicitSecretLiterals();
+      // Overlap retained when a newline-free stream exceeds the memory cap, sized to
+      // the longest explicit secret so any token spanning the flush boundary is held
+      // back whole rather than split before it can be matched.
+      const stderrOverlapLen = Math.max(
+        128,
+        ...stderrSecrets.map((secret) => secret.length)
+      );
+      const STDERR_BUFFER_LIMIT = 65536;
+
+      const emitStderr = (text: string): void => {
+        if (text.length === 0) {
+          return;
+        }
+        // Never forward a raw token/key to the onLog sink: every emitted segment is
+        // scrubbed through the same redactor (generic token patterns + the explicit
+        // KIRO_API_KEY literal) before it reaches the caller.
+        this.options.onLog?.("stderr", redactText(text, this.redactionOptions()));
+      };
+
+      // Redact and emit whatever is left in the buffer, exactly once (guarded so the
+      // `end` handler and `close`/`finish` cannot double-emit a trailing line).
+      const flushStderr = (): void => {
+        if (stderrFlushed) {
+          return;
+        }
+        stderrFlushed = true;
+        const remainder = stderrDecoder.end();
+        if (remainder.length > 0) {
+          stderrBuffer += remainder;
+        }
+        if (stderrBuffer.length > 0) {
+          emitStderr(stderrBuffer);
+          stderrBuffer = "";
+        }
+      };
+
       const finish = (code: number | null): void => {
         if (settled) {
           return;
         }
         settled = true;
+        // Requirement 17.12: flush any buffered stderr BEFORE resolving the turn so
+        // a credential split across the final chunks is still redacted, not dropped.
+        flushStderr();
         if (buffer.length > 0) {
           logger?.appendLine(buffer);
           consumeLine(buffer);
@@ -740,12 +788,34 @@ export class HeadlessFallbackChannel {
       }
       if (proc.stderr) {
         proc.stderr.on("data", (chunk: Buffer | string) => {
-          // Requirement 17.12: never forward a raw token/key to the onLog sink.
-          // Every emitted chunk is scrubbed through the same redactor (generic
-          // token patterns + host details + the explicit KIRO_API_KEY literal)
-          // before it reaches the caller.
-          const text = chunk.toString("utf-8");
-          this.options.onLog?.("stderr", redactText(text, this.redactionOptions()));
+          // Requirement 17.12: accumulate across chunks before matching. Redacting
+          // each raw chunk independently would leak both halves of a credential that
+          // is split across two `data` events (neither half matches on its own).
+          const chunkBuffer =
+            typeof chunk === "string" ? Buffer.from(chunk, "utf-8") : chunk;
+          stderrBuffer += stderrDecoder.write(chunkBuffer);
+          // Emit only complete lines (newline preserved) once the whole line has been
+          // assembled, so a token split across chunks is matched and scrubbed first.
+          let stderrNewlineIndex = stderrBuffer.indexOf("\n");
+          while (stderrNewlineIndex >= 0) {
+            const stderrLine = stderrBuffer.slice(0, stderrNewlineIndex + 1);
+            stderrBuffer = stderrBuffer.slice(stderrNewlineIndex + 1);
+            emitStderr(stderrLine);
+            stderrNewlineIndex = stderrBuffer.indexOf("\n");
+          }
+          // Protect memory on a newline-free huge stream: emit the prefix but keep an
+          // overlap tail so any secret spanning the flush boundary is not split before
+          // it can be matched.
+          if (stderrBuffer.length > STDERR_BUFFER_LIMIT) {
+            const cut = stderrBuffer.length - stderrOverlapLen;
+            const prefix = stderrBuffer.slice(0, cut);
+            stderrBuffer = stderrBuffer.slice(cut);
+            emitStderr(prefix);
+          }
+        });
+        proc.stderr.on("end", () => {
+          // Flush a trailing line that was never newline-terminated.
+          flushStderr();
         });
       }
 
