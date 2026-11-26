@@ -80,7 +80,8 @@ function buildStep(
   text: string,
   accepted: PythonPlannedEdit[],
   ordered: PythonPlannedEdit[],
-  reverted: boolean
+  reverted: boolean,
+  revertReason?: string
 ): PatchStep {
   const diff = accepted.length > 0 ? createPythonDiff(original, text, file) : "";
   return {
@@ -91,7 +92,7 @@ function buildStep(
     hunks: countHunks(diff),
     compat: false,
     reverted,
-    revertReason: reverted ? "all_edits_rejected" : undefined,
+    revertReason: reverted ? revertReason ?? "all_edits_rejected" : undefined,
     acceptedEdits: accepted.length,
     acceptedEditsCount: accepted.length,
     edits: ordered,
@@ -128,7 +129,7 @@ function runGate(
       reverted: true,
       revertReason: "parse_timeout",
       unknowns,
-      step: buildStep(file, original, original, [], ordered, true),
+      step: buildStep(file, original, original, [], ordered, true, "parse_timeout"),
     };
   }
 
@@ -188,7 +189,15 @@ function runGate(
     reverted,
     revertReason: reverted ? "all_edits_rejected" : undefined,
     unknowns,
-    step: buildStep(file, original, text, accepted, ordered, reverted),
+    step: buildStep(
+      file,
+      original,
+      text,
+      accepted,
+      ordered,
+      reverted,
+      reverted ? "all_edits_rejected" : undefined
+    ),
   };
 }
 

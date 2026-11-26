@@ -391,7 +391,12 @@ function lexicalPythonSignals(
     unhandled?: boolean;
   }> = [
     { re: /(?<![\w.])print(?![A-Za-z0-9_])(?!\s*\()/g, confidence: "high" },
-    { re: /(?<![\w.])exec\s+(?!\()/g, confidence: "high", unhandled: true },
+    // `exec` Py2 statement: require horizontal whitespace after `exec` and rule
+    // out a following call. `[ \t]+(?![ \t]*\()` avoids the `\s+(?!\()` backtrack
+    // where `exec  (code)` / `exec\t (code)` matched as Py2 because `\s+` gave
+    // back a whitespace char, letting the lookahead see whitespace instead of `(`.
+    // `[ \t]+` (not `\s+`) also keeps `exec\n(x)` from matching across statements.
+    { re: /(?<![\w.])exec[ \t]+(?![ \t]*\()/g, confidence: "high", unhandled: true },
     { re: /(?<![\w.])unicode\s*\(/g, confidence: "medium" },
     { re: /\.(?:iteritems|iterkeys|itervalues)\s*\(/g, confidence: "medium" },
     { re: /<>/g, confidence: "high", unhandled: true },

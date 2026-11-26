@@ -527,8 +527,50 @@ describe("Python M1 signal detection", () => {
     assert.equal(detectPythonSignalsLexical([{ path: "lf.py", content: lfString }]).length, 0);
     assert.equal(detectPythonSignalsLexical([{ path: "crlf.py", content: crlfString }]).length, 0);
 
-    const py3Exec = 'exec (code)\nexec(code)\n';
+    const py3Exec = 'exec (code)\nexec  (code)\nexec\t (code)\nexec(code)\n';
     assert.equal(detectPythonSignalsLexical([{ path: "exec3.py", content: py3Exec }]).length, 0);
+  });
+
+  // The sync `detectSignals` uses the tree-sitter path once the parser is
+  // initialized; temporarily clear the registered sync parser so these cases
+  // exercise the comment/string-aware lexical fallback (where the `exec` regex
+  // lives) rather than the parser, which would mask a regex regression.
+  function withLexicalFallback<T>(fn: () => T): T {
+    const g = globalThis as Record<string, unknown>;
+    const key = "__ggPythonParseSync";
+    const saved = g[key];
+    delete g[key];
+    try {
+      return fn();
+    } finally {
+      if (saved !== undefined) g[key] = saved;
+    }
+  }
+
+  it("synchronous detectSignals lexical fallback ignores Py3 exec calls separated by wide whitespace", () => {
+    const py3 = ["exec (code)", "exec  (code)", "exec\t (code)", "exec(code)"].join("\n") + "\n";
+    const result = withLexicalFallback(() =>
+      detectSignals([{ path: "exec3.py", content: py3 }])
+    );
+    const execSignals = result.filter((s) => s.matched.includes("exec"));
+    assert.equal(execSignals.length, 0, "Py3 exec call forms must not be flagged");
+    assert.equal(result.length, 0);
+  });
+
+  it("synchronous detectSignals lexical fallback flags Py2 exec statement forms as unhandled", () => {
+    const py2 = ['exec "x = 1"', "exec stmt in ns"].join("\n") + "\n";
+    const result = withLexicalFallback(() =>
+      detectSignals([{ path: "exec2.py", content: py2 }])
+    );
+    const execSignals = result.filter((s) => s.matched.includes("exec"));
+    assert.equal(execSignals.length, 2, "both Py2 exec statement forms must be flagged");
+    assert.deepEqual(
+      execSignals.map((s) => s.line),
+      [1, 2]
+    );
+    const py2Unknowns = result.unknowns.filter((u) => u.reason === "py2_residue");
+    assert.equal(py2Unknowns.length, 2);
+    assert.ok(py2Unknowns.every((u) => u.ruleId === "M1"));
   });
 
   it("lexical fallback detects ur/ru strings, old octals, long ints, tuple params, raise E, msg, and emits unknowns", () => {
