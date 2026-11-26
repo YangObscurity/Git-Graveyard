@@ -289,7 +289,7 @@ describe("SettingsStore — audit trail", () => {
 });
 
 
-describe("SettingsStore — explicit null vs unset sentinel (FIND-003 regression)", () => {
+describe("SettingsStore — explicit null vs unset sentinel", () => {
   it("round-trips an explicit null and never collapses it to unset", () => {
     const store = new SettingsStore();
     const entry = store.setSetting("customNote", null, {
@@ -340,27 +340,28 @@ describe("SettingsStore — explicit null vs unset sentinel (FIND-003 regression
     store.close();
   });
 
-  it("treats legacy \"null\" + system:required rows as unset but honours explicit null", () => {
-    const dir = makeTmpDir("gg-settings-legacy-");
+  it("treats the sentinel as the only unset marker and persists an explicit null", () => {
+    const dir = makeTmpDir("gg-settings-null-");
     const dbPath = path.join(dir, "settings.db");
 
-    // Simulate a database written before the sentinel existed.
-    const first = new SettingsStore(dbPath);
-    first.db.exec(
-      "UPDATE admin_settings SET valueJson = 'null', updatedBy = 'system:required' " +
-        "WHERE key = 'brokerWatchdogMs'"
-    );
-    first.close();
+    const store = new SettingsStore(dbPath);
+    // A Required_Setting that ships without a value is stored with the sentinel, never a literal
+    // "null"; that is exactly what keeps an explicit null distinguishable from "unset".
+    const seeded = store.db
+      .prepare("SELECT valueJson FROM admin_settings WHERE key = ?")
+      .get("brokerWatchdogMs") as { valueJson: string };
+    assert.equal(seeded.valueJson, UNSET_VALUE_SENTINEL);
+    assert.equal(store.getSetting("brokerWatchdogMs"), undefined);
+    assert.ok(store.validateRequiredSettings().missing.includes("brokerWatchdogMs"));
 
+    // An explicit null round-trips as a genuine null...
+    store.setSetting("brokerWatchdogMs", null, { actor: "owner" });
+    assert.equal(store.getSetting("brokerWatchdogMs"), null);
+    assert.equal(store.getAllSettings().brokerWatchdogMs, null);
+    store.close();
+
+    // ...and survives a reopen: it is never collapsed back to "unset".
     const reopened = new SettingsStore(dbPath);
-    assert.equal(reopened.getSetting("brokerWatchdogMs"), undefined);
-    assert.ok(
-      !Object.prototype.hasOwnProperty.call(reopened.getAllSettings(), "brokerWatchdogMs")
-    );
-    assert.ok(reopened.validateRequiredSettings().missing.includes("brokerWatchdogMs"));
-
-    // An explicit null set by a real actor must survive as a genuine null...
-    reopened.setSetting("brokerWatchdogMs", null, { actor: "owner" });
     assert.equal(reopened.getSetting("brokerWatchdogMs"), null);
     assert.equal(reopened.getAllSettings().brokerWatchdogMs, null);
     // ...while still counting as missing for the Required_Settings gate.
@@ -486,7 +487,7 @@ describe("analyzeRecordedRunsForCalibration — metrics from recorded events", (
     assert.equal(detailA.totalMs, 900_000);
     // The run.clock (80_000) and Pact (40_000) intervals overlap, so they must be merged to
     // 90_000 (1_010_000..1_100_000). The approval wait (300_000) is a disjoint span, and run A's
-    // merged paused total is 90_000 + 300_000 = 390_000 (WP-17-fix2: approval waits are excluded).
+    // merged paused total is 90_000 + 300_000 = 390_000 (approval waits are excluded).
     assert.equal(detailA.pausedMs, 390_000);
     assert.equal(detailA.activeMs, 510_000);
     assert.equal(detailA.pauseIntervals.length, 3);
@@ -591,7 +592,7 @@ describe("analyzeRecordedRunsForCalibration — metrics from recorded events", (
 });
 
 
-describe("proposeValue — cap floors (FIND-002 regression)", () => {
+describe("proposeValue — cap floors", () => {
   // Three clean runs: every task approved (0 rejections) and an instant prompt boundary
   // (skeleton.raised and skeleton.usage share a timestamp) so the deltas are 0 ms.
   function cleanRun(runId: string, baseTs: number): CalibrationSourceRun {
@@ -701,6 +702,52 @@ describe("runCalibration — recorded runs directory and --apply", () => {
     settingsStore.close();
   });
 
+  it("clears recalibrationRequired when --all or a covering --limit calibrates every run", () => {
+    const root = writeThreeRuns(); // four completed runs: calib-run-a..d
+
+    // The default sample of three leaves the fourth run uncalibrated, so the flag stays armed.
+    const limitedStore = new SettingsStore();
+    const limited = runCalibration({
+      runsDir: root,
+      settingsStore: limitedStore,
+      apply: true,
+      actor: "owner",
+    });
+    assert.deepEqual(limited.runIds, ["calib-run-a", "calib-run-b", "calib-run-c"]);
+    assert.equal(limited.recalibrationRequired, true);
+    assert.equal(limitedStore.isRecalibrationRequired(), true);
+    limitedStore.close();
+
+    // --all calibrates every completed run, so the flag clears.
+    const allStore = new SettingsStore();
+    const all = runCalibration({
+      runsDir: root,
+      settingsStore: allStore,
+      apply: true,
+      actor: "owner",
+      all: true,
+    });
+    assert.deepEqual(all.runIds, ["calib-run-a", "calib-run-b", "calib-run-c", "calib-run-d"]);
+    assert.equal(all.recalibrationRequired, false);
+    assert.equal(allStore.isRecalibrationRequired(), false);
+    allStore.close();
+
+    // --limit 4 covers the same four runs and clears the flag too.
+    const limitStore = new SettingsStore();
+    const limit4 = runCalibration({
+      runsDir: root,
+      settingsStore: limitStore,
+      apply: true,
+      actor: "owner",
+      limit: 4,
+    });
+    assert.equal(limit4.runIds.length, 4);
+    assert.equal(limit4.recalibrationRequired, false);
+    assert.equal(limitStore.isRecalibrationRequired(), false);
+    limitStore.close();
+  });
+
+
   it("commits calibrated settings with audit entries and ev citations on --apply", () => {
     const root = writeThreeRuns();
     const settingsStore = new SettingsStore();
@@ -725,9 +772,9 @@ describe("runCalibration — recorded runs directory and --apply", () => {
     assert.ok(audit[0].reason && audit[0].reason.includes("ev:11"));
 
     const state = settingsStore.getCalibrationState();
-    // FIND-16: `writeThreeRuns` also writes a fourth completed run (calib-run-d) that is outside
-    // the sampled window, so recalibration must stay required — the calibration only covered the
-    // first three runs.
+    // `writeThreeRuns` also writes a fourth completed run (calib-run-d) outside the sampled window,
+    // so recalibration must stay required — the calibration only covered the first three runs.
+    // `--all` (or `--limit 4`) would cover every run and clear the flag.
     assert.equal(state.recalibrationRequired, true);
     assert.equal(state.lastCalibratedAt, 12_345);
     assert.deepEqual(
@@ -833,8 +880,8 @@ describe("runCalibration — recorded runs directory and --apply", () => {
     const store = new SettingsStore(dbPath);
     assert.equal(store.getSetting("wardenRounds"), 5);
     assert.equal(store.getSetting("silentSkeletonMs"), 610_000);
-    // FIND-16: the CLI applied against four completed runs (writeThreeRuns writes calib-run-a..d),
-    // so calib-run-d is still uncalibrated and recalibration stays required.
+    // The CLI applied against four completed runs (writeThreeRuns writes calib-run-a..d) with the
+    // default sample of three, so calib-run-d is still uncalibrated and recalibration stays required.
     assert.equal(store.isRecalibrationRequired(), true);
 
     const audit = store.getAuditLog({ key: "wardenRounds" });
@@ -845,7 +892,7 @@ describe("runCalibration — recorded runs directory and --apply", () => {
 });
 
 
-describe("completed-run filtering — errored runs (FIND-004 regression)", () => {
+describe("completed-run filtering — errored runs", () => {
   // Sorts before "calib-run-a" so a broken filter would wrongly occupy the first slot.
   const erroredRun = mkRun("0-calib-run-error", [
     { seq: 1, ts: 500_000, kind: "run.started" },
@@ -945,7 +992,7 @@ describe("completed-run filtering — errored runs (FIND-004 regression)", () =>
     const both = store.syncRecordedRunCount({ eventStore, runStore });
     assert.equal(both.completedRecordedRuns, 3);
 
-    // The eventStore-only path must agree (FIND-004: it used to count the errored run).
+    // The eventStore-only path must agree: an errored run.done is not a completed Recorded_Run.
     const eventsOnly = store.syncRecordedRunCount({ eventStore });
     assert.equal(eventsOnly.completedRecordedRuns, 3);
 
@@ -960,7 +1007,7 @@ describe("completed-run filtering — errored runs (FIND-004 regression)", () =>
 });
 
 
-describe("WP-17-fix2 regressions — Cubic & PR-Agent findings", () => {
+describe("SettingsStore & calibration — hardening regressions", () => {
   function writeRunDir(root: string, run: CalibrationSourceRun): void {
     const runDir = path.join(root, run.runId);
     fs.mkdirSync(runDir, { recursive: true });
@@ -968,9 +1015,9 @@ describe("WP-17-fix2 regressions — Cubic & PR-Agent findings", () => {
     fs.writeFileSync(path.join(runDir, "events.ndjson"), ndjson, "utf8");
   }
 
-  // --- Item 1: isPlainObject / prototype-pollution hardening -----------------
+  // --- isPlainObject / prototype-pollution hardening -----------------
 
-  it("rejects Map/Set/Date/RegExp setting values with a TypeError (item 1)", () => {
+  it("rejects Map/Set/Date/RegExp setting values with a TypeError", () => {
     const store = new SettingsStore();
     for (const value of [new Map(), new Set(), new Date(), /re/]) {
       assert.throws(
@@ -985,7 +1032,7 @@ describe("WP-17-fix2 regressions — Cubic & PR-Agent findings", () => {
     store.close();
   });
 
-  it("rejects reserved prototype-pollution setting keys (item 1)", () => {
+  it("rejects reserved prototype-pollution setting keys", () => {
     const store = new SettingsStore();
     for (const key of ["__proto__", "constructor", "prototype"]) {
       assert.throws(() => store.setSetting(key, 1, { actor: "owner" }), TypeError);
@@ -1006,7 +1053,7 @@ describe("WP-17-fix2 regressions — Cubic & PR-Agent findings", () => {
     store.close();
   });
 
-  it("getAllSettings assigns via defineProperty so a __proto__ row cannot pollute (item 1)", () => {
+  it("getAllSettings assigns via defineProperty so a __proto__ row cannot pollute", () => {
     const store = new SettingsStore();
     store.db
       .prepare(
@@ -1022,9 +1069,9 @@ describe("WP-17-fix2 regressions — Cubic & PR-Agent findings", () => {
     store.close();
   });
 
-  // --- Item 2: concurrentLiveRuns -------------------------------------------
+  // --- concurrentLiveRuns -------------------------------------------
 
-  it("seeds an editable concurrentLiveRuns default of 1 and validates it (item 2)", () => {
+  it("seeds an editable concurrentLiveRuns default of 1 and validates it", () => {
     const store = new SettingsStore();
     assert.equal(E11_DEFAULT_SETTINGS.concurrentLiveRuns, 1);
     assert.equal(store.getSetting("concurrentLiveRuns"), 1);
@@ -1037,9 +1084,9 @@ describe("WP-17-fix2 regressions — Cubic & PR-Agent findings", () => {
     store.close();
   });
 
-  // --- Item 3: EventStore run.done override & seq ordering -------------------
+  // --- EventStore run.done override & seq ordering -------------------
 
-  it("lets an errored eventStore run.done override a completed runStore row (item 3)", () => {
+  it("lets an errored eventStore run.done override a completed runStore row", () => {
     const store = new SettingsStore();
     const eventStore = new EventStore(":memory:");
     const runStore = new RunStore(":memory:");
@@ -1089,7 +1136,7 @@ describe("WP-17-fix2 regressions — Cubic & PR-Agent findings", () => {
     runStore.close();
   });
 
-  it("picks the latest run.done by seq, tie-breaking on the later index (item 3)", () => {
+  it("picks the latest run.done by seq, tie-breaking on the later index", () => {
     const store = new SettingsStore();
     const eventStore = new EventStore(":memory:");
 
@@ -1120,9 +1167,9 @@ describe("WP-17-fix2 regressions — Cubic & PR-Agent findings", () => {
     eventStore.close();
   });
 
-  // --- Item 4: directory loader completeness ---------------------------------
+  // --- directory loader completeness ---------------------------------
 
-  it("skips a run lacking run.done when loading from --runs-dir (item 4)", () => {
+  it("skips a run lacking run.done when loading from --runs-dir", () => {
     const root = makeTmpDir("gg-calib-incomplete-");
     writeRunDir(root, runA);
     writeRunDir(root, runB);
@@ -1147,9 +1194,9 @@ describe("WP-17-fix2 regressions — Cubic & PR-Agent findings", () => {
     assert.ok(!result.runIds.includes("0-calib-run-incomplete"));
   });
 
-  // --- Item 5: refs normalization --------------------------------------------
+  // --- refs normalization --------------------------------------------
 
-  it("normalizes non-string refs to strings and never lets data.refs win (item 5)", () => {
+  it("normalizes non-string refs to strings and never lets data.refs win", () => {
     const root = makeTmpDir("gg-calib-refs-");
     const runId = "calib-run-refs";
     const dir = path.join(root, runId);
@@ -1185,9 +1232,9 @@ describe("WP-17-fix2 regressions — Cubic & PR-Agent findings", () => {
     assert.equal(loaded[0].events[0].data.to, "exhume");
   });
 
-  // --- Item 6: approval wait exclusion ---------------------------------------
+  // --- approval wait exclusion ---------------------------------------
 
-  it("subtracts approval.requested -> approval.resolved waits exactly once (item 6)", () => {
+  it("subtracts approval.requested -> approval.resolved waits exactly once", () => {
     const detail = analyzeRecordedRunsForCalibration([runA]).runWallClockDetails[0];
     const approval = detail.pauseIntervals.filter((p) => p.source === "approval_wait");
     assert.equal(approval.length, 1);
@@ -1213,9 +1260,9 @@ describe("WP-17-fix2 regressions — Cubic & PR-Agent findings", () => {
     assert.equal(merged.activeMs, 500);
   });
 
-  // --- Item 7: silence excludes in-flight spans ------------------------------
+  // --- silence excludes in-flight spans ------------------------------
 
-  it("excludes an in-flight command.started -> command.result from silence (item 7)", () => {
+  it("excludes an in-flight command.started -> command.result from silence", () => {
     const inflight = mkRun("calib-run-inflight", [
       { seq: 1, ts: 0, kind: "run.phase", data: { from: "queued", to: "exhume" } },
       { seq: 2, ts: 10_000, kind: "command.started", actor: "soulstitcher" },
@@ -1229,9 +1276,9 @@ describe("WP-17-fix2 regressions — Cubic & PR-Agent findings", () => {
     assert.deepEqual(metric.samples, [0]);
   });
 
-  // --- Item 8: run 4+ re-arms recalibration ----------------------------------
+  // --- run 4+ re-arms recalibration ----------------------------------
 
-  it("re-arms recalibrationRequired when a fourth completed run concludes (item 8)", () => {
+  it("re-arms recalibrationRequired when a fourth completed run concludes", () => {
     const root = makeTmpDir("gg-calib-run4-");
     writeRunDir(root, runA);
     writeRunDir(root, runB);
@@ -1263,9 +1310,9 @@ describe("WP-17-fix2 regressions — Cubic & PR-Agent findings", () => {
     settingsStore.close();
   });
 
-  // --- Item 9: CLI flag validation -------------------------------------------
+  // --- CLI flag validation -------------------------------------------
 
-  it("rejects value flags whose value is missing or another flag (item 9)", () => {
+  it("rejects value flags whose value is missing or another flag", () => {
     assert.throws(() => parseCalibrationArgs(["--db", "--json"]), /--db requires a path argument/);
     assert.throws(() => parseCalibrationArgs(["--db"]), /--db requires a path argument/);
     assert.throws(
@@ -1290,16 +1337,42 @@ describe("WP-17-fix2 regressions — Cubic & PR-Agent findings", () => {
     assert.equal(ok.db, "/tmp/events.db");
     assert.equal(ok.json, true);
   });
+
+  it("rejects an unknown --flag instead of ignoring it", () => {
+    assert.throws(() => parseCalibrationArgs(["--foo"]), /Unknown flag: --foo/);
+    assert.throws(() => parseCalibrationArgs(["--json", "--nope"]), /Unknown flag: --nope/);
+    // Non-flag positionals are still tolerated.
+    assert.equal(parseCalibrationArgs(["stray", "--json"]).json, true);
+  });
+
+  it("parses --limit and --all, rejecting a missing or non-positive --limit", () => {
+    assert.equal(parseCalibrationArgs(["--limit", "4"]).limit, 4);
+    assert.equal(parseCalibrationArgs(["--limit", "4", "--all"]).all, true);
+    assert.equal(parseCalibrationArgs(["--all"]).all, true);
+
+    for (const argv of [
+      ["--limit"],
+      ["--limit", "--json"],
+      ["--limit", "0"],
+      ["--limit", "abc"],
+      ["--limit", "1.5"],
+      ["--limit", "-2"],
+    ]) {
+      assert.throws(
+        () => parseCalibrationArgs(argv),
+        /--limit requires a positive integer/,
+        JSON.stringify(argv)
+      );
+    }
+  });
 });
 
 
 
 
 
-/**
- * WP-W1-17-fix — regressions for the seven PR #12 Cubic findings.
- */
-describe("WP-W1-17-fix regressions — Cubic PR #12 findings", () => {
+/** POST /api/start-run refusing when Required_Settings are unset. */
+describe("start-run — required-settings gate", () => {
   function writeRunDir(root: string, run: CalibrationSourceRun): void {
     const runDir = path.join(root, run.runId);
     fs.mkdirSync(runDir, { recursive: true });
@@ -1307,7 +1380,7 @@ describe("WP-W1-17-fix regressions — Cubic PR #12 findings", () => {
     fs.writeFileSync(path.join(runDir, "events.ndjson"), ndjson, "utf8");
   }
 
-  // --- Finding [4]: POST /api/start-run refuses when Required_Settings are unset -------
+  // --- POST /api/start-run refuses when Required_Settings are unset -------
 
   type InjectedStartRunRequest = Request & {
     runStore?: RunStore;
@@ -1328,7 +1401,7 @@ describe("WP-W1-17-fix regressions — Cubic PR #12 findings", () => {
     }) as InjectedStartRunRequest;
   }
 
-  it("returns 503 and creates/queues no run when Required_Settings are unset (finding 4)", async () => {
+  it("returns 503 and creates/queues no run when Required_Settings are unset", async () => {
     const runStore = new RunStore(":memory:");
     const eventStore = new EventStore(":memory:");
     // A brand-new store: its Required_Settings are seeded with the `__UNSET__` sentinel.
@@ -1361,7 +1434,7 @@ describe("WP-W1-17-fix regressions — Cubic PR #12 findings", () => {
     settingsStore.close();
   });
 
-  it("starts the run once every Required_Setting is configured (finding 4)", async () => {
+  it("starts the run once every Required_Setting is configured", async () => {
     const runStore = new RunStore(":memory:");
     const eventStore = new EventStore(":memory:");
     const settingsStore = new SettingsStore();
@@ -1398,11 +1471,8 @@ describe("WP-W1-17-fix regressions — Cubic PR #12 findings", () => {
 });
 
 
-/**
- * WP-W1-17-fix — settings validation, recalibration re-sync, event pairing and directory ordering
- * regressions for the remaining PR #12 Cubic findings.
- */
-describe("WP-W1-17-fix regressions — settings & calibration (Cubic PR #12)", () => {
+/** Settings validation, recalibration re-sync, event pairing and directory ordering. */
+describe("settings & calibration — validation and ordering", () => {
   function writeRunDir(root: string, run: CalibrationSourceRun): void {
     const runDir = path.join(root, run.runId);
     fs.mkdirSync(runDir, { recursive: true });
@@ -1410,9 +1480,9 @@ describe("WP-W1-17-fix regressions — settings & calibration (Cubic PR #12)", (
     fs.writeFileSync(path.join(runDir, "events.ndjson"), ndjson, "utf8");
   }
 
-  // --- Finding [9]: numeric/integer settings reject non-number values ---------------
+  // --- numeric/integer settings reject non-number values ---------------
 
-  it("rejects a string (and other non-numbers) for an integer setting before the generic check (finding 9)", () => {
+  it("rejects a string (and other non-numbers) for an integer setting before the generic check", () => {
     const store = new SettingsStore();
     for (const bad of ["300", "abc", true, false, [1], { n: 1 }]) {
       assert.throws(
@@ -1437,7 +1507,7 @@ describe("WP-W1-17-fix regressions — settings & calibration (Cubic PR #12)", (
     store.close();
   });
 
-  it("rejects strings for every other numeric key too (finding 9)", () => {
+  it("rejects strings for every other numeric key too", () => {
     const store = new SettingsStore();
     for (const key of ["promptWallClockMs", "silentSkeletonMs", "repoSizeCapKb", "boxCpu"]) {
       assert.throws(() => store.setSetting(key, "600000", { actor: "owner" }), TypeError);
@@ -1448,9 +1518,9 @@ describe("WP-W1-17-fix regressions — settings & calibration (Cubic PR #12)", (
     store.close();
   });
 
-  // --- Finding [15]: concurrentLiveRuns <= 5 ---------------------------------------
+  // --- concurrentLiveRuns <= 5 ---------------------------------------
 
-  it("caps concurrentLiveRuns at 5 and rejects 6+ with a RangeError (finding 15)", () => {
+  it("caps concurrentLiveRuns at 5 and rejects 6+ with a RangeError", () => {
     const store = new SettingsStore();
     store.setSetting("concurrentLiveRuns", 5, { actor: "owner" });
     assert.equal(store.getSetting("concurrentLiveRuns"), 5);
@@ -1466,9 +1536,9 @@ describe("WP-W1-17-fix regressions — settings & calibration (Cubic PR #12)", (
     store.close();
   });
 
-  // --- Finding [16]: --apply re-syncs every completed run id ------------------------
+  // --- --apply re-syncs every completed run id ------------------------
 
-  it("keeps recalibrationRequired when a fourth run completed before --apply (finding 16)", () => {
+  it("keeps recalibrationRequired when a fourth run completed before --apply", () => {
     const root = makeTmpDir("gg-fix16-runs-");
     writeRunDir(root, runA);
     writeRunDir(root, runB);
@@ -1496,10 +1566,8 @@ describe("WP-W1-17-fix regressions — settings & calibration (Cubic PR #12)", (
 });
 
 
-/**
- * WP-W1-17-fix — concurrent-activity pairing and directory ordering regressions (Cubic PR #12).
- */
-describe("WP-W1-17-fix regressions — event pairing & ordering (Cubic PR #12)", () => {
+/** Concurrent-activity pairing and directory ordering. */
+describe("event pairing & ordering", () => {
   function writeRunDir(root: string, run: CalibrationSourceRun): void {
     const runDir = path.join(root, run.runId);
     fs.mkdirSync(runDir, { recursive: true });
@@ -1507,9 +1575,9 @@ describe("WP-W1-17-fix regressions — event pairing & ordering (Cubic PR #12)",
     fs.writeFileSync(path.join(runDir, "events.ndjson"), ndjson, "utf8");
   }
 
-  // --- Finding [17]: pair concurrent commands by data.logRef ------------------------
+  // --- pair concurrent commands by data.logRef ------------------------
 
-  it("pairs concurrent command events by data.logRef, not actor (finding 17)", () => {
+  it("pairs concurrent command events by data.logRef, not actor", () => {
     const run = mkRun("cmd-logref", [
       { seq: 1, ts: 0, kind: "command.started", actor: "soulstitcher", data: { logRef: "L1" } },
       { seq: 2, ts: 0, kind: "command.started", actor: "soulstitcher", data: { logRef: "L2" } },
@@ -1525,9 +1593,9 @@ describe("WP-W1-17-fix regressions — event pairing & ordering (Cubic PR #12)",
     assert.deepEqual(metric.samples, [0]);
   });
 
-  // --- Finding [18]: pair concurrent tool calls by data.toolCallId ------------------
+  // --- pair concurrent tool calls by skeleton-scoped data.toolCallId ---
 
-  it("pairs concurrent tool calls by data.toolCallId, not skeletonId (finding 18)", () => {
+  it("pairs concurrent tool calls by data.toolCallId, not skeletonId", () => {
     const run = mkRun("tool-callid", [
       { seq: 1, ts: 0, kind: "skeleton.tool_call", skeletonId: "sk-x", data: { toolCallId: "T1" } },
       { seq: 2, ts: 0, kind: "skeleton.tool_call", skeletonId: "sk-x", data: { toolCallId: "T2" } },
@@ -1554,9 +1622,25 @@ describe("WP-W1-17-fix regressions — event pairing & ordering (Cubic PR #12)",
     assert.deepEqual(metric.samples, [0]);
   });
 
-  // --- Finding [22]: directory mode sorts runs by run.done ts -----------------------
+  it("pairs concurrent tool calls from different skeletons that reuse one toolCallId", () => {
+    const run = mkRun("tool-callid-scope", [
+      { seq: 1, ts: 0, kind: "skeleton.tool_call", skeletonId: "sk-1", data: { toolCallId: "call-1" } },
+      { seq: 2, ts: 0, kind: "skeleton.tool_call", skeletonId: "sk-2", data: { toolCallId: "call-1" } },
+      { seq: 3, ts: 500_000, kind: "skeleton.tool_result", skeletonId: "sk-1", data: { toolCallId: "call-1" } },
+      { seq: 4, ts: 600_000, kind: "skeleton.tool_result", skeletonId: "sk-2", data: { toolCallId: "call-1" } },
+      { seq: 5, ts: 1_000_000, kind: "run.done", data: { outcome: "resurrected" } },
+    ]);
 
-  it("sorts directory completed runs chronologically by run.done ts (finding 22)", () => {
+    const metric = analyzeRecordedRunsForCalibration([run]).silenceDurationsMs;
+    assert.equal(metric.status, "available");
+    // Both skeleton-scoped in-flight spans are recognised, so neither interleaving counts as silence.
+    assert.equal(metric.max, 0);
+    assert.deepEqual(metric.samples, [0]);
+  });
+
+  // --- directory mode sorts runs by run.done ts -----------------------
+
+  it("sorts directory completed runs chronologically by run.done ts", () => {
     const root = makeTmpDir("gg-fix22-runs-");
     // Names sort opposite to completion order: "aaa-" completes last, "zzz-" completes first.
     const late = mkRun("aaa-run-late", [

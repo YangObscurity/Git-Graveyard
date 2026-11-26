@@ -15,6 +15,7 @@ import { EventStore, type EventEnvelope } from "../lib/events/event-store";
 import {
   E11_DEFAULT_SETTINGS,
   SettingsStore,
+  pickLatestRunDoneEvent,
   resolveDefaultSettingsStorePath,
   type SettingsAuditEntry,
 } from "../lib/admin/settings-store";
@@ -85,6 +86,7 @@ export interface RunCalibrationOptions {
   apply?: boolean;
   actor?: string;
   limit?: number;
+  all?: boolean;
   ts?: number;
 }
 
@@ -101,13 +103,13 @@ const DEFAULT_RECORDED_RUNS_DIR = path.join(process.cwd(), "output", "recorded-r
 const DEFAULT_LIMIT = 3;
 
 /**
- * FIND-001: actor attributed to an `--apply` when none is supplied. This is a *documented* default
- * (not a silent one): an applied change is always written with a real operator identity, so the
- * audit trail never records an unknown/system actor for a calibration write.
+ * Actor attributed to an `--apply` when none is supplied. This is a *documented* default (not a
+ * silent one): an applied change is always written with a real operator identity, so the audit trail
+ * never records an unknown/system actor for a calibration write.
  */
 export const DEFAULT_CALIBRATION_ACTOR = "owner";
 
-/** FIND-001: thrown when `--apply` is requested without any way to persist the proposal. */
+/** Thrown when `--apply` is requested without any way to persist the proposal. */
 export const APPLY_REQUIRES_STORE_MESSAGE =
   "--apply requires a SettingsStore instance or settings-db path";
 
@@ -367,8 +369,8 @@ function calcRunWallClock(runs: CalibrationSourceRun[]): {
     if (pactPause) {
       rawIntervals.push({ start: pactPause, end: null, source: "pact_review" });
     }
-    // WP-17-fix2: an approval that never resolved still counts as a wait; clamp it to the run end
-    // (the shared clamp below turns `end: null` into `endEv.ts`).
+    // An approval that never resolved still counts as a wait; clamp it to the run end (the shared
+    // clamp below turns `end: null` into `endEv.ts`).
     for (const request of approvalAwaiting.values()) {
       rawIntervals.push({ start: request, end: null, source: "approval_wait" });
     }
@@ -479,7 +481,7 @@ function calcApprovalWaits(runs: CalibrationSourceRun[]): MetricDistribution {
  * pending. This builds the in-flight spans from matched pairs so a long-running command/tool call is
  * never mistaken for silence:
  *  - `command.started` -> `command.result`   (paired by actor)
- *  - `skeleton.tool_call` -> `skeleton.tool_result` (paired by skeleton id)
+ *  - `skeleton.tool_call` -> `skeleton.tool_result` (paired by skeleton-scoped tool call id)
  * Unmatched halves are ignored: a lone start or result is not a span, and treating it as one would
  * wrongly erase real silence (recorded fixtures and logs frequently omit the other half).
  */
@@ -510,22 +512,24 @@ function pendingActivityIntervals(
     }
   };
 
-  // FIND-17: concurrent tasks with the same role share `ev.actor`, so pair `command.started` /
+  // Concurrent tasks with the same role share `ev.actor`, so pair `command.started` /
   // `command.result` spans by the recorded `data.logRef` (falling back to the skeleton id, then the
-  // actor). Pairing by actor alone merged two simultaneous commands into a single span and dropped
+  // actor). Pairing by actor alone would merge two simultaneous commands into a single span and drop
   // the second, wrongly counting in-flight work as silence.
   pair("command.started", "command.result", (ev) => {
     const data = ev.data as Record<string, unknown> | undefined;
     return `command:${String(data?.logRef ?? ev.skeletonId ?? ev.actor)}`;
   });
-  // FIND-18: concurrent tool calls on one skeleton share `skeletonId`, so pair
-  // `skeleton.tool_call` / `skeleton.tool_result` spans by the recorded `data.toolCallId`.
+  // Concurrent skeletons run independent ACP sessions, so `data.toolCallId` is only unique *within*
+  // a skeleton. Scope the pairing key by skeleton (falling back to the actor) so two skeletons that
+  // both reuse `toolCallId: "tc-1"` never collide: each tool call pairs with its own result.
   pair("skeleton.tool_call", "skeleton.tool_result", (ev) => {
     const data = ev.data as Record<string, unknown> | undefined;
     const toolCallId = data?.toolCallId;
-    return `tool:${
-      typeof toolCallId === "string" ? toolCallId : ev.skeletonId ?? `actor:${ev.actor}`
-    }`;
+    const skelScope = ev.skeletonId ?? `actor:${ev.actor}`;
+    return typeof toolCallId === "string"
+      ? `tool:${skelScope}:${toolCallId}`
+      : `tool:${skelScope}`;
   });
   return intervals;
 }
@@ -599,7 +603,7 @@ interface HeadroomResult {
 }
 
 /**
- * FIND-002: per-key minimum floors so a calibration can never collapse a cap to `0`.
+ * Per-key minimum floors so a calibration can never collapse a cap to `0`.
  *
  * A clean run set (for example zero Warden rejections -> `max = 0`, or an instant/synthetic run ->
  * a `0` ms prompt or silence delta) must not disable Warden retries or propose a `0 ms` timeout.
@@ -831,8 +835,8 @@ function parseNdjsonEvents(text: string, fallbackRunId: string): EventEnvelope[]
       ts: Number(record.ts ?? 0),
       kind: String(record.kind ?? "unknown"),
       actor: String(record.actor ?? "unknown"),
-      // WP-17-fix2: spread `data` first so the normalized `refs` (always an array of strings) sits
-      // *after* the spread and can never be overwritten by a non-string `data.refs`.
+      // Spread `data` first so the normalized `refs` (always an array of strings) sits *after* the
+      // spread and can never be overwritten by a non-string `data.refs`.
       data: { ...data, refs: Array.isArray(data.refs) ? data.refs.map(String) : [] },
     };
     if (typeof record.skeletonId === "string") {
@@ -847,26 +851,12 @@ function parseNdjsonEvents(text: string, fallbackRunId: string): EventEnvelope[]
 }
 
 /**
- * FIND-004: returns the latest `run.done` event of a run (by `seq`), or `null` when the run never
- * concluded. Both recorded-run loaders and `SettingsStore.syncRecordedRunCount` use this so they
- * agree on what "the run's terminal outcome" is.
+ * A run whose latest `run.done` reports `outcome === "error"` is not a completed run. The latest
+ * event comes from the shared {@link pickLatestRunDoneEvent} so the CLI and the settings store agree
+ * on what "the run's terminal outcome" is.
  */
-function latestRunDoneEvent(events: EventEnvelope[]): EventEnvelope | null {
-  let latest: EventEnvelope | null = null;
-  for (const ev of events) {
-    if (ev.kind !== "run.done") {
-      continue;
-    }
-    if (latest === null || ev.seq >= latest.seq) {
-      latest = ev;
-    }
-  }
-  return latest;
-}
-
-/** FIND-004: a run whose latest `run.done` reports `outcome === "error"` is not a completed run. */
 function isErroredRun(events: EventEnvelope[]): boolean {
-  const done = latestRunDoneEvent(events);
+  const done = pickLatestRunDoneEvent(events);
   return done !== null && done.data.outcome === "error";
 }
 
@@ -875,14 +865,14 @@ export function loadRecordedRunsFromDir(dir: string, limit = DEFAULT_LIMIT): Cal
 }
 
 /**
- * WP-17-fix2: every *completed, non-error* run in a directory, ordered chronologically by the
- * run's `run.done` timestamp (ties broken by run id). Kept separate from
- * {@link loadRecordedRunsFromDir} (which slices to `limit` samples) so the full completed-run id set
- * can feed `recalibrationRequired` while only the first `limit` runs feed the distributions.
+ * Every *completed, non-error* run in a directory, ordered chronologically by the run's `run.done`
+ * timestamp (ties broken by run id). Kept separate from {@link loadRecordedRunsFromDir} (which
+ * slices to `limit` samples) so the full completed-run id set can feed `recalibrationRequired` while
+ * only the leading runs feed the distributions.
  *
- * FIND-22: sorting by directory name made the sample order depend on a custom `--run-id` naming
- * scheme, so directory mode could pick different "first three" runs than EventStore mode. Ordering
- * by the run's `run.done` ts matches {@link collectCompletedRunsFromEventStore} exactly.
+ * Ordering by `run.done` timestamp — never by directory name — keeps the sample order independent of
+ * any custom `--run-id` naming scheme, so directory mode picks the same runs as EventStore mode
+ * ({@link collectCompletedRunsFromEventStore}).
  */
 function collectCompletedRunsFromDir(dir: string): CalibrationSourceRun[] {
   if (!fs.existsSync(dir)) {
@@ -901,9 +891,9 @@ function collectCompletedRunsFromDir(dir: string): CalibrationSourceRun[] {
       continue;
     }
     const events = parseNdjsonEvents(fs.readFileSync(eventsPath, "utf8"), runId);
-    // FIND-004 + completeness: skip errored runs *and* runs that never concluded (no `run.done`) so
-    // an incomplete run can never enter calibration or displace a completed one.
-    const done = latestRunDoneEvent(events);
+    // Skip errored runs *and* runs that never concluded (no `run.done`) so an incomplete run can
+    // never enter calibration or displace a completed one.
+    const done = pickLatestRunDoneEvent(events);
     if (done === null || isErroredRun(events)) {
       continue;
     }
@@ -912,7 +902,7 @@ function collectCompletedRunsFromDir(dir: string): CalibrationSourceRun[] {
 
   runs.sort(
     (a, b) =>
-      (latestRunDoneEvent(a.events)?.ts ?? 0) - (latestRunDoneEvent(b.events)?.ts ?? 0) ||
+      (pickLatestRunDoneEvent(a.events)?.ts ?? 0) - (pickLatestRunDoneEvent(b.events)?.ts ?? 0) ||
       a.runId.localeCompare(b.runId)
   );
   return runs;
@@ -925,13 +915,13 @@ export function loadCompletedRunsFromEventStore(
   return collectCompletedRunsFromEventStore(store).slice(0, Math.max(0, limit));
 }
 
-/** WP-17-fix2: every completed, non-errored run in an EventStore (see the directory sibling). */
+/** Every completed, non-errored run in an EventStore (see the directory sibling). */
 function collectCompletedRunsFromEventStore(store: EventStore): CalibrationSourceRun[] {
   const ordered: Array<{ runId: string; doneTs: number; events: EventEnvelope[] }> = [];
   for (const runId of store.getRunIds()) {
     const events = store.getEvents(runId);
-    const done = latestRunDoneEvent(events);
-    // FIND-004: ignore runs that never concluded and runs that errored.
+    const done = pickLatestRunDoneEvent(events);
+    // Ignore runs that never concluded and runs that errored.
     if (!done || done.data.outcome === "error") {
       continue;
     }
@@ -943,16 +933,17 @@ function collectCompletedRunsFromEventStore(store: EventStore): CalibrationSourc
 }
 
 export function runCalibration(options?: RunCalibrationOptions): RunCalibrationResult {
-  // FIND-001: never silently no-op an --apply. Persisting requires a store; without one the caller
-  // must be told, rather than receiving a result that looks applied but wrote nothing.
+  // Never silently no-op an --apply. Persisting requires a store; without one the caller must be
+  // told, rather than receiving a result that looks applied but wrote nothing.
   if (options?.apply === true && !options.settingsStore) {
     throw new Error(APPLY_REQUIRES_STORE_MESSAGE);
   }
 
   const limit = options?.limit && options.limit > 0 ? Math.floor(options.limit) : DEFAULT_LIMIT;
 
-  // WP-17-fix2 / Requirement 8: collect *every* completed, non-error run so the recalibration
-  // counter sees runs beyond the sample window, then slice the first `limit` for the distributions.
+  // Requirement 8: collect *every* completed, non-error run so the recalibration counter sees runs
+  // beyond the sample window, then feed the leading `limit` runs (or every run with `--all`) into the
+  // distributions.
   let allCompletedRuns: CalibrationSourceRun[];
   if (options?.runsDir) {
     allCompletedRuns = collectCompletedRunsFromDir(options.runsDir);
@@ -962,7 +953,7 @@ export function runCalibration(options?: RunCalibrationOptions): RunCalibrationR
     allCompletedRuns = collectCompletedRunsFromDir(DEFAULT_RECORDED_RUNS_DIR);
   }
   const allCompletedRunIds = allCompletedRuns.map((run) => run.runId);
-  const sampleRuns = allCompletedRuns.slice(0, limit);
+  const sampleRuns = options?.all === true ? allCompletedRuns : allCompletedRuns.slice(0, limit);
 
   const analysis = analyzeRecordedRunsForCalibration(sampleRuns, {
     settingsStore: options?.settingsStore,
@@ -1006,9 +997,10 @@ export function runCalibration(options?: RunCalibrationOptions): RunCalibrationR
       runIds: analysis.runIds,
       ts: options.ts,
     });
-    // FIND-16: `markCalibrated` clears `recalibrationRequired` using only the sampled run ids. When
-    // runs 4+ had already completed before this `--apply`, re-sync against *every* completed run id
-    // so the flag is not cleared prematurely; runs outside the sample window keep it armed.
+    // `markCalibrated` clears `recalibrationRequired` using only the sampled run ids. Re-sync against
+    // *every* completed run id so the flag is not cleared prematurely: runs outside the sample window
+    // stay uncalibrated and keep it armed. With `--all` (or a `--limit` covering every run) the
+    // sampled ids equal the completed set, so the flag clears.
     settingsStore.syncRecordedRunCount({ recordedRunIds: allCompletedRunIds });
     recalibrationRequired = settingsStore.isRecalibrationRequired();
   }
@@ -1026,18 +1018,30 @@ export interface CliOptions {
   out?: string;
   apply: boolean;
   actor?: string;
+  limit?: number;
+  all?: boolean;
 }
 
 export function parseCalibrationArgs(argv: string[]): CliOptions {
   const options: CliOptions = { json: false, markdown: false, apply: false };
 
-  // WP-17-fix2: a value flag must be followed by a real value. Without this check a missing value
-  // (end of argv) or a following flag (`--db --json`) was swallowed into the option, silently
-  // dropping the flag that should have been parsed next.
+  // A value flag must be followed by a real value. Without this check a missing value (end of argv)
+  // or a following flag (`--db --json`) would be swallowed into the option, silently dropping the
+  // flag that should have been parsed next.
   const requireValue = (flag: string, at: number, noun = "path"): string => {
     const value = argv[at + 1];
     if (value === undefined || value.startsWith("--")) {
       throw new Error(`${flag} requires a ${noun} argument`);
+    }
+    return value;
+  };
+
+  // `--limit` takes a positive integer count of completed runs to calibrate.
+  const requirePositiveInteger = (flag: string, at: number): number => {
+    const raw = requireValue(flag, at, "positive integer");
+    const value = Number(raw);
+    if (!Number.isInteger(value) || value < 1) {
+      throw new Error(`${flag} requires a positive integer argument (received "${raw}")`);
     }
     return value;
   };
@@ -1065,6 +1069,10 @@ export function parseCalibrationArgs(argv: string[]): CliOptions {
         options.actor = requireValue("--actor", i, "value");
         i += 1;
         break;
+      case "--limit":
+        options.limit = requirePositiveInteger("--limit", i);
+        i += 1;
+        break;
       case "--json":
         options.json = true;
         break;
@@ -1074,7 +1082,14 @@ export function parseCalibrationArgs(argv: string[]): CliOptions {
       case "--apply":
         options.apply = true;
         break;
+      case "--all":
+        options.all = true;
+        break;
       default:
+        // An unknown `--flag` is a mistake, not something to silently ignore.
+        if (arg.startsWith("--")) {
+          throw new Error(`Unknown flag: ${arg}`);
+        }
         break;
     }
   }
@@ -1087,9 +1102,9 @@ function main(): void {
   const eventStore = options.db ? new EventStore(options.db) : undefined;
   let settingsStore = options.settingsDb ? new SettingsStore(options.settingsDb) : undefined;
 
-  // FIND-001: an explicit `--apply` without `--settings-db` must not be silently dropped. Resolve
-  // the default store (env override, then the shared default path) and open it so the proposal is
-  // actually persisted; `runCalibration` throws if apply is requested with no store at all.
+  // An explicit `--apply` without `--settings-db` must not be silently dropped. Resolve the default
+  // store (env override, then the shared default path) and open it so the proposal is actually
+  // persisted; `runCalibration` throws if apply is requested with no store at all.
   if (!settingsStore && options.apply) {
     const settingsPath = process.env.SETTINGS_STORE_PATH ?? resolveDefaultSettingsStorePath();
     settingsStore = new SettingsStore(settingsPath);
@@ -1102,6 +1117,8 @@ function main(): void {
       runsDir: options.runsDir,
       apply: options.apply,
       actor: options.actor,
+      limit: options.limit,
+      all: options.all,
     });
 
     const formatted = options.json ? result.json : result.markdown;
