@@ -5,6 +5,7 @@
  * via --resume-id, S2-false refusal and auto-denied asks.
  */
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
@@ -22,9 +23,12 @@ import {
 } from "../../lib/acp/stream-parser";
 import {
   HeadlessFallbackChannel,
+  buildAskAutoDeniedEventData,
   buildHeadlessArgs,
+  defaultResolveUserIds,
   isHeadlessFallbackAllowed,
 } from "../../lib/acp/headless-fallback";
+import type { HeadlessAskRequest } from "../../lib/acp/stream-parser";
 import type { ChildProcessLike, SpawnFunction } from "../../lib/supervisor/types";
 
 class MockProcess extends EventEmitter {
@@ -1545,10 +1549,11 @@ describe("HeadlessFallbackChannel auto-deny fail-closed", () => {
     }
   });
 
-  it("kills the child and fails closed when onAskAutoDeny throws", async () => {
+  it("kills the child, waits for close, and fails closed when onAskAutoDeny throws", async () => {
     const { logPath, cleanup } = tempLogPath("ask-throw");
     try {
       let killed = false;
+      let closedEmitted = false;
       const channel = makeChannel({
         logPath,
         onAskAutoDeny: () => {
@@ -1558,6 +1563,14 @@ describe("HeadlessFallbackChannel auto-deny fail-closed", () => {
           const proc = new MockProcess();
           proc.kill = () => {
             killed = true;
+            // Emit "close" ASYNCHRONOUSLY so the turn can only settle once the
+            // child actually exits, never synchronously inside kill().
+            setImmediate(() => {
+              closedEmitted = true;
+              proc.exitCode = null;
+              proc.signalCode = "SIGTERM";
+              proc.emit("close", null);
+            });
             return true;
           };
           setImmediate(() => {
@@ -1567,7 +1580,7 @@ describe("HeadlessFallbackChannel auto-deny fail-closed", () => {
             proc.stdout.write(
               JSON.stringify({ type: "ask_request", askId: "a-1", text: "q" }) + "\n"
             );
-            // Never closes on its own; the channel must settle on the hook failure.
+            // Never closes on its own; only the SIGTERM-triggered close settles it.
           });
           return proc as unknown as ChildProcessLike;
         },
@@ -1578,6 +1591,11 @@ describe("HeadlessFallbackChannel auto-deny fail-closed", () => {
       assert.equal(result.status, "failure");
       assert.equal(result.reason, "ask_auto_deny_failed");
       assert.equal(killed, true);
+      assert.equal(
+        closedEmitted,
+        true,
+        "runTurn() must wait for the child close before resolving"
+      );
       assert.equal(result.spawnError, "deny boom");
     } finally {
       cleanup();
@@ -1585,6 +1603,166 @@ describe("HeadlessFallbackChannel auto-deny fail-closed", () => {
   });
 });
 
+describe("HeadlessFallbackChannel ask.auto_denied redaction", () => {
+  it("redacts an explicit non-env kiroApiKey from the ask passed to onAskAutoDeny", async () => {
+    const { logPath, cleanup } = tempLogPath("ask-redact");
+    try {
+      // Assembled at runtime so no contiguous literal secret appears in-source.
+      const explicitKey = ["alpha", "custom", "key"].join("-");
+      const captured: HeadlessAskRequest[] = [];
+      const channel = makeChannel({
+        logPath,
+        kiroApiKey: explicitKey,
+        onAskAutoDeny: (ask) => {
+          captured.push(ask);
+        },
+        spawnFn: makeSpawn(
+          () => ({
+            lines: [
+              { type: "session", model: "claude-sonnet-5.5" },
+              {
+                type: "ask_request",
+                askId: `id-${explicitKey}`,
+                text: `question ${explicitKey}`,
+                options: [`opt-${explicitKey}`, { nested: `deep-${explicitKey}` }],
+              },
+            ],
+            code: 0,
+          }),
+          { calls: 0 }
+        ),
+      });
+
+      const result = await channel.runTurn({ prompt: "x" });
+      assert.equal(result.ok, true);
+      assert.equal(captured.length, 1);
+      const ask = captured[0];
+      assert.ok(
+        !JSON.stringify(ask).includes(explicitKey),
+        "the ask handed to onAskAutoDeny leaked the explicit key"
+      );
+      // The recorded auto-denied ask is clean too.
+      assert.ok(
+        !JSON.stringify(result.autoDeniedAsks).includes(explicitKey),
+        "the recorded autoDeniedAsks leaked the explicit key"
+      );
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("buildAskAutoDeniedEventData defensively redacts text and nested options", () => {
+    const explicitKey = ["alpha", "custom", "key"].join("-");
+    const ask: HeadlessAskRequest = {
+      askId: `id-${explicitKey}`,
+      toolCallId: null,
+      text: `question ${explicitKey}`,
+      raw: {
+        type: "ask_request",
+        options: [`opt-${explicitKey}`, { nested: `deep-${explicitKey}` }],
+      },
+    };
+    const data = buildAskAutoDeniedEventData(ask, { secrets: [explicitKey] });
+    assert.ok(
+      !JSON.stringify(data).includes(explicitKey),
+      "buildAskAutoDeniedEventData leaked the explicit key"
+    );
+    assert.ok((data.text ?? "").includes("[REDACTED]"));
+    assert.ok((data.question ?? "").includes("[REDACTED]"));
+  });
+});
+
+describe("HeadlessFallbackChannel sandbox user uid/gid resolution", () => {
+  it("resolves a known POSIX user to numeric uid/gid and an unknown user to null", () => {
+    if (process.platform === "win32") {
+      return;
+    }
+    const root = defaultResolveUserIds("root");
+    if (root !== null) {
+      assert.equal(root.uid, 0);
+      assert.equal(root.gid, 0);
+    }
+    assert.equal(defaultResolveUserIds("gg-definitely-not-a-user-xyz"), null);
+  });
+
+  it("fails closed without spawning when the sandbox user cannot be resolved (defaultSpawn)", async () => {
+    const { logPath, cleanup } = tempLogPath("uid-unresolved");
+    try {
+      const channel = makeChannel({
+        logPath,
+        // `spawn` is the module's defaultSpawn reference, so the channel takes
+        // the default-spawn (uid/gid) path while still never executing anything.
+        spawnFn: spawn as unknown as SpawnFunction,
+        user: "gg-definitely-not-a-user-xyz",
+        resolveUserIds: () => null,
+      });
+      const result = await channel.runTurn({ prompt: "x" });
+      assert.equal(result.ok, false);
+      assert.equal(result.reason, "spawn_failed");
+      assert.match(String(result.spawnError), /sandbox user/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("fails closed without spawning when the resolved uid cannot be adopted (defaultSpawn)", async () => {
+    // Only meaningful when the test suite runs without root privilege.
+    if (typeof process.getuid !== "function" || process.getuid() === 0) {
+      return;
+    }
+    const { logPath, cleanup } = tempLogPath("uid-nopriv");
+    try {
+      const requiredUid = process.getuid() + 12345;
+      const channel = makeChannel({
+        logPath,
+        spawnFn: spawn as unknown as SpawnFunction,
+        user: "gg-sandbox-user",
+        resolveUserIds: () => ({ uid: requiredUid, gid: requiredUid }),
+      });
+      const result = await channel.runTurn({ prompt: "x" });
+      assert.equal(result.ok, false);
+      assert.equal(result.reason, "spawn_failed");
+      assert.match(String(result.spawnError), /could not be adopted/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("uses the resolved numeric uid/gid on the default spawn when the user resolves", async () => {
+    if (typeof process.getuid !== "function") {
+      return;
+    }
+    const { logPath, cleanup } = tempLogPath("uid-resolved");
+    try {
+      const uid = process.getuid();
+      const gid = typeof process.getgid === "function" ? process.getgid() : uid;
+      const resolveCalls: string[] = [];
+      const channel = makeChannel({
+        logPath,
+        cwd: os.tmpdir(),
+        // A command that does not exist: spawn is ATTEMPTED with the resolved
+        // ids (proving resolution succeeded) and then fails with ENOENT.
+        command: "/nonexistent/gg-kiro-cli-xyz",
+        spawnFn: spawn as unknown as SpawnFunction,
+        user: "gg-sandbox-user",
+        resolveUserIds: (user) => {
+          resolveCalls.push(user);
+          return { uid, gid };
+        },
+      });
+      const result = await channel.runTurn({ prompt: "x" });
+      assert.deepEqual(resolveCalls, ["gg-sandbox-user"]);
+      assert.equal(result.ok, false);
+      assert.equal(result.reason, "spawn_failed");
+      assert.ok(
+        !/sandbox user/.test(String(result.spawnError)),
+        "the resolved ids must be adopted instead of failing closed"
+      );
+    } finally {
+      cleanup();
+    }
+  });
+});
 
 describe("HeadlessFallbackChannel missing-resume-id fail-closed", () => {
   it("refuses to resume when no session id is reported", async () => {

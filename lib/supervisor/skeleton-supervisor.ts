@@ -820,6 +820,34 @@ export class SkeletonSupervisor extends EventEmitter {
   }
 
   /**
+   * True when the Skeleton has entered a terminal/cancelling/failed state (or is
+   * terminating) and must NOT be resumed or resurrected to "raised". A concurrent
+   * `finish()`/`cancel()` or a fail-closed turn always wins.
+   */
+  private isTerminalOrCancelling(): boolean {
+    return (
+      this.isTerminating ||
+      this.state === "terminated" ||
+      this.state === "cancelling" ||
+      this.state === "failed" ||
+      !!this.failureReason
+    );
+  }
+
+  /**
+   * Restores the "raised" state after a headless turn settles, but NEVER
+   * overwrites a terminal/failure state: a concurrent `finish()`/`cancel()` or a
+   * fail-closed turn must always win so a terminated, cancelling, or failed
+   * Skeleton is never resurrected to "raised".
+   */
+  private restoreRaisedIfPermitted(): void {
+    if (this.isTerminalOrCancelling()) {
+      return;
+    }
+    this.state = "raised";
+  }
+
+  /**
    * Runs one Headless Fallback turn through the channel and awaits its real
    * result. A failed turn transitions the supervisor into the failed state with
    * the channel's real reason (for example `model_mismatch`, `gateway_missing`,
@@ -868,7 +896,7 @@ export class SkeletonSupervisor extends EventEmitter {
           }
           this.steeringHeadlessChannel = null;
           this.promptPending = false;
-          this.state = "raised";
+          this.restoreRaisedIfPermitted();
           return {
             status: "cancelled",
             rawLogPath,
@@ -900,7 +928,7 @@ export class SkeletonSupervisor extends EventEmitter {
         this.headlessCliSessionId = rawSessionId;
       }
       this.promptPending = false;
-      this.state = "raised";
+      this.restoreRaisedIfPermitted();
       return {
         status: "complete",
         output: turn.output,
@@ -910,9 +938,7 @@ export class SkeletonSupervisor extends EventEmitter {
       };
     } catch (err) {
       this.promptPending = false;
-      if (!this.failureReason) {
-        this.state = "raised";
-      }
+      this.restoreRaisedIfPermitted();
       throw err;
     } finally {
       if (this.activeHeadlessChannel === channel) {
@@ -993,6 +1019,17 @@ export class SkeletonSupervisor extends EventEmitter {
         } else {
           this.steeringHeadlessChannel = null;
         }
+      }
+      // A concurrent finish()/cancel() (or a fail-closed turn) must win: never
+      // start a replacement resume turn after the Skeleton was terminated,
+      // cancelled, or failed.
+      if (this.isTerminalOrCancelling()) {
+        throw new SkeletonSupervisorError(
+          this.failureReason ?? "cancelled",
+          `Cannot steer Skeleton: ${this.failureError ?? this.state}`,
+          String(this.role),
+          this.skeletonId
+        );
       }
       await this.runTrackedHeadlessTurn(correctionText, this.headlessLogPath());
       return;
