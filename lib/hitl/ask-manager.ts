@@ -286,10 +286,17 @@ export class AskManager {
     // The displayed command and the argv used for grant tracking must describe
     // the same canonical command. A non-empty `argv` is canonical; when
     // `commandText` is omitted it is derived canonically from that `argv`.
+    const rawCommandText =
+      typeof input.commandText === "string" && input.commandText.length > 0
+        ? input.commandText
+        : undefined;
     const suppliedArgv =
       Array.isArray(input.argv) && input.argv.length > 0 ? [...input.argv] : undefined;
+    // Unredacted canonical command text: explicit when supplied, otherwise
+    // derived from the raw argv. Agreement checks and grant tracking use these
+    // raw values; only the displayed card and question are redacted.
     const canonicalCommandText =
-      input.commandText || (suppliedArgv ? formatArgvCommand(suppliedArgv) : undefined);
+      rawCommandText ?? (suppliedArgv ? formatArgvCommand(suppliedArgv) : undefined);
     if (!input.runId || !canonicalCommandText || !input.cwd || !input.skeletonId) {
       throw new AskManagerError(
         "requestApproval requires runId, commandText (or argv), cwd and skeletonId",
@@ -298,9 +305,10 @@ export class AskManager {
     }
     // When both are supplied they must tokenize to the same canonical command;
     // otherwise a caller could display one command while registering a grant
-    // for a different one.
-    if (input.commandText && suppliedArgv) {
-      const tokenized = tokenizeSimpleCommand(input.commandText).map((w) =>
+    // for a different one. This check runs against the raw values, before any
+    // display redaction can alter them.
+    if (rawCommandText && suppliedArgv) {
+      const tokenized = tokenizeSimpleCommand(rawCommandText).map((w) =>
         removeQuotes(w)
       );
       const matches =
@@ -318,10 +326,6 @@ export class AskManager {
     const raisedAt = this.now();
     const expiresAt = input.expiresAt ?? raisedAt + this.approvalWaitMs;
     const options = ASK_OPTIONS.approve_command;
-    const commandText = redactText(canonicalCommandText);
-    const cwd = redactText(input.cwd);
-    const reason = redactText(input.reason ?? input.riskClass);
-    const question = redactText(`Approve command '${commandText}' in ${cwd}?`);
 
     // Keep the unredacted, tokenized argv and raw cwd/command so grant
     // tracking can register inputs that a later consumeGrant call can match.
@@ -333,6 +337,17 @@ export class AskManager {
       commandText: canonicalCommandText,
       cwd: input.cwd,
     });
+
+    // Redact each argv token BEFORE shell quoting: formatArgvCommand splits a
+    // single quote inside a registered secret into `'\''`, which would break
+    // exact secret matching. Only the displayed command is redacted; the raw
+    // argv stays in rawApprovalGrantInputs for grant tracking.
+    const commandText = redactText(
+      rawCommandText ?? formatArgvCommand(rawArgv.map((arg) => redactText(arg)))
+    );
+    const cwd = redactText(input.cwd);
+    const reason = redactText(input.reason ?? input.riskClass);
+    const question = redactText(`Approve command '${commandText}' in ${cwd}?`);
 
     const ask: AskRecord = {
       askId: approvalId,
@@ -453,14 +468,18 @@ export class AskManager {
     const skeletonId = ask.skeletonId ?? ask.card.skeletonId;
     const raw = this.rawApprovalGrantInputs.get(ask.askId);
     const argv = raw?.argv ?? [ask.card.commandText];
-    const commandText = raw?.commandText ?? ask.card.commandText;
     const cwd = raw?.cwd ?? ask.card.cwd;
     try {
       if (decision === "Approve once") {
         manager.grantOnce(skeletonId, argv, cwd, undefined, ask.runId);
       } else if (decision === "Approve this pattern for the run") {
-        manager.addPatternApproval(ask.runId, commandText, {
-          command: commandText,
+        // Register the pattern in the same representation that
+        // ApprovalManager.isPatternApproved matches argv against: argv.join(" ").
+        // Saving the formatted commandText would fail to match multi-token argv
+        // containing whitespace, quotes or empty arguments.
+        const pattern = argv.join(" ");
+        manager.addPatternApproval(ask.runId, pattern, {
+          command: pattern,
           cwd,
           skeletonId,
           approvedBy: "user",
