@@ -692,3 +692,83 @@ test("AskManager: argv quoting round-trips embedded quotes, metacharacters and e
   assert.equal(requested.length, 1);
 });
 
+
+test("AskManager: redacts each argv token before shell quoting so a secret containing a single quote is not leaked", () => {
+  const approvalManager = new ApprovalManager({ defaultWaitMs: 60_000 });
+  const store = new EventStore(":memory:");
+  const manager = new AskManager({ eventStore: store, approvalManager });
+
+  // Runtime-assembled secret containing a single quote; never commit a literal.
+  const secret = ["canary", String.fromCharCode(39), "seg", "9f31"].join("");
+  // The exact shell form formatArgvToken would emit when the token is NOT
+  // redacted first: a single quote split into `'\''`.
+  const shellQuoted = `'${secret.replace(/'/g, "'\\''")}'`;
+
+  // Register the secret with the redactor through a recognized secret env var,
+  // the same channel the module-level redactText reads, so requestApproval
+  // picks it up without a per-call options argument.
+  const envVar = "GITHUB_TOKEN";
+  const original = process.env[envVar];
+  process.env[envVar] = secret;
+  try {
+    const argv = ["printf", "%s", secret];
+    const card = manager.requestApproval({
+      runId: "run-secret-argv",
+      argv,
+      cwd: "/w",
+      riskClass: "safe",
+      skeletonId: "sk-secret",
+    });
+
+    const ask = manager.getAsk(card.approvalId);
+    assert.ok(ask);
+    const requested = store.getEvents("run-secret-argv", { kind: "approval.requested" });
+    assert.equal(requested.length, 1);
+
+    const haystack = [
+      card.commandText,
+      card.reason,
+      ask.question,
+      ...ask.refs,
+      JSON.stringify(requested.map((e) => e.data)),
+    ].join("\n");
+
+    assert.ok(!haystack.includes(secret), `raw secret leaked: ${haystack}`);
+    assert.ok(
+      !haystack.includes(shellQuoted),
+      `shell-quoted secret leaked: ${haystack}`
+    );
+    assert.ok(card.commandText.includes("[REDACTED]"));
+
+    // Grant tracking still works with the unredacted argv.
+    manager.resolveApproval(card.approvalId, "Approve once");
+    assert.equal(approvalManager.consumeGrant("sk-secret", [...argv], "/w"), true);
+  } finally {
+    if (original === undefined) {
+      delete process.env[envVar];
+    } else {
+      process.env[envVar] = original;
+    }
+  }
+});
+
+test("AskManager: pattern approvals register argv.join(\" \") so multi-token argv matches isPatternApproved", () => {
+  const approvalManager = new ApprovalManager({ defaultWaitMs: 60_000 });
+  const store = new EventStore(":memory:");
+  const manager = new AskManager({ eventStore: store, approvalManager });
+
+  const argv = ["printf", "%s", "a b", ""];
+  const card = manager.requestApproval({
+    runId: "run-pattern-argv",
+    argv,
+    cwd: "/w",
+    riskClass: "safe",
+    skeletonId: "sk-pattern",
+  });
+  manager.resolveApproval(card.approvalId, "Approve this pattern for the run");
+  assert.equal(
+    approvalManager.isPatternApproved("run-pattern-argv", ["printf", "%s", "a b", ""]),
+    true
+  );
+});
+
