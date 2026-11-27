@@ -27,12 +27,12 @@ import {
   SkeletonRole,
 } from "./model-allowlist";
 import {
-  buildSkeletonEnv,
   provisionSkeletonEnvironment,
   resolveSkeletonPaths,
   SkeletonPaths,
 } from "./skeleton-env";
 import { BudgetCapTracker, type BudgetCapSnapshot } from "./budget-caps";
+import { HeadlessFallbackChannel } from "../acp/headless-fallback";
 import type {
   ChildProcessLike,
   ExecutionChannel,
@@ -232,6 +232,27 @@ export class SkeletonSupervisor extends EventEmitter {
     | ((payload: GatewayFatalEventPayload) => void)
     | null = null;
   private gatewayListenerAttached: boolean = false;
+  /** The Headless Fallback channel driving the in-flight turn, if any. */
+  private activeHeadlessChannel: HeadlessFallbackChannel | null = null;
+  /**
+   * The channel whose in-flight turn a mid-turn `steer()` intentionally
+   * cancelled. While it matches the channel being finalized, a "cancelled" turn
+   * is a steer-driven resume rather than a Skeleton failure.
+   */
+  private steeringHeadlessChannel: HeadlessFallbackChannel | null = null;
+  /**
+   * The promise of the in-flight headless turn, if any. `steer()` awaits it after
+   * cancelling the active channel so two concurrent `kiro-cli` processes can never
+   * be spawned at the same time (Requirement 17.3).
+   */
+  private activeHeadlessTurn: Promise<unknown> | null = null;
+  /**
+   * The REAL session id reported by the CLI on a previous headless turn. It is
+   * kept separate from `sessionId` (which may hold a supervisor-side placeholder)
+   * and is the ONLY value ever passed as `--resume-id`. `null` until the CLI
+   * reports one, so the first headless turn is always a fresh (non-resumed) run.
+   */
+  private headlessCliSessionId: string | null = null;
 
   constructor(options: SkeletonSupervisorOptions) {
     super();
@@ -741,61 +762,21 @@ export class SkeletonSupervisor extends EventEmitter {
         ? formatTaskPrompt(promptText as TaskPromptOptions)
         : promptText;
 
+    // Requirements 17.2, 17.3, 17.4: the Headless Fallback execution is delegated
+    // ENTIRELY to HeadlessFallbackChannel, which streams stdout to disk
+    // (`headless-stream.jsonl`) BEFORE parsing, maps the exit code, verifies the
+    // active model against the allowlist, handles approval resumes via
+    // `--resume-id`, and auto-denies every `ask` during live streaming (failing
+    // closed when the required hook rejects). The turn is awaited and its real
+    // result or failure is propagated.
+    if (this.executionChannel === "Headless_Fallback") {
+      return this.runTrackedHeadlessTurn(resolvedPrompt, this.headlessLogPath());
+    }
+
     this.state = "prompting";
     this.promptPending = true;
 
     try {
-      // Requirements 17.2, 17.4: Headless Fallback execution channel
-      if (this.executionChannel === "Headless_Fallback") {
-        const modelId = this.verifiedModelId ?? getAssignedModelForRole(this.role, { hard: this.options.hard });
-        const args = [
-          "chat",
-          "--v3",
-          "--no-interactive",
-          "--agent",
-          String(this.role),
-          "--model",
-          String(modelId),
-          "--require-mcp-startup",
-          "--output-format",
-          "stream-json",
-        ];
-        if (this.options.gatewayToolIds && this.options.gatewayToolIds.length > 0) {
-          args.push("--trust-tools", this.options.gatewayToolIds.join(","));
-        }
-
-        const procEnv = buildSkeletonEnv({
-          kiroApiKey: this.options.kiroApiKey,
-          kiroHome: this.paths.kiroHomeDir,
-          home: this.paths.homeDir,
-          pathEnv: this.options.pathEnv,
-        });
-
-        const proc = this.spawnFn(this.options.command ?? "kiro-cli", args, {
-          cwd: this.cwd,
-          env: procEnv,
-          user: this.options.user ?? "skel",
-          stdio: ["pipe", "pipe", "pipe"],
-        });
-
-        const rawLogPath = path.join(this.paths.sessionsDir, `headless-${Date.now()}.raw`);
-        let rawOutput = "";
-        if (proc.stdout) {
-          proc.stdout.on("data", (chunk: Buffer | string) => {
-            rawOutput += chunk.toString("utf-8");
-            try {
-              fs.writeFileSync(rawLogPath, rawOutput, "utf-8");
-            } catch {
-              // Ignore disk write errors in mock/test
-            }
-          });
-        }
-
-        this.promptPending = false;
-        this.state = "raised";
-        return { status: "complete", output: rawOutput, rawLogPath };
-      }
-
       const result = await this.client!.sessionPrompt({
         sessionId: this.sessionId,
         prompt: resolvedPrompt,
@@ -811,8 +792,158 @@ export class SkeletonSupervisor extends EventEmitter {
       return result;
     } catch (err) {
       this.promptPending = false;
-      this.state = "raised";
+      if (!this.failureReason) {
+        this.state = "raised";
+      }
       throw err;
+    }
+  }
+
+  /**
+   * Starts a headless turn and tracks its promise so a concurrent `steer()` can
+   * cancel and await it BEFORE starting a resume turn. Exactly one headless turn
+   * is ever in flight (Requirement 17.3).
+   */
+  private runTrackedHeadlessTurn(
+    resolvedPrompt: unknown,
+    rawLogPath: string
+  ): Promise<unknown> {
+    const turn = this.runHeadlessTurn(resolvedPrompt, rawLogPath);
+    this.activeHeadlessTurn = turn;
+    const clear = (): void => {
+      if (this.activeHeadlessTurn === turn) {
+        this.activeHeadlessTurn = null;
+      }
+    };
+    turn.then(clear, clear);
+    return turn;
+  }
+
+  /**
+   * True when the Skeleton has entered a terminal/cancelling/failed state (or is
+   * terminating) and must NOT be resumed or resurrected to "raised". A concurrent
+   * `finish()`/`cancel()` or a fail-closed turn always wins.
+   */
+  private isTerminalOrCancelling(): boolean {
+    return (
+      this.isTerminating ||
+      this.state === "terminated" ||
+      this.state === "cancelling" ||
+      this.state === "failed" ||
+      !!this.failureReason
+    );
+  }
+
+  /**
+   * Restores the "raised" state after a headless turn settles, but NEVER
+   * overwrites a terminal/failure state: a concurrent `finish()`/`cancel()` or a
+   * fail-closed turn must always win so a terminated, cancelling, or failed
+   * Skeleton is never resurrected to "raised".
+   */
+  private restoreRaisedIfPermitted(): void {
+    if (this.isTerminalOrCancelling()) {
+      return;
+    }
+    this.state = "raised";
+  }
+
+  /**
+   * Runs one Headless Fallback turn through the channel and awaits its real
+   * result. A failed turn transitions the supervisor into the failed state with
+   * the channel's real reason (for example `model_mismatch`, `gateway_missing`,
+   * `missing_agent`, `stream_log_write_failed`, `ask_auto_deny_failed` or
+   * `headless_fallback_disabled`) and throws a `SkeletonSupervisorError`.
+   * Requirements 17.2-17.4, 17.11.
+   */
+  private async runHeadlessTurn(
+    resolvedPrompt: unknown,
+    rawLogPath: string
+  ): Promise<unknown> {
+    // The stream log lives under the Skeleton's sessions dir, never inside the
+    // worktree, so it can never be staged into a candidate commit.
+    fs.mkdirSync(this.paths.sessionsDir, { recursive: true });
+    const channel = this.createHeadlessChannel(rawLogPath);
+    this.activeHeadlessChannel = channel;
+    this.state = "prompting";
+    this.promptPending = true;
+
+    try {
+      const turn = await channel.runTurn({
+        prompt:
+          typeof resolvedPrompt === "string"
+            ? resolvedPrompt
+            : String(resolvedPrompt),
+        // The supervisor's own id is NOT a CLI session id. Only a real id
+        // reported by a previous headless turn may be used to resume.
+        resumeId: this.headlessCliSessionId ?? undefined,
+      });
+
+      if (!turn.ok) {
+        // A mid-turn steer() cancelled this turn on purpose; it is NOT a Skeleton
+        // failure. Preserve the real CLI session id so the replacement resume
+        // turn continues the same session, then return cleanly so steer() can
+        // start that resume turn with the Skeleton still "raised".
+        if (
+          turn.status === "cancelled" &&
+          this.steeringHeadlessChannel === channel
+        ) {
+          const rawSessionId = channel.getLastRawSessionId() ?? turn.sessionId;
+          if (
+            typeof rawSessionId === "string" &&
+            rawSessionId.trim().length > 0
+          ) {
+            this.headlessCliSessionId = rawSessionId;
+          }
+          this.steeringHeadlessChannel = null;
+          this.promptPending = false;
+          this.restoreRaisedIfPermitted();
+          return {
+            status: "cancelled",
+            rawLogPath,
+            sessionId: turn.sessionId,
+          };
+        }
+        const reason = (turn.reason ?? turn.status) as SupervisorFailureReason;
+        const detail =
+          turn.spawnError ??
+          turn.logError ??
+          `Headless Fallback turn failed: ${turn.status}`;
+        this.failSkeleton(reason, detail);
+        throw new SkeletonSupervisorError(
+          reason,
+          `Headless Fallback turn failed: ${detail}`,
+          String(this.role),
+          this.skeletonId
+        );
+      }
+
+      // Requirement 17.12: the PUBLIC session id stays redacted, but the resume
+      // must use the RAW CLI session id the channel retained internally, so a
+      // raw id that overlaps the API key still resumes correctly.
+      const rawSessionId = channel.getLastRawSessionId() ?? turn.sessionId;
+      if (
+        typeof rawSessionId === "string" &&
+        rawSessionId.trim().length > 0
+      ) {
+        this.headlessCliSessionId = rawSessionId;
+      }
+      this.promptPending = false;
+      this.restoreRaisedIfPermitted();
+      return {
+        status: "complete",
+        output: turn.output,
+        rawLogPath,
+        sessionId: turn.sessionId,
+        credits: turn.credits,
+      };
+    } catch (err) {
+      this.promptPending = false;
+      this.restoreRaisedIfPermitted();
+      throw err;
+    } finally {
+      if (this.activeHeadlessChannel === channel) {
+        this.activeHeadlessChannel = null;
+      }
     }
   }
 
@@ -858,39 +989,49 @@ export class SkeletonSupervisor extends EventEmitter {
     }
 
     if (this.executionChannel === "Headless_Fallback") {
-      const modelId = this.verifiedModelId ?? getAssignedModelForRole(this.role, { hard: this.options.hard });
-      const resumeId = this.sessionId ?? `resume-${this.skeletonId}`;
-      const args = [
-        "chat",
-        "--v3",
-        "--no-interactive",
-        "--agent",
-        String(this.role),
-        "--model",
-        String(modelId),
-        "--require-mcp-startup",
-        "--resume-id",
-        resumeId,
-        "--output-format",
-        "stream-json",
-      ];
-      if (this.options.gatewayToolIds && this.options.gatewayToolIds.length > 0) {
-        args.push("--trust-tools", this.options.gatewayToolIds.join(","));
+      // Requirement 17.3: the correction is delegated to the Headless Fallback
+      // channel, which resumes the CLI session with the real session id reported
+      // by an earlier turn (never the supervisor-side placeholder). If a headless
+      // turn is already in flight, cancel the active channel and wait for that
+      // turn to settle BEFORE starting the resume, so two concurrent `kiro-cli`
+      // processes can never be spawned at the same time.
+      if (
+        this.activeHeadlessChannel !== null ||
+        this.activeHeadlessTurn !== null ||
+        this.state === "prompting" ||
+        this.promptPending
+      ) {
+        // Record the channel BEFORE cancelling it so `runHeadlessTurn` treats the
+        // cancellation as steer-driven (resume) rather than a Skeleton failure.
+        this.steeringHeadlessChannel = this.activeHeadlessChannel;
+        this.activeHeadlessChannel?.cancel();
+        const inFlight = this.activeHeadlessTurn;
+        if (inFlight) {
+          try {
+            await inFlight;
+          } catch {
+            // The cancelled turn fails closed; steer still resumes from the
+            // settled CLI session state.
+          } finally {
+            // Clear the steer marker once the cancelled turn has settled.
+            this.steeringHeadlessChannel = null;
+          }
+        } else {
+          this.steeringHeadlessChannel = null;
+        }
       }
-
-      const procEnv = buildSkeletonEnv({
-        kiroApiKey: this.options.kiroApiKey,
-        kiroHome: this.paths.kiroHomeDir,
-        home: this.paths.homeDir,
-        pathEnv: this.options.pathEnv,
-      });
-
-      this.spawnFn(this.options.command ?? "kiro-cli", args, {
-        cwd: this.cwd,
-        env: procEnv,
-        user: this.options.user ?? "skel",
-        stdio: ["pipe", "pipe", "pipe"],
-      });
+      // A concurrent finish()/cancel() (or a fail-closed turn) must win: never
+      // start a replacement resume turn after the Skeleton was terminated,
+      // cancelled, or failed.
+      if (this.isTerminalOrCancelling()) {
+        throw new SkeletonSupervisorError(
+          this.failureReason ?? "cancelled",
+          `Cannot steer Skeleton: ${this.failureError ?? this.state}`,
+          String(this.role),
+          this.skeletonId
+        );
+      }
+      await this.runTrackedHeadlessTurn(correctionText, this.headlessLogPath());
       return;
     }
 
@@ -940,6 +1081,10 @@ export class SkeletonSupervisor extends EventEmitter {
    */
   public async cancel(reason: string = "cancelled"): Promise<void> {
     this.state = "cancelling";
+
+    // Requirement 17.8: abort the in-flight headless turn, if any, so its child
+    // process is signalled and the turn reports "cancelled".
+    this.activeHeadlessChannel?.cancel();
 
     if (this.client && this.sessionId) {
       try {
@@ -1021,6 +1166,9 @@ export class SkeletonSupervisor extends EventEmitter {
   public async finish(): Promise<void> {
     this.isTerminating = true;
 
+    // Abort any in-flight headless turn before tearing the Skeleton down.
+    this.activeHeadlessChannel?.cancel();
+
     // Audit N-B1: a finished Skeleton no longer listens for gateway fatal events.
     this.removeGatewayFatalListener();
 
@@ -1066,6 +1214,78 @@ export class SkeletonSupervisor extends EventEmitter {
         // Ignore
       }
     }
+  }
+
+  /**
+   * The disk path the Headless Fallback channel writes the raw stream-json to.
+   * It lives under the Skeleton's sessions dir, NEVER inside the worktree, so
+   * `commitDirtyWorktreeIfNeeded` can never stage the raw stream into a candidate
+   * (Requirement 17.4).
+   */
+  private headlessLogPath(): string {
+    return path.join(this.paths.sessionsDir, "headless-stream.jsonl");
+  }
+
+  /**
+   * Builds the Headless Fallback channel for a turn or correction, wiring the
+   * Skeleton's command, working directory, model, isolated environment, gateway
+   * tool ids, injectable spawn function and stream log location. Approval is
+   * bridged to `options.onApproval` (failing closed to `deny`), and the required
+   * auto-deny hook is forwarded verbatim (Requirement 17.11): when it is missing
+   * the channel is left without one so it fails closed with `ask_auto_deny_failed`
+   * before spawning, and a present hook's errors propagate.
+   */
+  private createHeadlessChannel(logPath: string): HeadlessFallbackChannel {
+    const modelId =
+      this.verifiedModelId ??
+      getAssignedModelForRole(this.role, { hard: this.options.hard });
+    const onAskAutoDeny = this.options.onAskAutoDeny;
+    return new HeadlessFallbackChannel({
+      runId: this.runId,
+      skeletonId: this.skeletonId,
+      kiroHomeDir: this.paths.kiroHomeDir,
+      homeDir: this.paths.homeDir,
+      modelId: String(modelId),
+      agentName: String(this.role),
+      cwd: this.cwd,
+      worktreeDir: this.cwd,
+      kiroApiKey: this.options.kiroApiKey,
+      pathEnv: this.options.pathEnv,
+      // The sandbox user defaults to "skel" so the headless process runs as the
+      // Skeleton user unless the caller overrides it.
+      user: this.options.user ?? "skel",
+      command: this.options.command ?? "kiro-cli",
+      spawnFn: this.spawnFn,
+      gatewayToolIds: this.options.gatewayToolIds,
+      logPath,
+      logTrustedBaseDir: this.paths.sessionsDir,
+      // Requirement 17.1: the supervisor already selected the Headless channel on
+      // P1 failure, so the channel runs only when P1 failed and P14 passed.
+      p1Passed: this.options.probeResults?.P1?.passed ?? false,
+      p14Passed: this.options.probeResults?.P14?.passed === true,
+      s2ResumeSupported: this.options.probeResults?.S2?.passed === true,
+      onApproval: async (request) => {
+        // Never auto-approve (or resume) after cancellation or termination.
+        if (
+          this.isTerminating ||
+          this.state === "terminated" ||
+          this.state === "cancelling"
+        ) {
+          return "deny";
+        }
+        const handler = this.options.onApproval;
+        if (typeof handler !== "function") {
+          // Fail closed: an unhandled approval is denied, never auto-approved.
+          return "deny";
+        }
+        try {
+          return await handler(request);
+        } catch {
+          return "deny";
+        }
+      },
+      ...(typeof onAskAutoDeny === "function" ? { onAskAutoDeny } : {}),
+    });
   }
 
   private attachProcessListeners(proc: ChildProcessLike): void {
@@ -1415,6 +1635,9 @@ export class SkeletonSupervisor extends EventEmitter {
   private terminateSkeletonProcess(): void {
     this.removeGatewayFatalListener();
     this.isTerminating = true;
+
+    // Abort any in-flight headless turn before tearing the Skeleton down.
+    this.activeHeadlessChannel?.cancel();
 
     if (this.client) {
       try {

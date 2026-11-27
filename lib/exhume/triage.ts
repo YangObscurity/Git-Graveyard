@@ -30,9 +30,11 @@ import {
   isApprovedSourceOrManifest,
 } from "../grimoire/detect";
 import {
+  detectPythonSignals,
   detectSignals,
   type DetectSignalsInputFile,
 } from "../grimoire/signals";
+import { isPythonFile } from "../grimoire/gate-js";
 import type { RuleId, Signal, UnknownRecord } from "../grimoire/types";
 import {
   classifyFailures,
@@ -251,6 +253,34 @@ export function scanBaseTreeFiles(
   return collected;
 }
 
+/**
+ * Merges signal lists into a single deterministic, deduplicated list ordered by
+ * file, line, column, ruleId, then matched text. Used to combine the synchronous
+ * `detectSignals` (non-Python files) and asynchronous `detectPythonSignals`
+ * (`.py` files) results in `runGrimoireBaseAnalysis`.
+ */
+function mergeSignals(...lists: Signal[][]): Signal[] {
+  const seen = new Set<string>();
+  const merged: Signal[] = [];
+  for (const list of lists) {
+    for (const signal of list) {
+      const key = `${signal.file}:${signal.line}:${signal.column}:${signal.ruleId}:${signal.matched}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      merged.push(signal);
+    }
+  }
+  merged.sort((a, b) => {
+    if (a.file !== b.file) return a.file < b.file ? -1 : 1;
+    if (a.line !== b.line) return a.line - b.line;
+    if (a.column !== b.column) return a.column - b.column;
+    if (a.ruleId !== b.ruleId) return a.ruleId < b.ruleId ? -1 : 1;
+    if (a.matched !== b.matched) return a.matched < b.matched ? -1 : 1;
+    return 0;
+  });
+  return merged;
+}
+
 export interface GrimoireBaseAnalysisOptions {
   runId: string;
   treeDir?: string;
@@ -315,8 +345,30 @@ export async function runGrimoireBaseAnalysis(
   }
 
   const unknowns: UnknownRecord[] = options.unknowns ? [...options.unknowns] : [];
-  const signalsResult = detectSignals(inputFiles, { unknowns });
-  const detectedSignals: Signal[] = Array.from(signalsResult);
+
+  // Split the inputs: `.py` files go through the asynchronous tree-sitter based
+  // `detectPythonSignals` (which also loads content from disk when omitted),
+  // and every other file goes through the synchronous `detectSignals`.
+  const pythonFiles: DetectSignalsInputFile[] = [];
+  const otherFiles: DetectSignalsInputFile[] = [];
+  for (const file of inputFiles) {
+    if (typeof file.path === "string" && isPythonFile(file.path)) {
+      pythonFiles.push(file);
+    } else {
+      otherFiles.push(file);
+    }
+  }
+
+  const syncResult = detectSignals(otherFiles, { unknowns });
+  const asyncResult = await detectPythonSignals(pythonFiles, { unknowns });
+
+  // Merge into one deterministic, deduplicated list. Both producers already
+  // sort their own results; re-sorting the union keeps the merged order stable
+  // regardless of which path produced a given signal.
+  const detectedSignals: Signal[] = mergeSignals(
+    Array.from(syncResult),
+    Array.from(asyncResult)
+  );
 
   let eventsEmitted = 0;
 

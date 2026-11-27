@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { resolvePermissionForm } from "../probes/probe-settles";
+import { BONESETTER_WRITABLE_FILENAMES } from "../agents/bonesetter";
 
 /**
  * Invariant KI-05 / Requirement 18.2:
@@ -1022,10 +1023,11 @@ export function decide(request: PermissionBrokerRequest): PermissionDecision {
                 }
               } else if (normRole === "Bonesetter") {
                 // The manifest and lock names are matched only at the cwd root,
-                // and setup.py is removed from the write list.
+                // and only the exact ten-name intersection shared with the
+                // Bonesetter tool boundary is writable (finding [21]).
                 // Uses the real target (realpath)
                 const realRel = path.relative(realCwd, realTarget).replace(/\\/g, "/").toLowerCase();
-                if (!realRel.includes("/") && MANIFEST_LOCK_FILENAMES.has(realRel)) {
+                if (!realRel.includes("/") && BONESETTER_WRITABLE_FILENAMES.has(realRel)) {
                   neededKind = "allow_once";
                   matchedRule = "allow_fs_write_scope";
                 } else {
