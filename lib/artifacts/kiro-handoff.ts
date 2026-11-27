@@ -67,27 +67,44 @@ function sanitizeSha(raw: string): string {
   return "BASE_SHA";
 }
 
+const SHELL_SAFE_ARG = /^[A-Za-z0-9_./:=+-]+$/;
+const COMMAND_SENTINELS = new Set(["not recorded", "not run"]);
+
+/**
+ * Quote a single argv element for safe shell use. Empty strings become '' and
+ * already-safe tokens are left as-is; everything else is single-quoted with any
+ * embedded single quotes escaped in the standard '\'' form.
+ */
+function shellQuoteArg(arg: string): string {
+  if (arg === "") return "''";
+  if (SHELL_SAFE_ARG.test(arg)) return arg;
+  return `'${arg.replace(/'/g, "'\\''")}'`;
+}
+
 /**
  * Collapse a recorded command (a single line or an argv array) into one clean
- * line. Returns null for empty values and for the sentinel "not recorded" /
- * "not run" markers so callers never emit a placeholder as a real command.
+ * shell line. Returns null for empty values and for the sentinel "not recorded"
+ * / "not run" markers so callers never emit a placeholder as a real command.
+ *
+ * Argv arrays preserve every element verbatim (no trimming, no empty filtering)
+ * and shell-quote each element individually. String commands keep their internal
+ * spacing verbatim; only the surrounding whitespace is trimmed.
  */
 function normalizeCommand(cmd?: string | readonly string[]): string | null {
   if (cmd === undefined || cmd === null) return null;
-  let joined: string;
-  if (typeof cmd === "string") {
-    joined = cmd;
+
+  let result: string;
+  if (Array.isArray(cmd)) {
+    if (cmd.length === 0) return null;
+    result = cmd.map((part) => shellQuoteArg(String(part))).join(" ");
   } else {
-    joined = (cmd as readonly string[])
-      .map((part) => String(part).trim())
-      .filter((part) => part.length > 0)
-      .join(" ");
+    // Preserve internal spacing; only strip the surrounding whitespace/newlines.
+    result = String(cmd).replace(/\r?\n/g, " ").trim();
   }
-  const collapsed = joined.replace(/\s+/g, " ").trim();
-  if (collapsed.length === 0) return null;
-  const lower = collapsed.toLowerCase();
-  if (lower === "not recorded" || lower === "not run") return null;
-  return collapsed;
+
+  if (result.length === 0) return null;
+  if (COMMAND_SENTINELS.has(result.trim().toLowerCase())) return null;
+  return result;
 }
 
 /** A step is runnable only when it has a real command and was not skipped. */
@@ -169,37 +186,10 @@ export function deriveVerificationCommands(input: KiroHandoffInput): string[] {
       if (cmd) commands.push(cmd);
     }
 
-    const concrete = dedupeCommands(commands);
-    if (concrete.length > 0) return concrete;
-
-    // No runnable rows were recorded. When every present step was explicitly
-    // marked not run / no tests found, treat them as inapplicable and emit
-    // nothing. Otherwise fall back to minimal, language-appropriate defaults.
-    const present = [installRow, buildRow, testRow].filter(
-      (r): r is KiroHandoffCommandStep => r !== undefined
-    );
-    const allExplicitlyInapplicable =
-      present.length > 0 &&
-      present.every((r) => {
-        const s = (r.status ?? "").trim().toLowerCase();
-        return s === "not run" || s === "no tests found";
-      });
-    if (allExplicitlyInapplicable) return [];
-
-    const lang = (cert.primaryLanguage ?? "").trim().toLowerCase();
-    const pm = (cert.packageManager ?? "").trim().toLowerCase();
-
-    if (lang === "python") {
-      if (pm === "poetry") return ["poetry install", "pytest"];
-      return ["pip install -r requirements.txt", "pytest"];
-    }
-    if (lang === "node" || lang === "javascript" || lang === "typescript") {
-      const pmInstall =
-        pm === "yarn" ? "yarn install" : pm === "pnpm" ? "pnpm install" : "npm install";
-      const pmTest = pm === "yarn" ? "yarn test" : pm === "pnpm" ? "pnpm test" : "npm test";
-      return [pmInstall, pmTest];
-    }
-    return [];
+    // Commands come only from what was actually recorded; nothing is guessed
+    // from language/package-manager defaults. When nothing runnable was recorded
+    // (e.g. only language metadata), this yields an empty list.
+    return dedupeCommands(commands);
   }
 
   // Neither source supplied: never assume unrecorded commands.

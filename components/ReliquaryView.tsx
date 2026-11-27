@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import type { RunOutcome } from "@/lib/lifecycle/lifecycle-manager";
 import type { TaskState, EventEnvelope } from "@/lib/events/types";
@@ -142,18 +142,18 @@ function beforeAfterStepKey(key: string): "install" | "build" | "test" | null {
 }
 
 /**
- * Fill in a missing step status from the before/after table, but only for steps
- * that already carry a recorded command. Never fabricates a command that was not
- * recorded, so an inapplicable step stays omitted rather than guessed.
+ * Derive a view of the recorded certificate with before/after table statuses
+ * filled in for steps that carry a recorded command but no status yet. Pure:
+ * it never mutates the recorded certificate and never fabricates a command that
+ * was not recorded, so an inapplicable step stays omitted rather than guessed.
+ * Only an absent status (undefined or empty) is populated; an explicit recorded
+ * status is never overwritten.
  */
-function applyBeforeAfterStatusFallback(
+function applyBeforeAfterFallback(
   cert: KiroHandoffCertificate | null,
   rows: BeforeAfterRowData[] | undefined
 ): KiroHandoffCertificate | null {
   if (!cert || !rows || rows.length === 0) return cert;
-  const hasCommandRows =
-    Array.isArray(cert.rows) && cert.rows.some((r) => Boolean(r.command));
-  if (!hasCommandRows) return cert;
 
   const fallback: Partial<Record<"install" | "build" | "test", string>> = {};
   for (const row of rows) {
@@ -163,22 +163,53 @@ function applyBeforeAfterStatusFallback(
     if (typeof status === "string" && status.length > 0) fallback[step] = status;
   }
 
-  const patch = (
+  const hasExplicitStatus = (step: KiroHandoffCommandStep): boolean =>
+    typeof step.status === "string" && step.status.trim().length > 0;
+
+  const withFallback = (
     step: KiroHandoffCommandStep | undefined,
     key: "install" | "build" | "test"
   ): KiroHandoffCommandStep | undefined => {
-    if (!step || step.status) return step;
+    if (!step || hasExplicitStatus(step)) return step;
     const status = fallback[key];
     return status ? { ...step, status } : step;
   };
 
-  const install = patch(cert.install, "install");
-  const build = patch(cert.build, "build");
-  const test = patch(cert.test, "test");
-  if (install === cert.install && build === cert.build && test === cert.test) {
-    return cert;
+  let changed = false;
+
+  const install = withFallback(cert.install, "install");
+  const build = withFallback(cert.build, "build");
+  const test = withFallback(cert.test, "test");
+  if (install !== cert.install) changed = true;
+  if (build !== cert.build) changed = true;
+  if (test !== cert.test) changed = true;
+
+  // Retry has no dedicated before/after row; keep it as recorded.
+  const retry = cert.retry;
+
+  let certRows = cert.rows;
+  if (Array.isArray(cert.rows) && cert.rows.length > 0) {
+    let rowsChanged = false;
+    const nextRows = cert.rows.map((entry) => {
+      const key =
+        entry.step === "install" || entry.step === "build" || entry.step === "test"
+          ? entry.step
+          : entry.step === "tests_repo"
+            ? "test"
+            : null;
+      if (!key) return entry;
+      const patched = withFallback(entry, key);
+      if (patched !== entry) rowsChanged = true;
+      return patched;
+    });
+    if (rowsChanged) {
+      certRows = nextRows;
+      changed = true;
+    }
   }
-  return { ...cert, install, build, test };
+
+  if (!changed) return cert;
+  return { ...cert, install, retry, build, test, rows: certRows };
 }
 
 export function parseEventsData(events: EventEnvelope[]): {
@@ -499,6 +530,14 @@ export function ReliquaryView({
     mergeHandoffCertificates(initialParsed?.certificate, propCertificate) ?? null
   );
 
+  // Derived purely from the recorded certificate and the before/after table so
+  // late-arriving data or table updates recompute cleanly without stale values
+  // or effect loops. The recorded certificate itself is never mutated.
+  const effectiveHandoffCertificate = useMemo(
+    () => applyBeforeAfterFallback(handoffCertificate, beforeAfterRows),
+    [handoffCertificate, beforeAfterRows]
+  );
+
   // Sync prop changes
   useEffect(() => {
     if (initialOutcome !== undefined) setOutcome(initialOutcome);
@@ -561,11 +600,6 @@ export function ReliquaryView({
       setHandoffCertificate((prev) => mergeHandoffCertificates(prev, propCertificate));
     }
   }, [propCertificate]);
-
-  useEffect(() => {
-    if (!beforeAfterRows) return;
-    setHandoffCertificate((prev) => applyBeforeAfterStatusFallback(prev, beforeAfterRows));
-  }, [beforeAfterRows]);
 
   // If initial props are omitted, fetch BOTH /api/runs/[runId] (authoritative) AND /api/runs/[runId]/events?from=1 (supplement/fallback)
   useEffect(() => {
@@ -1122,7 +1156,7 @@ export function ReliquaryView({
           repo={repo}
           baseSha={baseSha !== "0000000" ? baseSha : "BASE_SHA"}
           runId={runId}
-          certificate={handoffCertificate}
+          certificate={effectiveHandoffCertificate}
         />
       ) : (
         <p

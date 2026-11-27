@@ -22,6 +22,7 @@ import {
 } from "@/lib/artifacts/kiro-handoff";
 import { OpenInKiroHandoff } from "@/components/OpenInKiroHandoff";
 import { ReliquaryView } from "@/components/ReliquaryView";
+import type { BeforeAfterRowData } from "@/components/ReliquaryBeforeAfterTable";
 
 const REPO_ROOT = process.cwd();
 
@@ -549,5 +550,117 @@ describe("Open in Kiro handoff: verification commands follow the recorded certif
     assert.ok(html.includes("pip install -r requirements.txt"));
     assert.ok(html.includes("pytest"));
     assert.ok(!html.includes("npm"));
+  });
+});
+
+describe("Open in Kiro handoff: argv quoting and whitespace preservation", () => {
+  it("shell-quotes argv elements with spaces and preserves empty argv elements", () => {
+    const withSpace = deriveVerificationCommands({
+      owner: "octocat",
+      repo: "legacy",
+      baseSha: "abc1234def",
+      runId: "run-argv-space",
+      certificate: {
+        test: { step: "test", command: ["pytest", "tests/a b.py"], status: "passed" },
+      },
+    });
+    assert.deepEqual(withSpace, ["pytest 'tests/a b.py'"]);
+
+    const withEmpty = deriveVerificationCommands({
+      owner: "octocat",
+      repo: "legacy",
+      baseSha: "abc1234def",
+      runId: "run-argv-empty",
+      certificate: {
+        test: { step: "test", command: ["pytest", ""], status: "passed" },
+      },
+    });
+    assert.deepEqual(withEmpty, ["pytest ''"]);
+  });
+
+  it("preserves internal whitespace verbatim in string commands", () => {
+    const commands = deriveVerificationCommands({
+      owner: "octocat",
+      repo: "legacy",
+      baseSha: "abc1234def",
+      runId: "run-ws",
+      certificate: {
+        test: { step: "test", command: 'python -c "print(\'a  b\')"', status: "passed" },
+      },
+    });
+    assert.deepEqual(commands, ['python -c "print(\'a  b\')"']);
+    assert.ok(commands[0].includes("a  b"), "double space inside the string must survive");
+  });
+});
+
+describe("Open in Kiro handoff: no fabricated language defaults", () => {
+  it("emits only kiro-cli and the spec run when only language metadata is recorded", () => {
+    const certificate: KiroHandoffCertificate = {
+      primaryLanguage: "python",
+      packageManager: "pip",
+    };
+
+    const commands = deriveVerificationCommands({
+      owner: "octocat",
+      repo: "legacy",
+      baseSha: "abc1234def",
+      runId: "run-lang-only",
+      certificate,
+    });
+    assert.deepEqual(commands, []);
+
+    const plan = buildKiroHandoff({
+      owner: "octocat",
+      repo: "legacy",
+      baseSha: "abc1234def",
+      runId: "run-lang-only",
+      certificate,
+    });
+    const resume = plan.steps.find(
+      (s) => s.title === "Resume development locally with the Kiro CLI"
+    );
+    assert.ok(resume, "resume step must exist");
+    assert.deepEqual(resume!.commands, ["kiro-cli", "/spec run resurrection"]);
+  });
+});
+
+describe("ReliquaryView Open in Kiro handoff: pure before/after derivation", () => {
+  const buildNotRunRows: BeforeAfterRowData[] = [
+    {
+      label: "Build",
+      key: "build",
+      before: { status: "not run" },
+      after: { status: "not run" },
+    },
+  ];
+
+  it("omits a top-level recorded build command when the table marks build not run", () => {
+    const html = renderToStaticMarkup(
+      React.createElement(ReliquaryView, {
+        runId: "run-build-top",
+        owner: "octocat",
+        repo: "legacy",
+        baseSha: "abc1234def",
+        certificate: { build: { command: "npm run build" } },
+        beforeAfterRows: buildNotRunRows,
+      })
+    );
+    assert.ok(html.includes('data-testid="open-in-kiro-handoff"'));
+    assert.ok(!html.includes("npm run build"));
+  });
+
+  it("omits a rows-recorded build command when the table marks build not run", () => {
+    const html = renderToStaticMarkup(
+      React.createElement(ReliquaryView, {
+        runId: "run-build-rows",
+        owner: "octocat",
+        repo: "legacy",
+        baseSha: "abc1234def",
+        certificate: { rows: [{ step: "build", command: "npm run build" }] },
+        beforeAfterRows: buildNotRunRows,
+      })
+    );
+    assert.ok(html.includes('data-testid="open-in-kiro-handoff"'));
+    assert.ok(!html.includes("npm run build"));
   });
 });
