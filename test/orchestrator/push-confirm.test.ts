@@ -331,6 +331,50 @@ describe("RunOrchestrator: explicit push confirmation (Requirement 29.5)", () =>
     assert.equal(harness.pushCalls.length, 1);
   });
 
+  it("skips the push when the latest push_confirm answer is 'Do not push' after an earlier 'Push'", async () => {
+    const repoCtx = createTestRepo("run-pc-ask-latest-deny");
+    tmpDirs.push(repoCtx.tmpDir);
+    const harness = await runWithPush(repoCtx, {}, undefined, (h) => {
+      h.eventStore.append({
+        runId: repoCtx.runId,
+        kind: "ask.answered",
+        actor: "user",
+        data: { askId: "ask-push-1", kind: "push_confirm", answer: "Push" },
+      });
+      h.eventStore.append({
+        runId: repoCtx.runId,
+        kind: "ask.answered",
+        actor: "user",
+        data: { askId: "ask-push-2", kind: "push_confirm", answer: "Do not push" },
+      });
+    });
+    assert.equal(harness.pushCalls.length, 0);
+    const results = harness.eventStore.getEvents(repoCtx.runId, { kind: "push.result" });
+    assert.equal(results.length, 1);
+    assert.equal(results[0].data.ok, false);
+    assert.equal(results[0].data.skipped, true);
+  });
+
+  it("pushes when the latest push_confirm answer is 'Push' after an earlier 'Do not push'", async () => {
+    const repoCtx = createTestRepo("run-pc-ask-latest-push");
+    tmpDirs.push(repoCtx.tmpDir);
+    const harness = await runWithPush(repoCtx, {}, undefined, (h) => {
+      h.eventStore.append({
+        runId: repoCtx.runId,
+        kind: "ask.answered",
+        actor: "user",
+        data: { askId: "ask-push-1", kind: "push_confirm", answer: "Do not push" },
+      });
+      h.eventStore.append({
+        runId: repoCtx.runId,
+        kind: "ask.answered",
+        actor: "user",
+        data: { askId: "ask-push-2", kind: "push_confirm", answer: "Push" },
+      });
+    });
+    assert.equal(harness.pushCalls.length, 1);
+  });
+
   it("pushes when requestPushConfirmation resolves true and receives the push info", async () => {
     const repoCtx = createTestRepo("run-pc-cb");
     tmpDirs.push(repoCtx.tmpDir);

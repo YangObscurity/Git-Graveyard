@@ -297,6 +297,46 @@ function commitWorktree(worktreeDir: string, taskId: string, home: string): stri
   return runGit(["rev-parse", "HEAD"], worktreeDir, home);
 }
 
+/**
+ * Commits a large, unrelated file directly onto the run's integration branch
+ * (as a concurrent task's merge would), WITHOUT it ever being part of any
+ * candidate's diff. Used to prove `workerLoop` measures a candidate against its
+ * OWN worktree base so the bloat never overflows the capture buffer.
+ */
+function commitBigFileToIntegration(
+  fixture: RepoFixture,
+  fileName: string,
+  bytes: number
+): string {
+  const home = fixture.tmpDir;
+  const integrationRef = `graveyard/${fixture.runId}`;
+  const head = runGit(["rev-parse", integrationRef], fixture.gitDir, home);
+  const wt = path.join(fixture.tmpDir, `external-${fileName}-wt`);
+  fs.rmSync(wt, { recursive: true, force: true });
+  runGit(["worktree", "add", "--detach", wt, head], fixture.gitDir, home);
+  const line = "0123456789abcdef\n";
+  const count = Math.ceil(bytes / line.length);
+  fs.writeFileSync(path.join(wt, fileName), line.repeat(count), "utf8");
+  runGit(["add", "-A"], wt, home);
+  runGit(
+    [
+      "-c",
+      "user.name=External Merger",
+      "-c",
+      "user.email=external@example.test",
+      "commit",
+      "-m",
+      `external big merge ${fileName}`,
+    ],
+    wt,
+    home
+  );
+  const sha = runGit(["rev-parse", "HEAD"], wt, home);
+  runGit(["update-ref", `refs/heads/${integrationRef}`, sha], fixture.gitDir, home);
+  runGit(["worktree", "remove", "--force", wt], fixture.gitDir, home);
+  return sha;
+}
+
 function makeControlledRunner(home: string): ControlledRunner {
   const gates = new Map<string, () => void>();
   const contexts = new Map<string, ParallelSlotContext>();
@@ -1530,11 +1570,7 @@ describe("ParallelScheduler verifies warden candidateSha256 (Task 20.4)", () => 
   it("rejects an approval whose candidateSha256 does not match the candidate", async () => {
     const fixture = createRepoFixture("shamismatch");
     try {
-      const runner: ParallelSchedulerRunner = async () => ({
-        ok: true,
-        candidateSha: "0".repeat(40),
-        candidateSha256: "abcdef0123456789",
-      });
+      const controller = makeControlledRunner(fixture.tmpDir);
       const scheduler = new ParallelScheduler({
         runId: fixture.runId,
         runsDir: fixture.runDir,
@@ -1544,15 +1580,15 @@ describe("ParallelScheduler verifies warden candidateSha256 (Task 20.4)", () => 
         approvedTaskIds: ["A"],
         parallelCap: 1,
         maxAttempts: 1,
-        runner,
+        runner: controller.runner,
         wardenReview: async () => ({
           approved: true,
           reason: "looks good",
-          candidateSha256: "ffffffffffffffff",
+          candidateSha256: "f".repeat(64),
         }),
       });
 
-      const summary = await scheduler.run();
+      const summary = await drainRun(scheduler.run(), controller);
       assert.equal(summary.approved, 0);
       const records = scheduler.getReviewRecords();
       assert.equal(records.length, 1);
@@ -1901,12 +1937,20 @@ describe("ParallelScheduler verified merge & unblocking (Task 20.4)", () => {
         { parallelCap: 1, maxAttempts: 1 }
       );
 
-      // Park the worker inside resolveHeadSha() until we abort.
+      // Park the worker inside the candidate-head resolveHeadSha() call until we
+      // abort. The FIRST resolveHeadSha call captures the worktree base (the
+      // pre-rebase diff anchor) and resolves immediately.
+      let headCalls = 0;
       let releaseHead: ((sha: string) => void) | undefined;
-      (scheduler as any).resolveHeadSha = () =>
-        new Promise<string>((resolve) => {
+      (scheduler as any).resolveHeadSha = () => {
+        headCalls += 1;
+        if (headCalls === 1) {
+          return Promise.resolve("0".repeat(40));
+        }
+        return new Promise<string>((resolve) => {
           releaseHead = resolve;
         });
+      };
 
       const runPromise = scheduler.run();
       await waitFor(() => releaseHead !== undefined);
@@ -2211,4 +2255,375 @@ describe("ParallelScheduler merge reason propagation, large diffs & nested misma
   });
 });
 
+
+describe("ParallelScheduler merge lock, drift & rebase hardening (Task 20.4)", () => {
+  it("serializes concurrent merges so a drifting task never wipes a sibling's merge", async () => {
+    const fixture = createRepoFixture("drift");
+    try {
+      const tasks = [
+        makePactTask("A", { filesInScope: ["src/a.ts"], line: 1 }),
+        makePactTask("B", { filesInScope: ["src/b.ts"], line: 2 }),
+      ];
+      const controller = makeControlledRunner(fixture.tmpDir);
+      const harness = makeMergeHarness(fixture);
+      const integrationRef = `graveyard/${fixture.runId}`;
+
+      // Force A to merge before B's verified merge runs, while guaranteeing B's
+      // rebase check already happened: A only approves once B has reached the
+      // Warden, and B only approves once A has merged. With the reviews running
+      // concurrently (maxConcurrentWarden: 2) this is exactly the interleaving
+      // that used to let B's rollback clobber A's freshly merged ref.
+      let bReachedWarden!: () => void;
+      const bAtWarden = new Promise<void>((resolve) => {
+        bReachedWarden = resolve;
+      });
+      let aMerged!: () => void;
+      const aMergedPromise = new Promise<void>((resolve) => {
+        aMerged = resolve;
+      });
+
+      const mergeCandidate: NonNullable<
+        ParallelSchedulerOptions["mergeCandidate"]
+      > = async (candidate, decision) => {
+        const result = await harness.mergeCandidate(candidate, decision);
+        if (candidate.taskId === "A") {
+          aMerged();
+        }
+        return result;
+      };
+
+      const wardenReview: ParallelSchedulerWardenReview = async (candidate) => {
+        if (candidate.taskId === "A") {
+          await bAtWarden;
+        } else {
+          bReachedWarden();
+          await aMergedPromise;
+        }
+        harness.reviewedShas.set(candidate.taskId, candidate.candidateSha);
+        return { approved: true, candidateSha256: candidate.candidateSha256 };
+      };
+
+      const scheduler = makeScheduler(fixture, tasks, controller.runner, {
+        parallelCap: 2,
+        maxConcurrentWarden: 2,
+        maxAttempts: 1,
+        wardenReview,
+        mergeCandidate,
+      });
+
+      const summary = await drainRun(scheduler.run(), controller);
+
+      // A merged cleanly; B drifted against A's freshly merged head and was
+      // refused fail-closed without being merged.
+      assert.equal(summary.taskStates.A, "merged");
+      assert.equal(summary.merged, 1);
+      const records = scheduler.getReviewRecords();
+      const bRecord = records.find((record) => record.taskId === "B");
+      assert.ok(bRecord, "B must have produced a review record");
+      assert.equal(bRecord!.approved, false);
+      assert.equal(bRecord!.reason, "integration_head_changed");
+
+      // A's commit and its files are fully intact: the integration ref still
+      // descends from A's candidate commit and A's file was never wiped out by a
+      // rollback.
+      const head = runGit(
+        ["rev-parse", integrationRef],
+        fixture.gitDir,
+        fixture.tmpDir
+      );
+      assert.doesNotThrow(() =>
+        runGit(
+          [
+            "merge-base",
+            "--is-ancestor",
+            controller.committed.get("A")!,
+            head,
+          ],
+          fixture.gitDir,
+          fixture.tmpDir
+        )
+      );
+      assert.equal(
+        runGit(
+          ["show", `${integrationRef}:A.txt`],
+          fixture.gitDir,
+          fixture.tmpDir
+        ).trim(),
+        "A candidate"
+      );
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+
+  it("rejects the second of two concurrent same-file edits with rebase_conflict", async () => {
+    const fixture = createRepoFixture("samefile");
+    try {
+      const tasks = [
+        makePactTask("A", { filesInScope: ["src/a.ts"], line: 1 }),
+        makePactTask("B", { filesInScope: ["src/b.ts"], line: 2 }),
+      ];
+      const harness = makeMergeHarness(fixture);
+      const home = fixture.tmpDir;
+      const integrationRef = `graveyard/${fixture.runId}`;
+      const worktrees = new Map<string, string>();
+      let aQueuedResolve: (() => void) | undefined;
+      const aQueued = new Promise<void>((resolve) => {
+        aQueuedResolve = resolve;
+      });
+
+      const runner: ParallelSchedulerRunner = async (context) => {
+        worktrees.set(context.taskId, context.worktreeDir);
+        // Hold B until A's candidate is queued so A is reviewed (and merged)
+        // first; B is then rebased onto A and conflicts on the shared file.
+        if (context.taskId === "B") {
+          await aQueued;
+        }
+        const srcDir = path.join(context.worktreeDir, "src");
+        fs.mkdirSync(srcDir, { recursive: true });
+        fs.writeFileSync(
+          path.join(srcDir, "shared.ts"),
+          context.taskId === "A"
+            ? "export const who = 'A';\n"
+            : "export const who = 'B';\n",
+          "utf8"
+        );
+        runGit(["add", "-A"], context.worktreeDir, home);
+        runGit(
+          [
+            "-c",
+            "user.name=Test Runner",
+            "-c",
+            "user.email=runner@example.test",
+            "commit",
+            "-m",
+            `work ${context.taskId}`,
+          ],
+          context.worktreeDir,
+          home
+        );
+        const sha = runGit(["rev-parse", "HEAD"], context.worktreeDir, home);
+        return { ok: true, candidateSha: sha };
+      };
+
+      const scheduler = makeScheduler(fixture, tasks, runner, {
+        parallelCap: 2,
+        maxAttempts: 1,
+        wardenReview: harness.wardenReview,
+        mergeCandidate: harness.mergeCandidate,
+        onCandidate: (candidate) => {
+          if (candidate.taskId === "A") {
+            aQueuedResolve?.();
+          }
+        },
+      });
+
+      const summary = await scheduler.run();
+
+      assert.equal(summary.taskStates.A, "merged");
+      assert.equal(summary.merged, 1);
+      const records = scheduler.getReviewRecords();
+      const bRecord = records.find((record) => record.taskId === "B");
+      assert.ok(bRecord, "B must have produced a review record");
+      assert.equal(bRecord!.approved, false);
+      assert.equal(bRecord!.reason, "rebase_conflict");
+      assert.equal(summary.taskStates.B, "failed");
+      // The conflicted worktree was torn down deterministically.
+      assert.equal(fs.existsSync(worktrees.get("B")!), false);
+      // A's shared-file edit is the one that survived on the integration branch.
+      assert.match(
+        runGit(
+          ["show", `${integrationRef}:src/shared.ts`],
+          fixture.gitDir,
+          home
+        ),
+        /'A'/
+      );
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+
+  it("rejects an empty rebased diff fail-closed instead of reusing a stale hash", async () => {
+    const fixture = createRepoFixture("emptydiff");
+    try {
+      const tasks = [
+        makePactTask("A", { filesInScope: ["src/a.ts"], line: 1 }),
+        makePactTask("B", { filesInScope: ["src/b.ts"], line: 2 }),
+      ];
+      const harness = makeMergeHarness(fixture);
+      const home = fixture.tmpDir;
+      const worktrees = new Map<string, string>();
+      let aQueuedResolve: (() => void) | undefined;
+      const aQueued = new Promise<void>((resolve) => {
+        aQueuedResolve = resolve;
+      });
+
+      const runner: ParallelSchedulerRunner = async (context) => {
+        worktrees.set(context.taskId, context.worktreeDir);
+        if (context.taskId === "B") {
+          await aQueued;
+        }
+        const srcDir = path.join(context.worktreeDir, "src");
+        fs.mkdirSync(srcDir, { recursive: true });
+        // A and B make the EXACT same edit.
+        fs.writeFileSync(
+          path.join(srcDir, "shared.ts"),
+          "export const who = 'same';\n",
+          "utf8"
+        );
+        runGit(["add", "-A"], context.worktreeDir, home);
+        runGit(
+          [
+            "-c",
+            "user.name=Test Runner",
+            "-c",
+            "user.email=runner@example.test",
+            "commit",
+            "-m",
+            `work ${context.taskId}`,
+          ],
+          context.worktreeDir,
+          home
+        );
+        const sha = runGit(["rev-parse", "HEAD"], context.worktreeDir, home);
+        return { ok: true, candidateSha: sha };
+      };
+
+      const scheduler = makeScheduler(fixture, tasks, runner, {
+        parallelCap: 2,
+        maxAttempts: 1,
+        wardenReview: harness.wardenReview,
+        mergeCandidate: harness.mergeCandidate,
+        onCandidate: (candidate) => {
+          if (candidate.taskId === "A") {
+            aQueuedResolve?.();
+          }
+        },
+      });
+
+      const summary = await scheduler.run();
+
+      assert.equal(summary.merged, 1);
+      const records = scheduler.getReviewRecords();
+      const bRecord = records.find((record) => record.taskId === "B");
+      assert.ok(bRecord, "B must have produced a review record");
+      assert.equal(bRecord!.approved, false);
+      assert.equal(bRecord!.reason, "empty_rebased_diff");
+      assert.equal(summary.taskStates.B, "failed");
+      // The empty-diff worktree was torn down deterministically.
+      assert.equal(fs.existsSync(worktrees.get("B")!), false);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+
+  it("measures a worker candidate against its worktree base, not a bloated integration head", async () => {
+    const fixture = createRepoFixture("basesha");
+    try {
+      const home = fixture.tmpDir;
+      const integrationRef = `graveyard/${fixture.runId}`;
+      const runner: ParallelSchedulerRunner = async (context) => {
+        // A tiny candidate on top of the worktree base.
+        fs.writeFileSync(
+          path.join(context.worktreeDir, "tiny.txt"),
+          "tiny\n",
+          "utf8"
+        );
+        runGit(["add", "-A"], context.worktreeDir, home);
+        runGit(
+          [
+            "-c",
+            "user.name=Test Runner",
+            "-c",
+            "user.email=runner@example.test",
+            "commit",
+            "-m",
+            "tiny",
+          ],
+          context.worktreeDir,
+          home
+        );
+        const sha = runGit(["rev-parse", "HEAD"], context.worktreeDir, home);
+        // A large UNRELATED merge lands on the integration branch AFTER this
+        // worktree was cut from its base. A pre-rebase diff against the live
+        // integration head would now be a >20 MiB deletion and overflow the
+        // capture buffer; against the captured base it stays tiny.
+        commitBigFileToIntegration(fixture, "big.txt", 24 * 1024 * 1024);
+        return { ok: true, candidateSha: sha };
+      };
+
+      const harness = makeMergeHarness(fixture);
+      const scheduler = makeScheduler(
+        fixture,
+        [makePactTask("A", { filesInScope: ["src/a.ts"], line: 1 })],
+        runner,
+        {
+          parallelCap: 1,
+          maxAttempts: 1,
+          wardenReview: harness.wardenReview,
+          mergeCandidate: harness.mergeCandidate,
+        }
+      );
+
+      // Record every diff base the scheduler uses.
+      const diffBases: Array<string | undefined> = [];
+      const original = (scheduler as any).readCandidateDiff.bind(scheduler);
+      (scheduler as any).readCandidateDiff = (
+        dir: string,
+        sha: string,
+        base?: string
+      ) => {
+        diffBases.push(base);
+        return original(dir, sha, base);
+      };
+
+      const summary = await scheduler.run();
+
+      assert.equal(summary.merged, 1);
+      assert.equal(summary.taskStates.A, "merged");
+      // The tiny candidate never overflowed the capture buffer.
+      assert.equal(
+        scheduler
+          .getReviewRecords()
+          .some((record) => record.reason === "candidate_diff_too_large"),
+        false
+      );
+      // The pre-rebase diff was anchored at the captured worktree base — never at
+      // the bloated integration head.
+      assert.ok(
+        diffBases.includes(fixture.baseSha),
+        "worker diff must be measured against the worktree base"
+      );
+      assert.ok(
+        diffBases
+          .filter((base): base is string => base !== undefined)
+          .every((base) => base === fixture.baseSha),
+        "non-post-rebase diffs must always use the captured base"
+      );
+      // The bloated integration head and the tiny candidate both survived.
+      const bigSize = Number(
+        runGit(
+          ["cat-file", "-s", `${integrationRef}:big.txt`],
+          fixture.gitDir,
+          home
+        )
+      );
+      assert.ok(bigSize > 20 * 1024 * 1024, `big.txt size was ${bigSize}`);
+      assert.equal(
+        runGit(
+          ["show", `${integrationRef}:tiny.txt`],
+          fixture.gitDir,
+          home
+        ).trim(),
+        "tiny"
+      );
+    } finally {
+      fixture.cleanup();
+    }
+  });
+});
 
