@@ -40,6 +40,7 @@ import {
   defaultCollaborationStore,
   type CollaborationToolsOptions,
 } from "./collaboration-tools";
+import type { BudgetGovernor } from "../governor/budget-governor";
 
 export { ConfigurationError };
 
@@ -121,7 +122,23 @@ export interface McpGatewayOptions {
   backend?: ExecutionBackend;
   runbox?: Sandbox;
   auditbox?: Sandbox;
+  /** Fallback per-run budget governor consulted for every `sandbox_exec` when no run/skeleton governor is registered. */
+  budgetGovernor?: BudgetGovernor;
 }
+
+/**
+ * Skeleton registration extended with the optional per-skeleton budget governor. The base
+ * `RegisterSkeletonOptions` shape is unchanged, so an existing caller keeps working; the extra field
+ * is carried onto the registered entry and consulted ahead of the per-run governor.
+ */
+export type GatewayRegisterSkeletonOptions = RegisterSkeletonOptions & {
+  budgetGovernor?: BudgetGovernor;
+};
+
+/** Registered Skeleton extended with the optional per-skeleton budget governor. */
+export type GatewayRegisteredSkeleton = RegisteredSkeleton & {
+  budgetGovernor?: BudgetGovernor;
+};
 
 /**
  * R5-B4 (audit "fatal result", PARTIAL): decides whether a tool result is
@@ -162,9 +179,13 @@ export class McpGateway extends EventEmitter {
   readonly defaultTimeoutMs: number;
   readonly approvalWaitMs: number;
 
-  private readonly tokensToSkeleton: Map<string, RegisteredSkeleton> = new Map();
-  private readonly idsToSkeleton: Map<string, RegisteredSkeleton> = new Map();
+  private readonly tokensToSkeleton: Map<string, GatewayRegisteredSkeleton> = new Map();
+  private readonly idsToSkeleton: Map<string, GatewayRegisteredSkeleton> = new Map();
   private readonly connectedSkeletons: Set<string> = new Set();
+  /** Per-run budget governors registered by the orchestrator, keyed by runId. */
+  private readonly runGovernors: Map<string, BudgetGovernor> = new Map();
+  /** Runs asked to stop gracefully: a new `sandbox_exec` for such a run is refused. */
+  private readonly gracefulStopRuns: Set<string> = new Set();
 
   constructor(options?: McpGatewayOptions) {
     super();
@@ -228,7 +249,7 @@ export class McpGateway extends EventEmitter {
    * Requirement 19.2: Identify calling Skeleton by its bearer token.
    * Audit N-B10: reject duplicate registrations and empty identifiers.
    */
-  registerSkeleton(opts: RegisterSkeletonOptions): RegisteredSkeleton {
+  registerSkeleton(opts: GatewayRegisterSkeletonOptions): GatewayRegisteredSkeleton {
     const norm = normalizeRole(opts.role);
     if (!norm) {
       throw new Error(`Cannot register Skeleton: unknown role '${opts.role}'`);
@@ -272,7 +293,7 @@ export class McpGateway extends EventEmitter {
       throw new Error(`Cannot register Skeleton: duplicate bearerToken '${bearerToken}'`);
     }
 
-    const reg: RegisteredSkeleton = {
+    const reg: GatewayRegisteredSkeleton = {
       skeletonId: trimmedId,
       bearerToken,
       role: norm,
@@ -283,6 +304,7 @@ export class McpGateway extends EventEmitter {
       backend: opts.backend,
       runbox: opts.runbox,
       auditbox: opts.auditbox,
+      budgetGovernor: opts.budgetGovernor,
     };
 
     this.tokensToSkeleton.set(bearerToken, reg);
@@ -295,7 +317,7 @@ export class McpGateway extends EventEmitter {
   /**
    * Looks up a registered Skeleton by bearer token.
    */
-  getSkeletonByToken(token: string): RegisteredSkeleton | undefined {
+  getSkeletonByToken(token: string): GatewayRegisteredSkeleton | undefined {
     if (!token || typeof token !== "string") {
       return undefined;
     }
@@ -306,8 +328,50 @@ export class McpGateway extends EventEmitter {
   /**
    * Looks up a registered Skeleton by ID.
    */
-  getSkeletonById(skeletonId: string): RegisteredSkeleton | undefined {
+  getSkeletonById(skeletonId: string): GatewayRegisteredSkeleton | undefined {
     return this.idsToSkeleton.get(skeletonId);
+  }
+
+  // -------------------------------------------------------------------------------------------
+  // Per-run budget governor registry
+  // -------------------------------------------------------------------------------------------
+
+  /** Registers (or replaces) the budget governor consulted for every `sandbox_exec` of a run. */
+  registerRunBudgetGovernor(runId: string, governor: BudgetGovernor): void {
+    if (typeof runId !== "string" || runId.length === 0) {
+      return;
+    }
+    this.runGovernors.set(runId, governor);
+  }
+
+  /** Drops a run's budget governor once the run finishes. */
+  unregisterRunBudgetGovernor(runId: string): void {
+    this.runGovernors.delete(runId);
+  }
+
+  /** Resolves the budget governor registered for a run, if any. */
+  getRunBudgetGovernor(runId: string): BudgetGovernor | undefined {
+    return this.runGovernors.get(runId);
+  }
+
+  // -------------------------------------------------------------------------------------------
+  // Boundary-aware graceful stop
+  // -------------------------------------------------------------------------------------------
+
+  /**
+   * Marks a run as stopping gracefully. A subsequent `sandbox_exec` for the run is refused at this
+   * tool boundary WITHOUT executing a new sandbox command, so the in-flight worker turn ends cleanly.
+   */
+  markRunGracefulStop(runId: string): void {
+    if (typeof runId !== "string" || runId.length === 0) {
+      return;
+    }
+    this.gracefulStopRuns.add(runId);
+  }
+
+  /** Clears the graceful-stop marker for a run once it finishes. */
+  clearRunGracefulStop(runId: string): void {
+    this.gracefulStopRuns.delete(runId);
   }
 
   /**
@@ -425,8 +489,39 @@ export class McpGateway extends EventEmitter {
 
     // 3. Dispatch to specific tool handler
     switch (toolName) {
-      case "sandbox_exec":
+      case "sandbox_exec": {
+        // Boundary-aware graceful stop: never start a new sandbox command for a run that is
+        // stopping gracefully, so the in-flight worker turn ends at this tool boundary.
+        if (skeleton.runId && this.gracefulStopRuns.has(skeleton.runId)) {
+          return {
+            status: "refused",
+            code: "GRACEFUL_STOP",
+            error: "Refused: run is stopping gracefully at the next tool boundary",
+          };
+        }
+
+        // Per-run budget enforcement: refuse a sandbox command once any capped dimension is crossed,
+        // without executing it. The governor latches the crossing, so the run cannot silently resume.
+        const governor =
+          skeleton.budgetGovernor ??
+          (skeleton.runId ? this.runGovernors.get(skeleton.runId) : undefined) ??
+          this.options.budgetGovernor;
+        if (governor) {
+          const gate = governor.canDispatchSandboxExec();
+          if (!gate.allowed) {
+            return {
+              status: "refused",
+              code: "BUDGET_EXCEEDED",
+              error: `Refused: budget exceeded (${gate.dimensions.join(", ")})`,
+              dimensions: gate.dimensions,
+            };
+          }
+          governor.recordToolCall(skeleton.skeletonId);
+          governor.evaluate();
+        }
+
         return handleSandboxExec(args as SandboxExecParams, context, execOpts);
+      }
       case "sandbox_log":
         return handleSandboxLog(args as SandboxLogParams, context, execOpts);
       case "report_task_result":
@@ -468,7 +563,9 @@ export function getDefaultGateway(): McpGateway {
 /**
  * Registers a Skeleton on the default gateway instance.
  */
-export function registerSkeleton(opts: RegisterSkeletonOptions): RegisteredSkeleton {
+export function registerSkeleton(
+  opts: GatewayRegisterSkeletonOptions
+): GatewayRegisteredSkeleton {
   return getDefaultGateway().registerSkeleton(opts);
 }
 

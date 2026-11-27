@@ -65,6 +65,13 @@ export interface KillSwitchRuntimeControls {
   resumeAdmission?: () => void;
   pauseHost?: () => void;
   stopRun?: (runId: string, reason?: string) => void | Promise<void>;
+  /**
+   * Boundary-aware stop: ends a run at its next tool boundary without aborting the in-flight
+   * worker turn or deleting its worktree. Preferred over {@link stopRun} for `stop_gracefully`;
+   * `stopRun` (which aborts and cleans up worktrees) is only the fallback for a process that does
+   * not expose the graceful control.
+   */
+  stopRunGracefully?: (runId: string, reason?: string) => void | Promise<void>;
   killRun?: (runId: string, reason?: string) => void | Promise<void>;
   cancelQueuedRun?: (runId: string) => boolean;
   /**
@@ -388,7 +395,14 @@ export class KillSwitchService {
       for (const runId of affectedRunIds) {
         pending.push({
           runId,
-          promise: this.runRuntimeControl(controls.stopRun, runId, reason),
+          // A boundary-aware graceful stop keeps the worker's worktree and lets the in-flight
+          // turn settle at its next tool boundary. Only fall back to the aborting `stopRun` when
+          // the process exposes no graceful control.
+          promise: this.runRuntimeControl(
+            controls.stopRunGracefully ?? controls.stopRun,
+            runId,
+            reason
+          ),
           finalizeKilled: false,
         });
       }

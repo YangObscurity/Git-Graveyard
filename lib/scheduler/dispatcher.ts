@@ -43,6 +43,7 @@ import type {
   ScheduledTask,
   SchedulerSummary,
 } from "./types";
+import type { BudgetGovernor } from "../governor/budget-governor";
 
 /**
  * Result of a single worker execution session.
@@ -206,6 +207,12 @@ export interface TaskDispatcherOptions {
    * `ask.auto_denied` event through its event sink.
    */
   onAskAutoDeny?: SkeletonSupervisorOptions["onAskAutoDeny"];
+  /**
+   * Per-run budget governor. When supplied, the Dispatcher refuses to start a new prompt (worker or
+   * Warden) once any capped dimension is crossed, and meters prompt/turn usage so the governor can
+   * latch the exceeding dimension and stop the run with `budget_stopped`.
+   */
+  budgetGovernor?: BudgetGovernor;
 }
 
 /**
@@ -228,6 +235,15 @@ export class TaskDispatcher {
   private isPausedState = false;
   private stopReason?: string;
   private fatalError?: Error;
+
+  /**
+   * True while the run is stopping gracefully at its next tool boundary. New tasks are not
+   * dispatched, a live turn is never aborted, and each worker's worktree (uncommitted edits
+   * included) is kept on disk rather than merged or cleaned up.
+   */
+  private isGracefulStopState = false;
+
+  private readonly budgetGovernor?: BudgetGovernor;
 
   private stepCount = 0;
   private tasksProcessed = 0;
@@ -308,6 +324,7 @@ export class TaskDispatcher {
       options.eventStore ??
       (options.host as any)?.eventStore ??
       getDefaultEventStore();
+    this.budgetGovernor = options.budgetGovernor;
   }
 
   public isPaused(): boolean {
@@ -328,6 +345,14 @@ export class TaskDispatcher {
 
   public get isStopped(): boolean {
     return this.isStoppedState;
+  }
+
+  /**
+   * True once a graceful stop has been requested. Exposed so the orchestrator can treat it as a stop
+   * condition and finalize the run without ever having aborted a worker turn.
+   */
+  public get gracefulStopped(): boolean {
+    return this.isGracefulStopState;
   }
 
   public getLiveCount(): number {
@@ -518,9 +543,18 @@ export class TaskDispatcher {
    * re-raise. Only a task that stays re-raisable keeps its worktree on disk: a
    * `keep_commits` lay-to-rest still abandons the task (its commits stay on the
    * branch), a `discard` lay-to-rest and a stop clean the worktree up as before.
+   * A graceful stop always preserves the worktree (unless the Skeleton was
+   * explicitly laid to rest with `discard`), so the worker's uncommitted edits
+   * survive.
    */
   private shouldPreserveWorktreeOnAbort(active: ActiveTaskTracking): boolean {
-    if (this.isStoppedState || active.layToRestChoice === "discard") {
+    if (active.layToRestChoice === "discard") {
+      return false;
+    }
+    if (this.isGracefulStopState) {
+      return true;
+    }
+    if (this.isStoppedState) {
       return false;
     }
     const live = this.scheduler.getTask(active.taskId);
@@ -532,6 +566,45 @@ export class TaskDispatcher {
       live.state === "ready" ||
       live.state === "rejected"
     );
+  }
+
+  /**
+   * Refuses a new prompt once the per-run budget governor reports any capped dimension crossed,
+   * latching the exceedance on the Scheduler so `run()` stops and the run can finalize with
+   * `budget_stopped`. A Dispatcher without a governor always allows dispatch.
+   */
+  private enforcePromptBudget(skeletonId: string): boolean {
+    if (!this.budgetGovernor) {
+      return true;
+    }
+    const gate = this.budgetGovernor.canDispatchPrompt(skeletonId);
+    if (!gate.allowed) {
+      this.scheduler.setBudgetExceeded(
+        true,
+        `Budget exceeded: ${gate.dimensions.join(", ")}`
+      );
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Ends the prompt metering for a Skeleton and evaluates the governor, latching `budgetExceeded` on
+   * the Scheduler when any dimension is now crossed. Called from a `finally` so a prompt that threw
+   * still releases its metering.
+   */
+  private finishPromptBudgetMetering(skeletonId: string): void {
+    if (!this.budgetGovernor) {
+      return;
+    }
+    this.budgetGovernor.recordPromptEnd(skeletonId);
+    const snap = this.budgetGovernor.evaluate();
+    if (snap.exceededAny) {
+      this.scheduler.setBudgetExceeded(
+        true,
+        `Budget exceeded: ${snap.exceeded.join(", ")}`
+      );
+    }
   }
 
   /**
@@ -882,9 +955,61 @@ export class TaskDispatcher {
     this.activeTasks.clear();
   }
 
+  /**
+   * Requests a boundary-aware graceful stop. Unlike {@link stop} it:
+   * - never aborts a live worker turn (`active.abortController.abort()` is not called);
+   * - never deletes an active or preserved worktree;
+   * - tells the gateway to refuse a NEW `sandbox_exec` for this run, so the in-flight turn settles
+   *   cleanly at its next tool boundary.
+   *
+   * It marks every active task to keep its worktree (recording it in `preservedWorktrees`), sends a
+   * best-effort wrap-up steer to each Skeleton that supports steering, then awaits every in-flight
+   * pipeline so workers settle before this resolves.
+   */
+  public async stopGracefully(reason = "Graceful stop requested"): Promise<void> {
+    if (this.isGracefulStopState || this.isStoppedState) {
+      return;
+    }
+    this.isGracefulStopState = true;
+    this.stopReason = reason;
+    // Prevents `step()` / `run()` from handing out any new task.
+    this.scheduler.requestStop(reason);
+
+    // Refuse any NEW sandbox command for this run so the in-flight turn ends at its next boundary.
+    try {
+      (this.host?.gateway as any)?.markRunGracefulStop?.(this.runId);
+    } catch {
+      // A gateway that cannot observe the marker must not abort the graceful stop.
+    }
+
+    for (const active of this.activeTasks.values()) {
+      // Keep the worker's worktree (with its uncommitted edits) on disk.
+      active.preserveWorktree = true;
+      this.preservedWorktrees.set(active.taskId, {
+        worktreeDir: active.worktreeDir,
+        branch: active.branch,
+      } as TaskWorktreeResult);
+      if (active.supervisor && typeof active.supervisor.steer === "function") {
+        try {
+          await active.supervisor.steer(
+            "Wrap up now: the run is stopping gracefully at the next tool boundary. Finish the current tool call, save your work, and stop."
+          );
+        } catch {
+          // A steer failure must not abort the graceful stop.
+        }
+      }
+    }
+
+    // Let every in-flight worker settle at its boundary before returning.
+    await Promise.allSettled([...this.pipelinePromises.values()]);
+  }
+
   public async step(): Promise<DispatchLoopResult> {
     if (this.isStoppedState) {
       return this.buildResult("stopped");
+    }
+    if (this.isGracefulStopState) {
+      return this.buildResult("stopped", this.stopReason);
     }
     if (this.isPausedState) {
       return this.buildResult("idle");
@@ -896,6 +1021,10 @@ export class TaskDispatcher {
       return this.buildResult("stopped", this.scheduler.stopReason);
     }
     if (this.scheduler.isBudgetExceeded) {
+      return this.buildResult("stopped", this.scheduler.budgetReason);
+    }
+    // Refuse to hand out a new task once the run's budget is exhausted.
+    if (!this.enforcePromptBudget("dispatcher")) {
       return this.buildResult("stopped", this.scheduler.budgetReason);
     }
 
@@ -952,6 +1081,9 @@ export class TaskDispatcher {
         await this.delay(this.pollIntervalMs);
         continue;
       }
+      if (this.isGracefulStopState) {
+        return this.buildResult("stopped", this.stopReason);
+      }
       if (this.scheduler.isAllTerminal()) {
         return this.buildResult("completed");
       }
@@ -959,6 +1091,10 @@ export class TaskDispatcher {
         return this.buildResult("stopped", this.scheduler.stopReason);
       }
       if (this.scheduler.isBudgetExceeded) {
+        return this.buildResult("stopped", this.scheduler.budgetReason);
+      }
+      // Refuse to hand out a new task once the run's budget is exhausted.
+      if (!this.enforcePromptBudget("dispatcher")) {
         return this.buildResult("stopped", this.scheduler.budgetReason);
       }
       if (this.maxSteps && this.stepCount >= this.maxSteps) {
@@ -1088,23 +1224,42 @@ export class TaskDispatcher {
     let workerError: any = null;
 
     try {
+      if (!this.enforcePromptBudget(skeletonId)) {
+        // Budget exhausted: never start a new worker prompt. Keep the worktree on disk, move the task
+        // cleanly out of "running", and release its live slot so the loop can settle.
+        this.preservedWorktrees.set(task.id, worktreeRes);
+        this.transitionTaskOutOfRunning(
+          activeTracking,
+          this.scheduler.budgetReason ?? "Budget exceeded"
+        );
+        this.releaseActiveSkeletonSlot(activeTracking);
+        this.tasksProcessed++;
+        return;
+      }
       if (this.options.workerRunner) {
-        const outcome = await this.options.workerRunner({
-          task,
-          taskId: task.id,
-          runId: this.runId,
-          skeletonId,
-          role: task.role ?? "bonesetter",
-          model: this.scheduler.getModelTier(task.id),
-          worktreeDir: worktreeRes.worktreeDir,
-          worktreeRoot: worktreeRes.worktreeDir,
-          branch: worktreeRes.branch,
-          gitDir: this.gitDir,
-          runDir: this.runDir,
-          supervisor: activeTracking.supervisor,
-          emitEvent: (evt) => this.emitEvent(evt),
-          signal: abortController.signal,
-        });
+        this.budgetGovernor?.beginTurn(skeletonId);
+        this.budgetGovernor?.recordPromptStart(skeletonId);
+        let outcome: TaskExecutionOutcome | void;
+        try {
+          outcome = await this.options.workerRunner({
+            task,
+            taskId: task.id,
+            runId: this.runId,
+            skeletonId,
+            role: task.role ?? "bonesetter",
+            model: this.scheduler.getModelTier(task.id),
+            worktreeDir: worktreeRes.worktreeDir,
+            worktreeRoot: worktreeRes.worktreeDir,
+            branch: worktreeRes.branch,
+            gitDir: this.gitDir,
+            runDir: this.runDir,
+            supervisor: activeTracking.supervisor,
+            emitEvent: (evt) => this.emitEvent(evt),
+            signal: abortController.signal,
+          });
+        } finally {
+          this.finishPromptBudgetMetering(skeletonId);
+        }
         if (outcome && outcome.ok === false) {
           throw (
             outcome.error instanceof Error
@@ -1201,6 +1356,8 @@ export class TaskDispatcher {
           .filter(Boolean)
           .join("\n");
 
+        this.budgetGovernor?.beginTurn(skeletonId);
+        this.budgetGovernor?.recordPromptStart(skeletonId);
         try {
           await supervisor.raise();
           await supervisor.dispatchTask({
@@ -1209,6 +1366,7 @@ export class TaskDispatcher {
             role: task.role,
           });
         } finally {
+          this.finishPromptBudgetMetering(skeletonId);
           if (typeof supervisor.finish === "function") {
             try {
               await supervisor.finish();
@@ -1253,6 +1411,33 @@ export class TaskDispatcher {
       }
       await this.cleanupWorktree(worktreeRes.worktreeDir, task.id);
       this.activeTasks.delete(task.id);
+      this.tasksProcessed++;
+      return;
+    }
+
+    if (this.isGracefulStopState) {
+      // Boundary-aware graceful stop: the worker settled at its tool boundary. Never merge and never
+      // delete the worktree -- keep it (with any uncommitted edits) so the operator can inspect or
+      // recover the work, then move the task cleanly out of "running" and release its slot.
+      this.preservedWorktrees.set(task.id, worktreeRes);
+      this.transitionTaskOutOfRunning(
+        activeTracking,
+        this.stopReason ?? "Graceful stop requested"
+      );
+      this.releaseActiveSkeletonSlot(activeTracking);
+      this.tasksProcessed++;
+      return;
+    }
+
+    if (!this.enforcePromptBudget(skeletonId)) {
+      // The run's budget is exhausted: never start a Warden prompt. Keep the worker's worktree on
+      // disk, move the task cleanly out of "running", and release its live slot.
+      this.preservedWorktrees.set(task.id, worktreeRes);
+      this.transitionTaskOutOfRunning(
+        activeTracking,
+        this.scheduler.budgetReason ?? "Budget exceeded"
+      );
+      this.releaseActiveSkeletonSlot(activeTracking);
       this.tasksProcessed++;
       return;
     }
@@ -1335,60 +1520,76 @@ export class TaskDispatcher {
         if (abortController.signal.aborted || this.isStoppedState) {
           throw new Error("Task cancelled before Warden review");
         }
+        const wardenSkeletonId = `warden-${cleanTaskId}-${Date.now()}`;
+        // The run's budget gates the Warden prompt exactly like a worker prompt: refuse to start a
+        // review once any capped dimension is crossed.
+        if (!this.enforcePromptBudget(wardenSkeletonId)) {
+          throw new Error(
+            `Budget exceeded before Warden review: ${
+              this.scheduler.budgetReason ?? "budget exceeded"
+            }`
+          );
+        }
         const reviewFocus = activeTracking.reviewFocus?.length
           ? [...activeTracking.reviewFocus]
           : undefined;
-        if (this.options.wardenRunner) {
-          const wardenCtx: WardenReviewContext = {
-            task,
-            taskId: task.id,
-            runId: this.runId,
-            skeletonId: `warden-${cleanTaskId}-${Date.now()}`,
-            worktreeDir: worktreeRes.worktreeDir,
-            worktreeRoot: worktreeRes.worktreeDir,
-            gitDir: this.gitDir,
-            runDir: this.runDir,
-            diff: candidate.diff,
-            candidateSha: candidate.candidateSha,
-            candidateSha256: candidate.candidateSha256,
-            candidateTree: candidate.tree,
-            expectedIntegrationHeadSha: expectedHeadSha,
-            acceptanceCommand,
-            ...(reviewFocus ? { reviewFocus } : {}),
-            emitEvent: (evt) => this.emitEvent(evt),
-            signal: abortController.signal,
-          };
-          const rawResult = await this.options.wardenRunner(wardenCtx);
-          // A cancellation that landed during review must never proceed to merge.
-          if (abortController.signal.aborted || this.isStoppedState) {
-            throw new Error("Task cancelled during Warden review");
+        this.budgetGovernor?.beginTurn(wardenSkeletonId);
+        this.budgetGovernor?.recordPromptStart(wardenSkeletonId);
+        try {
+          if (this.options.wardenRunner) {
+            const wardenCtx: WardenReviewContext = {
+              task,
+              taskId: task.id,
+              runId: this.runId,
+              skeletonId: wardenSkeletonId,
+              worktreeDir: worktreeRes.worktreeDir,
+              worktreeRoot: worktreeRes.worktreeDir,
+              gitDir: this.gitDir,
+              runDir: this.runDir,
+              diff: candidate.diff,
+              candidateSha: candidate.candidateSha,
+              candidateSha256: candidate.candidateSha256,
+              candidateTree: candidate.tree,
+              expectedIntegrationHeadSha: expectedHeadSha,
+              acceptanceCommand,
+              ...(reviewFocus ? { reviewFocus } : {}),
+              emitEvent: (evt) => this.emitEvent(evt),
+              signal: abortController.signal,
+            };
+            const rawResult = await this.options.wardenRunner(wardenCtx);
+            // A cancellation that landed during review must never proceed to merge.
+            if (abortController.signal.aborted || this.isStoppedState) {
+              throw new Error("Task cancelled during Warden review");
+            }
+            return this.normalizeVerdictRecord(rawResult, candidate);
           }
-          return this.normalizeVerdictRecord(rawResult, candidate);
-        }
 
-        if (this.options.wardenReviewer) {
-          const rawResult = await this.options.wardenReviewer(
-            run,
-            reviewFocus ? { ...candidate, reviewFocus } : candidate,
-            acceptanceCommand
+          if (this.options.wardenReviewer) {
+            const rawResult = await this.options.wardenReviewer(
+              run,
+              reviewFocus ? { ...candidate, reviewFocus } : candidate,
+              acceptanceCommand
+            );
+            if (abortController.signal.aborted || this.isStoppedState) {
+              throw new Error("Task cancelled during Warden review");
+            }
+            return this.normalizeVerdictRecord(rawResult, candidate);
+          }
+
+          const rawResult = await this.defaultWardenReview(
+            task,
+            candidate,
+            acceptanceCommand,
+            worktreeRes.worktreeDir,
+            reviewFocus
           );
           if (abortController.signal.aborted || this.isStoppedState) {
             throw new Error("Task cancelled during Warden review");
           }
-          return this.normalizeVerdictRecord(rawResult, candidate);
+          return rawResult;
+        } finally {
+          this.finishPromptBudgetMetering(wardenSkeletonId);
         }
-
-        const rawResult = await this.defaultWardenReview(
-          task,
-          candidate,
-          acceptanceCommand,
-          worktreeRes.worktreeDir,
-          reviewFocus
-        );
-        if (abortController.signal.aborted || this.isStoppedState) {
-          throw new Error("Task cancelled during Warden review");
-        }
-        return rawResult;
       };
 
       const allowList =
@@ -1427,9 +1628,14 @@ export class TaskDispatcher {
       try {
         submitResult = await onSubmit(submissionReport);
       } catch (err: any) {
-        if (abortController.signal.aborted || this.isStoppedState) {
-          // The reviewer refused a cancelled candidate: never retry or fail the
-          // task - the control already recorded "abandoned" / "rejected".
+        if (
+          abortController.signal.aborted ||
+          this.isStoppedState ||
+          this.isGracefulStopState ||
+          this.scheduler.isBudgetExceeded
+        ) {
+          // The reviewer refused a cancelled / stopped candidate: never retry or fail the
+          // task - the control already recorded "abandoned" / "rejected" (or the run is stopping).
           await this.settleCancelledPipeline(activeTracking, worktreeRes);
           return;
         }

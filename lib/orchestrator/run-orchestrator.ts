@@ -93,6 +93,11 @@ import {
   releaseRunNetworkPolicy,
 } from "../backend/network-policy";
 import type { BaselineCommandRow } from "../exhume/death-certificate";
+import {
+  BudgetGovernor,
+  BUDGET_DIMENSIONS,
+  type BudgetCaps,
+} from "../governor/budget-governor";
 
 /**
  * Input options for approving a Pact draft.
@@ -181,6 +186,8 @@ export interface RunExecutionHandle {
   lifecycleManager: LifecycleManager;
   scheduler?: Scheduler;
   dispatcher?: TaskDispatcher;
+  /** Per-run budget governor enforcing the run's caps; consulted by the gateway and dispatcher. */
+  budgetGovernor?: BudgetGovernor;
   deathCertificate?: DeathCertificate;
   pactDraft?: PactDraftResult;
   finalCheckResult?: FinalCheckResult;
@@ -191,11 +198,57 @@ export interface RunExecutionHandle {
   pause(): void;
   resume(): void;
   stop(reason?: string): Promise<void>;
+  /**
+   * Boundary-aware graceful stop: ends the run at its next tool boundary without aborting the
+   * in-flight worker turn or deleting its worktree.
+   */
+  stopGracefully?(reason?: string): Promise<void>;
   kill(reason?: string): Promise<void>;
   approvePact(approval?: PactApprovalInput): Promise<void>;
   revisePact(feedback: string): Promise<PactDraftResult>;
   resolveApproval(approvalId: string, resolution?: any): Promise<any>;
   answerAsk(askId: string, answer: any): Promise<any>;
+}
+
+/**
+ * Reads the budget caps a run grants: any finite, non-negative `BUDGET_DIMENSIONS` key from the
+ * `caps` record and, when present, from a nested `caps.budget` record. Unknown keys (e.g.
+ * `runParallelCap`) are ignored, so a non-budget cap never becomes a budget dimension.
+ */
+function extractBudgetCaps(raw?: Record<string, unknown> | null): BudgetCaps {
+  const out: BudgetCaps = {};
+  const read = (source: Record<string, unknown> | null | undefined): void => {
+    if (!source || typeof source !== "object") {
+      return;
+    }
+    for (const dim of BUDGET_DIMENSIONS) {
+      const value = source[dim];
+      if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+        out[dim] = value;
+      }
+    }
+  };
+  read(raw);
+  const nestedBudget =
+    raw && typeof raw.budget === "object" && raw.budget !== null
+      ? (raw.budget as Record<string, unknown>)
+      : undefined;
+  read(nestedBudget);
+  return out;
+}
+
+/** True when two cap maps enforce exactly the same dimensions at the same values. */
+function budgetCapsEqual(a: BudgetCaps, b: BudgetCaps): boolean {
+  const keys = new Set<keyof BudgetCaps>([
+    ...(Object.keys(a) as Array<keyof BudgetCaps>),
+    ...(Object.keys(b) as Array<keyof BudgetCaps>),
+  ]);
+  for (const key of keys) {
+    if (a[key] !== b[key]) {
+      return false;
+    }
+  }
+  return true;
 }
 
 /**
@@ -812,6 +865,10 @@ export class RunOrchestrator extends EventEmitter {
         stopRequestedReason = reason ?? "User stopped run";
         await this.stopRun(runId, stopRequestedReason);
       },
+      stopGracefully: async (reason?: string) => {
+        stopRequestedReason = reason ?? "Graceful stop requested";
+        await this.stopRunGracefully(runId, stopRequestedReason);
+      },
       kill: async (reason?: string) => {
         killedReason = reason ?? "Admin killed run";
         await this.killRun(runId, killedReason);
@@ -908,10 +965,40 @@ export class RunOrchestrator extends EventEmitter {
       startedAt: run?.startedAt ?? Date.now(),
     });
 
+    // Per-run budget governor: caps are read from the run record. It is registered on the gateway so
+    // a `sandbox_exec` for this run is refused once any capped dimension is crossed, and passed to
+    // the TaskDispatcher so it gates worker/Warden prompts.
+    const initialCaps = extractBudgetCaps(run?.caps ?? null);
+    let budgetGovernor = new BudgetGovernor({
+      runId,
+      eventStore: this.host.eventStore,
+      runStore: this.host.runStore,
+      caps: initialCaps,
+    });
+    handle.budgetGovernor = budgetGovernor;
+    try {
+      (this.host.gateway as any)?.registerRunBudgetGovernor?.(runId, budgetGovernor);
+    } catch {
+      // A gateway that cannot register the governor must not abort the run.
+    }
+
     try {
       // 1. Exhume phase
       if (isFatal() || (lm.phase as string) === "done") {
         return await this.finalizeAborted(runId, lm, "error", "Fatal quarantine");
+      }
+
+      // A cap already crossed before dispatch must not start new work.
+      if (this.budgetBlocksDispatch(budgetGovernor, handle.scheduler)) {
+        return await this.executeEarlyExit(
+          runId,
+          handle,
+          "budget_stopped",
+          "Budget exceeded before exhume",
+          gitDir,
+          runDir,
+          baseSha
+        );
       }
 
       lm.transitionTo("exhume");
@@ -1092,6 +1179,17 @@ export class RunOrchestrator extends EventEmitter {
       }
 
       // 2. Plan phase
+      if (this.budgetBlocksDispatch(budgetGovernor, handle.scheduler)) {
+        return await this.executeEarlyExit(
+          runId,
+          handle,
+          "budget_stopped",
+          "Budget exceeded before plan",
+          gitDir,
+          runDir,
+          baseSha
+        );
+      }
       lm.transitionTo("plan");
       this.host.runStore.updateRun(runId, { phase: "plan" });
 
@@ -1269,8 +1367,14 @@ export class RunOrchestrator extends EventEmitter {
 
       let approvalInput: PactApprovalInput;
       if (this.options.autoApprovePact === false) {
-        // Await approval
-        approvalInput = await approvalDeferred.promise;
+        // Await approval. The run wall clock must exclude the Pact review / approval wait
+        // (Requirement 30.12), so pause the budget governor's clock across the wait.
+        budgetGovernor.pauseClockForPact();
+        try {
+          approvalInput = await approvalDeferred.promise;
+        } finally {
+          budgetGovernor.resumeClockFromPact();
+        }
       } else {
         // Auto approve or use already-received approval
         approvalInput = {
@@ -1287,6 +1391,29 @@ export class RunOrchestrator extends EventEmitter {
             caps: approvalInput.caps,
           },
         });
+      }
+
+      // A Pact approval may raise the caps. Rebuild the governor with the merged caps only when the
+      // approved caps actually change what is enforced, so an unchanged grant keeps the running
+      // governor's metering and clock semantics intact.
+      const approvalCaps: BudgetCaps = {
+        ...extractBudgetCaps(approvalInput.caps as Record<string, unknown> | undefined),
+        ...extractBudgetCaps(approvalInput.budget as Record<string, unknown> | undefined),
+      };
+      const mergedCaps: BudgetCaps = { ...initialCaps, ...approvalCaps };
+      if (!budgetCapsEqual(initialCaps, mergedCaps)) {
+        budgetGovernor = new BudgetGovernor({
+          runId,
+          eventStore: this.host.eventStore,
+          runStore: this.host.runStore,
+          caps: mergedCaps,
+        });
+        handle.budgetGovernor = budgetGovernor;
+        try {
+          (this.host.gateway as any)?.registerRunBudgetGovernor?.(runId, budgetGovernor);
+        } catch {
+          // A gateway that cannot re-register the governor must not abort the run.
+        }
       }
 
       const approvedTaskIds =
@@ -1332,6 +1459,7 @@ export class RunOrchestrator extends EventEmitter {
         wardenRunner: this.options.wardenRunner,
         wardenReviewer: this.options.wardenReviewer,
         pollIntervalMs: this.options.pollIntervalMs ?? 20,
+        budgetGovernor,
         emitEvent: (evt) => {
           this.emitEvent(evt as any);
         },
@@ -1360,14 +1488,20 @@ export class RunOrchestrator extends EventEmitter {
         );
       }
 
-      if (stopReason || dispatcher.stopped || scheduler.isStopRequested) {
+      if (
+        stopReason ||
+        dispatcher.stopped ||
+        dispatcher.gracefulStopped ||
+        scheduler.isStopRequested ||
+        scheduler.isBudgetExceeded
+      ) {
         const outcome = scheduler.isBudgetExceeded ? "budget_stopped" : "cancelled";
         lm.setOutcome(outcome);
         return await this.executeEarlyExit(
           runId,
           handle,
           outcome,
-          stopReason ?? scheduler.stopReason ?? "Stopped",
+          stopReason ?? scheduler.stopReason ?? scheduler.budgetReason ?? "Stopped",
           gitDir,
           runDir,
           baseSha
@@ -1619,6 +1753,13 @@ export class RunOrchestrator extends EventEmitter {
 
       return finalizeResult;
     } finally {
+      // The run is over: drop its gateway registrations so a later run cannot inherit them.
+      try {
+        (this.host.gateway as any)?.clearRunGracefulStop?.(runId);
+        (this.host.gateway as any)?.unregisterRunBudgetGovernor?.(runId);
+      } catch {
+        // Dropping gateway registrations must never mask the run's real result.
+      }
       await this.teardownRunResources(runId);
     }
   }
@@ -1679,6 +1820,31 @@ export class RunOrchestrator extends EventEmitter {
 
 
 
+  /**
+   * True when the run's budget already blocks new work. Latches the Scheduler flag when a scheduler
+   * exists so the run finalizes with `budget_stopped`.
+   */
+  private budgetBlocksDispatch(
+    governor: BudgetGovernor | undefined,
+    scheduler: Scheduler | undefined
+  ): boolean {
+    if (!governor) {
+      return false;
+    }
+    const gate = governor.canDispatchPrompt("orchestrator");
+    const snapshot = governor.snapshot();
+    if (gate.allowed && !snapshot.exceededAny) {
+      return false;
+    }
+    const dims = gate.allowed ? snapshot.exceeded : gate.dimensions;
+    try {
+      scheduler?.setBudgetExceeded(true, `Budget exceeded: ${dims.join(", ")}`);
+    } catch {
+      // Latching the flag is best-effort; the run still finalizes as budget_stopped.
+    }
+    return true;
+  }
+
   private async executeEarlyExit(
     runId: string,
     handle: RunExecutionHandle,
@@ -1690,6 +1856,13 @@ export class RunOrchestrator extends EventEmitter {
   ): Promise<FinalizeRunResult> {
     const lm = handle.lifecycleManager;
     lm.setOutcome(outcome);
+
+    // Graceful-stop contract: keep every worker's worktree (uncommitted edits included) on disk.
+    // Worktree removal belongs solely to the dispatcher's hard-stop/abort settle path; this
+    // early-exit path never touches a worktree, so a graceful stop's preserved worktrees survive.
+    if ((handle as any).gracefulStop === true) {
+      // Nothing to do: preserved worker worktrees stay in place on disk.
+    }
 
     if (lm.phase !== "report" && lm.canTransitionTo("report", { isEarlyExit: true, reason })) {
       try {
@@ -2698,6 +2871,31 @@ srv.listen(8080, "0.0.0.0");
       if (handle.dispatcher) {
         await handle.dispatcher.stop(reason);
       }
+    }
+  }
+
+  /**
+   * Boundary-aware graceful stop: marks the run as stopping gracefully, tells the gateway to refuse
+   * any NEW `sandbox_exec` for the run, and asks the dispatcher to let every in-flight worker settle
+   * at its next tool boundary. Unlike {@link stopRun} it never aborts a live turn and never deletes
+   * a worktree, so the worker's uncommitted edits survive.
+   */
+  public async stopRunGracefully(
+    runId: string,
+    reason = "Graceful stop requested"
+  ): Promise<void> {
+    const handle = this.activeRuns.get(runId);
+    if (handle) {
+      (handle as any).stopRequestedReason = reason;
+      (handle as any).gracefulStop = true;
+    }
+    try {
+      (this.host.gateway as any)?.markRunGracefulStop?.(runId);
+    } catch {
+      // A gateway that cannot observe the marker must not abort the graceful stop.
+    }
+    if (handle?.dispatcher) {
+      await handle.dispatcher.stopGracefully(reason);
     }
   }
 

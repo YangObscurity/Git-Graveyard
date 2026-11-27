@@ -167,6 +167,25 @@ function buildRuntimeControls(request: Request): KillSwitchRuntimeControls {
       }
       return undefined;
     },
+    // Preferred for `stop_gracefully`: ends the run at its next tool boundary without aborting the
+    // in-flight worker turn or deleting its worktree. Falls back to the aborting `stopRun` only when
+    // the resolved orchestrator (e.g. a test double) does not expose the graceful control.
+    stopRunGracefully: (runId: string, reason?: string) => {
+      const orchestrator = asRecord(resolveLiveOrchestrator(request));
+      if (orchestrator && typeof orchestrator.stopRunGracefully === "function") {
+        return (
+          orchestrator.stopRunGracefully as (id: string, why?: string) => void | Promise<void>
+        ).call(orchestrator, runId, reason);
+      }
+      if (orchestrator && typeof orchestrator.stopRun === "function") {
+        return (orchestrator.stopRun as (id: string, why?: string) => void | Promise<void>).call(
+          orchestrator,
+          runId,
+          reason
+        );
+      }
+      return undefined;
+    },
     killRun: (runId: string, reason?: string) => {
       const orchestrator = asRecord(resolveLiveOrchestrator(request));
       if (orchestrator && typeof orchestrator.killRun === "function") {
