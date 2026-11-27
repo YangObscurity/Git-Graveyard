@@ -295,7 +295,12 @@ export function formatM1(source: RepoMetaSource | null | undefined): MetricValue
   if (stars === undefined || forks === undefined) {
     return missing(NOT_AVAILABLE, "GitHub stars/forks were not recorded");
   }
-  const archived = s.archived === true ? "archived" : "not archived";
+  const archived =
+    s.archived === true
+      ? "archived"
+      : s.archived === false
+      ? "not archived"
+      : "archived status not available";
   const branch = str(s.defaultBranch) ?? NOT_AVAILABLE;
   const text = `${stars} stars, ${forks} forks, ${archived}, default branch ${branch} (as of ${asOf})`;
   return ok(text, [stars, forks]);
@@ -455,7 +460,12 @@ export function formatM11(source: TestCountsSource | null | undefined): MetricVa
   const failed = num(s.failed);
   const skipped = num(s.skipped);
   const total = num(s.total);
-  if (passed === undefined && failed === undefined && total === undefined) {
+  if (
+    passed === undefined &&
+    failed === undefined &&
+    total === undefined &&
+    skipped === undefined
+  ) {
     return missing(COUNTS_NOT_AVAILABLE, "no machine-readable runner report was parsed");
   }
   const parts: string[] = [];
@@ -636,6 +646,19 @@ export function formatM20(
   if (typeof now !== "number" || !Number.isFinite(now)) {
     return missing(NOT_AVAILABLE, "Necromancer clock now is unavailable");
   }
+  // Every row must be a well-formed record; a malformed element means the
+  // source is unusable, so report it cleanly instead of throwing.
+  for (const row of source) {
+    if (
+      !isRecord(row) ||
+      typeof row.skeletonId !== "string" ||
+      row.skeletonId.length === 0 ||
+      typeof row.raisedAt !== "number" ||
+      !Number.isFinite(row.raisedAt)
+    ) {
+      return missing(NOT_AVAILABLE, "a skeleton.raised record was malformed");
+    }
+  }
   const parts = source.map((row) => {
     const elapsed = Math.max(0, now - row.raisedAt);
     return `${row.skeletonId}: ${formatDuration(elapsed)}`;
@@ -770,7 +793,10 @@ export function formatM28(source: ReportCheckSource | null | undefined): MetricV
   if (s.checked === false) {
     return ok("Report not checked");
   }
-  const passed = s.passed === true;
+  if (typeof s.passed !== "boolean") {
+    return missing(NOT_AVAILABLE, "report check result is missing");
+  }
+  const passed = s.passed;
   const note = str(s.note);
   const base = passed ? "Report check passed" : "Report check failed";
   return ok(note ? `${base} — ${note}` : base);

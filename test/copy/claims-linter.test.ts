@@ -59,6 +59,20 @@ describe("claims-linter: forbidden claims (Requirement 40.9)", () => {
     assert.ok(rules(lintUiCopy("The AI understood")).includes("understood"));
   });
 
+  it("flags auxiliary and adverbial forms before 'understood'", () => {
+    const auxiliary = [
+      "The Skeleton has understood the task.",
+      "the agent had fully understood",
+      "model has already understood",
+      "The AI has now understood the repo",
+    ];
+    for (const copy of auxiliary) {
+      const result = lintUiCopy(copy);
+      assert.equal(result.ok, false, `expected failure for: ${copy}`);
+      assert.ok(rules(result).includes("understood"), `expected understood rule for: ${copy}`);
+    }
+  });
+
   it("flags the Kiro product claim", () => {
     assert.ok(rules(lintUiCopy("This is a Kiro product.")).includes("kiro-product"));
   });
@@ -88,6 +102,19 @@ describe("claims-linter: non-English prose", () => {
 
   it("accepts plain ASCII English", () => {
     assert.equal(hasNonEnglishProse("The quick brown fox jumps."), false);
+  });
+
+  it("flags Hebrew and other non-ASCII Unicode letters", () => {
+    assert.equal(hasNonEnglishProse("שלום"), true);
+    const result = lintUiCopy("שלום");
+    assert.equal(result.ok, false);
+    assert.ok(rules(result).includes("non-english"));
+  });
+
+  it("allows ASCII and typographic punctuation and symbols", () => {
+    assert.equal(hasNonEnglishProse("a — b – c … d"), false);
+    assert.equal(hasNonEnglishProse("box ┌─┐│└┘ 42% #1"), false);
+    assert.equal(hasNonEnglishProse("plain ASCII 123 !?.,;:'\"()[]{}<>/\\|@#$%^&*-_=+"), false);
   });
 });
 

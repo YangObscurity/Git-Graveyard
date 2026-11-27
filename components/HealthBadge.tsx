@@ -160,8 +160,9 @@ export function HealthBadge({
   }
 
   // Admission stopped by an auth failure, or live runs that cannot be read at
-  // all, are both reported plainly as unavailable.
-  if (!loading && (authFailure || liveRunsUnavailable)) {
+  // all, are deterministic unavailable states: report them plainly without
+  // waiting on the loading flag (which stays true in controlled mode).
+  if (authFailure || liveRunsUnavailable) {
     displayText = "Live runs: unavailable";
     statusKey = "unavailable";
   }

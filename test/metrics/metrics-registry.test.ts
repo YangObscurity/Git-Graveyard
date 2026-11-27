@@ -361,6 +361,68 @@ describe("M24–M31 formatters", () => {
   });
 });
 
+describe("formatter regressions: missing vs present fields", () => {
+  it("M1 distinguishes missing archived from not archived", () => {
+    const missingArchived = formatM1({
+      stars: 1,
+      forks: 1,
+      defaultBranch: "main",
+      asOf: "2026-11-07",
+    });
+    assert.equal(missingArchived.available, true);
+    assert.match(missingArchived.text, /archived status not available/);
+    assert.ok(!/not archived/.test(missingArchived.text));
+
+    const notArchived = formatM1({
+      stars: 1,
+      forks: 1,
+      archived: false,
+      defaultBranch: "main",
+      asOf: "2026-11-07",
+    });
+    assert.match(notArchived.text, /not archived/);
+
+    const archived = formatM1({
+      stars: 1,
+      forks: 1,
+      archived: true,
+      defaultBranch: "main",
+      asOf: "2026-11-07",
+    });
+    assert.match(archived.text, /, archived, /);
+  });
+
+  it("M11 formats skipped-only counts instead of Counts not available", () => {
+    const v = formatM11({ skipped: 3 });
+    assert.equal(v.available, true);
+    assert.equal(v.text, "3 skipped");
+    assert.deepEqual(v.numbers, [3]);
+    // Zero is a present value, not missing.
+    assert.equal(formatM11({ passed: 0 }).text, "0 passed");
+    assertFallback(formatM11({}), COUNTS_NOT_AVAILABLE);
+  });
+
+  it("M20 returns not available for a malformed skeleton row instead of throwing", () => {
+    const v = formatMetric("M20", { skeletons: [null], now: 1000 });
+    assertFallback(v, NOT_AVAILABLE);
+    assert.doesNotThrow(() =>
+      formatM20([null] as unknown as Array<{ skeletonId: string; raisedAt: number }>, 1000)
+    );
+    assertFallback(
+      formatM20([{ skeletonId: "", raisedAt: 1000 }], 1000),
+      NOT_AVAILABLE
+    );
+  });
+
+  it("M28 reports a missing check result rather than a fabricated failure", () => {
+    const missing = formatM28({ checked: true });
+    assertFallback(missing, NOT_AVAILABLE);
+    assert.match(missing.reason ?? "", /report check result is missing/);
+    // An explicit false still reports failed.
+    assert.match(formatM28({ checked: true, passed: false }).text, /Report check failed/);
+  });
+});
+
 describe("formatMetric dispatcher", () => {
   it("routes each id to its formatter", () => {
     assert.equal(formatMetric("M23", { count: 7 }).text, "7 tool calls");

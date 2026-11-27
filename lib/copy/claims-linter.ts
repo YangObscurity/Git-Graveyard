@@ -60,7 +60,8 @@ export const FORBIDDEN_CLAIM_PATTERNS: readonly ForbiddenPattern[] = [
   },
   {
     rule: "understood",
-    pattern: /\b(?:skeleton|model|agent|ai)\s+understood\b/gi,
+    pattern:
+      /\b(?:skeleton|model|agent|ai)(?:\s+(?:has|have|had|is|are|was|were|been|being|already|fully|just|now|then|really|actually|truly|simply))*\s+understood\b/gi,
     message: 'The UI must not claim a Skeleton "understood" something.',
   },
   {
@@ -82,9 +83,8 @@ export function isSafeClaim(text: string): boolean {
   return SAFE_CLAIM_PATTERN.test(text);
 }
 
-/** CJK and other non-Latin letters used to detect non-English prose. */
-const NON_ENGLISH_LETTER =
-  /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af\u0400-\u04ff\u0600-\u06ff]/;
+/** Matches any Unicode letter (used to detect non-English prose). */
+const UNICODE_LETTER = /\p{L}/u;
 
 function collectMatches(text: string, pattern: RegExp): string[] {
   const matches: string[] = [];
@@ -100,12 +100,14 @@ function collectMatches(text: string, pattern: RegExp): string[] {
   return matches;
 }
 
-/** True when the text contains non-ASCII letters (non-English prose). */
+/**
+ * True when the text contains any non-ASCII Unicode letter (non-English prose).
+ * ASCII English text, numbers and ASCII/typographic punctuation are allowed.
+ */
 export function hasNonEnglishProse(text: string): boolean {
-  if (NON_ENGLISH_LETTER.test(text)) return true;
-  // Any non-ASCII letter (accented Latin, etc.) in otherwise-English copy.
   for (const ch of text) {
-    if (ch.charCodeAt(0) > 0x7f && /[a-z]/i.test(ch.normalize("NFKD"))) {
+    const codePoint = ch.codePointAt(0);
+    if (codePoint !== undefined && codePoint > 0x7f && UNICODE_LETTER.test(ch)) {
       return true;
     }
   }

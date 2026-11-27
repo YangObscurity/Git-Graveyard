@@ -71,11 +71,18 @@ export function buildKiroHandoff(input: KiroHandoffInput): KiroHandoffPlan {
       title: "Clone at the pinned base sha and apply the patch",
       detail:
         `Clone ${owner}/${repo}, check out the pinned base commit, then apply the run patch. ` +
-        "The patch is applied with -p1 to match the repository root layout.",
+        "The patch is applied with -p1 to match the repository root layout. " +
+        "The upstream repository does not contain the downloaded run bundle, so first " +
+        "extract the downloaded archive into BUNDLE_DIR and copy all.patch and spec/ " +
+        "into the clone directory before running git apply -p1 all.patch.",
       commands: [
         `git clone ${cloneUrl} ${cloneDir}`,
         `cd ${cloneDir}`,
         `git checkout ${baseSha}`,
+        `export BUNDLE_DIR="$HOME/Downloads/git-graveyard-${runId}"`,
+        `mkdir -p "$BUNDLE_DIR"`,
+        `tar -xzf "$HOME/Downloads/git-graveyard-${runId}.tar.gz" -C "$BUNDLE_DIR"`,
+        `cp -R "$BUNDLE_DIR/all.patch" "$BUNDLE_DIR/spec" .`,
         "git apply -p1 all.patch",
       ],
     },

@@ -16,6 +16,7 @@ import * as fc from "fast-check";
 import { METRIC_IDS } from "../../lib/metrics/registry";
 import {
   formatMetric,
+  formatDuration,
   NOT_AVAILABLE,
   NOT_REPORTED,
   COUNTS_NOT_AVAILABLE,
@@ -311,5 +312,464 @@ describe("Property 14: Metric provenance (P14)", () => {
       }),
       { numRuns: 200 }
     );
+// ---- independent expectations for numeric metrics (P14) ----
+
+function isRecordValue(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function asRecord(value: unknown): Record<string, unknown> {
+  return isRecordValue(value) ? value : {};
+}
+function asNum(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+function asStr(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+function asTime(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string") {
+    const ms = Date.parse(value);
+    return Number.isNaN(ms) ? undefined : ms;
+  }
+  return undefined;
+}
+function round1(value: number): number {
+  return Math.round(value * 10) / 10;
+}
+function assertFallbackValue(value: MetricValue, expected: string, id: string): void {
+  assert.equal(value.available, false, `${id} expected a fallback, got ${value.text}`);
+  assert.equal(value.text, expected, `${id} fallback text`);
+  assert.ok(value.reason && value.reason.length > 0, `${id} fallback missing reason`);
+  assert.deepEqual(value.numbers, [], `${id} fallback carried numbers`);
+}
+
+const MS_PER_DAY = 86_400_000;
+const DAYS_PER_YEAR = 365.25;
+
+it("numeric metrics equal independently computed values and exact fallbacks", () => {
+  fc.assert(
+    fc.property(runArb, (run) => {
+      // M1: stars/forks/archived/branch
+      {
+        const src = asRecord(run.M1);
+        const v = formatMetric("M1", src);
+        const stars = asNum(src.stars);
+        const forks = asNum(src.forks);
+        const asOf = asStr(src.asOf);
+        if (stars === undefined || forks === undefined || asOf === undefined) {
+          assertFallbackValue(v, NOT_AVAILABLE, "M1");
+        } else {
+          const archived =
+            src.archived === true
+              ? "archived"
+              : src.archived === false
+              ? "not archived"
+              : "archived status not available";
+          const branch = asStr(src.defaultBranch) ?? NOT_AVAILABLE;
+          assert.equal(v.available, true, "M1 available");
+          assert.equal(
+            v.text,
+            `${stars} stars, ${forks} forks, ${archived}, default branch ${branch} (as of ${asOf})`
+          );
+          assert.deepEqual(v.numbers, [stars, forks]);
+        }
+      }
+
+      // M2: created/last commit dates
+      {
+        const src = asRecord(run.M2);
+        const v = formatMetric("M2", src);
+        const createdAt = asStr(src.createdAt);
+        const lastCommitAt = asStr(src.lastCommitAt);
+        if (createdAt === undefined || lastCommitAt === undefined) {
+          assertFallbackValue(v, NOT_AVAILABLE, "M2");
+        } else {
+          assert.equal(v.text, `Created ${createdAt}; last commit ${lastCommitAt}`);
+          assert.deepEqual(v.numbers, []);
+        }
+      }
+
+      // M3: years dead / lifespan
+      {
+        const src = asRecord(run.M3);
+        const v = formatMetric("M3", src);
+        const createdAt = asTime(src.createdAt);
+        const lastCommitAt = asTime(src.lastCommitAt);
+        const asOf = asTime(src.asOf);
+        if (createdAt === undefined || lastCommitAt === undefined || asOf === undefined) {
+          assertFallbackValue(v, NOT_AVAILABLE, "M3");
+        } else {
+          const yearsDead = round1((asOf - lastCommitAt) / MS_PER_DAY / DAYS_PER_YEAR);
+          const lifespanMs = lastCommitAt - createdAt;
+          const lifespanText =
+            lifespanMs < 0
+              ? "unknown"
+              : `${round1(lifespanMs / MS_PER_DAY / DAYS_PER_YEAR)} years`;
+          assert.equal(
+            v.text,
+            `Lifespan ${lifespanText}; years dead ${yearsDead} (as of ${src.asOf})`
+          );
+          assert.deepEqual(v.numbers, [yearsDead]);
+        }
+      }
+
+      // M6: per-rule base/final counts
+      {
+        const src = asRecord(run.M6);
+        const v = formatMetric("M6", src);
+        const base = isRecordValue(src.base) ? src.base : undefined;
+        const finalTree = isRecordValue(src.final) ? src.final : undefined;
+        if (base === undefined || finalTree === undefined) {
+          assertFallbackValue(v, NOT_AVAILABLE, "M6");
+        } else {
+          const rules = Array.from(
+            new Set([...Object.keys(base), ...Object.keys(finalTree)])
+          ).sort();
+          if (rules.length === 0) {
+            assert.equal(v.text, "No Grimoire signals on base or final tree");
+          } else {
+            const parts = rules.map((rule) => {
+              const b = asNum(base[rule]) ?? 0;
+              const f = asNum(finalTree[rule]) ?? 0;
+              return `${rule}: base ${b}, final ${f}`;
+            });
+            assert.equal(v.text, parts.join("; "));
+          }
+          assert.deepEqual(v.numbers, []);
+        }
+      }
+      // M11: parsed test counts
+      {
+        const src = asRecord(run.M11);
+        const v = formatMetric("M11", src);
+        const passed = asNum(src.passed);
+        const failed = asNum(src.failed);
+        const skipped = asNum(src.skipped);
+        const total = asNum(src.total);
+        if (
+          passed === undefined &&
+          failed === undefined &&
+          skipped === undefined &&
+          total === undefined
+        ) {
+          assertFallbackValue(v, COUNTS_NOT_AVAILABLE, "M11");
+        } else {
+          const parts: string[] = [];
+          const numbers: number[] = [];
+          if (passed !== undefined) {
+            parts.push(`${passed} passed`);
+            numbers.push(passed);
+          }
+          if (failed !== undefined) {
+            parts.push(`${failed} failed`);
+            numbers.push(failed);
+          }
+          if (skipped !== undefined) {
+            parts.push(`${skipped} skipped`);
+            numbers.push(skipped);
+          }
+          if (total !== undefined) {
+            parts.push(`${total} total`);
+            numbers.push(total);
+          }
+          assert.equal(v.text, parts.join(", "));
+          assert.deepEqual(v.numbers, numbers);
+        }
+      }
+
+      // M14: deprecation warnings
+      {
+        const src = asRecord(run.M14);
+        const v = formatMetric("M14", src);
+        const count = asNum(src.count);
+        if (src.formatRecorded !== true || count === undefined) {
+          assertFallbackValue(v, NOT_AVAILABLE, "M14");
+        } else {
+          assert.equal(v.text, `${count} deprecation warnings`);
+          assert.deepEqual(v.numbers, [count]);
+        }
+      }
+
+      // M17: numstat diff size
+      {
+        const src = asRecord(run.M17);
+        const v = formatMetric("M17", src);
+        const files = asNum(src.filesChanged);
+        const insertions = asNum(src.insertions);
+        const deletions = asNum(src.deletions);
+        if (files === undefined && insertions === undefined && deletions === undefined) {
+          assertFallbackValue(v, NOT_AVAILABLE, "M17");
+        } else {
+          const parts: string[] = [];
+          const numbers: number[] = [];
+          if (files !== undefined) {
+            parts.push(`${files} files changed`);
+            numbers.push(files);
+          }
+          if (insertions !== undefined) {
+            parts.push(`+${insertions}`);
+            numbers.push(insertions);
+          }
+          if (deletions !== undefined) {
+            parts.push(`-${deletions}`);
+            numbers.push(deletions);
+          }
+          assert.equal(v.text, parts.join(", "));
+          assert.deepEqual(v.numbers, numbers);
+        }
+      }
+
+      // M18: latest task states per task
+      {
+        const raw = run.M18;
+        const v = formatMetric("M18", raw);
+        if (!Array.isArray(raw) || raw.length === 0) {
+          assertFallbackValue(v, NOT_AVAILABLE, "M18");
+        } else {
+          const latest = new Map<string, string>();
+          for (const row of raw) {
+            const r = asRecord(row);
+            if (typeof r.taskId === "string") {
+              latest.set(r.taskId, String(r.state));
+            }
+          }
+          if (latest.size === 0) {
+            assertFallbackValue(v, NOT_AVAILABLE, "M18");
+          } else {
+            const counts = new Map<string, number>();
+            for (const state of latest.values()) {
+              counts.set(state, (counts.get(state) ?? 0) + 1);
+            }
+            const parts = Array.from(counts.entries())
+              .sort(([a], [b]) => a.localeCompare(b))
+              .map(([state, count]) => `${count} ${state}`);
+            assert.equal(v.text, parts.join(", "));
+            assert.deepEqual(v.numbers, []);
+          }
+        }
+      }
+      // M19: verdict counts
+      {
+        const src = asRecord(run.M19);
+        const v = formatMetric("M19", src);
+        const approve = asNum(src.approve);
+        const reject = asNum(src.reject);
+        if (approve === undefined && reject === undefined) {
+          assertFallbackValue(v, NOT_AVAILABLE, "M19");
+        } else {
+          const parts: string[] = [];
+          const numbers: number[] = [];
+          if (approve !== undefined) {
+            parts.push(`${approve} approved`);
+            numbers.push(approve);
+          }
+          if (reject !== undefined) {
+            parts.push(`${reject} rejected`);
+            numbers.push(reject);
+          }
+          assert.equal(v.text, parts.join(", "));
+          assert.deepEqual(v.numbers, numbers);
+        }
+      }
+
+      // M20: elapsed per skeleton against the clock now
+      {
+        const src = asRecord(run.M20);
+        const v = formatMetric("M20", src);
+        const skeletons = src.skeletons;
+        const now = asNum(src.now);
+        if (!Array.isArray(skeletons) || skeletons.length === 0) {
+          assertFallbackValue(v, NOT_AVAILABLE, "M20");
+        } else if (now === undefined) {
+          assertFallbackValue(v, NOT_AVAILABLE, "M20");
+        } else {
+          const malformed = skeletons.some((row) => {
+            const r = asRecord(row);
+            return (
+              !isRecordValue(row) ||
+              typeof r.skeletonId !== "string" ||
+              r.skeletonId.length === 0 ||
+              asNum(r.raisedAt) === undefined
+            );
+          });
+          if (malformed) {
+            assertFallbackValue(v, NOT_AVAILABLE, "M20");
+          } else {
+            const parts = skeletons.map((row) => {
+              const r = asRecord(row);
+              const id = String(r.skeletonId);
+              const raisedAt = asNum(r.raisedAt) ?? 0;
+              return `${id}: ${formatDuration(Math.max(0, now - raisedAt))}`;
+            });
+            assert.equal(v.text, parts.join("; "));
+            assert.deepEqual(v.numbers, []);
+          }
+        }
+      }
+
+      // M21: run elapsed and paused clock durations
+      {
+        const src = asRecord(run.M21);
+        const v = formatMetric("M21", src);
+        const elapsed = asNum(src.elapsedMs);
+        const paused = asNum(src.pausedMs);
+        if (elapsed === undefined && paused === undefined) {
+          assertFallbackValue(v, NOT_AVAILABLE, "M21");
+        } else {
+          const parts: string[] = [];
+          if (elapsed !== undefined) parts.push(`elapsed ${formatDuration(elapsed)}`);
+          if (paused !== undefined) parts.push(`paused ${formatDuration(paused)}`);
+          assert.equal(v.text, parts.join(", "));
+          assert.deepEqual(v.numbers, []);
+        }
+      }
+
+      // M22: reported credits only
+      {
+        const src = asRecord(run.M22);
+        const v = formatMetric("M22", src);
+        if (src.reported !== true) {
+          assertFallbackValue(v, NOT_REPORTED, "M22");
+        } else {
+          const perRun = asNum(src.perRun);
+          const perSkeleton = isRecordValue(src.perSkeleton) ? src.perSkeleton : undefined;
+          const parts: string[] = [];
+          const numbers: number[] = [];
+          if (perRun !== undefined) {
+            parts.push(`${perRun} credits this run`);
+            numbers.push(perRun);
+          }
+          if (perSkeleton) {
+            const entries = Object.entries(perSkeleton)
+              .map(([id, value]) => [id, asNum(value)] as const)
+              .filter((entry): entry is readonly [string, number] => entry[1] !== undefined);
+            for (const [id, value] of entries) {
+              parts.push(`${id}: ${value}`);
+              numbers.push(value);
+            }
+          }
+          if (parts.length === 0) {
+            assertFallbackValue(v, NOT_REPORTED, "M22");
+          } else {
+            assert.equal(v.text, parts.join("; "));
+            assert.deepEqual(v.numbers, numbers);
+          }
+        }
+      }
+
+      // M23: tool-call count
+      {
+        const src = asRecord(run.M23);
+        const v = formatMetric("M23", src);
+        const count = asNum(src.count);
+        if (count === undefined) {
+          assertFallbackValue(v, NOT_AVAILABLE, "M23");
+        } else {
+          assert.equal(v.text, `${count} tool calls`);
+          assert.deepEqual(v.numbers, [count]);
+        }
+      }
+      // M26: queue position
+      {
+        const src = asRecord(run.M26);
+        const v = formatMetric("M26", src);
+        const position = asNum(src.position);
+        if (position === undefined) {
+          assertFallbackValue(v, NOT_AVAILABLE, "M26");
+        } else {
+          assert.equal(v.text, `Queue position ${position}`);
+          assert.deepEqual(v.numbers, [position]);
+        }
+      }
+
+      // M27: tests added
+      {
+        const src = asRecord(run.M27);
+        const v = formatMetric("M27", src);
+        const files = Array.isArray(src.files)
+          ? src.files.filter((f): f is string => typeof f === "string")
+          : [];
+        const count = asNum(src.count);
+        if (files.length === 0 && count === undefined) {
+          assertFallbackValue(v, NOT_AVAILABLE, "M27");
+        } else {
+          const parts: string[] = [];
+          const numbers: number[] = [];
+          if (count !== undefined) {
+            parts.push(`${count} test files added`);
+            numbers.push(count);
+          } else {
+            parts.push(`${files.length} test files added`);
+            numbers.push(files.length);
+          }
+          if (files.length > 0) {
+            parts.push(`(${files.join(", ")})`);
+          }
+          assert.equal(v.text, parts.join(" "));
+          assert.deepEqual(v.numbers, numbers);
+        }
+      }
+
+      // M29: artifact size and hash
+      {
+        const src = asRecord(run.M29);
+        const v = formatMetric("M29", src);
+        const byteSize = asNum(src.byteSize);
+        const sha256 = asStr(src.sha256);
+        const kind = asStr(src.kind);
+        if (byteSize === undefined && sha256 === undefined) {
+          assertFallbackValue(v, NOT_AVAILABLE, "M29");
+        } else {
+          const parts: string[] = [];
+          const numbers: number[] = [];
+          if (kind !== undefined) parts.push(kind);
+          if (byteSize !== undefined) {
+            parts.push(`${byteSize} bytes`);
+            numbers.push(byteSize);
+          }
+          if (sha256 !== undefined) parts.push(`sha256 ${sha256}`);
+          assert.equal(v.text, parts.join(", "));
+          assert.deepEqual(v.numbers, numbers);
+        }
+      }
+
+      // M31: history counts
+      {
+        const src = asRecord(run.M31);
+        const v = formatMetric("M31", src);
+        const total = asNum(src.total);
+        const byOutcome = isRecordValue(src.byOutcome) ? src.byOutcome : undefined;
+        if (total === undefined && byOutcome === undefined) {
+          assertFallbackValue(v, NOT_AVAILABLE, "M31");
+        } else {
+          const parts: string[] = [];
+          const numbers: number[] = [];
+          if (total !== undefined) {
+            parts.push(`${total} runs`);
+            numbers.push(total);
+          }
+          if (byOutcome) {
+            const outcomes = Object.entries(byOutcome)
+              .map(([key, value]) => [key, asNum(value)] as const)
+              .filter((entry): entry is readonly [string, number] => entry[1] !== undefined)
+              .sort(([a], [b]) => a.localeCompare(b));
+            for (const [key, value] of outcomes) {
+              parts.push(`${key}: ${value}`);
+              numbers.push(value);
+            }
+          }
+          if (parts.length === 0) {
+            assertFallbackValue(v, NOT_AVAILABLE, "M31");
+          } else {
+            assert.equal(v.text, parts.join(", "));
+            assert.deepEqual(v.numbers, numbers);
+          }
+        }
+      }
+    }),
+    { numRuns: 500 }
+  );
+});
   });
 });

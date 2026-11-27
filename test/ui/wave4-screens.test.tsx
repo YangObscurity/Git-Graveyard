@@ -11,6 +11,7 @@ import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 
 import { HealthBadge } from "@/components/HealthBadge";
+import { ReliquaryView } from "@/components/ReliquaryView";
 import {
   GateView,
   describeInviteCodeError,
@@ -86,6 +87,18 @@ describe("Task 24.4 Gate: HealthBadge production & auth-failure states", () => {
     const html = render(<HealthBadge status="open" loading={false} />);
     assert.ok(html.includes("Live runs: open"));
     assert.ok(html.includes('data-ui-state="open"'));
+  });
+
+  it("renders 'Live runs: unavailable' for authFailure without loading={false}", () => {
+    const html = render(<HealthBadge authFailure />);
+    assert.ok(html.includes("Live runs: unavailable"));
+    assert.ok(html.includes('data-ui-state="unavailable"'));
+  });
+
+  it("renders 'Live runs: unavailable' for liveRunsUnavailable without loading={false}", () => {
+    const html = render(<HealthBadge liveRunsUnavailable />);
+    assert.ok(html.includes("Live runs: unavailable"));
+    assert.ok(html.includes('data-ui-state="unavailable"'));
   });
 });
 
@@ -365,6 +378,39 @@ describe("Task 24.6 Death Certificate: install failure is primary, build/test No
   });
 });
 
+describe("Task 24.6 Death Certificate: retry that passed runs build and test", () => {
+  it("shows real build/test statuses when install failed but retry passed", () => {
+    const cert = makeCert({
+      healthy: false,
+      install: {
+        step: "install",
+        command: "npm install",
+        status: "failed",
+        exitCode: 1,
+        reason: "network unreachable",
+      },
+      retry: {
+        step: "retry",
+        command: "npm install --prefer-offline",
+        status: "passed",
+        exitCode: 0,
+      },
+      build: { step: "build", command: "npm run build", status: "failed", exitCode: 2 },
+      test: { step: "test", command: "npm test", status: "passed", exitCode: 0 },
+      failureClasses: ["build_failed"],
+    });
+    const html = render(
+      <DeathCertificateView certificate={cert} runId="run-1" />
+    );
+    // A passed retry means install ultimately succeeded, so there is no
+    // install-failure banner and build/test are not "Not run".
+    assert.ok(!html.includes('data-testid="install-failure-primary"'));
+    assert.ok(!html.includes("Not run"));
+    assert.match(html, /data-testid="cert-row-build" data-status="failed"/);
+    assert.match(html, /data-testid="cert-row-test" data-status="passed"/);
+  });
+});
+
 describe("Task 24.6 Death Certificate: no tests found shows rule", () => {
   it("shows 'No tests found' with the deciding rule in the test row", () => {
     const cert = makeCert({
@@ -608,4 +654,28 @@ describe("Task 24.7 PactBudgetSettings: credits not reported note", () => {
     );
     assert.ok(html.includes('data-testid="budget-input-credits"'));
   });
+describe("ReliquaryView: Open in Kiro handoff only with real repository metadata", () => {
+  it("shows handoff instructions when owner, repo and baseSha are real", () => {
+    const html = render(
+      <ReliquaryView
+        runId="run-1"
+        outcome="resurrected"
+        owner="octocat"
+        repo="legacy"
+        baseSha="abcdef1234567"
+      />
+    );
+    assert.ok(html.includes('data-testid="open-in-kiro-handoff"'));
+    assert.ok(html.includes("git apply -p1 all.patch"));
+    assert.ok(!html.includes('data-testid="open-in-kiro-unavailable"'));
+  });
+
+  it("shows an honest unavailable notice when metadata is still placeholder", () => {
+    const html = render(<ReliquaryView runId="run-1" outcome="resurrected" />);
+    assert.ok(html.includes('data-testid="open-in-kiro-unavailable"'));
+    assert.ok(!html.includes('data-testid="open-in-kiro-handoff"'));
+    assert.ok(!html.includes("git clone https://github.com/owner/repo.git"));
+    assert.ok(!html.includes("git checkout 0000000"));
+  });
+});
 });

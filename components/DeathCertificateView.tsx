@@ -107,10 +107,14 @@ export function DeathCertificateView({
   const uiState = rows.length > 0 ? "ready" : "empty";
 
   // When install fails, build and test never ran. They are shown as the primary
-  // finding (install) with the later steps explicitly marked "Not run".
+  // finding (install) with the later steps explicitly marked "Not run". A retry
+  // row that passed means the install ultimately succeeded, so the later steps
+  // did run and must show their real statuses.
   const installRow = rows.find((r) => r.step === "install");
+  const retryRow = rows.find((r) => r.step === "retry");
+  const finalInstallRow = retryRow ?? installRow;
   const installFailed =
-    String(installRow?.status || "").toLowerCase() === "failed";
+    String(finalInstallRow?.status || "").toLowerCase() === "failed";
 
   function displayStatusForRow(r: BaselineCommandRow): {
     label: string;
@@ -335,8 +339,8 @@ export function DeathCertificateView({
             Because install failed, the build and test steps were not run. They
             are marked &ldquo;Not run&rdquo; below.
           </p>
-          {installRow?.reason && (
-            <p className="text-xs text-rose-100/90">{installRow.reason}</p>
+          {finalInstallRow?.reason && (
+            <p className="text-xs text-rose-100/90">{finalInstallRow.reason}</p>
           )}
         </div>
       )}

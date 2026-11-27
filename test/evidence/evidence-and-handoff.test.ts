@@ -226,6 +226,29 @@ describe("Task 26.4: kiro-handoff builder", () => {
     assert.ok(text.includes(".kiro/specs/resurrection/o-r/"));
     assert.ok(text.includes("Fallback") || text.includes("fallback"));
   });
+
+  it("explains extracting the bundle and copying all.patch and spec/ into the clone", () => {
+    const plan = buildKiroHandoff({
+      owner: "o",
+      repo: "r",
+      baseSha: "abc1234",
+      runId: "run-1",
+    });
+    const allCommands = plan.steps.flatMap((s) => s.commands);
+    const applyIndex = allCommands.indexOf("git apply -p1 all.patch");
+    const copyIndex = allCommands.findIndex(
+      (c) => c.startsWith("cp") && c.includes("all.patch") && c.includes("spec")
+    );
+    assert.ok(applyIndex >= 0, "must keep the literal git apply command");
+    assert.ok(copyIndex >= 0, "must copy all.patch and spec/ into the clone");
+    assert.ok(copyIndex < applyIndex, "bundle files must be copied before applying the patch");
+
+    const detail = plan.steps.map((s) => s.detail).join(" ");
+    assert.match(detail, /BUNDLE_DIR/);
+    assert.match(detail, /extract/i);
+    assert.match(detail, /all\.patch/);
+    assert.match(detail, /spec\//);
+  });
 });
 
 describe("Task 26.4: OpenInKiroHandoff component", () => {

@@ -6,10 +6,9 @@
  * `GET /api/history?fields=kiro`.
  *
  * Server-side callers can read the JSON straight from disk with `fs`; client-side
- * callers fall back to `fetch("/kiro-evidence.json")`.
+ * callers fall back to `fetch("/kiro-evidence.json")`. Node built-ins are loaded
+ * dynamically inside the server-only branch so client bundles never pull them in.
  */
-import * as fs from "node:fs";
-import * as path from "node:path";
 
 export interface EvidenceSpec {
   path: string;
@@ -122,11 +121,15 @@ function normalizeDoc(raw: unknown): KiroEvidenceDoc {
 export async function loadBuildEvidence(
   repoRoot: string | undefined = typeof process !== "undefined" ? process.cwd() : undefined
 ): Promise<KiroEvidenceDoc> {
-  if (repoRoot && typeof fs !== "undefined") {
-    const abs = path.join(repoRoot, "public", "kiro-evidence.json");
+  if (repoRoot && typeof process !== "undefined" && process.versions?.node) {
     try {
-      if (fs.existsSync(abs)) {
-        const parsed = JSON.parse(fs.readFileSync(abs, "utf8"));
+      const [{ existsSync, readFileSync }, path] = await Promise.all([
+        import("node:fs"),
+        import("node:path"),
+      ]);
+      const abs = path.join(repoRoot, "public", "kiro-evidence.json");
+      if (existsSync(abs)) {
+        const parsed = JSON.parse(readFileSync(abs, "utf8"));
         return normalizeDoc(parsed);
       }
     } catch {

@@ -909,13 +909,25 @@ export function ReliquaryView({
         />
       </section>
 
-      {/* 6. Open in Kiro handoff instructions (Requirement 38.9) */}
-      <OpenInKiroHandoff
-        owner={owner}
-        repo={repo}
-        baseSha={baseSha}
-        runId={runId}
-      />
+      {/* 6. Open in Kiro handoff instructions (Requirement 38.9). Only shown when
+          real repository metadata is available; placeholder fallbacks would
+          produce broken clone/checkout commands. */}
+      {owner !== "owner" && repo !== "repo" && baseSha !== "0000000" ? (
+        <OpenInKiroHandoff
+          owner={owner}
+          repo={repo}
+          baseSha={baseSha}
+          runId={runId}
+        />
+      ) : (
+        <p
+          data-testid="open-in-kiro-unavailable"
+          className="crypt-panel p-5 font-mono text-xs text-ash"
+        >
+          Open in Kiro handoff instructions are unavailable until the run
+          records its repository and base commit.
+        </p>
+      )}
 
       <CryptOrnament kind="divider" />
 
