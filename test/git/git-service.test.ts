@@ -7,6 +7,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { GitService, GitServiceError } from "../../lib/git/git-service";
 import { candidateSha256FromDiff } from "../../lib/merge/candidate-hash";
+import { EventStore } from "../../lib/events/event-store";
 
 interface TestRepoContext {
   tmpDir: string;
@@ -1733,4 +1734,130 @@ test("rule 6: mergeCandidate keeps server-computed candidateSha256 and compare-a
   assert.equal(casRes.ok, false);
   assert.equal(casRes.merged, false);
 });
+
+test("pushToFork: refuses an explicit negative push confirmation", async () => {
+  const service = new GitService({
+    ownerLogin: "fork-owner",
+    sourceRepoUrl: "https://github.com/source-owner/source-repo",
+  });
+
+  await assert.rejects(
+    async () => {
+      await service.pushToFork("run-confirm-1", {
+        targetRepoUrl: "https://github.com/fork-owner/fork-repo",
+        runPhase: "done",
+        invitePushFlag: true,
+        pushConfirm: false,
+        forkChecker: async () => "source-owner/source-repo",
+        token: "test-token",
+      });
+    },
+    (err: unknown) => {
+      assert.ok(err instanceof GitServiceError);
+      assert.equal(err.code, "PUSH_NOT_CONFIRMED");
+      return true;
+    }
+  );
+});
+
+test("pushToFork: emits push.requested and push.result without leaking the token", async () => {
+  const secretToken = ["gh", "p_", "event", "secret", "token", "9876"].join("");
+  const sha = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+
+  const script = `#!/usr/bin/env bash
+SCRIPT_DIR="$(cd "$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
+"${process.execPath}" -e '
+  const args = process.argv.slice(1);
+  if (args.includes("rev-parse")) {
+    process.stdout.write("${sha}\\n");
+    process.exit(0);
+  }
+  if (args.includes("push")) {
+    process.stdout.write("Everything up-to-date\\n");
+    process.exit(0);
+  }
+  process.exit(0);
+' -- "$@"
+`;
+
+  await withFakeGitInPath(script, async () => {
+    const eventStore = new EventStore(":memory:");
+    const service = new GitService({
+      ownerLogin: "fork-owner",
+      sourceRepoUrl: "https://github.com/source-owner/source-repo",
+    });
+
+    const res = await service.pushToFork("run-push-events", {
+      targetRepoUrl: "https://github.com/fork-owner/fork-repo",
+      runPhase: "done",
+      invitePushFlag: true,
+      forkChecker: async () => "source-owner/source-repo",
+      token: secretToken,
+      eventStore,
+    });
+    assert.equal(res.ok, true);
+
+    const requested = eventStore.getEvents("run-push-events", { kind: "push.requested" });
+    assert.equal(requested.length, 1);
+    assert.equal(requested[0].data.branch, "graveyard/run-push-events");
+
+    const result = eventStore.getEvents("run-push-events", { kind: "push.result" });
+    assert.equal(result.length, 1);
+    assert.equal(result[0].data.ok, true);
+    assert.equal(result[0].data.commitSha, sha);
+
+    const serialized = JSON.stringify(
+      eventStore.getEvents("run-push-events", {
+        kinds: ["push.requested", "push.result"],
+      })
+    );
+    assert.equal(serialized.includes(secretToken), false, "token must never appear in events");
+  });
+});
+
+test("pushToFork: holds an exclusive write lock per run", async () => {
+  const sha = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+
+  const script = `#!/usr/bin/env bash
+SCRIPT_DIR="$(cd "$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
+"${process.execPath}" -e '
+  const args = process.argv.slice(1);
+  if (args.includes("rev-parse")) {
+    setTimeout(() => { process.stdout.write("${sha}\\n"); process.exit(0); }, 400);
+  } else {
+    process.exit(0);
+  }
+' -- "$@"
+`;
+
+  await withFakeGitInPath(script, async () => {
+    const service = new GitService({
+      ownerLogin: "fork-owner",
+      sourceRepoUrl: "https://github.com/source-owner/source-repo",
+    });
+    const options = {
+      targetRepoUrl: "https://github.com/fork-owner/fork-repo",
+      runPhase: "done" as const,
+      invitePushFlag: true,
+      forkChecker: async () => "source-owner/source-repo",
+      token: "test-token",
+    };
+
+    const first = service.pushToFork("run-lock-1", options);
+    await new Promise((resolve) => setTimeout(resolve, 120));
+
+    await assert.rejects(
+      service.pushToFork("run-lock-1", options),
+      (err: unknown) => {
+        assert.ok(err instanceof GitServiceError);
+        assert.equal(err.code, "PUSH_LOCK_HELD");
+        return true;
+      }
+    );
+
+    const res = await first;
+    assert.equal(res.ok, true);
+  });
+});
+
 
