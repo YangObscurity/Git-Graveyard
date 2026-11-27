@@ -221,6 +221,34 @@ describe("M1 multi-line, nested and residue handling", () => {
     assert.ok(res.unknowns.some((u) => u.reason === "unicode_rebound"));
   });
 
+  it("records str_rebound when str is a parameter and leaves unicode(...) unrewritten", () => {
+    const src = "def f(str):\n    return unicode(123)\n";
+    const res = analyzePython(src, "a.py");
+    assert.equal(res.output, src);
+    assert.equal(res.edits.length, 0);
+    assert.ok(
+      res.unknowns.some((u) => u.reason === "str_rebound" && u.line === 2)
+    );
+    const tree = parsePython(src)!;
+    try {
+      assert.ok(
+        collectResidue(tree).some((item) => item.kind === "unicode_call"),
+        "unrewritten unicode(...) must remain unicode_call residue"
+      );
+    } finally {
+      tree.delete?.();
+    }
+    assert.equal(res.label, "m1-partial");
+  });
+
+  it("records str_rebound when str is assigned and leaves unicode(...) unrewritten", () => {
+    const src = "str = object\nx = unicode(123)\n";
+    const res = analyzePython(src, "a.py");
+    assert.equal(res.output, src);
+    assert.equal(res.edits.length, 0);
+    assert.ok(res.unknowns.some((u) => u.reason === "str_rebound"));
+  });
+
   it("records iterator_use for next(d.iteritems())", () => {
     const src = "x = next(d.iteritems())\n";
     const res = analyzePython(src, "a.py");
