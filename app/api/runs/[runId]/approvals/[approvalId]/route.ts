@@ -222,7 +222,8 @@ export async function POST(
   const orchestrator = resolveActiveOrchestrator(request, context);
 
   // Ownership is proven before any resolver runs: an approval bound to another
-  // run fails closed here rather than being resolved against this run.
+  // run fails closed here rather than being resolved against this run, and an
+  // approval whose ownership cannot be positively established fails closed too.
   const ownership = verifyApprovalOwnership(
     orchestrator,
     eventStore,
@@ -235,6 +236,16 @@ export async function POST(
         ok: false,
         error: "Approval does not belong to this run",
         code: "APPROVAL_RUN_MISMATCH",
+      },
+      { status: 403 }
+    );
+  }
+  if (ownership !== "ok") {
+    return Response.json(
+      {
+        ok: false,
+        error: "Approval ownership could not be verified for this run",
+        code: "APPROVAL_NOT_OWNED",
       },
       { status: 403 }
     );

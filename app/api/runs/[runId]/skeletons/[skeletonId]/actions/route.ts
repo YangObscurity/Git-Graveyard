@@ -78,8 +78,11 @@ const EVENT_KIND: Record<CanonicalAction, string> = {
 
 /**
  * Awaits the first method that exists on `target`, returning whether one ran.
- * A dispatched call that throws or rejects propagates to the caller so the
- * route can answer with an error instead of recording a false success.
+ * The handler's return value is inspected: an explicit `false` means the action
+ * was NOT dispatched (so a fallback candidate is tried, or the route fails
+ * closed), while `undefined` or `true` counts as dispatched. A dispatched call
+ * that throws or rejects propagates to the caller so the route can answer with
+ * an error instead of recording a false success.
  */
 async function callFirst(
   target: unknown,
@@ -90,8 +93,14 @@ async function callFirst(
   for (const name of names) {
     const fn = (target as Record<string, unknown>)[name];
     if (typeof fn === "function") {
-      await (fn as (...a: unknown[]) => unknown).apply(target, args);
-      return true;
+      const result = await (fn as (...a: unknown[]) => unknown).apply(
+        target,
+        args
+      );
+      // An explicit `false` is a refusal: treat the action as unhandled so the
+      // caller keeps trying other methods or fails closed. `undefined`/`true`
+      // both mean the handler accepted the action.
+      return result !== false;
     }
   }
   return false;
@@ -100,7 +109,6 @@ async function callFirst(
 /** Outcome of forwarding one action to the active dispatcher/warden. */
 interface DispatchOutcome {
   dispatched: boolean;
-  hadActiveHandle: boolean;
 }
 
 const SKELETON_EVENT_KINDS: readonly string[] = [
@@ -224,12 +232,11 @@ function verifySkeletonOwnership(
  * error instead of recording a false success.
  */
 async function forwardToDispatcher(
-  handle: { dispatcher?: unknown; warden?: unknown } | undefined,
+  handle: { dispatcher?: unknown; warden?: unknown },
   action: CanonicalAction,
   skeletonId: string,
   body: z.infer<typeof skeletonActionSchema>
 ): Promise<DispatchOutcome> {
-  if (!handle) return { dispatched: false, hadActiveHandle: false };
   const dispatcher = handle.dispatcher;
   let dispatched = false;
   switch (action) {
@@ -254,7 +261,7 @@ async function forwardToDispatcher(
         (await callFirst(dispatcher, ["addReviewFocus"], skeletonId, body.focus));
       break;
   }
-  return { dispatched, hadActiveHandle: true };
+  return { dispatched };
 }
 
 export async function POST(
@@ -347,7 +354,9 @@ export async function POST(
   const handle = orchestrator?.getActiveRun?.(runId);
 
   // Ownership: a Skeleton raised by one run may only be controlled through that
-  // run. A Skeleton known to belong to a different run fails closed.
+  // run, and ownership must be positively proven. Anything other than `"ok"`
+  // (including `"unknown"`) fails closed so a cross-run or unverifiable
+  // Skeleton can never be actioned.
   const ownership = verifySkeletonOwnership(eventStore, runId, skeletonId, handle);
   if (ownership === "mismatch") {
     return Response.json(
@@ -357,6 +366,30 @@ export async function POST(
         code: "SKELETON_RUN_MISMATCH",
       },
       { status: 403 }
+    );
+  }
+  if (ownership !== "ok") {
+    return Response.json(
+      {
+        ok: false,
+        error: "Skeleton ownership could not be verified for this run",
+        code: "SKELETON_NOT_OWNED",
+      },
+      { status: 403 }
+    );
+  }
+
+  // An action can only land when a live run handle exists to dispatch it. With
+  // no handle nothing consumes the action, so fail closed rather than recording
+  // a misleading past-tense `skeleton.*` event.
+  if (!handle) {
+    return Response.json(
+      {
+        ok: false,
+        error: "No active run handle is available to dispatch this skeleton action",
+        code: "SKELETON_NO_ACTIVE_HANDLE",
+      },
+      { status: 503 }
     );
   }
 
@@ -372,9 +405,9 @@ export async function POST(
     );
   }
 
-  // An attached dispatcher that never accepted the action means it did not
+  // An attached dispatcher that did not accept the action means it did not
   // land: fail closed rather than recording a false success event.
-  if (outcome.hadActiveHandle && !outcome.dispatched) {
+  if (!outcome.dispatched) {
     return Response.json(
       {
         ok: false,
@@ -405,15 +438,24 @@ export async function POST(
     eventData.focus = body.focus;
   }
 
-  eventStore.append(
-    redactEvent({
-      runId,
-      kind: eventKind,
-      actor: "user",
-      skeletonId,
-      data: eventData,
-    }) as never
-  );
+  try {
+    eventStore.append(
+      redactEvent({
+        runId,
+        kind: eventKind,
+        actor: "user",
+        skeletonId,
+        data: eventData,
+      }) as never
+    );
+  } catch {
+    // The action landed, but its audit event could not be persisted: surface a
+    // failure instead of claiming a success that was never recorded.
+    return Response.json(
+      { ok: false, error: "Failed to record the skeleton action" },
+      { status: 500 }
+    );
+  }
 
   return Response.json(
     {

@@ -301,6 +301,16 @@ export async function POST(
         { status: 403 }
       );
     }
+    if (ownership !== "ok") {
+      return Response.json(
+        {
+          ok: false,
+          error: "Skeleton ownership could not be verified for this run",
+          code: "SKELETON_NOT_OWNED",
+        },
+        { status: 403 }
+      );
+    }
   }
 
   const service = resolveMessageService(request, context, eventStore);

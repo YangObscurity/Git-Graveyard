@@ -118,13 +118,24 @@ function targetsSourceRepo(targetFork: string, sourceUrl: string): boolean {
 
 /**
  * True when a repository URL is a recognized GitHub spelling that carries no
- * embedded credentials in its authority (`https://user:pass@host/...`). SSH and
- * scp spellings canonicalize without a URL authority and are accepted.
+ * embedded credentials in its authority (`https://user:pass@host/...`). The
+ * standard `git` SSH user (`ssh://git@github.com/<owner>/<repo>`) is accepted;
+ * `canonicalRepoSlug` already rejects any other SSH user and any credential
+ * embedded in an SSH URL. An scp-style `git@github.com:<owner>/<repo>` spelling
+ * has no URL authority and is accepted.
  */
 function isCanonicalSourceUrl(raw: string): boolean {
   const trimmed = raw.trim();
   if (!trimmed) return false;
   if (!canonicalRepoSlug(trimmed)) return false;
+
+  // The `ssh://git@github.com/...` spelling is the only URL form allowed to
+  // carry a username: the standard `git` user. `canonicalRepoSlug` guarantees
+  // that exact user/host/repo shape before we get here.
+  if (/^ssh:\/\/git@github\.com\//i.test(trimmed)) {
+    return true;
+  }
+
   if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(trimmed)) {
     try {
       const parsed = new URL(trimmed);
@@ -190,28 +201,24 @@ function resolveAuthoritativeSourceUrl(
 
 /**
  * Defense-in-depth: the fork target must be exactly
- * `https://github.com/<owner>/<repo>` with an optional `.git` suffix, carrying
- * no embedded credentials and no HTTP / file / SSH / alternate-host endpoint.
- * This runs before any git operation touches the network.
+ * `https://github.com/<owner>/<repo>` with an optional `.git` suffix and an
+ * optional trailing slash, carrying no embedded credentials and no HTTP /
+ * file / SSH / alternate-host endpoint. The host match is case-insensitive to
+ * stay aligned with {@link canonicalRepoSlug}. This runs before any git
+ * operation touches the network.
  */
 function isValidForkTarget(raw: string): boolean {
   if (typeof raw !== "string") return false;
   const trimmed = raw.trim();
   if (!trimmed) return false;
   if (hasEmbeddedCredentials(trimmed)) return false;
-  if (!/^https:\/\//.test(trimmed)) return false;
+  if (!/^https:\/\//i.test(trimmed)) return false;
 
-  const match = trimmed.match(
-    /^https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?$/
-  );
-  if (!match) return false;
-
-  const owner = match[1];
-  const repo = match[2];
-  if (owner === "." || owner === ".." || repo === "." || repo === "..") {
-    return false;
-  }
-  return true;
+  // Reuse the exact canonicalization the rest of the route trusts: it accepts
+  // an optional `.git` suffix and an optional trailing slash and is
+  // case-insensitive on the `github.com` host, while rejecting every other
+  // host spelling and any embedded credential.
+  return canonicalRepoSlug(trimmed) !== null;
 }
 
 interface PendingPushAsk {
@@ -306,13 +313,13 @@ function findPendingPushConfirmAsk(
     return toResult(requestedAskId);
   }
 
+  // No explicit ask was requested: the newest unanswered `push_confirm` ask is
+  // authoritative. If that newest ask is invalid (e.g. it carries no target
+  // fork), return its error instead of falling back to an older ask.
   for (let i = order.length - 1; i >= 0; i -= 1) {
     const askId = order[i];
     if (answered.has(askId)) continue;
-    const result = toResult(askId);
-    if (!("status" in result)) {
-      return result;
-    }
+    return toResult(askId);
   }
 
   return {
@@ -445,6 +452,40 @@ export async function POST(
     const askId =
       body.askId ??
       `push_confirm:${runId}:${Date.now().toString(36)}`;
+
+    // A caller-supplied askId must not retarget an existing confirmation: it may
+    // only be used when nothing in this run's log has raised or answered it.
+    if (body.askId) {
+      let existing: EventEnvelope[];
+      try {
+        existing = eventStore.getEvents(runId);
+      } catch {
+        return Response.json(
+          {
+            ok: false,
+            error: "Could not read the run event log",
+            code: "EVENT_LOG_UNAVAILABLE",
+          },
+          { status: 500 }
+        );
+      }
+      const alreadyUsed = existing.some((event) => {
+        const data = event.data as Record<string, unknown> | undefined;
+        if (!data || data.askId !== body.askId) return false;
+        return event.kind === "ask.raised" || event.kind === "ask.answered";
+      });
+      if (alreadyUsed) {
+        return Response.json(
+          {
+            ok: false,
+            error:
+              "That push confirmation id has already been raised or answered",
+            code: "PUSH_ASK_ALREADY_EXISTS",
+          },
+          { status: 409 }
+        );
+      }
+    }
 
     eventStore.append(
       redactEvent({

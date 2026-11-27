@@ -238,6 +238,22 @@ export async function POST(
     );
   }
 
+  // A pending push confirmation may only be consumed by the push route that
+  // actually performs the push. This is checked before any handler runs (and
+  // regardless of `handled`) so a `push_confirm` ask can never be silently
+  // answered here without performing the push.
+  if (findAskKind(eventStore, runId, askId) === "push_confirm") {
+    return Response.json(
+      {
+        ok: false,
+        error:
+          "This push confirmation must be answered through POST /api/runs/[runId]/push-fork",
+        code: "PUSH_CONFIRM_NOT_HANDLED",
+      },
+      { status: 409 }
+    );
+  }
+
   let handlerThrew = false;
 
   if (askManager) {
@@ -281,19 +297,6 @@ export async function POST(
           ok: false,
           error: "No active handler accepted this answer",
           code: "ASK_NOT_HANDLED",
-        },
-        { status: 409 }
-      );
-    }
-
-    // Offline store-only mode: no handler is attached. A pending `push_confirm`
-    // must not be consumed here, because only the push route performs the push.
-    if (findAskKind(eventStore, runId, askId) === "push_confirm") {
-      return Response.json(
-        {
-          ok: false,
-          error: "This push confirmation must be answered through the push route",
-          code: "PUSH_CONFIRM_NOT_HANDLED",
         },
         { status: 409 }
       );
