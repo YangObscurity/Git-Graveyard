@@ -34,6 +34,15 @@ interface GitPusher {
 }
 
 /**
+ * In-flight claim set for confirmed pushes, keyed by `runId:askId`. Two
+ * concurrent callers for the same pending confirmation must never both pass
+ * the pending-ask lookup and run `pushToFork` twice, so the first caller to
+ * claim the key wins and any other is refused with a conflict until the claim
+ * is released in `finally`.
+ */
+const inFlightPushAsks = new Set<string>();
+
+/**
  * Resolves the GitService that performs the fork push: an explicit injection on
  * the request/context or the active orchestrator's service, else a fresh one
  * bound to this run's source repository.
@@ -571,32 +580,33 @@ export async function POST(
     );
   }
 
-  eventStore.append(
-    redactEvent({
-      runId,
-      kind: "ask.answered",
-      actor: "user",
-      data: {
-        askId: pendingAsk.askId,
-        kind: "push_confirm",
-        answer: "Push",
-        targetFork,
-        branch: pushedBranch,
+  // Claim the confirmation for this request before the first await that
+  // performs the push. A second concurrent caller for the same pending ask is
+  // refused with a conflict rather than running a duplicate push.
+  const claimKey = `${runId}:${pendingAsk.askId}`;
+  if (inFlightPushAsks.has(claimKey)) {
+    return Response.json(
+      {
+        ok: false,
+        error: "A push for this confirmation is already in progress",
+        code: "PUSH_ALREADY_IN_FLIGHT",
       },
-    }) as never
-  );
-
-  const orchestrator = resolveActiveOrchestrator(request, context);
-  const gitService = resolveGitService(request, context, orchestrator, sourceUrl);
-
-  const sink: Pick<EventStore, "append"> = {
-    append: (input) =>
-      eventStore.append(
-        redactEvent(input as unknown as Record<string, unknown>) as never
-      ),
-  };
+      { status: 409 }
+    );
+  }
+  inFlightPushAsks.add(claimKey);
 
   try {
+    const orchestrator = resolveActiveOrchestrator(request, context);
+    const gitService = resolveGitService(request, context, orchestrator, sourceUrl);
+
+    const sink: Pick<EventStore, "append"> = {
+      append: (input) =>
+        eventStore.append(
+          redactEvent(input as unknown as Record<string, unknown>) as never
+        ),
+    };
+
     const result = (await gitService.pushToFork(runId, {
       targetRepoUrl: targetFork,
       sourceRepoUrl: sourceUrl,
@@ -606,6 +616,23 @@ export async function POST(
       pushConfirm: true,
       eventStore: sink,
     })) as { commitSha?: string; branch?: string } | null;
+
+    // Consume the confirmation only after the push actually succeeded: a
+    // transient git/network error must not burn a still-valid pending ask.
+    eventStore.append(
+      redactEvent({
+        runId,
+        kind: "ask.answered",
+        actor: "user",
+        data: {
+          askId: pendingAsk.askId,
+          kind: "push_confirm",
+          answer: "Push",
+          targetFork,
+          branch: pushedBranch,
+        },
+      }) as never
+    );
 
     return Response.json(
       {
@@ -624,6 +651,8 @@ export async function POST(
       { ok: false, error: "Unable to complete the fork push" },
       { status: statusForPushError(code) }
     );
+  } finally {
+    inFlightPushAsks.delete(claimKey);
   }
 }
 

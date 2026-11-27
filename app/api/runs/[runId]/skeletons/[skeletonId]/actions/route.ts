@@ -325,6 +325,16 @@ export async function POST(
       { status: 400 }
     );
   }
+  if (action === "lay_to_rest" && !body.choice) {
+    return Response.json(
+      {
+        ok: false,
+        error: "choice is required for lay-to-rest",
+        code: "SKELETON_CHOICE_REQUIRED",
+      },
+      { status: 400 }
+    );
+  }
 
   const runStore = resolveRunStore(request);
   const eventStore = resolveEventStore(request, undefined, runStore);
@@ -449,10 +459,20 @@ export async function POST(
       }) as never
     );
   } catch {
-    // The action landed, but its audit event could not be persisted: surface a
-    // failure instead of claiming a success that was never recorded.
+    // The action landed (dispatched to the active handler), but its audit
+    // event could not be persisted. Surface the ambiguity explicitly instead
+    // of throwing an uncaught error that disguises the dispatch state.
     return Response.json(
-      { ok: false, error: "Failed to record the skeleton action" },
+      {
+        ok: false,
+        error: "Failed to record the skeleton action",
+        runId,
+        skeletonId,
+        action,
+        eventKind,
+        dispatched: true,
+        persisted: false,
+      },
       { status: 500 }
     );
   }

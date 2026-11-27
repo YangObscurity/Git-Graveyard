@@ -259,7 +259,10 @@ export async function POST(
         approvalId,
         resolution
       );
-      if (res !== null && res !== undefined) {
+      // Truthiness, not null/undefined: a resolver that explicitly returns
+      // `false` (or any falsy value) refused the approval, so it must not be
+      // recorded as resolved nor widen the run's approved patterns.
+      if (res) {
         resolved = true;
       }
     } catch {}
@@ -302,7 +305,8 @@ export async function POST(
           ...resolution,
           runId,
         });
-        if (res !== null && res !== undefined) {
+        // A falsy resolver result (including `false`) is a refusal.
+        if (res) {
           resolved = true;
         }
       }
@@ -348,6 +352,22 @@ export async function POST(
       },
     }) as never
   );
+
+  // No resolver accepted the approval: this is a conflict, not a success. The
+  // caller must not interpret a 200 as the approval having been resolved.
+  if (!resolved) {
+    return Response.json(
+      {
+        ok: false,
+        error: "Approval could not be resolved",
+        runId,
+        approvalId,
+        decision: body.decision,
+        resolved: false,
+      },
+      { status: 409 }
+    );
+  }
 
   return Response.json(
     {
