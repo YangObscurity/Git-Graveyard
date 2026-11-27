@@ -83,6 +83,12 @@ export function isDetectorFile(filename: string): boolean {
   if (filename.endsWith(".tsx") && filename.length > 4) return true;
   if (filename.endsWith(".jsx") && filename.length > 4) return true;
   if (filename === "webpack.config" || filename.startsWith("webpack.config.")) return true;
+  // Python fixtures: the Grimoire detector reads `.py` sources and the four
+  // Python manifest file names from R3-7 (APPROVED_PATTERNS in detect.ts).
+  if (filename.endsWith(".py") && filename.length > 3) return true;
+  if (filename === "pyproject.toml") return true;
+  if (filename === "Pipfile") return true;
+  if (/^requirements.*\.txt$/.test(filename)) return true;
   if (LOCK_FILE_SET.has(filename)) return true;
   return false;
 }

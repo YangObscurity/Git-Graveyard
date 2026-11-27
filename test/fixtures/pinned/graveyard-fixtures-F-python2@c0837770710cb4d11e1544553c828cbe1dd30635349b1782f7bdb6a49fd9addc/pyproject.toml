@@ -1,0 +1,15 @@
+[project]
+name = "f-python2"
+version = "1.0.0"
+description = "Test fixture for Python 2 to 3 modernization."
+requires-python = ">=3.9"
+
+[tool.poetry]
+name = "f-python2"
+version = "1.0.0"
+description = "Test fixture for Python 2 to 3 modernization."
+authors = ["graveyard-fixtures"]
+
+[tool.poetry.dependencies]
+python = ">=3.9"
+argparse = "1.4.0"
