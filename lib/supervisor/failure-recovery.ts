@@ -19,23 +19,25 @@ export const SECURITY_CONTAINMENT_EVENT_KIND = "security.containment";
 /**
  * Fail-closed redaction helper: replaces every string leaf value with the
  * redaction mask. Used when a caller-supplied redactor throws so no partial,
- * unredacted data can ever be returned.
+ * unredacted data can ever be returned. Arrays and objects are both tracked in
+ * `seen`, and any already-seen value collapses to the mask, so cyclic structures
+ * can never recurse infinitely or leak original references.
  */
-function redactAllStringLeaves(
+export function redactAllStringLeaves(
   value: unknown,
   seen: WeakSet<object> = new WeakSet()
 ): unknown {
   if (typeof value === "string") {
     return "[REDACTED]";
   }
-  if (Array.isArray(value)) {
-    return value.map((item) => redactAllStringLeaves(item, seen));
-  }
   if (value !== null && typeof value === "object") {
     if (seen.has(value)) {
-      return value;
+      return "[REDACTED]";
     }
     seen.add(value);
+    if (Array.isArray(value)) {
+      return value.map((item) => redactAllStringLeaves(item, seen));
+    }
     const out: Record<string, unknown> = {};
     for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
       out[key] = redactAllStringLeaves(item, seen);
@@ -602,6 +604,9 @@ export class FailureRecoveryHandler {
       }
     }
 
+    let finalPath = worktreeDir;
+    let movedTo: string | null = null;
+
     try {
       // Open the marker with O_NOFOLLOW so it is created as a brand-new file and
       // a pre-existing symlink at that path is never followed (O_EXCL fails the
@@ -635,8 +640,9 @@ export class FailureRecoveryHandler {
       }
 
       // A chmod failure must propagate so read-only containment fails loudly.
-      // The move happens first because a read-only directory cannot be renamed.
-      let finalPath = worktreeDir;
+      // The move happens first because a read-only directory cannot be renamed;
+      // the real moved path is recorded immediately so a later failure never
+      // reports the stale pre-rename path.
       if (hasQuarantineRoot) {
         const root = quarantineRoot as string;
         const target = path.join(
@@ -644,6 +650,7 @@ export class FailureRecoveryHandler {
           `${path.basename(worktreeDir)}-${this.now()}`
         );
         fs.renameSync(worktreeDir, target);
+        movedTo = target;
         finalPath = target;
         this.quarantinedWorktrees.add(target);
       }
@@ -658,13 +665,28 @@ export class FailureRecoveryHandler {
           realTarget !== realQuarantineRoot &&
           !realTarget.startsWith(realQuarantineRoot + path.sep)
         ) {
-          return null;
+          // Verification failed: roll the rename back cleanly when possible so no
+          // stale path is reported; otherwise report the real moved path.
+          if (movedTo !== null) {
+            try {
+              fs.renameSync(movedTo, worktreeDir);
+              this.quarantinedWorktrees.delete(movedTo);
+              movedTo = null;
+            } catch {
+              // Keep the moved path below.
+            }
+          }
+          return movedTo;
         }
       }
 
       return finalPath;
     } catch {
-      return null;
+      // A post-rename failure (e.g. the read-only pass or realpath verification
+      // throwing) must not report the stale pre-rename path. The worktree stays
+      // contained and the actual moved path is returned so the result and the
+      // emitted event stay accurate.
+      return movedTo;
     }
   }
 
@@ -683,16 +705,27 @@ export class FailureRecoveryHandler {
       const entries = fs.readdirSync(current, { withFileTypes: true });
       for (const entry of entries) {
         const full = path.join(current, entry.name);
-        // Never follow or chmod a symlink; skip it so the link target outside the
-        // worktree is left untouched.
-        if (entry.isSymbolicLink()) {
+        // Re-lstat immediately before chmod to close the Dirent TOCTOU window:
+        // the entry may have been swapped for a symlink or a hard-linked file
+        // between readdir and chmod. Never chmod a symlink or a multi-hardlink
+        // file, as that would reach outside the worktree or the file's aliases.
+        let st: fs.Stats;
+        try {
+          st = fs.lstatSync(full);
+        } catch {
           continue;
         }
-        if (entry.isDirectory()) {
+        if (st.isSymbolicLink()) {
+          continue;
+        }
+        if (st.isDirectory()) {
           stack.push(full);
-        } else {
+          continue;
+        }
+        if (st.isFile() && st.nlink === 1) {
           fs.chmodSync(full, 0o444);
         }
+        // Anything else (device, socket, fifo, or multi-hardlink file) is skipped.
       }
     }
     for (const dir of dirs) {
@@ -704,8 +737,45 @@ export class FailureRecoveryHandler {
     return this.quarantinedWorktrees.has(worktreeDir);
   }
 
-  isMergeBlocked(runId: string): boolean {
-    return this.blockedMerges.has(runId);
+  private hasQuarantineMarker(worktreeDir: string): boolean {
+    try {
+      fs.lstatSync(path.join(worktreeDir, ".QUARANTINED"));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Reports whether a run's merge is blocked. In addition to the in-memory set,
+   * the block is reconstructed from the persisted `security.containment` events
+   * and, when a worktree path is supplied, from the on-disk `.QUARANTINED` marker,
+   * so a merge block survives a supervisor restart.
+   */
+  isMergeBlocked(runId: string, worktreeDir?: string): boolean {
+    if (this.blockedMerges.has(runId)) {
+      return true;
+    }
+    try {
+      const events = this.deps.eventStore.getEvents(runId, {
+        kind: SECURITY_CONTAINMENT_EVENT_KIND,
+      });
+      if (events.some((e) => e.data?.mergeBlocked === true)) {
+        this.blockedMerges.add(runId);
+        return true;
+      }
+    } catch {
+      // Ignore store errors and fall through to the on-disk marker check.
+    }
+    if (typeof worktreeDir === "string" && worktreeDir.length > 0) {
+      if (
+        this.quarantinedWorktrees.has(worktreeDir) ||
+        this.hasQuarantineMarker(worktreeDir)
+      ) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**

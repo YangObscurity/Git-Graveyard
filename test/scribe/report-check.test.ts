@@ -9,6 +9,7 @@ import {
   buildEvidenceIndex,
   checkReading,
   extractMarkers,
+  splitSentences,
   runReportCheckWithRetry,
   assignRunOutcomeWithInstallComparison,
 } from "../../lib/scribe/report-check";
@@ -509,5 +510,114 @@ test("report-check: ScribeService applies the injected redactor to installCompar
   const serialized = JSON.stringify(events[0].data);
   assert.ok(!serialized.includes(secret));
   assert.ok(serialized.includes("[REDACTED]"));
+});
+
+test("report-check: rejects a fabricated marker even without any numeral or status keyword", () => {
+  const index = buildEvidenceIndex({ commandResults: [{ id: "build" }] });
+
+  const markerOnly = checkReading("See cmd:fabricated.", index);
+  assert.equal(markerOnly.passed, false);
+  assert.ok(markerOnly.unbackedClaims.some((c) => c.ref === "cmd:fabricated"));
+
+  // A marker that does resolve is accepted even without a numeral or status word.
+  const resolved = checkReading("See cmd:build.", index);
+  assert.equal(resolved.passed, true);
+});
+
+test("report-check: single newlines split sentences without trailing whitespace", () => {
+  assert.deepEqual(splitSentences("alpha\nbeta"), ["alpha", "beta"]);
+  assert.deepEqual(splitSentences("alpha\n\nbeta"), ["alpha", "beta"]);
+  assert.deepEqual(splitSentences("one. two."), ["one.", "two."]);
+
+  const index = buildEvidenceIndex({ commandResults: [{ id: "build" }] });
+  const reading = checkReading("See cmd:build.\nSee cmd:fabricated.", index);
+  assert.equal(reading.passed, false);
+  assert.ok(reading.unbackedClaims.some((c) => c.ref === "cmd:fabricated"));
+});
+
+test("report-check: only command.result events resolve cmd: markers", () => {
+  const startedOnly = buildEvidenceIndex({
+    events: [
+      {
+        runId: "r",
+        seq: 1,
+        ts: 0,
+        kind: "command.started",
+        actor: "a",
+        data: { id: "started-only", refs: [] },
+      },
+    ],
+  });
+  assert.equal(startedOnly.resolve("cmd:started-only"), false);
+
+  const completed = buildEvidenceIndex({
+    events: [
+      {
+        runId: "r",
+        seq: 2,
+        ts: 0,
+        kind: "command.result",
+        actor: "a",
+        data: { id: "completed", refs: [] },
+      },
+    ],
+  });
+  assert.equal(completed.resolve("cmd:completed"), true);
+});
+
+test("report-check: a trailing sentence period is stripped from non-file markers", () => {
+  assert.deepEqual(extractMarkers("See cmd:abc."), ["cmd:abc"]);
+  assert.deepEqual(extractMarkers("See ev:7."), ["ev:7"]);
+  // Dots inside a file path are preserved so extensions stay intact.
+  assert.deepEqual(extractMarkers("See file:src/a.ts."), ["file:src/a.ts."]);
+
+  const index = buildEvidenceIndex({ commandResults: [{ id: "abc" }] });
+  assert.equal(index.resolve("cmd:abc."), true);
+  assert.equal(checkReading("See cmd:abc.", index).passed, true);
+});
+
+test("report-check: install error ref is redacted while plain refs pass through", () => {
+  const ghToken = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  const result = assignRunOutcomeWithInstallComparison({
+    tasks: [{ id: "task-1", state: "merged" }],
+    finalCheck: { installPassed: false },
+    newInstallError: {
+      command: "npm ci",
+      exitCode: 1,
+      error: "install failed",
+      ref: `cmd:${ghToken}`,
+    },
+  });
+  const ref = String(result.installComparison.new?.ref ?? "");
+  assert.ok(!ref.includes(ghToken));
+  assert.ok(ref.includes("[REDACTED]"));
+
+  const plain = assignRunOutcomeWithInstallComparison({
+    tasks: [{ id: "task-1", state: "merged" }],
+    finalCheck: { installPassed: false },
+    newInstallError: {
+      command: "npm ci",
+      exitCode: 1,
+      error: "install failed",
+      ref: "cmd:install",
+    },
+  });
+  assert.equal(plain.installComparison.new?.ref, "cmd:install");
+
+  const redactor = new Redactor({ autoRegisterEnvSecrets: false });
+  const custom = "custom-ref-secret-abc-123456";
+  redactor.registerSecret(custom);
+  const withRedactor = assignRunOutcomeWithInstallComparison({
+    tasks: [{ id: "task-1", state: "merged" }],
+    finalCheck: { installPassed: false },
+    newInstallError: {
+      command: "npm ci",
+      exitCode: 1,
+      error: "install failed",
+      ref: `cmd:${custom}`,
+    },
+    redactor,
+  });
+  assert.ok(!String(withRedactor.installComparison.new?.ref).includes(custom));
 });
 

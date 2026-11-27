@@ -136,7 +136,9 @@ export function deriveTaskStates(events: readonly EventEnvelope[]): DerivedTaskS
     const state = String(data.state ?? data.status ?? "pending");
     byId.set(id, { id, state, seq: ev.seq });
   }
-  return Array.from(byId.values()).sort((a, b) => a.id.localeCompare(b.id));
+  return Array.from(byId.values()).sort((a, b) =>
+    a.id < b.id ? -1 : a.id > b.id ? 1 : 0
+  );
 }
 
 /**

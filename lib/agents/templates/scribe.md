@@ -71,8 +71,13 @@ numerical value and every status assertion with an explicit citation marker.
 - Valid markers are `cmd:<id>` for a recorded command result, `file:<path[:line]>`
   for an artifact or workspace file, `gh:<ref>` for a GitHub snapshot, and `ev:<seq>`
   for a recorded event sequence number.
-- Markers MUST resolve against the stored evidence index. Fabricated or non-existent
-  markers are rejected, and any sentence or clause whose numeral or status keyword is
+- Markers MUST resolve against the stored evidence index. Any fabricated or
+  non-existent marker is rejected, even when the clause carries no numeral or
+  status keyword, and any sentence or clause whose numeral or status keyword is
   left uncited is treated as an unbacked claim.
+- Each line is verified independently; consecutive lines separated by a line break
+  are never merged, so a marker from one line can never back a claim on another.
+- A trailing sentence period is not part of a `cmd:`, `gh:`, or `ev:` marker id,
+  while dots inside a `file:<path>` payload are preserved.
 - If the reading fails the evidence check it is retried once; when it still fails the
   reading is dropped entirely and replaced with the fallback notice.

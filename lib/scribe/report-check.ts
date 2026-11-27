@@ -48,6 +48,27 @@ export const EVIDENCE_MARKER_REGEX =
 
 const NUMERAL_REGEX = /\d/;
 
+/**
+ * Strips a trailing sentence terminator from a marker so that the punctuation at
+ * the end of a sentence (e.g. the `.` in `cmd:abc.`) is never captured as part of
+ * the marker id. Dots inside a `file:<path>` payload are preserved because path
+ * extensions are meaningful.
+ */
+export function normalizeMarkerToken(marker: string): string {
+  if (typeof marker !== "string" || marker.length === 0) {
+    return "";
+  }
+  const colon = marker.indexOf(":");
+  if (colon <= 0) {
+    return marker;
+  }
+  const prefix = marker.slice(0, colon).toLowerCase();
+  if (prefix === "file") {
+    return marker;
+  }
+  return marker.replace(/\.+$/, "");
+}
+
 function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -120,7 +141,7 @@ export class EvidenceIndex {
     if (typeof marker !== "string") {
       return false;
     }
-    const trimmed = marker.trim();
+    const trimmed = normalizeMarkerToken(marker.trim());
     if (trimmed.length === 0) {
       return false;
     }
@@ -161,7 +182,7 @@ function addMarker(collected: CollectedMarkers, marker: string): void {
   if (typeof marker !== "string") {
     return;
   }
-  const trimmed = marker.trim();
+  const trimmed = normalizeMarkerToken(marker.trim());
   if (trimmed.length === 0) {
     return;
   }
@@ -224,10 +245,7 @@ export function buildEvidenceIndex(input: EvidenceIndexInput = {}): EvidenceInde
         }
       }
       const id = data.id ?? data.commandId ?? data.commandRef;
-      if (
-        typeof id === "string" &&
-        (event.kind === "command.result" || event.kind === "command.started")
-      ) {
+      if (typeof id === "string" && event.kind === "command.result") {
         collected.commandIds.add(id);
         collected.rawMarkers.add(`cmd:${id}`);
       }
@@ -292,7 +310,7 @@ export function splitSentences(reading: string): string[] {
     return [];
   }
   return reading
-    .split(/(?<=[.!?\n])\s+/)
+    .split(/\n+|(?<=[.!?])\s+/)
     .map((s) => s.trim())
     .filter((s) => s.length > 0);
 }
@@ -321,7 +339,10 @@ export function extractMarkers(text: string): string[] {
   const markers: string[] = [];
   let match: RegExpExecArray | null;
   while ((match = regex.exec(text)) !== null) {
-    markers.push(match[0]);
+    const normalized = normalizeMarkerToken(match[0]);
+    if (normalized.length > 0) {
+      markers.push(normalized);
+    }
     if (match[0].length === 0) {
       regex.lastIndex++;
     }
@@ -375,20 +396,23 @@ export function checkReading(
       const withoutMarkers = stripMarkers(clause);
       const hasNumeral = NUMERAL_REGEX.test(withoutMarkers);
       const status = detectStatus(withoutMarkers);
-      if (!hasNumeral && !status) {
-        continue;
-      }
-      checkedCount++;
+      const requiresEvidence = hasNumeral || status !== null;
+      const claim: string = status ?? (hasNumeral ? "numeral" : "marker");
       const markers = extractMarkers(clause);
-      const claim: string = status ?? "numeral";
-      if (markers.length === 0) {
-        unbackedClaims.push({
-          claim,
-          text: clause.trim(),
-          reason: "Missing required evidence marker (cmd:, file:, gh:, ev:)",
-        });
-        continue;
+      if (requiresEvidence) {
+        checkedCount++;
+        if (markers.length === 0) {
+          unbackedClaims.push({
+            claim,
+            text: clause.trim(),
+            reason: "Missing required evidence marker (cmd:, file:, gh:, ev:)",
+          });
+          continue;
+        }
       }
+      // Every marker is validated even when the clause carries no numeral or
+      // status keyword, so a fabricated marker such as "See cmd:fabricated." is
+      // rejected instead of being silently skipped.
       for (const marker of markers) {
         if (index.resolve(marker)) {
           resolvedMarkers.push(marker);
@@ -694,7 +718,10 @@ function toInstallRow(
         : null,
     exitCode: typeof value.exitCode === "number" ? value.exitCode : null,
     error: redactInstallText(String(error), redactor, redactionOptions),
-    ref: value.ref ?? null,
+    ref:
+      value.ref !== undefined && value.ref !== null
+        ? redactInstallText(String(value.ref), redactor, redactionOptions)
+        : null,
   };
   if (
     row.error.length === 0 &&

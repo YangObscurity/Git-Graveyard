@@ -9,6 +9,7 @@ import { RunStore } from "../../lib/runs/run-store";
 import {
   FailureRecoveryHandler,
   SECURITY_CONTAINMENT_EVENT_KIND,
+  redactAllStringLeaves,
 } from "../../lib/supervisor/failure-recovery";
 import {
   BootReconciliationService,
@@ -426,7 +427,12 @@ test("failure-recovery: transitions a run to budget_stopped on Kiro credit exhau
   const run = runStore.getRun("run-budget")!;
   assert.equal(run.phase, "done");
   assert.equal(run.outcome, "budget_stopped");
-  assert.ok(eventStore.getEvents("run-budget").some((e) => e.kind === "task.state"));
+  const preservedTask = eventStore
+    .getEvents("run-budget", { kind: "task.state" })
+    .find((e) => e.data.taskId === "task-1");
+  assert.ok(preservedTask);
+  assert.equal(preservedTask!.data.taskId, "task-1");
+  assert.equal(preservedTask!.data.state, "merged");
   assert.equal(
     eventStore.getEvents("run-budget", { kind: "budget.exceeded" }).length,
     1
@@ -1010,3 +1016,369 @@ test("failure-recovery: a throwing custom redactor fails closed and redacts ever
   assert.equal(anomalies[0].data.reason, "[REDACTED]");
   assert.equal(anomalies[0].data.timeoutMs, 1000);
 });
+
+test("failure-recovery: BootReconciliationService honors an injected redactor and fails closed", async () => {
+  // A caller-supplied redactor is invoked for every emitted boot event.
+  const runStore = new RunStore(":memory:");
+  const eventStore = new EventStore(":memory:");
+  runStore.createRun({
+    runId: "run-br",
+    url: "https://github.com/owner/repo",
+    sha: "abc",
+    phase: "legion",
+  });
+  let redactorCalls = 0;
+  const spy = {
+    redactEventData: (data: Record<string, unknown>) => {
+      redactorCalls++;
+      return data;
+    },
+  } as unknown as Redactor;
+  const service = new BootReconciliationService({ eventStore, redactor: spy });
+  await service.reconcileOnBoot({ runStore, eventStore });
+  assert.ok(redactorCalls >= 1);
+
+  // A throwing custom redactor fails closed: every string leaf is redacted.
+  const runStore2 = new RunStore(":memory:");
+  const eventStore2 = new EventStore(":memory:");
+  runStore2.createRun({
+    runId: "run-br-fail",
+    url: "https://github.com/owner/repo",
+    sha: "abc",
+    phase: "legion",
+  });
+  const throwing = {
+    redactEventData: () => {
+      throw new Error("redactor exploded");
+    },
+  } as unknown as Redactor;
+  const service2 = new BootReconciliationService({
+    eventStore: eventStore2,
+    redactor: throwing,
+  });
+  await service2.reconcileOnBoot({ runStore: runStore2, eventStore: eventStore2 });
+  const clock = eventStore2.getEvents("run-br-fail", { kind: "run.clock" });
+  assert.equal(clock.length, 1);
+  assert.equal(clock[0].data.action, "[REDACTED]");
+  assert.equal(clock[0].data.reason, "[REDACTED]");
+});
+
+test("failure-recovery: a non-array backend.list aborts lost-box transitions", async () => {
+  const runStore = new RunStore(":memory:");
+  const eventStore = new EventStore(":memory:");
+  runStore.createRun({
+    runId: "run-nonarray",
+    url: "https://github.com/owner/repo",
+    sha: "abc",
+    phase: "legion",
+    sandboxId: "box-keep",
+  });
+
+  let destroyed = 0;
+  const service = new BootReconciliationService();
+  const result = await service.reconcileOnBoot({
+    runStore,
+    eventStore,
+    backend: {
+      list: () => null as unknown as unknown[],
+      destroy: () => {
+        destroyed++;
+      },
+    },
+  });
+
+  assert.deepEqual(result.errored, []);
+  assert.ok(result.recovered.includes("run-nonarray"));
+  assert.equal(destroyed, 0);
+  const run = runStore.getRun("run-nonarray")!;
+  assert.equal(run.phase, "legion");
+  assert.equal(run.outcome, null);
+});
+
+test("failure-recovery: handleBoxFailure never reruns the command once the recreation cap is reached", async () => {
+  const service = new BootReconciliationService();
+  let rerunCalls = 0;
+  const result = await service.handleBoxFailure({
+    runId: "run-cap-2",
+    sandboxId: "box-1",
+    kind: "oom",
+    priorRecreations: 1,
+    rerunCommand: () => {
+      rerunCalls++;
+      return { exitCode: 0 };
+    },
+  });
+  assert.equal(rerunCalls, 0);
+  assert.equal(result.recreated, false);
+  assert.equal(result.attempts, 1);
+  assert.equal(result.flags.oomKilled, true);
+  assert.equal(result.sandboxId, "box-1");
+});
+
+test("failure-recovery: handleKiroCreditExhaustion rejects a missing run without emitting events", () => {
+  const runStore = new RunStore(":memory:");
+  const eventStore = new EventStore(":memory:");
+  const service = new BootReconciliationService({ runStore, eventStore });
+
+  assert.throws(() => service.handleKiroCreditExhaustion({ runId: "run-missing" }));
+  assert.equal(
+    eventStore.getEvents("run-missing", { kind: "budget.exceeded" }).length,
+    0
+  );
+
+  // Without a runStore the run can never be validated, so it must also fail
+  // closed instead of claiming a budget_stopped success.
+  const noStore = new BootReconciliationService({ eventStore });
+  assert.throws(() => noStore.handleKiroCreditExhaustion({ runId: "run-missing-2" }));
+  assert.equal(
+    eventStore.getEvents("run-missing-2", { kind: "budget.exceeded" }).length,
+    0
+  );
+});
+
+test("failure-recovery: handleGitHubRateLimit sanitizes NaN and negative retryAfterSec", () => {
+  const eventStore = new EventStore(":memory:");
+  const now = 1_000_000;
+  const service = new BootReconciliationService({ eventStore, now: () => now });
+
+  const nan = service.handleGitHubRateLimit({
+    runId: "run-gh-nan",
+    statusCode: 429,
+    retryAfterSec: Number.NaN,
+  });
+  assert.equal(nan.retryAfterSec, null);
+  assert.equal(nan.resetAtMs, now + 60000);
+  assert.equal(nan.cooldownMs, 60000);
+
+  const negative = service.handleGitHubRateLimit({
+    runId: "run-gh-neg",
+    statusCode: 403,
+    retryAfterSec: -5,
+  });
+  assert.equal(negative.retryAfterSec, null);
+  assert.equal(negative.resetAtMs, now + 60000);
+  assert.equal(negative.cooldownMs, 60000);
+
+  const events = eventStore.getEvents("run-gh-nan", {
+    kind: "system.github_rate_limit",
+  });
+  assert.equal(events.length, 1);
+  assert.equal(events[0].data.retryAfterSec, null);
+});
+
+test("failure-recovery: pre-kill identity re-verification blocks a swapped command and prefers killVerified", async () => {
+  const runStore = new RunStore(":memory:");
+  const eventStore = new EventStore(":memory:");
+
+  // (a) killVerified is preferred and the plain kill hook is never used.
+  const verified: number[] = [];
+  const killedA: number[] = [];
+  const a = await new BootReconciliationService().reconcileOnBoot({
+    runStore,
+    eventStore,
+    pidFiles: [{ pid: 601, command: "kiro-cli --acp", expectedOwner: "root" }],
+    processOps: {
+      isAlive: () => true,
+      readCommand: () => "kiro-cli --acp",
+      readOwner: () => "root",
+      kill: (pid) => {
+        killedA.push(pid);
+      },
+      killVerified: (pid) => {
+        verified.push(pid);
+      },
+    },
+  });
+  assert.deepEqual(verified, [601]);
+  assert.deepEqual(killedA, []);
+  assert.deepEqual(a.reapedPids, [601]);
+
+  // (b) Without killVerified, identity is re-checked immediately before the kill;
+  // a command that changed between checks is never signalled.
+  let reads = 0;
+  const killedB: number[] = [];
+  const b = await new BootReconciliationService().reconcileOnBoot({
+    runStore,
+    eventStore,
+    pidFiles: [{ pid: 602, command: "kiro-cli --acp", expectedOwner: "root" }],
+    processOps: {
+      isAlive: () => true,
+      readCommand: () => {
+        reads++;
+        return reads === 1 ? "kiro-cli --acp" : "vim notes.md";
+      },
+      readOwner: () => "root",
+      kill: (pid) => {
+        killedB.push(pid);
+      },
+    },
+  });
+  assert.deepEqual(killedB, []);
+  assert.deepEqual(b.reapedPids, []);
+  assert.ok(b.failedPids.includes(602));
+});
+
+
+test("failure-recovery: redactAllStringLeaves is cycle-safe for arrays and objects", () => {
+  const arr: unknown[] = ["secret"];
+  arr.push(arr);
+  const outArr = redactAllStringLeaves(arr) as unknown[];
+  assert.equal(outArr[0], "[REDACTED]");
+  assert.equal(outArr[1], "[REDACTED]");
+
+  const obj: Record<string, unknown> = { secret: "value" };
+  obj.self = obj;
+  const outObj = redactAllStringLeaves(obj) as Record<string, unknown>;
+  assert.equal(outObj.secret, "[REDACTED]");
+  assert.equal(outObj.self, "[REDACTED]");
+});
+
+test("failure-recovery: isMergeBlocked survives a fresh handler instance via the eventStore", () => {
+  const eventStore = new EventStore(":memory:");
+  const first = new FailureRecoveryHandler({ eventStore });
+  first.quarantineWorktree({ runId: "run-restart", reason: "secret_detected" });
+
+  // A brand-new handler with empty in-memory sets reconstructs the block.
+  const second = new FailureRecoveryHandler({ eventStore });
+  assert.equal(second.isMergeBlocked("run-restart"), true);
+  assert.equal(second.isMergeBlocked("run-unrelated"), false);
+});
+
+test("failure-recovery: isMergeBlocked detects an on-disk .QUARANTINED marker", () => {
+  const eventStore = new EventStore(":memory:");
+  const handler = new FailureRecoveryHandler({ eventStore });
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "gg-marker-"));
+  fs.writeFileSync(path.join(tmp, ".QUARANTINED"), "{}");
+  try {
+    assert.equal(handler.isMergeBlocked("run-marker", tmp), true);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+  assert.equal(handler.isMergeBlocked("run-marker", tmp), false);
+});
+
+
+test("failure-recovery: quarantineWorktree never chmods a multi-hardlink file", () => {
+  const eventStore = new EventStore(":memory:");
+  const handler = new FailureRecoveryHandler({ eventStore });
+
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "gg-hardlink-"));
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "gg-hardlink-out-"));
+  const outsideFile = path.join(outside, "aliased.txt");
+  fs.writeFileSync(outsideFile, "shared");
+  fs.chmodSync(outsideFile, 0o644);
+  const beforeMode = fs.statSync(outsideFile).mode;
+  // A hard link inside the worktree shares the inode (nlink = 2).
+  fs.linkSync(outsideFile, path.join(tmp, "alias.txt"));
+  // A single-link file inside must still be locked read-only.
+  fs.writeFileSync(path.join(tmp, "plain.txt"), "x");
+
+  try {
+    const result = handler.quarantineWorktree({
+      runId: "run-hardlink",
+      worktreeDir: tmp,
+      reason: "secret_detected",
+    });
+
+    assert.equal(result.isolated, true);
+    // The multi-hardlink file is skipped: its shared inode keeps its mode.
+    assert.equal(fs.statSync(outsideFile).mode, beforeMode);
+    assert.equal(fs.statSync(path.join(tmp, "alias.txt")).mode, beforeMode);
+    // A normal single-link file is still made read-only.
+    assert.equal(fs.statSync(path.join(tmp, "plain.txt")).mode & 0o222, 0);
+  } finally {
+    const restore = (target: string, mode: number) => {
+      try {
+        fs.chmodSync(target, mode);
+      } catch {
+        // ignore
+      }
+    };
+    restore(tmp, 0o755);
+    restore(path.join(tmp, ".QUARANTINED"), 0o644);
+    restore(path.join(tmp, "plain.txt"), 0o644);
+    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test("failure-recovery: a post-rename containment failure returns the accurate moved path", () => {
+  const eventStore = new EventStore(":memory:");
+  const fixedNow = 1_234_567;
+  const handler = new FailureRecoveryHandler({ eventStore, now: () => fixedNow });
+
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "gg-postrename-"));
+  const quarantineRoot = fs.mkdtempSync(
+    path.join(os.tmpdir(), "gg-postrename-root-")
+  );
+  // An unreadable subdirectory makes the read-only pass throw after the rename,
+  // exercising the post-rename failure path.
+  const locked = path.join(tmp, "locked");
+  fs.mkdirSync(locked);
+  fs.chmodSync(locked, 0o000);
+
+  const makeWritableAndRemove = (root: string) => {
+    const walk = (dir: string) => {
+      try {
+        fs.chmodSync(dir, 0o755);
+      } catch {
+        // ignore
+      }
+      let entries: fs.Dirent[] = [];
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const entry of entries) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          walk(full);
+        } else {
+          try {
+            fs.chmodSync(full, 0o644);
+          } catch {
+            // ignore
+          }
+        }
+      }
+    };
+    if (fs.existsSync(root)) {
+      walk(root);
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  };
+
+  try {
+    const result = handler.quarantineWorktree({
+      runId: "run-postrename",
+      skeletonId: "sk-postrename",
+      worktreeDir: tmp,
+      reason: "secret_detected",
+      quarantineRoot,
+    });
+
+    const expected = path.join(
+      quarantineRoot,
+      `${path.basename(tmp)}-${fixedNow}`
+    );
+    assert.equal(result.isolated, true);
+    assert.equal(result.worktreeDir, expected);
+    assert.notEqual(result.worktreeDir, tmp);
+    assert.equal(fs.existsSync(expected), true);
+    assert.equal(fs.existsSync(path.join(expected, ".QUARANTINED")), true);
+    // The unreadable subdirectory proves the read-only pass threw after the
+    // rename: it was never chmodded, so the post-rename failure path was taken.
+    assert.equal(fs.statSync(path.join(expected, "locked")).mode & 0o777, 0o000);
+
+    const events = eventStore.getEvents("run-postrename", {
+      kind: SECURITY_CONTAINMENT_EVENT_KIND,
+    });
+    assert.equal(events.length, 1);
+    assert.equal(events[0].data.worktree, expected);
+  } finally {
+    makeWritableAndRemove(tmp);
+    makeWritableAndRemove(quarantineRoot);
+  }
+});
+

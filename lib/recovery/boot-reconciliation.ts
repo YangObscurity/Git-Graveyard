@@ -38,6 +38,12 @@ export interface ProcessOps {
   readCommand?(pid: number): string | null | undefined;
   readOwner?(pid: number): string | number | null | undefined;
   kill?(pid: number, signal?: NodeJS.Signals | string): boolean | void;
+  /**
+   * Optional atomic hook: re-verifies the process command/owner and signals it in
+   * one indivisible operation so no other process can be killed between the check
+   * and the signal. When provided it is preferred over `kill`.
+   */
+  killVerified?(pid: number, signal?: NodeJS.Signals | string): boolean | void;
 }
 
 export interface PidFileRecord {
@@ -176,6 +182,35 @@ export interface BootReconciliationDeps {
   readonly now?: () => number;
 }
 
+/**
+ * Fail-closed redaction helper: replaces every string leaf value with the
+ * redaction mask, and is cycle-safe for both objects and arrays so a self
+ * referential structure can never recurse infinitely or leak original values.
+ */
+function redactAllStringLeaves(
+  value: unknown,
+  seen: WeakSet<object> = new WeakSet()
+): unknown {
+  if (typeof value === "string") {
+    return "[REDACTED]";
+  }
+  if (value !== null && typeof value === "object") {
+    if (seen.has(value)) {
+      return "[REDACTED]";
+    }
+    seen.add(value);
+    if (Array.isArray(value)) {
+      return value.map((item) => redactAllStringLeaves(item, seen));
+    }
+    const out: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      out[key] = redactAllStringLeaves(item, seen);
+    }
+    return out;
+  }
+  return value;
+}
+
 function boxId(box: SandboxBoxInfo): string | null {
   const fromLabels = box.labels?.sandboxId ?? box.labels?.id;
   const id = box.sandboxId ?? box.id ?? fromLabels;
@@ -272,7 +307,18 @@ export class BootReconciliationService {
   }
 
   private redact(data: Record<string, unknown>): Record<string, unknown> {
-    return redactEventData(data, this.deps.redactionOptions);
+    const byOptions = redactEventData(data, this.deps.redactionOptions);
+    const redactor = this.deps.redactor;
+    if (!redactor || typeof redactor.redactEventData !== "function") {
+      return byOptions;
+    }
+    try {
+      return redactor.redactEventData(byOptions);
+    } catch {
+      // Fail closed: if the injected redactor throws, redact every string leaf
+      // rather than returning partially redacted data.
+      return redactAllStringLeaves(byOptions) as Record<string, unknown>;
+    }
   }
 
   /**
@@ -284,7 +330,7 @@ export class BootReconciliationService {
     if (!processOps) {
       return false;
     }
-    if (typeof processOps.kill !== "function") {
+    if (typeof processOps.kill !== "function" && typeof processOps.killVerified !== "function") {
       return false;
     }
     const pid = pf?.pid;
@@ -388,8 +434,21 @@ export class BootReconciliationService {
       if (this.canReap(pf, processOps)) {
         let signalled = false;
         try {
-          const outcome = processOps?.kill?.(pf.pid, "SIGTERM");
-          signalled = outcome !== false;
+          const killVerified = processOps?.killVerified;
+          if (typeof killVerified === "function") {
+            // Preferred atomic path: the processOps hooks handle re-verification and
+            // signalling in a single indivisible operation.
+            const outcome = killVerified(pf.pid, "SIGTERM");
+            signalled = outcome !== false;
+          } else {
+            // Re-verify the process command/owner identity immediately before the
+            // kill so a PID reused between the first check and the signal is never
+            // signalled (closes the TOCTOU window).
+            if (this.canReap(pf, processOps)) {
+              const outcome = processOps?.kill?.(pf.pid, "SIGTERM");
+              signalled = outcome !== false;
+            }
+          }
         } catch {
           signalled = false;
         }
@@ -446,12 +505,20 @@ export class BootReconciliationService {
       return true;
     };
 
+    let listValid = true;
     let boxes: SandboxBoxInfo[] = [];
     if (backend) {
       const raw = await backend.list(filterLabels);
-      boxes = (Array.isArray(raw) ? raw : []).filter(
-        (b): b is SandboxBoxInfo => typeof b === "object" && b !== null
-      );
+      if (Array.isArray(raw)) {
+        boxes = raw.filter(
+          (b): b is SandboxBoxInfo => typeof b === "object" && b !== null
+        );
+      } else {
+        // A non-array (null/undefined/garbage) list result is not a trustworthy
+        // empty set: abort lost-box transitions so living runs are never falsely
+        // marked lost while the backend listing is unavailable.
+        listValid = false;
+      }
     }
     const boxIds = new Set<string>();
     for (const box of boxes) {
@@ -502,7 +569,7 @@ export class BootReconciliationService {
     const errored: string[] = [];
     for (const run of living) {
       const boxPresent = run.sandboxId ? boxIds.has(run.sandboxId) : true;
-      if (backend && run.sandboxId && !boxPresent) {
+      if (listValid && backend && run.sandboxId && !boxPresent) {
         runStore.markSandboxLost(run.runId, run.sandboxId);
         runStore.updateRun(run.runId, {
           phase: "done",
@@ -564,7 +631,10 @@ export class BootReconciliationService {
     // A failed recreation must never rerun the command against the original,
     // already-failed box.
     let recreationFailed = false;
-    if (prior < 1 && typeof input.recreateBox === "function") {
+    // When the recreation cap (one recreation per failure) has already been reached,
+    // the failed box must not be re-run at all.
+    const capReached = prior >= 1;
+    if (!capReached && typeof input.recreateBox === "function") {
       // A recreation is performed or at least attempted, so advance the counter
       // so callers persisting result.attempts enforce the 1-recreation cap.
       attempts = prior + 1;
@@ -598,7 +668,7 @@ export class BootReconciliationService {
 
     const spec = normalizeCommand(input.failedCommand);
     let commandOutcome: CommandOutcome = { ...flags };
-    if (!recreationFailed && typeof input.rerunCommand === "function") {
+    if (!capReached && !recreationFailed && typeof input.rerunCommand === "function") {
       try {
         const outcome = await input.rerunCommand({
           runId: input.runId,
@@ -632,8 +702,15 @@ export class BootReconciliationService {
    */
   handleGitHubRateLimit(input: GitHubRateLimitInput): GitHubRateLimitResult {
     const now = this.now();
+    const rawRetryAfterSec = input.retryAfterSec;
+    // NaN, Infinity and negative values are unusable: fall back cleanly to the
+    // default cooldown rather than producing an invalid reset time.
     const retryAfterSec =
-      typeof input.retryAfterSec === "number" ? input.retryAfterSec : null;
+      typeof rawRetryAfterSec === "number" &&
+      Number.isFinite(rawRetryAfterSec) &&
+      rawRetryAfterSec >= 0
+        ? rawRetryAfterSec
+        : null;
     const fallbackReset =
       now + (retryAfterSec !== null ? retryAfterSec * 1000 : 60000);
     const resetAtMs =
@@ -680,21 +757,30 @@ export class BootReconciliationService {
     const eventStore = input.eventStore ?? this.deps.eventStore;
     const now = this.now();
 
-    let preservedMergedWork = true;
-    if (runStore) {
-      const run = runStore.getRun(input.runId);
-      if (run) {
-        const merged = (run.metadata as Record<string, unknown> | null)
-          ?.mergedTasksCount;
-        preservedMergedWork = typeof merged === "number" ? merged > 0 : true;
-      }
-      runStore.updateRun(input.runId, {
-        phase: "done",
-        outcome: "budget_stopped",
-        endedAt: now,
-        updatedAt: now,
-      });
+    // Validate the run before touching any state: a missing run must never be
+    // reported as a successful budget_stopped transition or emit events.
+    if (!runStore) {
+      throw new Error(
+        `handleKiroCreditExhaustion requires a runStore to validate run "${input.runId}"`
+      );
     }
+    const run = runStore.getRun(input.runId);
+    if (!run) {
+      throw new Error(
+        `handleKiroCreditExhaustion: run "${input.runId}" not found`
+      );
+    }
+
+    const merged = (run.metadata as Record<string, unknown> | null)
+      ?.mergedTasksCount;
+    const preservedMergedWork = typeof merged === "number" ? merged > 0 : true;
+
+    runStore.updateRun(input.runId, {
+      phase: "done",
+      outcome: "budget_stopped",
+      endedAt: now,
+      updatedAt: now,
+    });
 
     let event: EventEnvelope | null = null;
     if (eventStore) {
