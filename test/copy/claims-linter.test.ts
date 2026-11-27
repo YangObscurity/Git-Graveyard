@@ -193,4 +193,36 @@ describe("GlossedTerm: first-appearance SSR rendering (Requirement 47.4)", () =>
       assert.ok(html.includes(`data-glossed-term="${term}"`));
     }
   });
+
+  it("keeps first-appearance gloss under React.StrictMode and renders second sibling as span", () => {
+    const html = renderToStaticMarkup(
+      React.createElement(
+        React.StrictMode,
+        null,
+        React.createElement(
+          GlossProvider,
+          null,
+          React.createElement(GlossedTerm, { term: "Grimoire" }),
+          React.createElement(GlossedTerm, { term: "Grimoire" })
+        )
+      )
+    );
+    const abbrCount = (html.match(/<abbr/g) ?? []).length;
+    const spanCount = (html.match(/<span/g) ?? []).length;
+    assert.equal(abbrCount, 1);
+    assert.equal(spanCount, 1);
+  });
+
+  it("still glosses subsequent appearances when showOnce is false", () => {
+    const html = renderToStaticMarkup(
+      React.createElement(
+        GlossProvider,
+        null,
+        React.createElement(GlossedTerm, { term: "Grimoire" }),
+        React.createElement(GlossedTerm, { term: "Grimoire", showOnce: false })
+      )
+    );
+    const abbrCount = (html.match(/<abbr/g) ?? []).length;
+    assert.equal(abbrCount, 2);
+  });
 });

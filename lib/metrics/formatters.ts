@@ -882,7 +882,7 @@ export const METRIC_FORMATTERS: Readonly<Record<MetricId, MetricFormatter>> = {
   M19: (s) => formatM19(s as VerdictCountsSource),
   M20: (s) => {
     const record = isRecord(s) ? s : {};
-    const now = num(record.now) ?? 0;
+    const now = num(record.now) ?? Number.NaN;
     const rows = Array.isArray(record.skeletons)
       ? (record.skeletons as readonly SkeletonElapsedSource[])
       : (s as readonly SkeletonElapsedSource[]);

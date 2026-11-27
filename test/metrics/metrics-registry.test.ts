@@ -372,6 +372,11 @@ describe("formatMetric dispatcher", () => {
     assert.equal(v.text, "s1: 2s");
   });
 
+  it("M20 dispatcher returns not available when clock now is omitted", () => {
+    const v = formatMetric("M20", { skeletons: [{ skeletonId: "s1", raisedAt: 1000 }] });
+    assertFallback(v, NOT_AVAILABLE);
+  });
+
   it("every id returns a MetricValue with a numbers array", () => {
     for (const id of ALL_IDS) {
       const v = formatMetric(id, {});

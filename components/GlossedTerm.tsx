@@ -63,13 +63,29 @@ export function GlossedTerm({
   const definition = glossary[term];
   const visible = children ?? term;
 
-  let isFirstAppearance = true;
-  if (showOnce && context) {
-    isFirstAppearance = !context.seen.has(term);
-    if (isFirstAppearance) {
-      context.seen.add(term);
+  const decisionRef = React.useRef<{
+    term: GothicTerm;
+    showOnce: boolean;
+    context: GlossContextValue | null;
+    isFirst: boolean;
+  } | null>(null);
+
+  if (
+    decisionRef.current === null ||
+    decisionRef.current.term !== term ||
+    decisionRef.current.showOnce !== showOnce ||
+    decisionRef.current.context !== context
+  ) {
+    let isFirst = true;
+    if (showOnce && context) {
+      isFirst = !context.seen.has(term);
+      if (isFirst) {
+        context.seen.add(term);
+      }
     }
+    decisionRef.current = { term, showOnce, context, isFirst };
   }
+  const isFirstAppearance = decisionRef.current.isFirst;
 
   if (!isFirstAppearance) {
     return <span className={className}>{visible}</span>;
