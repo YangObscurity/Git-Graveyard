@@ -76,10 +76,19 @@ export function sha256Argv(argv: string[]): string {
 
 /**
  * Derives a conservative run-scoped command prefix from an approved argv: the
- * leading run of non-flag tokens, always including the program name. So
- * `["npm", "test", "--watch"]` yields `"npm test"` and
- * `["python", "-m", "unittest"]` yields `"python"`. The result is a prefix, so
- * `matchCommandPattern` still requires a word boundary before matching.
+ * program name plus the leading run of literal (non-flag) subcommand tokens.
+ * The result is a prefix, so `matchCommandPattern` still requires a word
+ * boundary before matching.
+ *
+ * A prefix is only safe when a literal subcommand immediately follows the
+ * executable. Whenever a flag precedes the first subcommand - or no subcommand
+ * is present at all - auto-derivation is refused and `undefined` is returned,
+ * because a bare executable prefix (e.g. `"node"`, `"git"`) would authorize any
+ * later invocation of that program (CWE-863). For instance,
+ * `["npm", "test", "--watch"]` yields `"npm test"` and `["git", "status"]`
+ * yields `"git status"`, while `["node", "-e", "…"]`,
+ * `["python", "-m", "unittest"]` and `["node"]` yield `undefined`. Callers must
+ * fall back to an explicit `pattern` or exact argv (one-time grant) matching.
  */
 export function deriveCommandPrefix(
   argv: readonly string[] | undefined
@@ -89,6 +98,14 @@ export function deriveCommandPrefix(
     (token) => typeof token === "string" && token.trim().length > 0
   );
   if (tokens.length === 0) return undefined;
+
+  // Require a literal subcommand right after the executable. An executable on
+  // its own, or one followed by flags (which may themselves introduce the real
+  // subcommand), cannot be widened into a safe prefix.
+  if (tokens[1] === undefined || tokens[1].startsWith("-")) {
+    return undefined;
+  }
+
   const head: string[] = [tokens[0]];
   for (let i = 1; i < tokens.length; i += 1) {
     if (tokens[i].startsWith("-")) break;
@@ -801,18 +818,53 @@ export class ApprovalManager {
     }
 
     const joined = argv.join(" ");
-    const cmd = argv[0];
 
     for (const pat of patterns) {
-      if (pat === cmd || pat === joined) {
-        return true;
-      }
-      if (matchCommandPattern(pat, argv)) {
+      if (this.patternMatchesCommand(pat, argv, joined)) {
         return true;
       }
     }
 
     return false;
+  }
+
+  /**
+   * Matches one recorded run-scoped pattern against an argv. Explicit regex and
+   * wildcard patterns keep their authored semantics; a plain prefix only matches
+   * on a word boundary. A bare executable pattern (a single token with no
+   * subcommand, e.g. `"node"` or `"git"`) matches only an exact command, so it
+   * can never widen to authorize arbitrary later invocations of that program
+   * (CWE-863).
+   */
+  private patternMatchesCommand(
+    pattern: string,
+    argv: string[],
+    joined: string
+  ): boolean {
+    const cleanPat = typeof pattern === "string" ? pattern.trim() : "";
+    if (!cleanPat) {
+      return false;
+    }
+
+    const isRegex = /^\/.+\/[gimsuy]*$/.test(cleanPat);
+    const isWildcard = cleanPat.includes("*") || cleanPat.includes("?");
+    if (isRegex || isWildcard) {
+      return matchCommandPattern(cleanPat, argv);
+    }
+
+    if (cleanPat === joined) {
+      return true;
+    }
+
+    // Without a literal subcommand a pattern must match the command exactly;
+    // only a multi-token prefix may match with a following word boundary.
+    if (!cleanPat.includes(" ") && !cleanPat.includes("\t")) {
+      return false;
+    }
+
+    return (
+      joined.startsWith(`${cleanPat} `) || joined.startsWith(`${cleanPat}\t`)
+    );
   }
 
   /**

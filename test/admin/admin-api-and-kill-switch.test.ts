@@ -1066,8 +1066,9 @@ describe("Kill switch (Task 22.5)", () => {
     const getBody = (await get.json()) as { state: { pausedNewRuns: boolean } };
     assert.equal(getBody.state.pausedNewRuns, false);
 
-    // ...and on a subsequent POST, which rehydrates the persisted `false` before it acts. A level
-    // that does not itself set the pause flag exposes whether the stale in-memory `true` survived.
+    // ...and on a subsequent POST, which rehydrates the persisted `false` before it acts. Every
+    // kill-switch level now persists `pauseNewRuns = true`, so the response must report `true` — the
+    // rehydrated `false` was replaced by `execute`, and the stale in-memory `true` no longer leaks.
     const post = await killPost(
       attach(
         jsonRequest(
@@ -1079,7 +1080,8 @@ describe("Kill switch (Task 22.5)", () => {
     );
     assert.equal(post.status, 200);
     const postBody = (await post.json()) as { state: { pausedNewRuns: boolean } };
-    assert.equal(postBody.state.pausedNewRuns, false);
+    assert.equal(postBody.state.pausedNewRuns, true);
+    assert.equal(stores.settingsStore.getSetting("killSwitch.pauseNewRuns"), true);
   });
 
   it("excludes finished (done) runs from stop_gracefully preview and execute", () => {
@@ -1917,6 +1919,246 @@ describe("Kill switch live runtime wiring (Task 22.5)", () => {
     );
     assert.equal(res.status, 200);
     assert.equal(admissionPaused, true);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Regressions: atomic kill-switch persistence, runtime-control failures, queue sync & parity
+// ---------------------------------------------------------------------------------------------
+
+const KILL_SWITCH_URL = "http://test/api/admin/kill-switch";
+const QUEUE_URL = "http://test/api/admin/queue";
+
+function killPostLevel(level: string): Promise<Response> {
+  return killPost(
+    attach(
+      jsonRequest(
+        KILL_SWITCH_URL,
+        { level, confirmed: true },
+        { method: "POST", headers: adminHeaders() }
+      )
+    )
+  );
+}
+
+function queuePostAction(body: Record<string, unknown>): Promise<Response> {
+  return queuePost(
+    attach(jsonRequest(QUEUE_URL, body, { method: "POST", headers: adminHeaders() }))
+  );
+}
+
+function queueGetSnapshot(): Promise<Response> {
+  return queueGet(attach(new Request(QUEUE_URL, { headers: adminHeaders() })));
+}
+
+describe("Kill-switch atomic persistence (regressions)", () => {
+  for (const level of ["stop_gracefully", "hard_kill"] as const) {
+    it(`persists pausedNewRuns=true when executing ${level} directly`, async () => {
+      const res = await killPostLevel(level);
+      assert.equal(res.status, 200);
+      assert.equal(stores.settingsStore.getSetting("killSwitch.pauseNewRuns"), true);
+      assert.equal(stores.settingsStore.getSetting("killSwitch.lastLevel"), level);
+    });
+  }
+
+  it("surfaces failedRunIds and keeps a run retryable when killRun rejects", async () => {
+    stores.runStore.createRun({
+      runId: "hard-fail",
+      url: "https://x/y",
+      sha: "e".repeat(40),
+      phase: "legion",
+    });
+    let attempts = 0;
+    (globalThis as unknown as { __runOrchestrator?: unknown }).__runOrchestrator = {
+      pauseAdmission: () => undefined,
+      killRun: async () => {
+        attempts += 1;
+        if (attempts === 1) {
+          throw new Error("kill transport down");
+        }
+      },
+    };
+
+    const first = await killPostLevel("hard_kill");
+    assert.equal(first.status, 500);
+    const firstBody = (await first.json()) as { error?: string; failedRunIds?: string[] };
+    assert.equal(firstBody.error, "kill_switch_runtime_control_failed");
+    assert.deepEqual(firstBody.failedRunIds, ["hard-fail"]);
+
+    // The rejected kill must NOT finalize the run as killed — it stays retryable.
+    const afterFail = stores.runStore.getRun("hard-fail");
+    assert.notEqual(afterFail?.outcome, "killed");
+    assert.equal(afterFail?.phase, "legion");
+
+    // A follow-up hard_kill still targets the same run and now succeeds.
+    const second = await killPostLevel("hard_kill");
+    assert.equal(second.status, 200);
+    assert.equal(attempts, 2);
+    assert.equal(stores.runStore.getRun("hard-fail")?.outcome, "killed");
+    assert.equal(stores.runStore.getRun("hard-fail")?.phase, "done");
+  });
+
+  it("surfaces failedRunIds when stopRun rejects without finalizing the run", async () => {
+    stores.runStore.createRun({
+      runId: "stop-fail",
+      url: "https://x/y",
+      sha: "f".repeat(40),
+      phase: "legion",
+    });
+    (globalThis as unknown as { __runOrchestrator?: unknown }).__runOrchestrator = {
+      pauseAdmission: () => undefined,
+      stopRun: async () => {
+        throw new Error("stop transport down");
+      },
+    };
+
+    const res = await killPostLevel("stop_gracefully");
+    assert.equal(res.status, 500);
+    const body = (await res.json()) as { error?: string; failedRunIds?: string[] };
+    assert.equal(body.error, "kill_switch_runtime_control_failed");
+    assert.deepEqual(body.failedRunIds, ["stop-fail"]);
+    // The stop still took effect durably and never finalized the run.
+    assert.equal(stores.settingsStore.getSetting("killSwitch.stopGracefully"), true);
+    assert.equal(stores.runStore.getRun("stop-fail")?.phase, "legion");
+  });
+
+  it("keeps stoppingGracefully true for a concurrent GET while stop_gracefully awaits runtime stops", async () => {
+    let releaseStop: () => void = () => undefined;
+    const stopGate = new Promise<void>((resolve) => {
+      releaseStop = resolve;
+    });
+    let stopStarted = false;
+    (globalThis as unknown as { __runOrchestrator?: unknown }).__runOrchestrator = {
+      pauseAdmission: () => undefined,
+      stopRun: async () => {
+        stopStarted = true;
+        await stopGate;
+      },
+    };
+    stores.runStore.createRun({
+      runId: "stop-concurrent",
+      url: "https://x/y",
+      sha: "a".repeat(40),
+      phase: "legion",
+    });
+
+    const postPromise = killPostLevel("stop_gracefully");
+    // Let the POST run through execute + persist, then park on the awaited stopRun.
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(stopStarted, true);
+    assert.equal(stores.settingsStore.getSetting("killSwitch.stopGracefully"), true);
+
+    const getRes = await killGet(attach(new Request(KILL_SWITCH_URL, { headers: adminHeaders() })));
+    assert.equal(getRes.status, 200);
+    const body = (await getRes.json()) as { state: { stoppingGracefully: boolean } };
+    assert.equal(body.state.stoppingGracefully, true);
+
+    releaseStop();
+    const postRes = await postPromise;
+    assert.equal(postRes.status, 200);
+  });
+});
+
+describe("Admin queue synchronization (regressions)", () => {
+  it("purges runs that left the queued phase even when still present in the FIFO queue", async () => {
+    satisfyRequiredSettings(stores.settingsStore);
+    stores.runStore.createInviteCode({ code: "q-purge-invite", allowedRunCount: 5 });
+    const started = await startRunPost(
+      attach(
+        startRunRequest({
+          url: "https://github.com/a/b",
+          sha: "a".repeat(40),
+          inviteCode: "q-purge-invite",
+          runId: "q-purge-run",
+        })
+      )
+    );
+    assert.equal(started.status, 202);
+
+    const queue = resolveFifoQueue({ eventStore: stores.eventStore, runStore: stores.runStore });
+    assert.equal(queue.has("q-purge-run"), true);
+
+    // The run starts: its RunStore phase leaves `queued` while the FIFO queue still lists it.
+    stores.runStore.updateRun("q-purge-run", { phase: "legion", queuePosition: null });
+    assert.equal(queue.has("q-purge-run"), true);
+
+    const res = await queueGetSnapshot();
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as { queue: { entries: Array<{ runId: string }> } };
+    assert.equal(
+      body.queue.entries.some((entry) => entry.runId === "q-purge-run"),
+      false
+    );
+    assert.equal(queue.has("q-purge-run"), false);
+  });
+
+  it("fails closed (500) without stale success when runStore.updateRun throws", async () => {
+    satisfyRequiredSettings(stores.settingsStore);
+    stores.runStore.createInviteCode({ code: "q-fail-invite", allowedRunCount: 5 });
+    const started = await startRunPost(
+      attach(
+        startRunRequest({
+          url: "https://github.com/a/b",
+          sha: "b".repeat(40),
+          inviteCode: "q-fail-invite",
+          runId: "q-fail-run",
+        })
+      )
+    );
+    assert.equal(started.status, 202);
+
+    const originalUpdateRun = stores.runStore.updateRun.bind(stores.runStore);
+    (stores.runStore as unknown as { updateRun: unknown }).updateRun = () => {
+      throw new Error("store write failed");
+    };
+    try {
+      for (const action of ["move", "remove", "cancel"] as const) {
+        const res = await queuePostAction({ action, runId: "q-fail-run", position: 1 });
+        assert.equal(res.status, 500, `expected a retryable 500 for action ${action}`);
+        const body = (await res.json()) as { ok: boolean; error?: string };
+        assert.equal(body.ok, false);
+        assert.equal(body.error, "queue_store_update_failed");
+      }
+      // Memory never diverged: the run is still queued with its position and no terminal outcome.
+      const run = stores.runStore.getRun("q-fail-run");
+      assert.equal(run?.phase, "queued");
+      assert.equal(run?.queuePosition, 1);
+      assert.equal(run?.outcome, null);
+    } finally {
+      (stores.runStore as unknown as { updateRun: unknown }).updateRun = originalUpdateRun;
+    }
+  });
+
+  it("surfaces every run admitted at queueDepthCap > 5 through /api/start-run", async () => {
+    satisfyRequiredSettings(stores.settingsStore);
+    stores.runStore.createInviteCode({ code: "q-depth-invite", allowedRunCount: 50 });
+    const admission = (globalThis as unknown as { __admission?: { queueDepthCap?: number } })
+      .__admission;
+    assert.ok(admission);
+    admission.queueDepthCap = 7;
+
+    const runIds = Array.from({ length: 7 }, (_, index) => `q-depth-${index + 1}`);
+    for (const runId of runIds) {
+      const res = await startRunPost(
+        attach(
+          startRunRequest({
+            url: "https://github.com/a/b",
+            sha: "c".repeat(40),
+            inviteCode: "q-depth-invite",
+            runId,
+          })
+        )
+      );
+      assert.equal(res.status, 202, `expected ${runId} to be admitted`);
+    }
+
+    const res = await queueGetSnapshot();
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as { queue: { entries: Array<{ runId: string }> } };
+    const visible = new Set(body.queue.entries.map((entry) => entry.runId));
+    for (const runId of runIds) {
+      assert.equal(visible.has(runId), true, `expected ${runId} to be visible in the admin queue`);
+    }
   });
 });
 

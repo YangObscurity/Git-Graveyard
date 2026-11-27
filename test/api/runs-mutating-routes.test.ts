@@ -14,6 +14,7 @@ import { TaskDispatcher } from "@/lib/scheduler/dispatcher";
 import { parsePact } from "@/lib/pact/pact-parser";
 import { renderPact } from "@/lib/pact/pact-renderer";
 import { RunOrchestrator } from "@/lib/orchestrator/run-orchestrator";
+import { deriveCommandPrefix } from "@/lib/gateway/approval-manager";
 import { RuntimeHost, resetRuntimeHost } from "@/lib/runtime/runtime-host";
 
 import { POST as postMessage, GET as getMessages } from "@/app/api/runs/[runId]/messages/route";
@@ -2988,5 +2989,168 @@ describe("mutating run routes against real objects", () => {
     assert.ok((tracking.instructions?.length ?? 0) >= 1);
     assert.ok(tracking.reviewFocus?.includes("check auth edge cases"));
   });
+  it("scopes approve_pattern so a flagged command never widens to the bare executable", async () => {
+    const { runStore, eventStore } = makeStores();
+    const runId = "run-scoped-pattern";
+    makeRun(runStore, runId);
+    const host = makeRealHost({ runStore, eventStore });
+    const orchestrator = trackOrchestrator(
+      new RunOrchestrator({ host, runStore, eventStore, runsDir: makeTempDir() })
+    );
+    (globalThis as Record<string, unknown>).__runOrchestrator = orchestrator;
+    const manager = host.gateway.approvalManager;
+
+    // A flag before the first literal subcommand - or no subcommand at all -
+    // refuses auto-derivation instead of collapsing to a bare executable.
+    assert.equal(deriveCommandPrefix(["node", "-e", "console.log(1)"]), undefined);
+    assert.equal(deriveCommandPrefix(["git", "-c", "core.pager=cat"]), undefined);
+    assert.equal(deriveCommandPrefix(["python", "-m", "unittest"]), undefined);
+    assert.equal(deriveCommandPrefix(["node"]), undefined);
+    // Executable plus literal subcommand still scopes narrowly to that prefix.
+    assert.equal(deriveCommandPrefix(["git", "status"]), "git status");
+    assert.equal(deriveCommandPrefix(["npm", "test", "--watch"]), "npm test");
+
+    // Approving the flagged command with `approve_pattern` records no run-scoped
+    // pattern, so an arbitrary later `node` run stays unapproved.
+    const flagged = await manager.requestApproval({
+      runId,
+      skeletonId: "skel-flag",
+      argv: ["node", "-e", "console.log(1)"],
+      cwd: "/workspace/repo",
+    });
+    const flaggedRes = await resolveApproval(
+      jsonRequest(
+        `http://test/api/runs/${runId}/approvals/${flagged.approvalId}`,
+        { decision: "approve_pattern" }
+      ),
+      { params: Promise.resolve({ runId, approvalId: flagged.approvalId }) }
+    );
+    assert.equal(flaggedRes.status, 200);
+    assert.equal(manager.isPatternApproved(runId, ["node", "other.js"]), false);
+    assert.equal(manager.isPatternApproved(runId, ["node"]), false);
+    assert.equal(runStore.getApprovedPatterns(runId).length, 0);
+
+    // A safe `git status` subcommand prefix still approves scoped follow-ups,
+    // but never widens to a different subcommand or the bare executable.
+    const safe = await manager.requestApproval({
+      runId,
+      skeletonId: "skel-safe",
+      argv: ["git", "status"],
+      cwd: "/workspace/repo",
+    });
+    const safeRes = await resolveApproval(
+      jsonRequest(
+        `http://test/api/runs/${runId}/approvals/${safe.approvalId}`,
+        { decision: "approve_pattern" }
+      ),
+      { params: Promise.resolve({ runId, approvalId: safe.approvalId }) }
+    );
+    assert.equal(safeRes.status, 200);
+    assert.equal(manager.isPatternApproved(runId, ["git", "status"]), true);
+    assert.equal(manager.isPatternApproved(runId, ["git", "status", "--short"]), true);
+    assert.equal(manager.isPatternApproved(runId, ["git", "statuses"]), false);
+    assert.equal(manager.isPatternApproved(runId, ["git", "commit", "-m", "x"]), false);
+    assert.equal(manager.isPatternApproved(runId, ["git"]), false);
+    assert.equal(manager.isPatternApproved(runId, ["node", "other.js"]), false);
+  });
+
+
+  it("preserves unowned admission-queue entries while removing started runs", async () => {
+    const { runStore, eventStore } = makeStores();
+    const ownedRunId = "run-owned-queue";
+    const orphanRunId = "run-orphan-queue";
+    makeRun(runStore, ownedRunId);
+    const host = makeRealHost({ runStore, eventStore });
+
+    const g = globalThis as Record<string, any>;
+    const orphanEntry = {
+      runId: orphanRunId,
+      queuePosition: 9,
+      url: "https://github.com/sibling-owner/sibling-repo",
+      sha: "f".repeat(40),
+      origin: "sibling-surface",
+      metadata: { note: "keep-me" },
+    };
+    g.__admissionQueue = [orphanEntry];
+
+    const orchestrator = trackOrchestrator(
+      new RunOrchestrator({
+        host,
+        runStore,
+        eventStore,
+        runsDir: makeTempDir(),
+        // Fail fast so startRun's synchronous queue bookkeeping is all we exercise.
+        exhumeRunner: async () => {
+          throw new Error("stub exhume");
+        },
+      })
+    );
+    (globalThis as Record<string, unknown>).__runOrchestrator = orchestrator;
+
+    // Pausing admission makes enqueue only sync the shared queue.
+    orchestrator.pauseAdmission();
+    orchestrator.enqueueRun(ownedRunId);
+
+    const afterEnqueue = g.__admissionQueue as Array<Record<string, any>>;
+    const orphanAfterEnqueue = afterEnqueue.find((e) => e && e.runId === orphanRunId);
+    assert.ok(orphanAfterEnqueue, "unowned entry must survive the sync");
+    assert.equal(orphanAfterEnqueue.metadata.note, "keep-me");
+    assert.equal(orphanAfterEnqueue.origin, "sibling-surface");
+    assert.equal(orphanAfterEnqueue.queuePosition, 9);
+    const ownedAfterEnqueue = afterEnqueue.find((e) => e && e.runId === ownedRunId);
+    assert.ok(ownedAfterEnqueue, "the orchestrator's own queued run is tracked");
+    assert.equal(ownedAfterEnqueue.queuePosition, 1);
+
+    // Starting the run removes only its own entry; the unowned entry is intact.
+    const handle = orchestrator.startRun(ownedRunId);
+    const afterStart = g.__admissionQueue as Array<Record<string, any>>;
+    assert.equal(afterStart.some((e) => e && e.runId === ownedRunId), false);
+    const orphanAfterStart = afterStart.find((e) => e && e.runId === orphanRunId);
+    assert.ok(orphanAfterStart, "unowned entry must survive the start");
+    assert.equal(orphanAfterStart.metadata.note, "keep-me");
+    assert.equal(orphanAfterStart.origin, "sibling-surface");
+    assert.equal(orphanAfterStart.queuePosition, 9);
+
+    await handle.promise.catch(() => {});
+    g.__admissionQueue.length = 0;
+  });
+
+
+  it("interruptSkeleton releases the running slot and reraiseSkeleton re-queues it", async () => {
+    const { runStore, eventStore } = makeStores();
+    const runId = "run-interrupt-reraise";
+    makeRun(runStore, runId);
+    const runsDir = makeTempDir();
+    const host = makeRealHost({ runStore, eventStore });
+    const skeletonId = "skeleton-T1";
+    const { scheduler, dispatcher } = makeDispatcherWithActiveSkeleton(
+      runId,
+      { runStore, eventStore },
+      host,
+      runsDir,
+      skeletonId
+    );
+
+    // Put the scheduler task into "running" so the interrupt has work to do.
+    scheduler.dispatchTask("T1");
+    assert.equal(scheduler.getTask("T1")?.state, "running");
+    assert.equal(dispatcher.getLiveCount(), 1);
+
+    const interrupted = await dispatcher.interruptSkeleton(skeletonId);
+    assert.equal(interrupted, true);
+    // The interrupt releases the live slot and leaves the task out of "running".
+    assert.equal(dispatcher.getLiveCount(), 0);
+    assert.equal(dispatcher.getActiveTask("T1"), undefined);
+    assert.notEqual(scheduler.getTask("T1")?.state, "running");
+
+    // Re-raise locates the interrupted task through the persistent lookup and
+    // re-queues it cleanly back to "running".
+    const reraised = await dispatcher.reraiseSkeleton(skeletonId);
+    assert.equal(reraised, true);
+    assert.equal(scheduler.getTask("T1")?.state, "running");
+    assert.equal(dispatcher.getLiveCount(), 1);
+  });
+
+
 });
 

@@ -305,5 +305,194 @@ describe("Read-time field redaction across admin redact and event reads", () => 
     assert.deepEqual(redactionEvents[0].data.fields, ["logs"]);
     assert.deepEqual(redactionEvents[0].data.targetSeqs, [1, 2]);
   });
+
+  it("scrubs data.command on cmd.output events when fields: [\"commands\"] is active without touching unrelated events", async () => {
+    const runId = "run-redaction-commands";
+    stores.runStore.createRun({
+      runId,
+      url: "https://example.test/owner/repo",
+      sha: "d".repeat(40),
+      phase: "done",
+      outcome: "resurrected",
+    });
+
+    stores.eventStore.append({
+      runId,
+      kind: "cmd.output",
+      actor: "necromancer",
+      data: {
+        refs: [],
+        command: "CANARY-COMMAND-LINE",
+        cmd: "CANARY-CMD",
+        argv: ["CANARY-ARGV"],
+      },
+    });
+    // A non-command event that also carries a `command` key must not be classified as a command.
+    stores.eventStore.append({
+      runId,
+      kind: "run.queued",
+      actor: "necromancer",
+      data: { refs: [], command: "CANARY-UNRELATED-COMMAND", queuePosition: 2 },
+    });
+
+    const redact = await runAction(runId, { action: "redact", fields: ["commands"] });
+    assert.equal(redact.status, 200);
+
+    const tap = new EventTap(stores.eventStore);
+    const events = tap.getEvents(runId, { from: 0, to: 100 });
+
+    const cmd = events.find((event) => event.kind === "cmd.output");
+    assert.ok(cmd);
+    assert.equal(cmd!.data.command, "[REDACTED]");
+    assert.equal(cmd!.data.cmd, "[REDACTED]");
+    assert.equal(cmd!.data.argv, "[REDACTED]");
+    assert.equal(cmd!.data.redacted, true);
+
+    const queued = events.find((event) => event.kind === "run.queued");
+    assert.ok(queued);
+    assert.equal(queued!.data.command, "CANARY-UNRELATED-COMMAND");
+    assert.equal(queued!.data.redacted, undefined);
+  });
+
+  it("scrubs nested stdout/stderr/output at depth when fields: [\"logs\"] is active while root refs stays intact", async () => {
+    const runId = "run-redaction-nested";
+    stores.runStore.createRun({
+      runId,
+      url: "https://example.test/owner/repo",
+      sha: "e".repeat(40),
+      phase: "done",
+      outcome: "resurrected",
+    });
+
+    stores.eventStore.append({
+      runId,
+      kind: "skeleton.log",
+      actor: "bonesetter",
+      data: {
+        refs: ["ev:nested-root"],
+        keep: "CANARY-ROOT-KEEP",
+        meta: {
+          stdout: "CANARY-NESTED-STDOUT",
+          stderr: "CANARY-NESTED-STDERR",
+          output: "CANARY-NESTED-OUTPUT",
+          keep: "CANARY-NESTED-KEEP",
+          deeper: { output: "CANARY-DEEP-OUTPUT", keep: "CANARY-DEEP-KEEP" },
+        },
+      },
+    });
+
+    const redact = await runAction(runId, { action: "redact", fields: ["logs"] });
+    assert.equal(redact.status, 200);
+
+    const tap = new EventTap(stores.eventStore);
+    const event = tap
+      .getEvents(runId, { from: 0, to: 100 })
+      .find((candidate) => candidate.kind === "skeleton.log");
+    assert.ok(event);
+
+    // The root-level `refs` exception holds and unrelated keys are untouched.
+    assert.deepEqual(event!.data.refs, ["ev:nested-root"]);
+    assert.equal(event!.data.keep, "CANARY-ROOT-KEEP");
+
+    const meta = event!.data.meta as Record<string, unknown>;
+    assert.equal(meta.stdout, "[REDACTED]");
+    assert.equal(meta.stderr, "[REDACTED]");
+    assert.equal(meta.output, "[REDACTED]");
+    assert.equal(meta.keep, "CANARY-NESTED-KEEP");
+
+    const deeper = meta.deeper as Record<string, unknown>;
+    assert.equal(deeper.output, "[REDACTED]");
+    assert.equal(deeper.keep, "CANARY-DEEP-KEEP");
+
+    assert.equal(event!.data.redacted, true);
+    assert.equal(event!.data.redactedByOwner, true);
+  });
+
+  it("fails closed (throws) when the admin.redaction lookup fails instead of serving unredacted events", () => {
+    const runId = "run-redaction-failclosed";
+    stores.runStore.createRun({
+      runId,
+      url: "https://example.test/owner/repo",
+      sha: "f".repeat(40),
+      phase: "done",
+      outcome: "resurrected",
+    });
+    stores.eventStore.append({
+      runId,
+      kind: "cmd.output",
+      actor: "necromancer",
+      data: { refs: [], output: "CANARY-FAILCLOSED-OUTPUT" },
+    });
+    stores.eventStore.append({
+      runId,
+      kind: "admin.redaction",
+      actor: "owner",
+      data: { refs: [], fields: ["logs"], reviewed: true },
+    });
+
+    const tap = new EventTap(stores.eventStore);
+    // Sanity: with the redaction rules loadable the output is scrubbed.
+    const healthy = tap.getEvents(runId);
+    assert.equal(
+      healthy.find((event) => event.kind === "cmd.output")!.data.output,
+      "[REDACTED]"
+    );
+
+    const originalGetEvents = stores.eventStore.getEvents.bind(stores.eventStore) as (
+      id: string,
+      options?: unknown
+    ) => unknown;
+    (stores.eventStore as unknown as { getEvents: typeof originalGetEvents }).getEvents = (
+      id,
+      options
+    ) => {
+      if (options && (options as { kind?: string }).kind === "admin.redaction") {
+        throw new Error("redaction store unavailable");
+      }
+      return originalGetEvents(id, options);
+    };
+    try {
+      assert.throws(() => tap.getEvents(runId), /redaction store unavailable/);
+    } finally {
+      (stores.eventStore as unknown as { getEvents: unknown }).getEvents = originalGetEvents;
+    }
+  });
+
+  it("rejects an uncompilable pattern with 400 and performs no DB or event writes", async () => {
+    const runId = "run-redaction-bad-pattern";
+    stores.runStore.createRun({
+      runId,
+      url: "https://example.test/owner/repo",
+      sha: "g".repeat(40),
+      phase: "done",
+      outcome: "resurrected",
+    });
+
+    const res = await runAction(runId, {
+      action: "redact",
+      fields: ["logs"],
+      patterns: ["(", "CANARY(VALID)"],
+    });
+    assert.equal(res.status, 400);
+    assert.equal(
+      ((await res.json()) as { error: string }).error,
+      "invalid_redaction_pattern"
+    );
+
+    // No admin.redaction audit record was appended and the run was not marked reviewed.
+    assert.equal(stores.eventStore.getEvents(runId, { kind: "admin.redaction" }).length, 0);
+    const run = stores.runStore.getRun(runId);
+    assert.notEqual(run?.metadata?.reviewed, true);
+    assert.equal(run?.metadata?.redactionFields, undefined);
+
+    // A valid pattern is still accepted and performs the write.
+    const ok = await runAction(runId, {
+      action: "redact",
+      fields: ["logs"],
+      patterns: ["CANARY\\.(VALID)"],
+    });
+    assert.equal(ok.status, 200);
+    assert.equal(stores.eventStore.getEvents(runId, { kind: "admin.redaction" }).length, 1);
+  });
 });
 

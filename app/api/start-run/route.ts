@@ -450,10 +450,20 @@ export async function POST(request: Request): Promise<Response> {
       queueDepth = numberSetting(settings.getSetting("queueDepth"));
       queueIdleLimitMs = numberSetting(settings.getSetting("queueIdleLimitMs"));
     }
+    // Sync the mirror queue's depth capacity with this route's admission cap: every run accepted
+    // with HTTP 202 must be enqueuable into the FIFO queue the Admin view reads, otherwise it could
+    // never be seen or managed there. Keep the larger of the admission cap and the settings value.
+    const mirrorQueueDepth =
+      Number.isFinite(queueDepthCap) && queueDepthCap > 0
+        ? Math.max(
+            queueDepthCap,
+            typeof queueDepth === "number" && Number.isFinite(queueDepth) ? queueDepth : 0
+          )
+        : queueDepth;
     const fifo = resolveFifoQueue({
       eventStore,
       runStore,
-      queueDepth,
+      queueDepth: mirrorQueueDepth,
       queueIdleLimitMs,
     });
     if (!fifo.has(runId)) {

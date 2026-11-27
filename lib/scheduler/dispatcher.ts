@@ -211,6 +211,13 @@ export class TaskDispatcher {
   private tasksFailed = 0;
 
   private readonly activeTasks: Map<string, ActiveTaskTracking> = new Map();
+  /**
+   * Persistent Skeleton-scoped lookup keyed by `skeletonId`. It outlives the
+   * live `activeTasks` slot so an interrupt or lay-to-rest that releases a task
+   * out of `"running"` can still be located - and re-raised - by id afterwards.
+   */
+  private readonly knownSkeletonTasks: Map<string, ActiveTaskTracking> =
+    new Map();
   private readonly eventStore?: EventStore | any;
 
   private mergeLock: Promise<void> = Promise.resolve();
@@ -315,13 +322,114 @@ export class TaskDispatcher {
     return undefined;
   }
 
+  /** Records a Skeleton's tracking entry in the persistent lookup. */
+  private rememberSkeletonTask(active: ActiveTaskTracking): void {
+    if (
+      active &&
+      typeof active.skeletonId === "string" &&
+      active.skeletonId.length > 0
+    ) {
+      this.knownSkeletonTasks.set(active.skeletonId, active);
+    }
+  }
+
+  /**
+   * Resolves a tracking entry from the persistent lookup, accepting the same
+   * Skeleton-id / task-id / `skeleton-<taskId>` alias spellings as a live slot.
+   */
+  private findKnownSkeletonTask(
+    skeletonId: string
+  ): ActiveTaskTracking | undefined {
+    if (typeof skeletonId !== "string" || skeletonId.length === 0) {
+      return undefined;
+    }
+    const direct = this.knownSkeletonTasks.get(skeletonId);
+    if (direct) {
+      return direct;
+    }
+    for (const known of this.knownSkeletonTasks.values()) {
+      if (
+        known.skeletonId === skeletonId ||
+        known.taskId === skeletonId ||
+        `skeleton-${known.taskId}` === skeletonId
+      ) {
+        return known;
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Resolves the tracked entry addressed by a Skeleton-scoped control: a live
+   * slot is preferred, and the persistent lookup is the fallback so a control
+   * that follows an interrupt or lay-to-rest still lands.
+   */
+  private resolveTrackedSkeleton(
+    skeletonId: string
+  ): ActiveTaskTracking | undefined {
+    return (
+      this.findActiveBySkeleton(skeletonId) ??
+      this.findKnownSkeletonTask(skeletonId)
+    );
+  }
+
+  /**
+   * Releases a task's live scheduler slot while keeping its Skeleton in the
+   * persistent lookup so a later `reraiseSkeleton` can still find it.
+   */
+  private releaseActiveSkeletonSlot(active: ActiveTaskTracking): void {
+    this.rememberSkeletonTask(active);
+    if (this.activeTasks.get(active.taskId) === active) {
+      this.activeTasks.delete(active.taskId);
+    }
+  }
+
+  /**
+   * Moves an interrupted task cleanly out of `"running"` (to `"rejected"`, from
+   * which a `reraiseSkeleton` can re-queue it) without consuming an attempt.
+   * A task that is not currently running is left untouched.
+   */
+  private transitionTaskOutOfRunning(
+    active: ActiveTaskTracking,
+    reason: string
+  ): void {
+    const live = this.scheduler.getTask(active?.taskId);
+    if (!live || live.state !== "running") {
+      return;
+    }
+    try {
+      this.scheduler.rejectTask(live.id, { reason, retry: false });
+    } catch {
+      // The slot release must still proceed even if the move is refused.
+    }
+  }
+
+  /**
+   * Lays a tracked task to rest in the scheduler, abandoning it cleanly from a
+   * running or ready state. Other states (including terminal ones) are left as
+   * they are.
+   */
+  private abandonTrackedTask(active: ActiveTaskTracking, reason: string): void {
+    const live = this.scheduler.getTask(active?.taskId);
+    if (!live) {
+      return;
+    }
+    if (live.state === "running" || live.state === "ready") {
+      try {
+        this.scheduler.layToRest(live.id, reason);
+      } catch {
+        // The slot release must still proceed even if the move is refused.
+      }
+    }
+  }
+
   /**
    * Interrupts one Skeleton: aborts its in-flight turn and cancels its session
    * without touching the rest of the run. Returns false when no live Skeleton
    * matches, so the caller can fail closed.
    */
   public async interruptSkeleton(skeletonId: string): Promise<boolean> {
-    const active = this.findActiveBySkeleton(skeletonId);
+    const active = this.resolveTrackedSkeleton(skeletonId);
     if (!active) {
       return false;
     }
@@ -333,6 +441,10 @@ export class TaskDispatcher {
         // A cancel failure must not erase the interrupt already recorded.
       }
     }
+    // Move the task cleanly out of "running" and release its live slot, while
+    // keeping it in the persistent lookup so it can be re-raised by id.
+    this.transitionTaskOutOfRunning(active, "Skeleton interrupted by user");
+    this.releaseActiveSkeletonSlot(active);
     this.emitControlEvent(active, "interrupt");
     return true;
   }
@@ -342,7 +454,7 @@ export class TaskDispatcher {
    * false when no live Skeleton matches.
    */
   public async reraiseSkeleton(skeletonId: string): Promise<boolean> {
-    const active = this.findActiveBySkeleton(skeletonId);
+    const active = this.resolveTrackedSkeleton(skeletonId);
     if (!active) {
       return false;
     }
@@ -353,6 +465,25 @@ export class TaskDispatcher {
         // A raise failure leaves the task tracked; the control is still
         // considered delivered so the operator can retry.
       }
+    }
+    // Re-queue the interrupted task: a rejected task returns to ready and a
+    // ready task is dispatched back to running, then its live slot is restored.
+    const live = this.scheduler.getTask(active.taskId);
+    if (live) {
+      try {
+        if (live.state === "rejected") {
+          this.scheduler.retryTask(live.id);
+        }
+        if (live.state === "ready") {
+          this.scheduler.dispatchTask(live.id);
+        }
+      } catch {
+        // The Skeleton slot is still restored below so the control lands.
+      }
+    }
+    this.rememberSkeletonTask(active);
+    if (!this.activeTasks.has(active.taskId)) {
+      this.activeTasks.set(active.taskId, active);
     }
     this.emitControlEvent(active, "reraise");
     return true;
@@ -368,7 +499,7 @@ export class TaskDispatcher {
     skeletonId: string,
     choice?: "keep_commits" | "discard" | string
   ): Promise<boolean> {
-    const active = this.findActiveBySkeleton(skeletonId);
+    const active = this.resolveTrackedSkeleton(skeletonId);
     if (!active) {
       return false;
     }
@@ -389,6 +520,15 @@ export class TaskDispatcher {
         // A cancel failure must not erase the recorded choice.
       }
     }
+    // Abandon the task in the scheduler and release its live slot, keeping the
+    // persistent lookup entry for any follow-up control on the same Skeleton.
+    this.abandonTrackedTask(
+      active,
+      normalized === "discard"
+        ? "Skeleton laid to rest (work discarded)"
+        : "Skeleton laid to rest (work kept)"
+    );
+    this.releaseActiveSkeletonSlot(active);
     this.emitControlEvent(active, "lay_to_rest", { choice: normalized });
     return true;
   }
@@ -404,7 +544,7 @@ export class TaskDispatcher {
     text: string,
     delivery?: string
   ): Promise<boolean> {
-    const active = this.findActiveBySkeleton(skeletonId);
+    const active = this.resolveTrackedSkeleton(skeletonId);
     if (!active) {
       return false;
     }
@@ -420,10 +560,12 @@ export class TaskDispatcher {
       active.instructions = [];
     }
     active.instructions.push({ text: trimmed, delivery: strategy, at: Date.now() });
+    if (strategy === "interrupt") {
+      active.abortController.abort();
+    }
     if (active.supervisor) {
       try {
         if (strategy === "interrupt") {
-          active.abortController.abort();
           await active.supervisor.cancel("Skeleton instructed to stop now");
         } else if (typeof active.supervisor.steer === "function") {
           await active.supervisor.steer(trimmed);
@@ -431,6 +573,13 @@ export class TaskDispatcher {
       } catch {
         // The instruction is still queued for the Skeleton.
       }
+    }
+    if (strategy === "interrupt") {
+      // An interrupt_now delivery stops the Skeleton now: move it out of
+      // "running" and release its live slot, keeping it retrievable by id so a
+      // later `reraiseSkeleton` can re-queue it.
+      this.transitionTaskOutOfRunning(active, "Skeleton instructed to stop now");
+      this.releaseActiveSkeletonSlot(active);
     }
     this.emitControlEvent(active, "send_instruction", { delivery: strategy });
     return true;
@@ -444,7 +593,7 @@ export class TaskDispatcher {
     skeletonId: string,
     text: string
   ): Promise<boolean> {
-    const active = this.findActiveBySkeleton(skeletonId);
+    const active = this.resolveTrackedSkeleton(skeletonId);
     if (!active) {
       return false;
     }
@@ -711,6 +860,7 @@ export class TaskDispatcher {
       startedAt: Date.now(),
     };
     this.activeTasks.set(task.id, activeTracking);
+    this.rememberSkeletonTask(activeTracking);
 
     let workerFailed = false;
     let workerError: any = null;
@@ -859,8 +1009,14 @@ export class TaskDispatcher {
     }
 
     if (abortController.signal.aborted || this.isStoppedState) {
+      // An interrupted (or stopping) task must leave "running" cleanly and give
+      // up its live scheduler slot, while staying retrievable for a re-raise.
+      this.transitionTaskOutOfRunning(
+        activeTracking,
+        this.stopReason ?? "Skeleton interrupted"
+      );
       await this.cleanupWorktree(worktreeRes.worktreeDir, task.id);
-      this.activeTasks.delete(task.id);
+      this.releaseActiveSkeletonSlot(activeTracking);
       return;
     }
 

@@ -345,6 +345,12 @@ export class RunOrchestrator extends EventEmitter {
   private readonly activeRuns: Map<string, RunExecutionHandle> = new Map();
   private readonly runDeferreds: Map<string, Deferred<PactApprovalInput>> =
     new Map();
+  /**
+   * Every runId this orchestrator has admitted or started. It is the ownership
+   * marker for the shared `globalThis.__admissionQueue`: only entries for these
+   * runs are ever touched, so entries written by another surface are preserved.
+   */
+  private readonly ownedRunIds: Set<string> = new Set();
 
   private isAdmissionPausedState = false;
   private isStoppedState = false;
@@ -443,6 +449,9 @@ export class RunOrchestrator extends EventEmitter {
     if (!runId || typeof runId !== "string") {
       throw new TypeError("runId must be a non-empty string");
     }
+
+    // From here on the orchestrator owns this run's admission-queue entry.
+    this.ownedRunIds.add(runId);
 
     if (this.activeRuns.has(runId)) {
       return { queuePosition: 0, runId };
@@ -569,9 +578,14 @@ export class RunOrchestrator extends EventEmitter {
 
   /**
    * Mirrors the orchestrator's internal admission queue into the shared
-   * `globalThis.__admissionQueue` the runtime host and diagnostics read,
-   * preserving any richer entry fields already present for a queued run and
-   * renumbering positions to match.
+   * `globalThis.__admissionQueue` the runtime host and diagnostics read.
+   *
+   * Ownership is explicit. Only entries whose run is owned by this orchestrator
+   * (`ownedRunIds`) are managed: the currently queued runs are rebuilt in queue
+   * order, reusing each entry and its richer fields and renumbering positions;
+   * an owned run that is no longer queued (started, cancelled or removed) has
+   * its entry dropped. Every other entry was written by a different surface and
+   * is preserved untouched, keeping its order and extra fields intact.
    */
   private syncAdmissionQueue(): void {
     const g = globalThis as unknown as {
@@ -580,29 +594,63 @@ export class RunOrchestrator extends EventEmitter {
     if (!Array.isArray(g.__admissionQueue)) {
       return;
     }
+
     const existing = new Map<
       string,
       { runId?: string; queuePosition?: number }
     >();
+    const unowned: Array<{ runId?: string; queuePosition?: number }> = [];
     for (const entry of g.__admissionQueue) {
-      if (
+      const isOwned =
         entry &&
         typeof entry === "object" &&
         typeof entry.runId === "string" &&
-        !existing.has(entry.runId)
-      ) {
-        existing.set(entry.runId, entry);
+        this.ownedRunIds.has(entry.runId);
+      if (!isOwned) {
+        // Written by another surface: keep the entry and its fields as-is.
+        unowned.push(entry);
+        continue;
+      }
+      // Collect the richer field set already recorded for a queued run; owned
+      // runs that are no longer queued are intentionally left out and removed.
+      if (!existing.has(entry.runId as string)) {
+        existing.set(entry.runId as string, entry);
       }
     }
+
     const next = this.queue.map((runId, index) => {
       const entry = existing.get(runId) ?? { runId };
       entry.runId = runId;
       entry.queuePosition = index + 1;
       return entry;
     });
+
     g.__admissionQueue.length = 0;
     for (const entry of next) {
       g.__admissionQueue.push(entry);
+    }
+    for (const entry of unowned) {
+      g.__admissionQueue.push(entry);
+    }
+  }
+
+  /**
+   * Removes exactly one run's entries from the shared admission queue, leaving
+   * every other entry - including unowned ones - untouched. Called when a run
+   * leaves the queue to begin execution.
+   */
+  private removeRunFromAdmissionQueue(runId: string): void {
+    const g = globalThis as unknown as {
+      __admissionQueue?: Array<{ runId?: string; queuePosition?: number }>;
+    };
+    if (!Array.isArray(g.__admissionQueue)) {
+      return;
+    }
+    for (let i = g.__admissionQueue.length - 1; i >= 0; i -= 1) {
+      const entry = g.__admissionQueue[i];
+      if (entry && typeof entry === "object" && entry.runId === runId) {
+        g.__admissionQueue.splice(i, 1);
+      }
     }
   }
 
@@ -620,7 +668,9 @@ export class RunOrchestrator extends EventEmitter {
       const nextRunId = this.queue.shift();
       if (nextRunId) {
         this.updateQueuePositions();
-        this.syncAdmissionQueue();
+        // `startRun` removes the dequeued run from the shared admission queue
+        // and re-syncs, so the managed entries stay correct without wiping the
+        // entries this orchestrator does not own.
         try {
           this.startRun(nextRunId);
         } catch {
@@ -643,6 +693,9 @@ export class RunOrchestrator extends EventEmitter {
       throw new TypeError("runId must be a non-empty string");
     }
 
+    // Starting a run makes the orchestrator its owner for admission purposes.
+    this.ownedRunIds.add(runId);
+
     const existingHandle = this.activeRuns.get(runId);
     if (existingHandle) {
       return existingHandle;
@@ -654,6 +707,11 @@ export class RunOrchestrator extends EventEmitter {
       this.queue.splice(qIdx, 1);
       this.updateQueuePositions();
     }
+
+    // The run is beginning execution, so it no longer waits in the shared
+    // admission queue: drop its entry cleanly without disturbing unowned ones.
+    this.removeRunFromAdmissionQueue(runId);
+    this.syncAdmissionQueue();
 
     // Ensure run record exists
     let runRecord = this.host.runStore.getRun(runId);

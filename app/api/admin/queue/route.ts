@@ -11,7 +11,7 @@ import {
   type FifoQueue,
   type QueueEntry,
 } from "@/lib/admission/fifo-queue";
-import type { RunRecord, RunStore } from "@/lib/runs/run-store";
+import type { RunRecord, RunStore, UpdateRunInput } from "@/lib/runs/run-store";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -158,6 +158,19 @@ function hydrateQueue(request: Request, queue: FifoQueue, runStore: RunStore): v
   for (const id of admissionIds) push(id);
   for (const row of rows) push(row.runId);
 
+  // Purge every entry already in the FIFO queue whose RunStore record left the `queued` phase (it
+  // started or completed) or lost its queue position, even when a live surface still lists it. This
+  // guarantees a started/completed run never lingers in a queue snapshot.
+  for (const entry of queue.list()) {
+    const row = safeGetRun(runStore, entry.runId);
+    if (
+      row &&
+      (row.phase !== "queued" || row.queuePosition === null || row.queuePosition === undefined)
+    ) {
+      queue.remove(entry.runId);
+    }
+  }
+
   for (const runId of ordered) {
     if (queue.has(runId)) {
       continue;
@@ -165,7 +178,7 @@ function hydrateQueue(request: Request, queue: FifoQueue, runStore: RunStore): v
     const row = safeGetRun(runStore, runId);
     if (row) {
       // A run the store already finalized (done/cancelled) or explicitly marked as no longer
-      // positioned is not re-admitted, even if a live surface still lists it.
+      // positioned is not (re-)admitted, even if a live surface still lists it.
       if (row.phase !== "queued") {
         continue;
       }
@@ -265,6 +278,31 @@ function removeFromOrchestrator(orchestrator: Record<string, unknown> | null, ru
 }
 
 
+/**
+ * Persists a queue mutation to the RunStore BEFORE the in-memory queue is mutated. A failed write is
+ * surfaced as a retryable HTTP 500 instead of a stale success, and because the store write happens
+ * first the in-memory queue never diverges from the store on failure.
+ */
+function persistQueueChange(
+  runStore: RunStore,
+  runId: string,
+  updates: UpdateRunInput
+): Response | null {
+  if (!safeGetRun(runStore, runId)) {
+    return null;
+  }
+  try {
+    runStore.updateRun(runId, updates);
+    return null;
+  } catch {
+    return Response.json(
+      { ok: false, error: "queue_store_update_failed", runId },
+      { status: 500 }
+    );
+  }
+}
+
+
 export async function GET(request: Request): Promise<Response> {
   const settingsStore = resolveSettingsStore(request);
   const auth = requireAdminAuth(request, process.env, { settingsStore });
@@ -299,27 +337,37 @@ export async function POST(request: Request): Promise<Response> {
 
   switch (action) {
     case "remove": {
+      if (!queue.has(runId)) {
+        return Response.json({ ok: false, error: "not_queued" }, { status: 404 });
+      }
+      // Persist the removal BEFORE mutating the in-memory queue so a failed store write fails closed
+      // (retryable 500) instead of leaving memory and the RunStore diverged.
+      const removePersistError = persistQueueChange(runStore, runId, { queuePosition: null });
+      if (removePersistError) {
+        return removePersistError;
+      }
       const removed: QueueEntry | null = queue.remove(runId);
       if (!removed) {
         return Response.json({ ok: false, error: "not_queued" }, { status: 404 });
       }
       removeFromAdmissionQueue(runId);
       removeFromOrchestrator(orchestrator, runId);
-      // Persist the removal so a later snapshot does not re-hydrate the run from its queued row.
-      try {
-        if (safeGetRun(runStore, runId)) {
-          runStore.updateRun(runId, { queuePosition: null });
-        }
-      } catch {
-        // The queue mutation already succeeded; a missing run row must not fail the response.
-      }
       return Response.json({ ok: true, removed, queue: queue.snapshot() });
     }
     case "move": {
-      const position =
+      if (!queue.has(runId)) {
+        return Response.json({ ok: false, error: "not_queued" }, { status: 404 });
+      }
+      const depth = queue.snapshot().depth;
+      const requested =
         typeof body.position === "number" && Number.isFinite(body.position)
           ? Math.floor(body.position)
           : previousPosition ?? 1;
+      const position = Math.min(Math.max(1, requested || 1), Math.max(1, depth));
+      const movePersistError = persistQueueChange(runStore, runId, { queuePosition: position });
+      if (movePersistError) {
+        return movePersistError;
+      }
       const moved: QueueEntry | null = queue.move(runId, position);
       if (!moved) {
         return Response.json({ ok: false, error: "not_queued" }, { status: 404 });
@@ -339,6 +387,20 @@ export async function POST(request: Request): Promise<Response> {
       return Response.json({ ok: true, moved, queue: queue.snapshot() });
     }
     case "cancel": {
+      if (!queue.has(runId)) {
+        return Response.json({ ok: false, error: "not_queued" }, { status: 404 });
+      }
+      // Persist the terminal state BEFORE removing the entry so a failed store write fails closed
+      // (retryable 500) rather than cancelling the queue entry without the run actually terminating.
+      const cancelPersistError = persistQueueChange(runStore, runId, {
+        phase: "done",
+        outcome: "cancelled",
+        queuePosition: null,
+        endedAt: Date.now(),
+      });
+      if (cancelPersistError) {
+        return cancelPersistError;
+      }
       const cancelled: QueueEntry | null = queue.cancel(runId);
       if (!cancelled) {
         return Response.json({ ok: false, error: "not_queued" }, { status: 404 });

@@ -316,10 +316,16 @@ export async function POST(request: Request): Promise<Response> {
     });
   }
 
-  const result = await service.executeLive(body.level, {
+  // Run the synchronous state mutation first, then persist the kill-switch flags BEFORE awaiting any
+  // asynchronous `stopRun` / `killRun`. `execute` and `persistState` run in the same synchronous tick,
+  // so a concurrent `GET /api/admin/kill-switch` can never rehydrate a stale
+  // `stoppingGracefully: false` over the in-flight execution.
+  const result = service.execute(body.level, {
     actor: auth.actor.id,
     reason: typeof body.reason === "string" ? body.reason : undefined,
   });
+
+  let persistFailed = false;
   try {
     persistState(settings, auth.actor.id, service);
   } catch {
@@ -327,11 +333,35 @@ export async function POST(request: Request): Promise<Response> {
     // authoritative for this store so a later request's rehydrate cannot silently revert the active
     // pause/stop, and report the failure so the caller does not assume the state survived.
     markKillSwitchUnpersistedAuthority(storeKey);
+    persistFailed = true;
+  }
+
+  // The durable state is already written, so it is safe to await the live runtime controls now.
+  if (typeof result.waitForRuntime === "function") {
+    await result.waitForRuntime();
+  }
+
+  if (persistFailed) {
     return Response.json({ ok: false, error: "kill_switch_persist_failed" }, { status: 500 });
   }
   // The write succeeded, so the persisted SettingsStore now matches the in-memory state: drop any
   // unpersisted-authority mark left by an earlier transient failure so future requests rehydrate
   // from the store again.
   clearKillSwitchUnpersistedAuthority(storeKey);
+
+  if (result.failedRunIds.length > 0) {
+    // A live `stopRun` / `killRun` rejected: the level did not fully take effect for these runs, so
+    // return a retryable failure naming them instead of a misleading success.
+    return Response.json(
+      {
+        ok: false,
+        error: "kill_switch_runtime_control_failed",
+        failedRunIds: result.failedRunIds,
+        result,
+        state: mergedState(service, settings),
+      },
+      { status: 500 }
+    );
+  }
   return Response.json({ ok: true, result, state: mergedState(service, settings) });
 }

@@ -36,6 +36,13 @@ export interface KillSwitchResult extends KillSwitchPreview {
   actor: string;
   reason: string | null;
   /**
+   * IDs of runs whose live runtime control (`stopRun` / `killRun`) rejected. Empty when every
+   * collected control settled successfully. A non-empty list means the level did not fully take
+   * effect for those runs, so the caller must surface a retryable failure (HTTP 500) instead of a
+   * success and can target exactly those runs on a follow-up execution.
+   */
+  failedRunIds: string[];
+  /**
    * Resolves once every asynchronous runtime control (`stopRun` / `killRun`) collected during
    * `execute` has settled. `execute` stays synchronous for its existing callers; a caller that must
    * wait for the live RuntimeHost / RunOrchestrator (the Admin route) awaits this (or `executeLive`).
@@ -75,6 +82,18 @@ export interface KillSwitchState {
   stoppingGracefully: boolean;
   lastLevel: KillSwitchLevel | null;
   lastExecutedAt: number | null;
+}
+
+/**
+ * One asynchronous runtime termination collected by {@link KillSwitchService.execute}: the promise
+ * must settle before the execution is considered complete. `finalizeKilled` records whether a
+ * successful settle should also mark the run `"killed"` in the `RunStore` (hard kill of an active
+ * run), so a rejected control leaves the run retryable.
+ */
+interface PendingRuntimeControl {
+  runId: string;
+  promise: Promise<void>;
+  finalizeKilled: boolean;
 }
 
 function isQueued(run: RunRecord): boolean {
@@ -213,9 +232,11 @@ export class KillSwitchService {
 
     switch (level) {
       case "pause_new_runs":
+        // Every level halts new admission, so all three persist `pausedNewRuns = true`.
         this.pausedNewRuns = true;
         break;
       case "stop_gracefully":
+        this.pausedNewRuns = true;
         this.stoppingGracefully = true;
         for (const runId of preview.affectedRunIds) {
           this.emit(runId, "system.worker_state", actor, {
@@ -226,18 +247,19 @@ export class KillSwitchService {
         }
         break;
       case "hard_kill": {
+        this.pausedNewRuns = true;
         for (const runId of preview.affectedRunIds) {
           const run = this.runStore.getRun(runId);
-          if (run && run.phase !== "done") {
-            this.runStore.updateRun(runId, {
-              outcome: "killed",
-              phase: "done",
-              endedAt: at,
-            });
+          const queued = run !== null && isQueued(run);
+          // A queued run has no live `killRun` to await, so it is finalized synchronously. An active
+          // run is only finalized as `"killed"` once its live `killRun` settles successfully (in the
+          // `waitForRuntime` closure below), so a rejected kill leaves it retryable.
+          if (run && run.phase !== "done" && queued) {
+            this.finalizeKilled(runId, at);
           }
           if (this.queue) {
             try {
-              if (run && isQueued(run)) {
+              if (queued) {
                 this.queue.remove(runId);
               } else {
                 this.queue.cancel(runId);
@@ -277,9 +299,29 @@ export class KillSwitchService {
       executedAt: at,
       actor,
       reason,
+      failedRunIds: [],
     };
     if (pending.length > 0) {
-      result.waitForRuntime = () => Promise.allSettled(pending).then(() => undefined);
+      result.waitForRuntime = async () => {
+        const settled = await Promise.allSettled(pending.map((task) => task.promise));
+        settled.forEach((outcome, index) => {
+          const task = pending[index];
+          if (outcome.status === "rejected") {
+            // A rejected control is NOT a success: the run stays retryable and is reported so the
+            // caller returns a retryable failure instead of pretending the kill completed.
+            result.failedRunIds.push(task.runId);
+            return;
+          }
+          if (task.finalizeKilled) {
+            try {
+              this.finalizeKilled(task.runId, at);
+            } catch {
+              // If the terminal write itself fails the run is not finalized and stays retryable.
+              result.failedRunIds.push(task.runId);
+            }
+          }
+        });
+      };
     }
     return result;
   }
@@ -303,17 +345,19 @@ export class KillSwitchService {
   /**
    * Drives the optional live runtime controls for a level: the admission/host pause and, per affected
    * run, the synchronous `cancelQueuedRun` (queued) or async `stopRun` / `killRun` (active). Every
-   * hook is synchronous-safe: a throwing hook is swallowed (the kill switch must never be blocked by
-   * a flaky control) and any returned promise is collected for {@link KillSwitchResult.waitForRuntime}.
+   * returned task carries the promise so {@link KillSwitchResult.waitForRuntime} can settle them with
+   * `Promise.allSettled` — a rejected promise is surfaced through `failedRunIds` instead of being
+   * silently treated as success, and an active hard-kill run is only finalized once its `killRun`
+   * resolves.
    */
   private applyRuntimeControls(
     level: KillSwitchLevel,
     affectedRunIds: string[],
     queuedRunIds: Set<string>,
     reason: string | null
-  ): Array<Promise<void>> {
+  ): PendingRuntimeControl[] {
     const controls = this.runtimeControls;
-    const pending: Array<Promise<void>> = [];
+    const pending: PendingRuntimeControl[] = [];
     if (!controls) {
       return pending;
     }
@@ -324,10 +368,11 @@ export class KillSwitchService {
 
     if (level === "stop_gracefully") {
       for (const runId of affectedRunIds) {
-        const promise = this.invokeAsync(controls.stopRun, runId, reason ?? undefined);
-        if (promise) {
-          pending.push(promise);
-        }
+        pending.push({
+          runId,
+          promise: this.runRuntimeControl(controls.stopRun, runId, reason),
+          finalizeKilled: false,
+        });
       }
     } else if (level === "hard_kill") {
       for (const runId of affectedRunIds) {
@@ -340,10 +385,11 @@ export class KillSwitchService {
             }
           }
         } else {
-          const promise = this.invokeAsync(controls.killRun, runId, reason ?? undefined);
-          if (promise) {
-            pending.push(promise);
-          }
+          pending.push({
+            runId,
+            promise: this.runRuntimeControl(controls.killRun, runId, reason),
+            finalizeKilled: true,
+          });
         }
       }
     }
@@ -362,28 +408,39 @@ export class KillSwitchService {
     }
   }
 
-  private invokeAsync(
+  /**
+   * Invokes one asynchronous runtime control and returns its promise WITHOUT swallowing a rejection,
+   * so `waitForRuntime` can record the run in `failedRunIds`. A missing control (or one that returns
+   * no promise) resolves immediately and counts as success; a synchronously-throwing control becomes
+   * a rejected promise so it is reported instead of silently dropped.
+   */
+  private runRuntimeControl(
     fn?: (runId: string, reason?: string) => void | Promise<void>,
     runId?: string,
-    reason?: string
-  ): Promise<void> | null {
+    reason?: string | null
+  ): Promise<void> {
     if (typeof fn !== "function" || typeof runId !== "string") {
-      return null;
+      return Promise.resolve();
     }
     try {
-      const outcome = fn(runId, reason);
+      const outcome = fn(runId, reason ?? undefined);
       if (outcome && typeof (outcome as Promise<void>).then === "function") {
-        return Promise.resolve(outcome as Promise<void>).then(
-          () => undefined,
-          () => undefined
-        );
+        return Promise.resolve(outcome as Promise<void>);
       }
-    } catch {
-      // A flaky asynchronous control must never block the kill switch.
+    } catch (error) {
+      return Promise.reject(error);
     }
-    return null;
+    return Promise.resolve();
   }
 
+  /** Finalizes a run as `"killed"` in the RunStore once (guarded so a retry cannot double-write). */
+  private finalizeKilled(runId: string, at: number): void {
+    const run = this.runStore.getRun(runId);
+    if (!run || run.phase === "done") {
+      return;
+    }
+    this.runStore.updateRun(runId, { outcome: "killed", phase: "done", endedAt: at });
+  }
 
   private emit(
     runId: string,

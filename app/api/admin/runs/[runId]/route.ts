@@ -206,6 +206,21 @@ export async function POST(request: Request, context: RouteContext): Promise<Res
       const targetSeqs = parseSeqList(body.targetSeqs);
       const secrets = parseStringList(body.secrets);
       const patterns = parseStringList(body.patterns);
+      // Pre-validate every caller-supplied pattern before mutating the run row or appending the
+      // audit event: an uncompilable regex must be rejected with zero DB/event writes, otherwise the
+      // read path could silently skip the intended redaction.
+      if (patterns) {
+        for (const pattern of patterns) {
+          try {
+            new RegExp(pattern, "g");
+          } catch {
+            return Response.json(
+              { ok: false, error: "invalid_redaction_pattern" },
+              { status: 400 }
+            );
+          }
+        }
+      }
       const updated = runStore.updateRun(runId, {
         metadata: {
           ...metadata,

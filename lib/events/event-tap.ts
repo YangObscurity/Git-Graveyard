@@ -153,7 +153,11 @@ function fieldAppliesToKind(field: string, kind: string): boolean {
     case "prompts":
       return lower.startsWith("prompt") || lower.includes("prompt");
     case "commands":
-      return lower.startsWith("command") || lower.includes("command");
+      return (
+        lower.startsWith("command") ||
+        lower.includes("command") ||
+        lower === "cmd.output"
+      );
     default:
       return true;
   }
@@ -238,7 +242,11 @@ function scrubEventDataFields(
       if (result.changed) changed = true;
       next[key] = result.value;
     } else {
-      const result = scrubNestedValue(entry, fields);
+      // Recurse with the same expanded mapped key set the root level matches against, so nested
+      // keys (e.g. a nested `stdout`/`stderr`/`output` under `fields: ["logs"]`) are scrubbed at
+      // every depth. `rootKeys` never contains `refs`, so the root-level `refs` exception holds for
+      // nested objects as well.
+      const result = scrubNestedValue(entry, rootKeys);
       if (result.changed) changed = true;
       next[key] = result.value;
     }
@@ -392,57 +400,56 @@ export class EventTap {
     const extraSecrets = new Set<string>();
     const extraPatterns: RegExp[] = [];
 
-    try {
-      const redactions = this.eventStore.getEvents(runId, {
-        kind: "admin.redaction",
-      });
-      for (const red of redactions) {
-        const d = red.data as Record<string, unknown> | undefined;
-        if (!d) continue;
+    // Fail closed: if the owner redaction rules cannot be loaded this query throws and the error
+    // propagates out of getEvents/iterateEvents/getEvent, so a reader aborts instead of being served
+    // stored events that may still contain secrets.
+    const redactions = this.eventStore.getEvents(runId, {
+      kind: "admin.redaction",
+    });
+    for (const red of redactions) {
+      const d = red.data as Record<string, unknown> | undefined;
+      if (!d) continue;
 
-        if (typeof d.targetSeq === "number") {
-          redactedSeqs.add(d.targetSeq);
+      if (typeof d.targetSeq === "number") {
+        redactedSeqs.add(d.targetSeq);
+      }
+      if (typeof d.seq === "number") {
+        redactedSeqs.add(d.seq);
+      }
+      if (typeof d.redactedSeq === "number") {
+        redactedSeqs.add(d.redactedSeq);
+      }
+      if (Array.isArray(d.targetSeqs)) {
+        for (const s of d.targetSeqs) {
+          if (typeof s === "number") redactedSeqs.add(s);
         }
-        if (typeof d.seq === "number") {
-          redactedSeqs.add(d.seq);
+      }
+      if (Array.isArray(d.redactedSeqs)) {
+        for (const s of d.redactedSeqs) {
+          if (typeof s === "number") redactedSeqs.add(s);
         }
-        if (typeof d.redactedSeq === "number") {
-          redactedSeqs.add(d.redactedSeq);
+      }
+      if (Array.isArray(d.secrets)) {
+        for (const s of d.secrets) {
+          if (typeof s === "string" && s.length > 0) extraSecrets.add(s);
         }
-        if (Array.isArray(d.targetSeqs)) {
-          for (const s of d.targetSeqs) {
-            if (typeof s === "number") redactedSeqs.add(s);
-          }
+      }
+      if (Array.isArray(d.fields)) {
+        for (const f of d.fields) {
+          if (typeof f === "string" && f.length > 0) redactedFields.add(f);
         }
-        if (Array.isArray(d.redactedSeqs)) {
-          for (const s of d.redactedSeqs) {
-            if (typeof s === "number") redactedSeqs.add(s);
-          }
-        }
-        if (Array.isArray(d.secrets)) {
-          for (const s of d.secrets) {
-            if (typeof s === "string" && s.length > 0) extraSecrets.add(s);
-          }
-        }
-        if (Array.isArray(d.fields)) {
-          for (const f of d.fields) {
-            if (typeof f === "string" && f.length > 0) redactedFields.add(f);
-          }
-        }
-        if (Array.isArray(d.patterns)) {
-          for (const p of d.patterns) {
-            if (typeof p === "string" && p.length > 0) {
-              try {
-                extraPatterns.push(new RegExp(p, "g"));
-              } catch {
-                // Ignore invalid regex string in event data
-              }
+      }
+      if (Array.isArray(d.patterns)) {
+        for (const p of d.patterns) {
+          if (typeof p === "string" && p.length > 0) {
+            try {
+              extraPatterns.push(new RegExp(p, "g"));
+            } catch {
+              // Ignore invalid regex string in event data
             }
           }
         }
       }
-    } catch {
-      // If table query fails, continue without admin redactions
     }
 
     return { redactedSeqs, redactedFields, extraSecrets, extraPatterns };
