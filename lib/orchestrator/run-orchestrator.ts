@@ -1277,6 +1277,7 @@ export class RunOrchestrator extends EventEmitter {
                 invitePushFlag: currentRun.pushFlag,
                 pushConfirm: true,
                 eventStore: this.host.eventStore,
+                emitEvent: (evt) => this.emitEvent(evt as any),
               });
             } catch (err) {
               // Surface a redacted push.result unless pushToFork already

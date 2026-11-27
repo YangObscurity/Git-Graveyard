@@ -1884,6 +1884,87 @@ SCRIPT_DIR="$(cd "$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
   });
 });
 
+test("pushToFork: emitEvent receives redacted push events without duplicated fields", async () => {
+  const secretToken = ["gh", "p_", "emit", "path", "secret", "token", "2468"].join("");
+  const sha = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+
+  const script = `#!/usr/bin/env bash
+"${process.execPath}" -e '
+  const args = process.argv.slice(1);
+  if (args.includes("rev-parse")) {
+    process.stdout.write("${sha}");
+    process.exit(0);
+  }
+  if (args.includes("push")) {
+    process.stdout.write("Everything up-to-date");
+    process.exit(0);
+  }
+  process.exit(0);
+' -- "$@"
+`;
+
+  await withFakeGitInPath(script, async () => {
+    const emitted: Array<{
+      runId: string;
+      kind: string;
+      actor: string;
+      data: Record<string, unknown>;
+      ts: number;
+    }> = [];
+    const service = new GitService({
+      ownerLogin: "fork-owner",
+      sourceRepoUrl: "https://github.com/source-owner/source-repo",
+    });
+
+    const res = await service.pushToFork("run-push-emit", {
+      pushConfirm: true,
+      targetRepoUrl: "https://github.com/fork-owner/fork-repo",
+      runPhase: "done",
+      invitePushFlag: true,
+      forkChecker: async () => "source-owner/source-repo",
+      token: secretToken,
+      emitEvent: (evt) => emitted.push(evt),
+    });
+    assert.equal(res.ok, true);
+
+    const requested = emitted.find((e) => e.kind === "push.requested");
+    assert.ok(requested, "push.requested must be emitted");
+    assert.equal(requested.runId, "run-push-emit");
+    assert.equal(requested.data.branch, "graveyard/run-push-emit");
+    assert.equal(
+      requested.data.targetRepoUrl,
+      "https://github.com/fork-owner/fork-repo"
+    );
+    // branch/targetRepoUrl live only at the data top level; runId is not nested.
+    assert.equal("runId" in requested.data, false);
+    assert.deepEqual(Object.keys(requested.data).sort(), [
+      "branch",
+      "refs",
+      "targetRepoUrl",
+    ]);
+
+    const result = emitted.find((e) => e.kind === "push.result");
+    assert.ok(result, "push.result must be emitted");
+    assert.equal(result.runId, "run-push-emit");
+    assert.equal(result.data.ok, true);
+    assert.equal(result.data.commitSha, sha);
+    assert.equal(result.data.branch, "graveyard/run-push-emit");
+    assert.equal("runId" in result.data, false);
+    assert.deepEqual(Object.keys(result.data).sort(), [
+      "branch",
+      "commitSha",
+      "ok",
+      "refs",
+      "stderr",
+      "stdout",
+      "targetRepoUrl",
+    ]);
+
+    // The redacting emitter must never surface the write token.
+    assert.equal(JSON.stringify(emitted).includes(secretToken), false);
+  });
+});
+
 test("pushToFork: holds an exclusive write lock per run", async () => {
   const sha = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
 

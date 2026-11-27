@@ -106,24 +106,66 @@ function basename(token: string): string {
 }
 
 /**
- * True only for explicit docker/podman host-bind syntax
- * (`-v <host_path>:<container_path>` or `--volume=<host>:<container>`). A bare
- * path such as pytest's `-v /tests` has no `<host>:<container>` pair and must
- * not be treated as a host mount.
+ * True only for an explicit host-bind spec `<host>:<container>` whose host side
+ * begins with `/`, `.` or `~`. A bare path such as pytest's `-v /tests` has no
+ * colon pair and is never a host mount.
+ */
+function isHostBindVolumeSpec(value: string): boolean {
+  const colon = value.indexOf(":");
+  if (colon <= 0) return false;
+  const host = value.slice(0, colon);
+  return (
+    host.startsWith("/") || host.startsWith(".") || host.startsWith("~")
+  );
+}
+
+/**
+ * True only for explicit docker/podman host-bind syntax. Recognizes the long
+ * form (`--volume=<host>:<container>` / `--volume <host>:<container>`) and the
+ * short form in every documented shape: `-v <host>:<container>`,
+ * `-v<host>:<container>`, `-v=<host>:<container>`, and clustered short options
+ * ending in `v` (`-itv <host>:<container>`, `-itv=<host>:<container>`,
+ * `-itv<host>:<container>`). A bare path such as pytest's `-v /tests` has no
+ * `<host>:<container>` pair and must not be treated as a host mount.
  */
 export function isHostBindVolumeMount(tokens: readonly string[]): boolean {
   for (let i = 0; i < tokens.length; i++) {
     const token = tokens[i];
     const eq = token.indexOf("=");
-    const flag = eq >= 0 ? token.slice(0, eq) : token;
-    if (flag !== "-v" && flag !== "--volume") continue;
-    const value = (eq >= 0 ? token.slice(eq + 1) : tokens[i + 1] ?? "").trim();
-    const colon = value.indexOf(":");
-    if (colon <= 0) continue;
-    const host = value.slice(0, colon);
-    if (host.startsWith("/") || host.startsWith(".") || host.startsWith("~")) {
-      return true;
+
+    // Long form: --volume=<value> or --volume <value>.
+    if (token === "--volume" || token.startsWith("--volume=")) {
+      const value = (eq >= 0 ? token.slice(eq + 1) : tokens[i + 1] ?? "").trim();
+      if (isHostBindVolumeSpec(value)) return true;
+      continue;
     }
+
+    // Short form only: a single leading dash.
+    if (!token.startsWith("-") || token.startsWith("--") || token === "-") {
+      continue;
+    }
+    const body = token.slice(1);
+    const bodyEq = body.indexOf("=");
+
+    let flags: string;
+    let attached: string | null;
+    if (bodyEq >= 0) {
+      flags = body.slice(0, bodyEq);
+      attached = body.slice(bodyEq + 1);
+    } else {
+      // Split a leading cluster of letters from any attached value.
+      const split = /^([a-zA-Z]+)(.*)$/.exec(body);
+      if (!split) continue;
+      flags = split[1];
+      attached = split[2] || null;
+    }
+
+    if (!flags.endsWith("v")) continue;
+    const value =
+      attached !== null && attached !== ""
+        ? attached
+        : tokens[i + 1] ?? "";
+    if (isHostBindVolumeSpec(value.trim())) return true;
   }
   return false;
 }
@@ -294,7 +336,9 @@ function collectSubcommands(argv: readonly string[], depth = 0): string[][] {
     return out;
   }
 
-  return [words];
+  // Normalize shell quote pairs in every token so a quoted form such as
+  // `"rm" -rf "/"` cannot bypass the destructive/host checks downstream.
+  return [words.map((w) => removeQuotes(w))];
 }
 
 /**
@@ -539,43 +583,76 @@ const DIFF_GIT_HEADER = /^diff --git (?:")?a\/(.+?)(?:")? (?:")?b\/(.+?)(?:")?$/
 const DIFF_OLD_PATH = /^--- (?:")?a\/(.+?)(?:")?$/;
 const DIFF_NEW_PATH = /^\+\+\+ (?:")?b\/(.+?)(?:")?$/;
 const DIFF_RENAME = /^(?:rename|copy) (?:from|to) (?:")?(.+?)(?:")?$/;
+const HUNK_HEADER = /^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@/;
 
 /**
  * Extracts candidate file paths from a unified diff, tolerating quoted and
  * rename/copy headers.
+ *
+ * Hunk bodies are consumed by exact hunk-header line counting: `@@ -a,b +c,d @@`
+ * sets an old-line budget of `b` (default 1) and a new-line budget of `d`
+ * (default 1); `-` lines spend the old budget, `+` lines the new budget, and
+ * context lines spend both. `\ No newline at end of file` markers spend
+ * nothing. This keeps deleted `-- ...` content lines inside a hunk from being
+ * read as file headers while traditional multi-file unified diffs WITHOUT
+ * `diff --git` lines still expose their subsequent `--- a/...` / `+++ b/...`
+ * headers.
  */
 export function parseDiffPaths(diff: string): string[] {
   if (typeof diff !== "string" || !diff) return [];
   const paths = new Set<string>();
-  // Unified diffs are read in two states: file headers (before any hunk) and
-  // hunk bodies (after `@@ ... @@`). Deleted lines inside a hunk body that begin
-  // with `-- ` (i.e. `--- ...`) are patch content, never file paths.
-  let inHunkBody = false;
-  for (const line of diff.split("\n")) {
-    const trimmed = line.replace(/\r$/, "");
-    if (trimmed.startsWith("@@")) {
-      inHunkBody = true;
+  let oldLeft = 0;
+  let newLeft = 0;
+  for (const rawLine of diff.split("\n")) {
+    const line = rawLine.replace(/\r$/, "");
+
+    // Inside a hunk body: spend the line budgets before header detection.
+    if (oldLeft > 0 || newLeft > 0) {
+      if (line.startsWith("\\")) continue;
+      if (line.startsWith("-")) {
+        oldLeft = Math.max(0, oldLeft - 1);
+        continue;
+      }
+      if (line.startsWith("+")) {
+        newLeft = Math.max(0, newLeft - 1);
+        continue;
+      }
+      if (line.startsWith(" ") || line === "") {
+        oldLeft = Math.max(0, oldLeft - 1);
+        newLeft = Math.max(0, newLeft - 1);
+        continue;
+      }
+      // A non-hunk line ends the (possibly malformed) hunk early.
+      oldLeft = 0;
+      newLeft = 0;
+    }
+
+    const hunk = HUNK_HEADER.exec(line);
+    if (hunk) {
+      oldLeft = hunk[1] !== undefined ? parseInt(hunk[1], 10) : 1;
+      newLeft = hunk[2] !== undefined ? parseInt(hunk[2], 10) : 1;
       continue;
     }
-    let match = DIFF_GIT_HEADER.exec(trimmed);
+
+    let match = DIFF_GIT_HEADER.exec(line);
     if (match) {
-      inHunkBody = false;
+      oldLeft = 0;
+      newLeft = 0;
       paths.add(match[1]);
       paths.add(match[2]);
       continue;
     }
-    if (inHunkBody) continue;
-    match = DIFF_OLD_PATH.exec(trimmed);
+    match = DIFF_OLD_PATH.exec(line);
     if (match) {
       paths.add(match[1]);
       continue;
     }
-    match = DIFF_NEW_PATH.exec(trimmed);
+    match = DIFF_NEW_PATH.exec(line);
     if (match) {
       paths.add(match[1]);
       continue;
     }
-    match = DIFF_RENAME.exec(trimmed);
+    match = DIFF_RENAME.exec(line);
     if (match) {
       paths.add(match[1]);
       continue;
