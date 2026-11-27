@@ -309,4 +309,25 @@ describe("Task 26.4: ReliquaryView Open in Kiro handoff gating", () => {
     assert.ok(html.includes('data-testid="open-in-kiro-unavailable"'));
     assert.ok(!html.includes('data-testid="open-in-kiro-handoff"'));
   });
+  it("merges owner from props with repo from initialEvents into a real handoff target", () => {
+    const html = renderToStaticMarkup(
+      React.createElement(ReliquaryView, {
+        runId: "run-mixed",
+        owner: "octocat",
+        initialEvents: [
+          {
+            runId: "run-mixed",
+            seq: 1,
+            ts: 1731672000000,
+            kind: "exhume.certificate",
+            actor: "exhumer",
+            data: { repo: "project", refs: [] },
+          },
+        ],
+      })
+    );
+    assert.ok(html.includes('data-testid="open-in-kiro-handoff"'));
+    assert.ok(html.includes("https://github.com/octocat/project.git"));
+    assert.ok(!html.includes('data-testid="open-in-kiro-unavailable"'));
+  });
 });

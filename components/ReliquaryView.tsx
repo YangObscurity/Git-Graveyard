@@ -327,15 +327,13 @@ export function ReliquaryView({
   const [hidden, setHidden] = useState<boolean>(
     propHidden !== undefined ? Boolean(propHidden) : Boolean(initialParsed?.hidden)
   );
-  const [owner, setOwner] = useState<string>(propOwner ?? "owner");
-  const [repo, setRepo] = useState<string>(propRepo ?? "repo");
+  const [owner, setOwner] = useState<string | undefined>(propOwner ?? initialParsed?.owner);
+  const [repo, setRepo] = useState<string | undefined>(propRepo ?? initialParsed?.repo);
   const [baseSha, setBaseSha] = useState<string>(propBaseSha ?? initialParsed?.baseSha ?? "0000000");
   const [headSha, setHeadSha] = useState<string>(propHeadSha ?? "0000000");
-  // Track whether real repository metadata (owner AND repo) has been recorded,
-  // so placeholder fallbacks never masquerade as a real target.
-  const [hasRepoMetadata, setHasRepoMetadata] = useState<boolean>(
-    Boolean(propOwner && propRepo)
-  );
+  // Repository metadata is available whenever both owner and repo are known,
+  // regardless of whether they came from props, events, or the run record.
+  const hasRepoMetadata = Boolean(owner && repo);
   const [eventBuildPassed, setEventBuildPassed] = useState<boolean | undefined>(
     initialParsed?.buildPassed
   );
@@ -382,8 +380,20 @@ export function ReliquaryView({
   }, [propReportCheck]);
 
   useEffect(() => {
-    setHasRepoMetadata(Boolean(propOwner && propRepo));
-  }, [propOwner, propRepo]);
+    if (propOwner !== undefined) setOwner(propOwner);
+  }, [propOwner]);
+
+  useEffect(() => {
+    if (propRepo !== undefined) setRepo(propRepo);
+  }, [propRepo]);
+
+  useEffect(() => {
+    if (propBaseSha !== undefined) setBaseSha(propBaseSha);
+  }, [propBaseSha]);
+
+  useEffect(() => {
+    if (propHeadSha !== undefined) setHeadSha(propHeadSha);
+  }, [propHeadSha]);
 
   useEffect(() => {
     if (propBeforeAfterRows !== undefined) setBeforeAfterRows(propBeforeAfterRows);
@@ -418,7 +428,6 @@ export function ReliquaryView({
         }
         if (parsed.owner) setOwner(parsed.owner);
         if (parsed.repo) setRepo(parsed.repo);
-        if (parsed.owner && parsed.repo) setHasRepoMetadata(true);
         if (parsed.tasks) setTasks(Object.values(parsed.tasks));
         if (parsed.artifacts) setArtifacts(parsed.artifacts);
         if (parsed.reportCheck) setReportCheckInfo(parsed.reportCheck);
@@ -502,7 +511,6 @@ export function ReliquaryView({
             const realRepo = runData.run.repo ?? parsedRepo?.repo;
             if (realOwner) setOwner(realOwner);
             if (realRepo) setRepo(realRepo);
-            if (realOwner && realRepo) setHasRepoMetadata(true);
             if (runData.run.baseSha) setBaseSha(runData.run.baseSha);
             else if (typeof runData.run.sha === "string" && runData.run.sha && runData.run.sha !== "HEAD") {
               setBaseSha(runData.run.sha);
@@ -531,9 +539,8 @@ export function ReliquaryView({
           if (parsed.baseSha && !runData?.run?.baseSha) {
             setBaseSha((prev) => (prev === "0000000" ? parsed.baseSha! : prev));
           }
-          if (parsed.owner && !runData?.run?.owner) setOwner(parsed.owner);
-          if (parsed.repo && !runData?.run?.repo) setRepo(parsed.repo);
-          if (parsed.owner && parsed.repo) setHasRepoMetadata(true);
+          if (parsed.owner) setOwner((prev) => prev ?? parsed.owner);
+          if (parsed.repo) setRepo((prev) => prev ?? parsed.repo);
           if (parsed.buildPassed !== undefined) {
             setEventBuildPassed(parsed.buildPassed);
           }
@@ -721,7 +728,7 @@ export function ReliquaryView({
             <h1 className="text-xl md:text-2xl font-bold text-bone font-mono tracking-tight">
               Run: {runId}
             </h1>
-            {hasRepoMetadata && (
+            {hasRepoMetadata && owner && repo ? (
               <div className="text-xs text-ash">
                 Target: <span className="text-parchment">{owner}/{repo}</span>
                 {baseSha !== "0000000" && (
@@ -731,7 +738,7 @@ export function ReliquaryView({
                   <span className="ml-1 text-dust">→ head {headSha.slice(0, 7)}</span>
                 )}
               </div>
-            )}
+            ) : null}
           </div>
           {packing && (
             <StatusPill
@@ -947,7 +954,7 @@ export function ReliquaryView({
       {/* 6. Open in Kiro handoff instructions (Requirement 38.9). Only shown when
           real repository metadata is available; placeholder fallbacks would
           produce broken clone/checkout commands. */}
-      {hasRepoMetadata ? (
+      {hasRepoMetadata && owner && repo ? (
         <OpenInKiroHandoff
           owner={owner}
           repo={repo}
