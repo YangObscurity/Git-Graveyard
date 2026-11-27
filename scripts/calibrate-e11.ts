@@ -192,6 +192,78 @@ function phaseOf(ev: EventEnvelope): string | null {
   return null;
 }
 
+/**
+ * Target values a Warden verdict may name that are *not* task IDs: run-level gates, the Pact, the
+ * final-check phase, reports, branches, or a bare candidate SHA. A `verdict` for one of these must
+ * not be attributed to a task, otherwise distinct non-task verdicts collapse together.
+ */
+const NON_TASK_VERDICT_TARGETS = new Set([
+  "final",
+  "final_check",
+  "run",
+  "integration",
+  "pact",
+  "report",
+  "gate",
+  "summary",
+]);
+
+const NON_TASK_VERDICT_TARGET_PREFIXES = ["run:", "final:", "report:", "pact:", "branch:"];
+
+const SHA1_HEX_PATTERN = /^[0-9a-f]{40}$/i;
+
+function isNonTaskVerdictTarget(target: string): boolean {
+  const normalized = target.trim().toLowerCase();
+  if (NON_TASK_VERDICT_TARGETS.has(normalized)) {
+    return true;
+  }
+  if (NON_TASK_VERDICT_TARGET_PREFIXES.some((prefix) => normalized.startsWith(prefix))) {
+    return true;
+  }
+  return SHA1_HEX_PATTERN.test(target.trim());
+}
+
+/**
+ * Normalize a task-ID candidate: trim, strip an optional leading `task:` prefix, and treat an empty
+ * result as "no task ID". Returning `null` lets the caller fall through to the next candidate.
+ */
+function normalizeVerdictTaskId(raw: unknown): string | null {
+  if (typeof raw !== "string") {
+    return null;
+  }
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) {
+    return null;
+  }
+  const stripped = trimmed.replace(/^task:\s*/i, "").trim();
+  return stripped.length > 0 ? stripped : null;
+}
+
+/**
+ * Resolve the task ID an `verdict` event refers to, or `null` when it is not a task verdict.
+ *
+ * Gateway Warden verdicts (lib/gateway/collaboration-tools.ts) emit `kind: "verdict"` with
+ * `data.target` and *without* `ev.taskId`/`ev.data.taskId`, so the task must be recovered from the
+ * target. Run-level targets (Pact, final-check, reports, branches, bare candidate SHAs) are not
+ * tasks and resolve to `null` so they never inflate the per-task rejection counts.
+ */
+export function extractVerdictTaskId(ev: EventEnvelope): string | null {
+  const direct = normalizeVerdictTaskId(ev.taskId) ?? normalizeVerdictTaskId(ev.data.taskId);
+  if (direct !== null) {
+    return direct;
+  }
+
+  const target = ev.data.target;
+  if (typeof target === "string") {
+    const trimmed = target.trim();
+    if (trimmed.length > 0 && !isNonTaskVerdictTarget(trimmed)) {
+      return normalizeVerdictTaskId(trimmed);
+    }
+  }
+
+  return null;
+}
+
 function calcWardenRejectionRounds(runs: CalibrationSourceRun[]): MetricDistribution {
   const perTask = new Map<string, number>();
   const citations: string[] = [];
@@ -202,9 +274,11 @@ function calcWardenRejectionRounds(runs: CalibrationSourceRun[]): MetricDistribu
       if (ev.kind !== "verdict") {
         continue;
       }
+      const taskId = extractVerdictTaskId(ev);
+      if (taskId === null) {
+        continue;
+      }
       sawVerdict = true;
-      const rawTask = ev.taskId ?? ev.data.taskId;
-      const taskId = typeof rawTask === "string" && rawTask.length > 0 ? rawTask : "unknown-task";
       const groupKey = `${run.runId}::${taskId}`;
       if (!perTask.has(groupKey)) {
         perTask.set(groupKey, 0);
