@@ -335,9 +335,12 @@ export async function POST(
         { status: statusForMessageError(err) }
       );
     }
+    // An unexpected storage failure is not a refusal: it is reported generically
+    // so the internal exception (which may carry paths or query detail) never
+    // reaches the caller.
     return Response.json(
-      { ok: false, error: "Message was refused" },
-      { status: 400 }
+      { ok: false, error: "Message could not be persisted" },
+      { status: 500 }
     );
   }
 
@@ -421,7 +424,7 @@ export async function GET(
 
   return Response.json(
     { ok: true, runId, messages: readMessages(events) },
-    { status: 200 }
+    { status: 200, headers: { "Cache-Control": "no-store" } }
   );
 }
 

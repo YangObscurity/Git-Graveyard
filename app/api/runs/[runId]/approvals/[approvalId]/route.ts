@@ -337,21 +337,36 @@ export async function POST(
     }
   }
 
-  eventStore.append(
-    redactEvent({
-      runId,
-      kind: "approval.resolved",
-      actor: "user",
-      data: {
+  try {
+    eventStore.append(
+      redactEvent({
+        runId,
+        kind: "approval.resolved",
+        actor: "user",
+        data: {
+          approvalId,
+          decision: body.decision,
+          scope: body.scope,
+          pattern: body.pattern,
+          reason: body.reason,
+          resolved,
+        },
+      }) as never
+    );
+  } catch {
+    return Response.json(
+      {
+        ok: false,
+        error: "The approval was resolved but its audit event could not be recorded",
+        code: "APPROVAL_AUDIT_FAILED",
+        runId,
         approvalId,
         decision: body.decision,
-        scope: body.scope,
-        pattern: body.pattern,
-        reason: body.reason,
         resolved,
       },
-    }) as never
-  );
+      { status: 500 }
+    );
+  }
 
   // No resolver accepted the approval: this is a conflict, not a success. The
   // caller must not interpret a 200 as the approval having been resolved.
