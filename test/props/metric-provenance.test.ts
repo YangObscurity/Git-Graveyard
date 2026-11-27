@@ -16,7 +16,6 @@ import * as fc from "fast-check";
 import { METRIC_IDS } from "../../lib/metrics/registry";
 import {
   formatMetric,
-  formatDuration,
   NOT_AVAILABLE,
   NOT_REPORTED,
   COUNTS_NOT_AVAILABLE,
@@ -337,6 +336,23 @@ function asTime(value: unknown): number | undefined {
 function round1(value: number): number {
   return Math.round(value * 10) / 10;
 }
+/**
+ * Independent duration formatter for the M20/M21 property checks. Computes
+ * seconds/minutes/hours directly from the millisecond value instead of importing
+ * the production formatter under test, so the assertions stay honest.
+ */
+function expectedDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return NOT_AVAILABLE;
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  const seconds = ms / 1000;
+  if (seconds < 60) return `${round1(seconds)}s`;
+  const minutes = Math.floor(seconds / 60);
+  const remSeconds = Math.round(seconds % 60);
+  if (minutes < 60) return `${minutes}m ${remSeconds}s`;
+  const hours = Math.floor(minutes / 60);
+  const remMinutes = minutes % 60;
+  return `${hours}h ${remMinutes}m`;
+}
 function assertFallbackValue(value: MetricValue, expected: string, id: string): void {
   assert.equal(value.available, false, `${id} expected a fallback, got ${value.text}`);
   assert.equal(value.text, expected, `${id} fallback text`);
@@ -600,7 +616,7 @@ it("numeric metrics equal independently computed values and exact fallbacks", ()
               const r = asRecord(row);
               const id = String(r.skeletonId);
               const raisedAt = asNum(r.raisedAt) ?? 0;
-              return `${id}: ${formatDuration(Math.max(0, now - raisedAt))}`;
+              return `${id}: ${expectedDuration(Math.max(0, now - raisedAt))}`;
             });
             assert.equal(v.text, parts.join("; "));
             assert.deepEqual(v.numbers, []);
@@ -618,8 +634,8 @@ it("numeric metrics equal independently computed values and exact fallbacks", ()
           assertFallbackValue(v, NOT_AVAILABLE, "M21");
         } else {
           const parts: string[] = [];
-          if (elapsed !== undefined) parts.push(`elapsed ${formatDuration(elapsed)}`);
-          if (paused !== undefined) parts.push(`paused ${formatDuration(paused)}`);
+          if (elapsed !== undefined) parts.push(`elapsed ${expectedDuration(elapsed)}`);
+          if (paused !== undefined) parts.push(`paused ${expectedDuration(paused)}`);
           assert.equal(v.text, parts.join(", "));
           assert.deepEqual(v.numbers, []);
         }
@@ -772,4 +788,16 @@ it("numeric metrics equal independently computed values and exact fallbacks", ()
   );
 });
   });
+it("M20 and M21 duration formatting matches fixed golden values", () => {
+  // Guards against silent regressions such as 61000ms rendering as "1m 2s".
+  assert.equal(
+    formatMetric("M20", { skeletons: [{ skeletonId: "s1", raisedAt: 1000 }], now: 62000 })
+      .text,
+    "s1: 1m 1s"
+  );
+  assert.equal(
+    formatMetric("M21", { elapsedMs: 61000, pausedMs: 500 }).text,
+    "elapsed 1m 1s, paused 500ms"
+  );
+});
 });

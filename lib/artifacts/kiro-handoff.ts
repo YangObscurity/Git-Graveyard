@@ -70,27 +70,25 @@ export function buildKiroHandoff(input: KiroHandoffInput): KiroHandoffPlan {
     {
       title: "Clone at the pinned base sha and apply the patch",
       detail:
-        `Clone ${owner}/${repo}, check out the pinned base commit, then apply the run patch. ` +
-        "The patch is applied with -p1 to match the repository root layout. " +
-        "The upstream repository does not contain the downloaded run bundle, so first " +
-        "extract the downloaded archive into BUNDLE_DIR and copy all.patch and spec/ " +
-        "into the clone directory before running git apply -p1 all.patch.",
+        `Clone ${owner}/${repo} and check out the pinned base commit ${baseSha}. ` +
+        "Then copy the downloaded all.patch file from your Reliquary Downloads " +
+        '(for example "$HOME/Downloads/all.patch") into the clone directory before ' +
+        "applying it. The patch is applied with -p1 to match the repository root layout.",
       commands: [
         `git clone ${cloneUrl} ${cloneDir}`,
         `cd ${cloneDir}`,
         `git checkout ${baseSha}`,
-        `export BUNDLE_DIR="$HOME/Downloads/git-graveyard-${runId}"`,
-        `mkdir -p "$BUNDLE_DIR"`,
-        `tar -xzf "$HOME/Downloads/git-graveyard-${runId}.tar.gz" -C "$BUNDLE_DIR"`,
-        `cp -R "$BUNDLE_DIR/all.patch" "$BUNDLE_DIR/spec" .`,
+        `cp "$HOME/Downloads/all.patch" .`,
         "git apply -p1 all.patch",
       ],
     },
     {
       title: "Copy the spec bundle into Kiro's spec folder",
       detail:
-        "Copy the generated spec/ directory into the Kiro specs folder so the spec " +
-        "appears in the Kiro IDE / CLI.",
+        "Place the downloaded spec/ bundle directory alongside the clone (or copy it " +
+        "from the downloaded spec export) so the copy source is available, then copy " +
+        "the generated spec/ directory into the Kiro specs folder so the spec appears " +
+        "in the Kiro IDE / CLI.",
       commands: [
         `mkdir -p ${specCopyTarget}`,
         `cp -R spec/. ${specCopyTarget}`,

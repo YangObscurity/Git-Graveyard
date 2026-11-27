@@ -19,6 +19,7 @@ import {
   formatKiroHandoffText,
 } from "@/lib/artifacts/kiro-handoff";
 import { OpenInKiroHandoff } from "@/components/OpenInKiroHandoff";
+import { ReliquaryView } from "@/components/ReliquaryView";
 
 const REPO_ROOT = process.cwd();
 
@@ -227,7 +228,7 @@ describe("Task 26.4: kiro-handoff builder", () => {
     assert.ok(text.includes("Fallback") || text.includes("fallback"));
   });
 
-  it("explains extracting the bundle and copying all.patch and spec/ into the clone", () => {
+  it("copies the downloaded all.patch before applying it and never assumes a tar.gz archive", () => {
     const plan = buildKiroHandoff({
       owner: "o",
       repo: "r",
@@ -235,17 +236,19 @@ describe("Task 26.4: kiro-handoff builder", () => {
       runId: "run-1",
     });
     const allCommands = plan.steps.flatMap((s) => s.commands);
+    const text = formatKiroHandoffText(plan);
+    // The Reliquary download endpoint serves individual files, not a .tar.gz bundle.
+    assert.ok(!text.includes(".tar.gz"));
+
     const applyIndex = allCommands.indexOf("git apply -p1 all.patch");
     const copyIndex = allCommands.findIndex(
-      (c) => c.startsWith("cp") && c.includes("all.patch") && c.includes("spec")
+      (c) => c.startsWith("cp") && c.includes("all.patch")
     );
     assert.ok(applyIndex >= 0, "must keep the literal git apply command");
-    assert.ok(copyIndex >= 0, "must copy all.patch and spec/ into the clone");
-    assert.ok(copyIndex < applyIndex, "bundle files must be copied before applying the patch");
+    assert.ok(copyIndex >= 0, "must copy the downloaded all.patch into the clone");
+    assert.ok(copyIndex < applyIndex, "all.patch must be copied before applying the patch");
 
     const detail = plan.steps.map((s) => s.detail).join(" ");
-    assert.match(detail, /BUNDLE_DIR/);
-    assert.match(detail, /extract/i);
     assert.match(detail, /all\.patch/);
     assert.match(detail, /spec\//);
   });
@@ -264,5 +267,46 @@ describe("Task 26.4: OpenInKiroHandoff component", () => {
     assert.ok(html.includes("Open in Kiro Handoff Instructions"));
     assert.ok(html.includes("git apply -p1 all.patch"));
     assert.ok(html.includes(".kiro/specs/resurrection/test-owner-test-repo/"));
+  });
+});
+
+describe("Task 26.4: ReliquaryView Open in Kiro handoff gating", () => {
+  it("renders the handoff when owner, repo and baseSha are provided", () => {
+    const html = renderToStaticMarkup(
+      React.createElement(ReliquaryView, {
+        runId: "run-kiro-handoff",
+        owner: "octocat",
+        repo: "repo",
+        baseSha: "abc1234",
+      })
+    );
+    assert.ok(html.includes('data-testid="open-in-kiro-handoff"'));
+    assert.ok(html.includes("git apply -p1 all.patch"));
+    assert.ok(!html.includes('data-testid="open-in-kiro-unavailable"'));
+  });
+
+  it("renders the handoff when owner and repo are provided without baseSha", () => {
+    const html = renderToStaticMarkup(
+      React.createElement(ReliquaryView, {
+        runId: "r-x",
+        owner: "test-owner",
+        repo: "test-repo",
+      })
+    );
+    assert.ok(html.includes('data-testid="open-in-kiro-handoff"'));
+    assert.ok(html.includes("git apply -p1 all.patch"));
+    assert.ok(html.includes(".kiro/specs/resurrection/test-owner-test-repo/"));
+    assert.ok(!html.includes('data-testid="open-in-kiro-unavailable"'));
+  });
+
+  it("renders the honest unavailable notice when owner and repo are omitted", () => {
+    const html = renderToStaticMarkup(
+      React.createElement(ReliquaryView, {
+        runId: "r-empty",
+        outcome: "partial",
+      })
+    );
+    assert.ok(html.includes('data-testid="open-in-kiro-unavailable"'));
+    assert.ok(!html.includes('data-testid="open-in-kiro-handoff"'));
   });
 });

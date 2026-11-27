@@ -110,6 +110,8 @@ export function parseEventsData(events: EventEnvelope[]): {
   packing?: boolean;
   hidden?: boolean;
   baseSha?: string;
+  owner?: string;
+  repo?: string;
   buildPassed?: boolean;
   testsPassed?: boolean;
   tasks?: Record<string, TaskLedgerItem>;
@@ -120,6 +122,8 @@ export function parseEventsData(events: EventEnvelope[]): {
   let isPacking: boolean | undefined = undefined;
   let isHidden: boolean | undefined = undefined;
   let certBaseSha: string | undefined = undefined;
+  let certOwner: string | undefined = undefined;
+  let certRepo: string | undefined = undefined;
   let finalBuildPassed: boolean | undefined = undefined;
   let finalTestsPassed: boolean | undefined = undefined;
   let repCheck: ReliquaryReportCheckInfo | undefined = undefined;
@@ -132,9 +136,19 @@ export function parseEventsData(events: EventEnvelope[]): {
     }
 
     if (ev.kind === "exhume.certificate") {
-      const bs = (ev.data as Record<string, unknown>)?.baseSha;
+      const d = ev.data as Record<string, unknown>;
+      const bs = d?.baseSha;
       if (typeof bs === "string" && bs.length > 0) {
         certBaseSha = bs;
+      }
+      if (typeof d?.owner === "string" && d.owner.length > 0) certOwner = d.owner;
+      if (typeof d?.repo === "string" && d.repo.length > 0) certRepo = d.repo;
+      if ((!certOwner || !certRepo) && typeof d?.repoUrl === "string" && d.repoUrl.length > 0) {
+        const parsed = repoFromUrl(d.repoUrl);
+        if (parsed) {
+          if (!certOwner) certOwner = parsed.owner;
+          if (!certRepo) certRepo = parsed.repo;
+        }
       }
     }
 
@@ -252,6 +266,8 @@ export function parseEventsData(events: EventEnvelope[]): {
     packing: isPacking,
     hidden: isHidden,
     baseSha: certBaseSha,
+    owner: certOwner,
+    repo: certRepo,
     buildPassed: finalBuildPassed,
     testsPassed: finalTestsPassed,
     tasks: Object.keys(discoveredTasks).length > 0 ? discoveredTasks : undefined,
@@ -315,6 +331,11 @@ export function ReliquaryView({
   const [repo, setRepo] = useState<string>(propRepo ?? "repo");
   const [baseSha, setBaseSha] = useState<string>(propBaseSha ?? initialParsed?.baseSha ?? "0000000");
   const [headSha, setHeadSha] = useState<string>(propHeadSha ?? "0000000");
+  // Track whether real repository metadata (owner AND repo) has been recorded,
+  // so placeholder fallbacks never masquerade as a real target.
+  const [hasRepoMetadata, setHasRepoMetadata] = useState<boolean>(
+    Boolean(propOwner && propRepo)
+  );
   const [eventBuildPassed, setEventBuildPassed] = useState<boolean | undefined>(
     initialParsed?.buildPassed
   );
@@ -361,6 +382,10 @@ export function ReliquaryView({
   }, [propReportCheck]);
 
   useEffect(() => {
+    setHasRepoMetadata(Boolean(propOwner && propRepo));
+  }, [propOwner, propRepo]);
+
+  useEffect(() => {
     if (propBeforeAfterRows !== undefined) setBeforeAfterRows(propBeforeAfterRows);
   }, [propBeforeAfterRows]);
 
@@ -388,6 +413,12 @@ export function ReliquaryView({
         if (parsed.outcome !== undefined) setOutcome(parsed.outcome);
         if (parsed.packing !== undefined) setPacking(parsed.packing);
         if (parsed.hidden !== undefined) setHidden(parsed.hidden);
+        if (parsed.baseSha !== undefined) {
+          setBaseSha((prev) => (prev === "0000000" ? parsed.baseSha! : prev));
+        }
+        if (parsed.owner) setOwner(parsed.owner);
+        if (parsed.repo) setRepo(parsed.repo);
+        if (parsed.owner && parsed.repo) setHasRepoMetadata(true);
         if (parsed.tasks) setTasks(Object.values(parsed.tasks));
         if (parsed.artifacts) setArtifacts(parsed.artifacts);
         if (parsed.reportCheck) setReportCheckInfo(parsed.reportCheck);
@@ -467,10 +498,11 @@ export function ReliquaryView({
           }
           if (runData.run) {
             const parsedRepo = repoFromUrl(runData.run.url);
-            if (runData.run.owner) setOwner(runData.run.owner);
-            else if (parsedRepo) setOwner(parsedRepo.owner);
-            if (runData.run.repo) setRepo(runData.run.repo);
-            else if (parsedRepo) setRepo(parsedRepo.repo);
+            const realOwner = runData.run.owner ?? parsedRepo?.owner;
+            const realRepo = runData.run.repo ?? parsedRepo?.repo;
+            if (realOwner) setOwner(realOwner);
+            if (realRepo) setRepo(realRepo);
+            if (realOwner && realRepo) setHasRepoMetadata(true);
             if (runData.run.baseSha) setBaseSha(runData.run.baseSha);
             else if (typeof runData.run.sha === "string" && runData.run.sha && runData.run.sha !== "HEAD") {
               setBaseSha(runData.run.sha);
@@ -499,6 +531,9 @@ export function ReliquaryView({
           if (parsed.baseSha && !runData?.run?.baseSha) {
             setBaseSha((prev) => (prev === "0000000" ? parsed.baseSha! : prev));
           }
+          if (parsed.owner && !runData?.run?.owner) setOwner(parsed.owner);
+          if (parsed.repo && !runData?.run?.repo) setRepo(parsed.repo);
+          if (parsed.owner && parsed.repo) setHasRepoMetadata(true);
           if (parsed.buildPassed !== undefined) {
             setEventBuildPassed(parsed.buildPassed);
           }
@@ -686,7 +721,7 @@ export function ReliquaryView({
             <h1 className="text-xl md:text-2xl font-bold text-bone font-mono tracking-tight">
               Run: {runId}
             </h1>
-            {(owner !== "owner" || repo !== "repo") && (
+            {hasRepoMetadata && (
               <div className="text-xs text-ash">
                 Target: <span className="text-parchment">{owner}/{repo}</span>
                 {baseSha !== "0000000" && (
@@ -912,11 +947,11 @@ export function ReliquaryView({
       {/* 6. Open in Kiro handoff instructions (Requirement 38.9). Only shown when
           real repository metadata is available; placeholder fallbacks would
           produce broken clone/checkout commands. */}
-      {owner !== "owner" && repo !== "repo" && baseSha !== "0000000" ? (
+      {hasRepoMetadata ? (
         <OpenInKiroHandoff
           owner={owner}
           repo={repo}
-          baseSha={baseSha}
+          baseSha={baseSha !== "0000000" ? baseSha : "BASE_SHA"}
           runId={runId}
         />
       ) : (
@@ -924,8 +959,8 @@ export function ReliquaryView({
           data-testid="open-in-kiro-unavailable"
           className="crypt-panel p-5 font-mono text-xs text-ash"
         >
-          Open in Kiro handoff instructions are unavailable until the run
-          records its repository and base commit.
+          Open in Kiro handoff instructions are unavailable until the run records
+          its repository.
         </p>
       )}
 
