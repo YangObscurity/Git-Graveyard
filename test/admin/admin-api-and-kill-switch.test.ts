@@ -6,7 +6,7 @@ import { DatabaseSync } from "node:sqlite";
 
 import { RunStore } from "@/lib/runs/run-store";
 import { EventStore } from "@/lib/events/event-store";
-import { SettingsStore } from "@/lib/admin/settings-store";
+import { SettingsStore, ALWAYS_REQUIRED_SETTING_KEYS } from "@/lib/admin/settings-store";
 import {
   ADMIN_REVOKED_SESSIONS_SETTING_KEY,
   AdminRevocationStoreError,
@@ -32,6 +32,7 @@ import {
 import { GET as inviteGet, POST as invitePost } from "@/app/api/admin/invite-codes/route";
 import { GET as settingsGet, PATCH as settingsPatch } from "@/app/api/admin/settings/route";
 import { GET as queueGet, POST as queuePost } from "@/app/api/admin/queue/route";
+import { POST as startRunPost } from "@/app/api/start-run/route";
 import { POST as runActionPost } from "@/app/api/admin/runs/[runId]/route";
 import { GET as killGet, POST as killPost } from "@/app/api/admin/kill-switch/route";
 import { GET as promoGet, POST as promoPost } from "@/app/api/admin/promotion-audit/route";
@@ -100,6 +101,23 @@ beforeEach(() => {
   resetFifoQueueRegistry();
   resetKillSwitchRegistry();
   stores = makeStores();
+
+  // Reset the process-wide live wiring so start-run / queue / kill-switch tests stay isolated.
+  const g = globalThis as unknown as {
+    __admissionQueue?: unknown[];
+    __admission?: unknown;
+    __runOrchestrator?: unknown;
+  };
+  if (Array.isArray(g.__admissionQueue)) {
+    g.__admissionQueue.length = 0;
+  }
+  g.__admission = {
+    isPaused: () => false,
+    isUnavailable: () => false,
+    isHealthy: () => true,
+    getQueueLength: () => 0,
+  };
+  delete g.__runOrchestrator;
 });
 
 afterEach(() => {
@@ -107,6 +125,8 @@ afterEach(() => {
   resetAdminSessionState();
   resetFifoQueueRegistry();
   resetKillSwitchRegistry();
+  const g = globalThis as unknown as { __runOrchestrator?: unknown };
+  delete g.__runOrchestrator;
   try {
     stores.db.close();
   } catch {
@@ -1564,6 +1584,339 @@ describe("Promotion audit nested reserved keys (Task 22.5)", () => {
     const body = (await res.json()) as { present: boolean; verified: boolean };
     assert.equal(body.present, true);
     assert.equal(body.verified, false);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Real wiring: start-run -> Admin queue -> live orchestrator admission queue
+// ---------------------------------------------------------------------------------------------
+
+function satisfyRequiredSettings(store: SettingsStore): void {
+  const updates: Record<string, number> = {};
+  for (const key of ALWAYS_REQUIRED_SETTING_KEYS) {
+    updates[key] = 1;
+  }
+  // Keep queued runs from being idle-evicted during the test.
+  updates.queueIdleLimitMs = 3_600_000;
+  store.setSettingsBatch(updates, { actor: "test" });
+}
+
+interface MockOrchestrator {
+  snapshotQueued: string[];
+  moveCalls: Array<[string, number]>;
+  removeCalls: string[];
+  cancelCalls: string[];
+  paused: boolean;
+}
+
+function installMockOrchestrator(): MockOrchestrator {
+  const state: MockOrchestrator = {
+    snapshotQueued: [],
+    moveCalls: [],
+    removeCalls: [],
+    cancelCalls: [],
+    paused: false,
+  };
+  (globalThis as unknown as { __runOrchestrator?: unknown }).__runOrchestrator = {
+    pauseAdmission: () => {
+      state.paused = true;
+    },
+    resumeAdmission: () => {
+      state.paused = false;
+    },
+    killRun: async () => undefined,
+    stopRun: async () => undefined,
+    getQueueSnapshot: () => ({
+      queued: [...state.snapshotQueued],
+      active: [],
+      paused: state.paused,
+      maxConcurrentRuns: 1,
+      total: state.snapshotQueued.length,
+    }),
+    moveQueuedRun: (runId: string, position: number) => {
+      state.moveCalls.push([runId, position]);
+      const index = state.snapshotQueued.indexOf(runId);
+      if (index >= 0) {
+        state.snapshotQueued.splice(index, 1);
+      }
+      state.snapshotQueued.splice(Math.max(0, position - 1), 0, runId);
+      return true;
+    },
+    removeQueuedRun: (runId: string) => {
+      state.removeCalls.push(runId);
+      const index = state.snapshotQueued.indexOf(runId);
+      if (index >= 0) {
+        state.snapshotQueued.splice(index, 1);
+      }
+      return true;
+    },
+    cancelQueuedRun: (runId: string) => {
+      state.cancelCalls.push(runId);
+      const index = state.snapshotQueued.indexOf(runId);
+      if (index >= 0) {
+        state.snapshotQueued.splice(index, 1);
+      }
+      return true;
+    },
+  };
+  return state;
+}
+
+function startRunRequest(body: Record<string, unknown>): Request {
+  return jsonRequest("http://test/api/start-run", body, { method: "POST" });
+}
+
+
+describe("Admin queue <-> start-run real wiring (Task 22.5)", () => {
+  it("surfaces a run submitted through POST /api/start-run in GET /api/admin/queue", async () => {
+    satisfyRequiredSettings(stores.settingsStore);
+    stores.runStore.createInviteCode({ code: "queue-live-invite", allowedRunCount: 5 });
+
+    const res = await startRunPost(
+      attach(
+        startRunRequest({
+          url: "https://github.com/a/b",
+          sha: "a".repeat(40),
+          inviteCode: "queue-live-invite",
+          runId: "run-live-queue",
+        })
+      )
+    );
+    assert.equal(res.status, 202);
+
+    const admissionQueue = (
+      globalThis as unknown as { __admissionQueue?: Array<{ runId: string }> }
+    ).__admissionQueue;
+    assert.ok(admissionQueue?.some((entry) => entry.runId === "run-live-queue"));
+
+    const snapshotRes = await queueGet(
+      attach(new Request("http://test/api/admin/queue", { headers: adminHeaders() }))
+    );
+    assert.equal(snapshotRes.status, 200);
+    const snapshot = (await snapshotRes.json()) as {
+      queue: { entries: Array<{ runId: string }> };
+    };
+    assert.ok(snapshot.queue.entries.some((entry) => entry.runId === "run-live-queue"));
+  });
+
+  it("moves, removes and cancels a real queued run across the FIFO queue, admission queue and orchestrator", async () => {
+    satisfyRequiredSettings(stores.settingsStore);
+    stores.runStore.createInviteCode({ code: "queue-live-ops", allowedRunCount: 5 });
+    const orchestrator = installMockOrchestrator();
+
+    for (const runId of ["run-op-a", "run-op-b"]) {
+      const res = await startRunPost(
+        attach(
+          startRunRequest({
+            url: "https://github.com/a/b",
+            sha: "b".repeat(40),
+            inviteCode: "queue-live-ops",
+            runId,
+          })
+        )
+      );
+      assert.equal(res.status, 202);
+    }
+    // Mirror them into the mocked live orchestrator queue (as a live process would hold them).
+    orchestrator.snapshotQueued.push("run-op-a", "run-op-b");
+
+    const admit = (): Array<{ runId: string; queuePosition: number }> =>
+      (
+        globalThis as unknown as {
+          __admissionQueue?: Array<{ runId: string; queuePosition: number }>;
+        }
+      ).__admissionQueue ?? [];
+
+    // move run-op-b to position 1
+    const moveRes = await queuePost(
+      attach(
+        jsonRequest(
+          "http://test/api/admin/queue",
+          { action: "move", runId: "run-op-b", position: 1 },
+          { method: "POST", headers: adminHeaders() }
+        )
+      )
+    );
+    assert.equal(moveRes.status, 200);
+    const moved = (await moveRes.json()) as { queue: { entries: Array<{ runId: string }> } };
+    assert.equal(moved.queue.entries[0].runId, "run-op-b");
+    assert.deepEqual(orchestrator.moveCalls[0], ["run-op-b", 1]);
+    assert.deepEqual(
+      admit().map((entry) => entry.runId),
+      ["run-op-b", "run-op-a"]
+    );
+
+    // cancel run-op-a
+    const cancelRes = await queuePost(
+      attach(
+        jsonRequest(
+          "http://test/api/admin/queue",
+          { action: "cancel", runId: "run-op-a" },
+          { method: "POST", headers: adminHeaders() }
+        )
+      )
+    );
+    assert.equal(cancelRes.status, 200);
+    assert.ok(orchestrator.cancelCalls.includes("run-op-a"));
+    assert.ok(!admit().some((entry) => entry.runId === "run-op-a"));
+    assert.equal(stores.runStore.getRun("run-op-a")?.outcome, "cancelled");
+
+    // remove run-op-b
+    const removeRes = await queuePost(
+      attach(
+        jsonRequest(
+          "http://test/api/admin/queue",
+          { action: "remove", runId: "run-op-b" },
+          { method: "POST", headers: adminHeaders() }
+        )
+      )
+    );
+    assert.equal(removeRes.status, 200);
+    assert.ok(orchestrator.removeCalls.includes("run-op-b"));
+    assert.ok(!admit().some((entry) => entry.runId === "run-op-b"));
+
+    // A later snapshot no longer re-hydrates the removed / cancelled runs.
+    const afterRes = await queueGet(
+      attach(new Request("http://test/api/admin/queue", { headers: adminHeaders() }))
+    );
+    const after = (await afterRes.json()) as { queue: { entries: Array<{ runId: string }> } };
+    assert.ok(!after.queue.entries.some((entry) => entry.runId === "run-op-a"));
+    assert.ok(!after.queue.entries.some((entry) => entry.runId === "run-op-b"));
+  });
+});
+
+
+describe("Kill switch live runtime wiring (Task 22.5)", () => {
+  it("drives pauseAdmission / pauseHost / stopRun / killRun across all three levels and blocks new runs", async () => {
+    satisfyRequiredSettings(stores.settingsStore);
+    stores.runStore.createInviteCode({ code: "kill-live-invite", allowedRunCount: 5 });
+
+    let hostPaused = false;
+    let admissionPaused = false;
+    const stopped: string[] = [];
+    const killed: string[] = [];
+    const cancelledQueued: string[] = [];
+
+    (globalThis as unknown as { __admission?: unknown }).__admission = {
+      isPaused: () => hostPaused || admissionPaused,
+      isUnavailable: () => false,
+      isHealthy: () => true,
+      getQueueLength: () => 0,
+      pause: () => {
+        hostPaused = true;
+      },
+    };
+    (globalThis as unknown as { __runOrchestrator?: unknown }).__runOrchestrator = {
+      pauseAdmission: () => {
+        admissionPaused = true;
+      },
+      resumeAdmission: () => {
+        admissionPaused = false;
+      },
+      stopRun: async (runId: string) => {
+        stopped.push(runId);
+      },
+      killRun: async (runId: string) => {
+        killed.push(runId);
+      },
+      cancelQueuedRun: (runId: string) => {
+        cancelledQueued.push(runId);
+        return true;
+      },
+    };
+
+    stores.runStore.createRun({
+      runId: "kill-active",
+      url: "https://x/y",
+      sha: "1".repeat(40),
+      phase: "legion",
+    });
+    stores.runStore.createRun({
+      runId: "kill-queued",
+      url: "https://x/y",
+      sha: "2".repeat(40),
+      phase: "queued",
+      queuePosition: 1,
+    });
+    const admissionQueue = (globalThis as unknown as { __admissionQueue?: unknown[] })
+      .__admissionQueue;
+    admissionQueue?.push({
+      runId: "kill-queued",
+      url: "https://x/y",
+      sha: "2".repeat(40),
+      queuePosition: 1,
+      queuedAt: Date.now(),
+    });
+
+    const killPostJson = (level: string): Promise<Response> =>
+      killPost(
+        attach(
+          jsonRequest(
+            "http://test/api/admin/kill-switch",
+            { level, confirmed: true, reason: "drill" },
+            { method: "POST", headers: adminHeaders() }
+          )
+        )
+      );
+
+    // 1. pause_new_runs -> pauseAdmission + pauseHost
+    const pause = await killPostJson("pause_new_runs");
+    assert.equal(pause.status, 200);
+    assert.equal(admissionPaused, true);
+    assert.equal(hostPaused, true);
+
+    // The pause blocks subsequent live runs with 503.
+    const blocked = await startRunPost(
+      attach(
+        startRunRequest({
+          url: "https://github.com/a/b",
+          sha: "c".repeat(40),
+          inviteCode: "kill-live-invite",
+          runId: "run-after-pause",
+        })
+      )
+    );
+    assert.equal(blocked.status, 503);
+
+    // 2. stop_gracefully -> pauseAdmission + pauseHost + stopRun(active)
+    hostPaused = false;
+    admissionPaused = false;
+    const stop = await killPostJson("stop_gracefully");
+    assert.equal(stop.status, 200);
+    assert.deepEqual(stopped, ["kill-active"]);
+    assert.equal(admissionPaused, true);
+    assert.equal(hostPaused, true);
+
+    // 3. hard_kill -> pauseAdmission + pauseHost + cancelQueuedRun(queued) + killRun(active)
+    hostPaused = false;
+    admissionPaused = false;
+    const hard = await killPostJson("hard_kill");
+    assert.equal(hard.status, 200);
+    assert.ok(killed.includes("kill-active"));
+    assert.ok(cancelledQueued.includes("kill-queued"));
+    assert.ok(
+      !admissionQueue?.some((entry) => (entry as { runId?: string }).runId === "kill-queued")
+    );
+    assert.equal(admissionPaused, true);
+    assert.equal(hostPaused, true);
+  });
+
+  it("rehydrates persisted pause onto the live admission control", async () => {
+    satisfyRequiredSettings(stores.settingsStore);
+    stores.settingsStore.setSetting("killSwitch.pauseNewRuns", true, { actor: "owner" });
+
+    let admissionPaused = false;
+    (globalThis as unknown as { __runOrchestrator?: unknown }).__runOrchestrator = {
+      pauseAdmission: () => {
+        admissionPaused = true;
+      },
+    };
+
+    const res = await killGet(
+      attach(new Request("http://test/api/admin/kill-switch", { headers: adminHeaders() }))
+    );
+    assert.equal(res.status, 200);
+    assert.equal(admissionPaused, true);
   });
 });
 

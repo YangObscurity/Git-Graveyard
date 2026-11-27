@@ -35,6 +35,12 @@ export interface KillSwitchResult extends KillSwitchPreview {
   executedAt: number;
   actor: string;
   reason: string | null;
+  /**
+   * Resolves once every asynchronous runtime control (`stopRun` / `killRun`) collected during
+   * `execute` has settled. `execute` stays synchronous for its existing callers; a caller that must
+   * wait for the live RuntimeHost / RunOrchestrator (the Admin route) awaits this (or `executeLive`).
+   */
+  waitForRuntime?: () => Promise<void>;
 }
 
 export interface KillSwitchQueueHook {
@@ -42,11 +48,26 @@ export interface KillSwitchQueueHook {
   remove(runId: string): unknown;
 }
 
+/**
+ * Live process controls the kill switch can drive in addition to mutating the RunStore: the shared
+ * RuntimeHost admission surface and the active RunOrchestrator. Every hook is optional so an
+ * isolated unit test (or a process without a live orchestrator) keeps working unchanged.
+ */
+export interface KillSwitchRuntimeControls {
+  pauseAdmission?: () => void;
+  resumeAdmission?: () => void;
+  pauseHost?: () => void;
+  stopRun?: (runId: string, reason?: string) => void | Promise<void>;
+  killRun?: (runId: string, reason?: string) => void | Promise<void>;
+  cancelQueuedRun?: (runId: string) => boolean;
+}
+
 export interface KillSwitchOptions {
   runStore: RunStore;
   eventStore: EventStore;
   queue?: KillSwitchQueueHook | null;
   now?: () => number;
+  runtimeControls?: KillSwitchRuntimeControls | null;
 }
 
 export interface KillSwitchState {
@@ -68,6 +89,7 @@ export class KillSwitchService {
   private readonly runStore: RunStore;
   private readonly eventStore: EventStore;
   private readonly queue: KillSwitchQueueHook | null;
+  private readonly runtimeControls: KillSwitchRuntimeControls | null;
   private readonly now: () => number;
 
   private pausedNewRuns = false;
@@ -82,6 +104,7 @@ export class KillSwitchService {
     this.runStore = options.runStore;
     this.eventStore = options.eventStore;
     this.queue = options.queue ?? null;
+    this.runtimeControls = options.runtimeControls ?? null;
     this.now = options.now ?? (() => Date.now());
   }
 
@@ -120,6 +143,18 @@ export class KillSwitchService {
     }
     if (state.lastLevel !== undefined && state.lastLevel !== null) {
       this.lastLevel = state.lastLevel;
+    }
+
+    // Reflect the persisted enforcement flags onto the live RuntimeHost / RunOrchestrator so a cold
+    // start (or a request after an out-of-band persist) re-arms the same admission pause the kill
+    // switch enforced before it restarted.
+    if (this.runtimeControls) {
+      if (this.pausedNewRuns) {
+        this.invokeSync(this.runtimeControls.pauseAdmission);
+      }
+      if (this.stoppingGracefully) {
+        this.invokeSync(this.runtimeControls.pauseHost);
+      }
     }
   }
 
@@ -166,6 +201,16 @@ export class KillSwitchService {
     const reason = options?.reason ?? null;
     const at = this.now();
 
+    // Capture which affected runs were still queued *before* the RunStore mutation below, so the
+    // live runtime controls can tell a queued run (cancel) from an active run (stop / kill).
+    const queuedRunIds = new Set<string>();
+    for (const runId of preview.affectedRunIds) {
+      const run = this.runStore.getRun(runId);
+      if (run && isQueued(run)) {
+        queuedRunIds.add(runId);
+      }
+    }
+
     switch (level) {
       case "pause_new_runs":
         this.pausedNewRuns = true;
@@ -208,6 +253,8 @@ export class KillSwitchService {
         break;
     }
 
+    const pending = this.applyRuntimeControls(level, preview.affectedRunIds, queuedRunIds, reason);
+
     if (preview.affectedRunIds.length === 0) {
       this.emit(SYSTEM_RUN_ID, "admin.kill", actor, { level, actor, reason, affectedRunCount: 0 });
     } else {
@@ -224,14 +271,119 @@ export class KillSwitchService {
     this.lastLevel = level;
     this.lastExecutedAt = at;
 
-    return {
+    const result: KillSwitchResult = {
       ...preview,
       executed: true,
       executedAt: at,
       actor,
       reason,
     };
+    if (pending.length > 0) {
+      result.waitForRuntime = () => Promise.allSettled(pending).then(() => undefined);
+    }
+    return result;
   }
+
+  /**
+   * Async counterpart to {@link execute}: runs the same synchronous mutation and then awaits every
+   * asynchronous runtime control (`stopRun` / `killRun`) it collected, so a caller that must not
+   * return before the live RunOrchestrator actually stopped/killed the runs can simply `await`.
+   */
+  async executeLive(
+    level: KillSwitchLevel,
+    options: KillSwitchExecuteOptions
+  ): Promise<KillSwitchResult> {
+    const result = this.execute(level, options);
+    if (typeof result.waitForRuntime === "function") {
+      await result.waitForRuntime();
+    }
+    return result;
+  }
+
+  /**
+   * Drives the optional live runtime controls for a level: the admission/host pause and, per affected
+   * run, the synchronous `cancelQueuedRun` (queued) or async `stopRun` / `killRun` (active). Every
+   * hook is synchronous-safe: a throwing hook is swallowed (the kill switch must never be blocked by
+   * a flaky control) and any returned promise is collected for {@link KillSwitchResult.waitForRuntime}.
+   */
+  private applyRuntimeControls(
+    level: KillSwitchLevel,
+    affectedRunIds: string[],
+    queuedRunIds: Set<string>,
+    reason: string | null
+  ): Array<Promise<void>> {
+    const controls = this.runtimeControls;
+    const pending: Array<Promise<void>> = [];
+    if (!controls) {
+      return pending;
+    }
+
+    // All three levels halt new admission on the live host + orchestrator.
+    this.invokeSync(controls.pauseAdmission);
+    this.invokeSync(controls.pauseHost);
+
+    if (level === "stop_gracefully") {
+      for (const runId of affectedRunIds) {
+        const promise = this.invokeAsync(controls.stopRun, runId, reason ?? undefined);
+        if (promise) {
+          pending.push(promise);
+        }
+      }
+    } else if (level === "hard_kill") {
+      for (const runId of affectedRunIds) {
+        if (queuedRunIds.has(runId)) {
+          if (typeof controls.cancelQueuedRun === "function") {
+            try {
+              controls.cancelQueuedRun(runId);
+            } catch {
+              // A failed queue cancellation must not block the kill.
+            }
+          }
+        } else {
+          const promise = this.invokeAsync(controls.killRun, runId, reason ?? undefined);
+          if (promise) {
+            pending.push(promise);
+          }
+        }
+      }
+    }
+
+    return pending;
+  }
+
+  private invokeSync(fn?: () => void): void {
+    if (typeof fn !== "function") {
+      return;
+    }
+    try {
+      fn();
+    } catch {
+      // A flaky synchronous control must never block the kill switch.
+    }
+  }
+
+  private invokeAsync(
+    fn?: (runId: string, reason?: string) => void | Promise<void>,
+    runId?: string,
+    reason?: string
+  ): Promise<void> | null {
+    if (typeof fn !== "function" || typeof runId !== "string") {
+      return null;
+    }
+    try {
+      const outcome = fn(runId, reason);
+      if (outcome && typeof (outcome as Promise<void>).then === "function") {
+        return Promise.resolve(outcome as Promise<void>).then(
+          () => undefined,
+          () => undefined
+        );
+      }
+    } catch {
+      // A flaky asynchronous control must never block the kill switch.
+    }
+    return null;
+  }
+
 
   private emit(
     runId: string,

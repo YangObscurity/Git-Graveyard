@@ -1,10 +1,12 @@
 import {
+  resolveActiveOrchestrator,
   resolveEventStore,
   resolveRunStore,
   resolveSettingsStore,
 } from "@/lib/runtime/store-context";
 import { requireAdminAuth } from "@/lib/admin/admin-session";
 import { resolveFifoQueue } from "@/lib/admission/fifo-queue";
+import { getRuntimeHost } from "@/lib/runtime/runtime-host";
 import {
   KILL_SWITCH_LEVELS,
   KillSwitchService,
@@ -13,6 +15,7 @@ import {
   killSwitchServiceRegistry,
   markKillSwitchUnpersistedAuthority,
   type KillSwitchLevel,
+  type KillSwitchRuntimeControls,
   type KillSwitchState,
 } from "@/lib/admin/kill-switch";
 import type { SettingsStore } from "@/lib/admin/settings-store";
@@ -50,6 +53,152 @@ const KILL_SWITCH_STOP_KEY = "killSwitch.stopGracefully";
 const KILL_SWITCH_LAST_LEVEL_KEY = "killSwitch.lastLevel";
 
 /**
+ * Resolves the active live `RunOrchestrator`. A request carrying injected stores (an isolated test
+ * harness) makes `resolveActiveOrchestrator` return null, so the process-global orchestrator is
+ * checked first and again as a fallback — the kill switch must still reach the live process handle.
+ */
+function resolveLiveOrchestrator(request?: Request): unknown {
+  const g = globalThis as unknown as { __runOrchestrator?: unknown };
+  if (g.__runOrchestrator) {
+    return g.__runOrchestrator;
+  }
+  try {
+    const orchestrator = resolveActiveOrchestrator(request);
+    if (orchestrator) {
+      return orchestrator;
+    }
+  } catch {
+    // No live orchestrator reachable.
+  }
+  return null;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" ? (value as Record<string, unknown>) : null;
+}
+
+/** Pauses the live RuntimeHost admission surface (adapter on `globalThis` or the shared host). */
+function pauseLiveHost(): void {
+  const g = globalThis as unknown as {
+    __runtimeHost?: { pause?: () => void };
+    __admission?: { pause?: () => void };
+  };
+  let paused = false;
+  const runtimeHost = asRecord(g.__runtimeHost);
+  if (runtimeHost && typeof runtimeHost.pause === "function") {
+    try {
+      (runtimeHost.pause as () => void).call(g.__runtimeHost);
+      paused = true;
+    } catch {
+      // A failing host pause must not abort the kill switch.
+    }
+  }
+  const admission = asRecord(g.__admission);
+  if (admission && typeof admission.pause === "function") {
+    try {
+      (admission.pause as () => void).call(g.__admission);
+      paused = true;
+    } catch {
+      // A failing admission pause must not abort the kill switch.
+    }
+  }
+  if (!paused) {
+    try {
+      getRuntimeHost().pause();
+    } catch {
+      // A missing/unstartable host must not abort the kill switch.
+    }
+  }
+}
+
+/** Removes a run from the in-memory admission queue, reindexing the remaining positions. */
+function removeFromAdmissionQueue(runId: string): boolean {
+  const g = globalThis as unknown as { __admissionQueue?: unknown };
+  const queue = g.__admissionQueue;
+  if (!Array.isArray(queue)) {
+    return false;
+  }
+  const index = queue.findIndex((entry) => asRecord(entry)?.runId === runId);
+  if (index < 0) {
+    return false;
+  }
+  queue.splice(index, 1);
+  queue.forEach((entry, position) => {
+    const record = asRecord(entry);
+    if (record) {
+      record.queuePosition = position + 1;
+    }
+  });
+  return true;
+}
+
+/** Builds the live runtime-control hooks the kill switch drives for this process. */
+function buildRuntimeControls(request: Request): KillSwitchRuntimeControls {
+  return {
+    pauseAdmission: () => {
+      const orchestrator = asRecord(resolveLiveOrchestrator(request));
+      if (orchestrator && typeof orchestrator.pauseAdmission === "function") {
+        try {
+          (orchestrator.pauseAdmission as () => void).call(orchestrator);
+        } catch {
+          // A failing orchestrator pause must not abort the kill switch.
+        }
+      }
+    },
+    resumeAdmission: () => {
+      const orchestrator = asRecord(resolveLiveOrchestrator(request));
+      if (orchestrator && typeof orchestrator.resumeAdmission === "function") {
+        try {
+          (orchestrator.resumeAdmission as () => void).call(orchestrator);
+        } catch {
+          // ignore
+        }
+      }
+    },
+    pauseHost: () => pauseLiveHost(),
+    stopRun: (runId: string, reason?: string) => {
+      const orchestrator = asRecord(resolveLiveOrchestrator(request));
+      if (orchestrator && typeof orchestrator.stopRun === "function") {
+        return (orchestrator.stopRun as (id: string, why?: string) => void | Promise<void>).call(
+          orchestrator,
+          runId,
+          reason
+        );
+      }
+      return undefined;
+    },
+    killRun: (runId: string, reason?: string) => {
+      const orchestrator = asRecord(resolveLiveOrchestrator(request));
+      if (orchestrator && typeof orchestrator.killRun === "function") {
+        return (orchestrator.killRun as (id: string, why?: string) => void | Promise<void>).call(
+          orchestrator,
+          runId,
+          reason
+        );
+      }
+      return undefined;
+    },
+    cancelQueuedRun: (runId: string) => {
+      let cancelled = false;
+      const orchestrator = asRecord(resolveLiveOrchestrator(request));
+      if (orchestrator && typeof orchestrator.cancelQueuedRun === "function") {
+        try {
+          if ((orchestrator.cancelQueuedRun as (id: string) => boolean).call(orchestrator, runId) !== false) {
+            cancelled = true;
+          }
+        } catch {
+          // ignore
+        }
+      }
+      if (removeFromAdmissionQueue(runId)) {
+        cancelled = true;
+      }
+      return cancelled;
+    },
+  };
+}
+
+/**
  * Returns the shared {@link KillSwitchService} bound to a particular `RunStore`, so successive Admin
  * calls observe the same pause/stop state while distinct stores (tests, other processes) stay
  * isolated. A shared instance is required because the service mutates in-memory state on `execute`.
@@ -80,6 +229,7 @@ function buildService(request: Request): {
         cancel: (runId) => queue.cancel(runId),
         remove: (runId) => queue.remove(runId),
       },
+      runtimeControls: buildRuntimeControls(request),
     });
     services.set(storeKey, service);
   }
@@ -166,7 +316,7 @@ export async function POST(request: Request): Promise<Response> {
     });
   }
 
-  const result = service.execute(body.level, {
+  const result = await service.executeLive(body.level, {
     actor: auth.actor.id,
     reason: typeof body.reason === "string" ? body.reason : undefined,
   });

@@ -1,9 +1,20 @@
 import test, { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import * as crypto from "node:crypto";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 
 import { RunStore } from "@/lib/runs/run-store";
 import { EventStore } from "@/lib/events/event-store";
+import { LogStore } from "@/lib/events/log-store";
+import { GitService } from "@/lib/git/git-service";
+import { Scheduler } from "@/lib/scheduler/scheduler";
+import { TaskDispatcher } from "@/lib/scheduler/dispatcher";
+import { parsePact } from "@/lib/pact/pact-parser";
+import { renderPact } from "@/lib/pact/pact-renderer";
+import { RunOrchestrator } from "@/lib/orchestrator/run-orchestrator";
+import { RuntimeHost, resetRuntimeHost } from "@/lib/runtime/runtime-host";
 
 import { POST as postMessage, GET as getMessages } from "@/app/api/runs/[runId]/messages/route";
 import { POST as resolveApproval } from "@/app/api/runs/[runId]/approvals/[approvalId]/route";
@@ -491,10 +502,14 @@ describe("mutating run API routes", () => {
         data: { approvalId: "appr-1" },
       });
 
-      const calls: Array<{ id: string; decision: string }> = [];
+      const calls: Array<{ id: string; decision: string; scope?: string }> = [];
       (globalThis as Record<string, unknown>).__runOrchestrator = {
         resolveApproval: async (_runId: string, approvalId: string, resolution: any) => {
-          calls.push({ id: approvalId, decision: resolution.decision });
+          calls.push({
+            id: approvalId,
+            decision: resolution.decision,
+            scope: resolution.scope,
+          });
           return { ok: true };
         },
       };
@@ -512,7 +527,9 @@ describe("mutating run API routes", () => {
       assert.equal(data.approvalId, "appr-1");
       assert.equal(data.decision, "approve_once");
       assert.equal(data.resolved, true);
-      assert.deepEqual(calls, [{ id: "appr-1", decision: "approve_once" }]);
+      assert.deepEqual(calls, [
+        { id: "appr-1", decision: "approved", scope: "once" },
+      ]);
 
       const events = eventStore.getEvents(runId, { kind: "approval.resolved" });
       assert.equal(events.length, 1);
@@ -2538,6 +2555,438 @@ describe("mutating run API routes", () => {
       assert.equal(headersOf(calls[0])["x-invite-code"], "code-123");
       assert.deepEqual(JSON.parse(String(calls[0].init.body)), { action: "pause" });
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Real-object integration: the routes are driven against a real RunOrchestrator,
+// TaskDispatcher, ApprovalManager and fork checker instead of hand-rolled mocks.
+// ---------------------------------------------------------------------------
+describe("mutating run routes against real objects", () => {
+  let savedEnv: NodeJS.ProcessEnv;
+  const tempDirs: string[] = [];
+  const hosts: RuntimeHost[] = [];
+  const orchestrators: RunOrchestrator[] = [];
+
+  beforeEach(() => {
+    savedEnv = { ...process.env };
+    process.env.DISABLE_AUTO_ORCHESTRATOR = "1";
+    delete process.env.ADMIN_TOKEN;
+    delete process.env.ADMIN_KEY;
+    const g = globalThis as Record<string, unknown>;
+    delete g.__runStore;
+    delete g.__eventStore;
+    delete g.__runOrchestrator;
+  });
+
+  afterEach(async () => {
+    for (const orch of orchestrators.splice(0)) {
+      try {
+        await orch.shutdown();
+      } catch {}
+    }
+    for (const host of hosts.splice(0)) {
+      try {
+        await host.stop({ closeStores: true });
+      } catch {}
+    }
+    try {
+      await resetRuntimeHost({ closeStores: true });
+    } catch {}
+    const g = globalThis as Record<string, unknown>;
+    delete g.__runStore;
+    delete g.__eventStore;
+    delete g.__runOrchestrator;
+    process.env = savedEnv;
+    for (const dir of tempDirs.splice(0)) {
+      try {
+        fs.rmSync(dir, { recursive: true, force: true });
+      } catch {}
+    }
+  });
+
+  function makeTempDir(): string {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gg-real-"));
+    tempDirs.push(dir);
+    return dir;
+  }
+
+  function makeRealHost(stores: {
+    runStore: RunStore;
+    eventStore: EventStore;
+  }): RuntimeHost {
+    const host = new RuntimeHost({
+      skipReconcile: true,
+      runStore: stores.runStore,
+      eventStore: stores.eventStore,
+      logStore: new LogStore({ inMemory: true }),
+      backend: {} as never,
+    });
+    hosts.push(host);
+    return host;
+  }
+
+  function trackOrchestrator(orch: RunOrchestrator): RunOrchestrator {
+    orchestrators.push(orch);
+    return orch;
+  }
+
+  interface ActiveTracking {
+    abortController: AbortController;
+    layToRestChoice?: string;
+    instructions?: Array<{ text: string; delivery: string; at: number }>;
+    reviewFocus?: string[];
+  }
+
+  /** Builds a real Scheduler + TaskDispatcher with one live Skeleton. */
+  function makeDispatcherWithActiveSkeleton(
+    runId: string,
+    stores: { runStore: RunStore; eventStore: EventStore },
+    host: RuntimeHost,
+    runsDir: string,
+    skeletonId: string
+  ): {
+    scheduler: Scheduler;
+    dispatcher: TaskDispatcher;
+    tracking: ActiveTracking;
+  } {
+    const tasks = parsePact(
+      `- [ ] T1. Repair add()\n  - role: bonesetter\n  - files: index.js\n  - accept: npm test\n`
+    ).tasks;
+    const scheduler = new Scheduler({
+      pact: renderPact(tasks),
+      tasks,
+      runId,
+      approvedTaskIds: ["T1"],
+      pactApproved: true,
+      runParallelCap: 1,
+    });
+    const dispatcher = new TaskDispatcher({
+      runId,
+      scheduler,
+      gitService: new GitService({ runsDir }),
+      host,
+      runDir: path.join(runsDir, runId),
+      gitDir: path.join(runsDir, runId, "git"),
+      eventStore: stores.eventStore,
+    });
+    const tracking: ActiveTracking = {
+      abortController: new AbortController(),
+    };
+    const activeTask: Record<string, unknown> = {
+      task: tasks[0] as unknown as never,
+      taskId: "T1",
+      skeletonId,
+      worktreeDir: path.join(runsDir, runId, "wt"),
+      branch: "task/T1",
+      abortController: tracking.abortController,
+      startedAt: Date.now(),
+    };
+    (
+      dispatcher as unknown as {
+        activeTasks: Map<string, Record<string, unknown>>;
+      }
+    ).activeTasks.set("T1", activeTask);
+    return {
+      scheduler,
+      dispatcher,
+      tracking: activeTask as unknown as ActiveTracking,
+    };
+  }
+
+  function attachHandle(
+    orchestrator: RunOrchestrator,
+    runId: string,
+    dispatcher: TaskDispatcher,
+    scheduler: Scheduler
+  ): void {
+    (
+      orchestrator as unknown as { activeRuns: Map<string, unknown> }
+    ).activeRuns.set(runId, {
+      runId,
+      dispatcher,
+      scheduler,
+      lifecycleManager: { phase: "legion" },
+      getPhase: () => "legion",
+      pause: () => {},
+      resume: () => {},
+      stop: async () => {},
+      kill: async () => {},
+      approvePact: async () => {},
+      revisePact: async () => ({}) as never,
+      resolveApproval: async () => null,
+      answerAsk: async () => null,
+      promise: Promise.resolve({} as never),
+    });
+  }
+
+
+  it("resolves approve_once, approve_pattern and deny through a real ApprovalManager", async () => {
+    const { runStore, eventStore } = makeStores();
+    const runId = "run-real-appr";
+    makeRun(runStore, runId);
+    const host = makeRealHost({ runStore, eventStore });
+    const orchestrator = trackOrchestrator(
+      new RunOrchestrator({ host, runStore, eventStore, runsDir: makeTempDir() })
+    );
+    (globalThis as Record<string, unknown>).__runOrchestrator = orchestrator;
+    const manager = host.gateway.approvalManager;
+
+    // approve_once approves exactly the single request, without a pattern.
+    const onceReq = await manager.requestApproval({
+      runId,
+      skeletonId: "skel-1",
+      argv: ["npm", "test"],
+      cwd: "/workspace/repo",
+    });
+    const onceRes = await resolveApproval(
+      jsonRequest(
+        `http://test/api/runs/${runId}/approvals/${onceReq.approvalId}`,
+        { decision: "approve_once" }
+      ),
+      {
+        params: Promise.resolve({ runId, approvalId: onceReq.approvalId }),
+      }
+    );
+    assert.equal(onceRes.status, 200);
+    assert.equal(manager.getApprovalRecord(onceReq.approvalId)?.status, "approved");
+    assert.equal(
+      manager.consumeGrant(
+        "skel-1",
+        ["npm", "test"],
+        "/workspace/repo",
+        onceReq.approvalId,
+        runId
+      ),
+      true
+    );
+    assert.equal(manager.isPatternApproved(runId, ["npm", "test"]), false);
+
+    // approve_pattern records a run-scoped pattern exactly once.
+    const patternReq = await manager.requestApproval({
+      runId,
+      skeletonId: "skel-1",
+      argv: ["npm", "run", "lint"],
+      cwd: "/workspace/repo",
+    });
+    const patternRes = await resolveApproval(
+      jsonRequest(
+        `http://test/api/runs/${runId}/approvals/${patternReq.approvalId}`,
+        { decision: "approve_pattern", pattern: "npm run lint" }
+      ),
+      {
+        params: Promise.resolve({ runId, approvalId: patternReq.approvalId }),
+      }
+    );
+    assert.equal(patternRes.status, 200);
+    assert.equal(manager.isPatternApproved(runId, ["npm", "run", "lint"]), true);
+    assert.equal(runStore.getApprovedPatterns(runId).length, 1);
+
+    // deny denies the request outright.
+    const denyReq = await manager.requestApproval({
+      runId,
+      skeletonId: "skel-1",
+      argv: ["rm", "-rf", "/tmp/scratch"],
+      cwd: "/workspace/repo",
+    });
+    const denyRes = await resolveApproval(
+      jsonRequest(
+        `http://test/api/runs/${runId}/approvals/${denyReq.approvalId}`,
+        { decision: "deny" }
+      ),
+      {
+        params: Promise.resolve({ runId, approvalId: denyReq.approvalId }),
+      }
+    );
+    assert.equal(denyRes.status, 200);
+    assert.equal(manager.getApprovalRecord(denyReq.approvalId)?.status, "denied");
+  });
+
+  it("pushes through a real RunOrchestrator that supplies a fork checker", async () => {
+    const { runStore, eventStore } = makeStores();
+    const runId = "run-real-push";
+    makeRun(runStore, runId, {
+      pushFlag: true,
+      pushTargetFork: "https://github.com/target-owner/fork-repo",
+    });
+    const runsDir = makeTempDir();
+    const captured: Array<Record<string, unknown>> = [];
+    const fakeGitService = {
+      runsDir,
+      pushToFork: async (_runId: string, options: Record<string, unknown>) => {
+        captured.push(options);
+        return { commitSha: "c".repeat(40), branch: options.branchName };
+      },
+    };
+    const host = makeRealHost({ runStore, eventStore });
+    const orchestrator = trackOrchestrator(
+      new RunOrchestrator({
+        host,
+        runStore,
+        eventStore,
+        runsDir,
+        gitService: fakeGitService as never,
+        forkChecker: () => "source-owner/source-repo",
+        ownerLogin: "target-owner",
+        githubToken: "ghp_testtoken",
+      })
+    );
+    (globalThis as Record<string, unknown>).__runOrchestrator = orchestrator;
+
+    const askId = await raisePushConfirmAsk(runId, {
+      targetFork: "https://github.com/target-owner/fork-repo",
+    });
+    const res = await pushFork(
+      jsonRequest(`http://test/api/runs/${runId}/push-fork`, {
+        confirmed: true,
+        askId,
+      }),
+      runParams(runId)
+    );
+    assert.equal(res.status, 200);
+    const body = await readJson(res);
+    assert.equal(body.sourceUntouched, true);
+    assert.equal(captured.length, 1);
+    // The orchestrator's fork checker, owner login, token and run dirs reach
+    // the push, so it can never fail with MISSING_FORK_CHECKER.
+    assert.equal(typeof captured[0].forkChecker, "function");
+    assert.equal(captured[0].ownerLogin, "target-owner");
+    assert.equal(captured[0].token, "ghp_testtoken");
+    assert.equal(typeof captured[0].gitDir, "string");
+    assert.equal(typeof captured[0].runDir, "string");
+  });
+
+
+  it("keeps one MessageService per EventStore so ids increment across POSTs", async () => {
+    const { runStore, eventStore } = makeStores();
+    const runId = "run-real-msg-seq";
+    makeRun(runStore, runId);
+
+    const first = await postMessage(
+      jsonRequest(`http://test/api/runs/${runId}/messages`, {
+        to: "exhumer",
+        intent: "instruct",
+        text: "first",
+      }),
+      runParams(runId)
+    );
+    const second = await postMessage(
+      jsonRequest(`http://test/api/runs/${runId}/messages`, {
+        to: "exhumer",
+        intent: "instruct",
+        text: "second",
+      }),
+      runParams(runId)
+    );
+    assert.equal(first.status, 200);
+    assert.equal(second.status, 200);
+    assert.equal((await readJson(first)).message.id, `${runId}:msg:1`);
+    assert.equal((await readJson(second)).message.id, `${runId}:msg:2`);
+    assert.equal(eventStore.getEvents(runId, { kind: "message.sent" }).length, 2);
+  });
+
+  it("routes an interrupt_now message to the active run's real TaskDispatcher", async () => {
+    const { runStore, eventStore } = makeStores();
+    const runId = "run-real-msg-interrupt";
+    makeRun(runStore, runId);
+    const runsDir = makeTempDir();
+    const host = makeRealHost({ runStore, eventStore });
+    const skeletonId = "skeleton-T1";
+    const { scheduler, dispatcher, tracking } =
+      makeDispatcherWithActiveSkeleton(
+        runId,
+        { runStore, eventStore },
+        host,
+        runsDir,
+        skeletonId
+      );
+    const orchestrator = trackOrchestrator(
+      new RunOrchestrator({ host, runStore, eventStore, runsDir })
+    );
+    attachHandle(orchestrator, runId, dispatcher, scheduler);
+    (globalThis as Record<string, unknown>).__runOrchestrator = orchestrator;
+    eventStore.append({
+      runId,
+      kind: "skeleton.raised",
+      actor: "necromancer",
+      skeletonId,
+      data: { skeletonId },
+    });
+
+    const res = await postMessage(
+      jsonRequest(`http://test/api/runs/${runId}/messages`, {
+        to: "bonesetter",
+        intent: "interrupt",
+        text: "stop now",
+        delivery: "interrupt_now",
+        skeletonId,
+      }),
+      runParams(runId)
+    );
+    assert.equal(res.status, 200);
+    const body = await readJson(res);
+    assert.equal(body.message.delivery, "interrupt_now");
+
+    for (let i = 0; i < 40 && !tracking.abortController.signal.aborted; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(tracking.abortController.signal.aborted, true);
+  });
+
+  it("drives real TaskDispatcher skeleton controls through the actions route", async () => {
+    const { runStore, eventStore } = makeStores();
+    const runId = "run-real-skel";
+    makeRun(runStore, runId);
+    const runsDir = makeTempDir();
+    const host = makeRealHost({ runStore, eventStore });
+    const skeletonId = "skeleton-T1";
+    const { scheduler, dispatcher, tracking } =
+      makeDispatcherWithActiveSkeleton(
+        runId,
+        { runStore, eventStore },
+        host,
+        runsDir,
+        skeletonId
+      );
+    const orchestrator = trackOrchestrator(
+      new RunOrchestrator({ host, runStore, eventStore, runsDir })
+    );
+    attachHandle(orchestrator, runId, dispatcher, scheduler);
+    (globalThis as Record<string, unknown>).__runOrchestrator = orchestrator;
+    eventStore.append({
+      runId,
+      kind: "skeleton.raised",
+      actor: "necromancer",
+      skeletonId,
+      data: { skeletonId },
+    });
+
+    const cases: Array<{ action: string; body: Record<string, unknown> }> = [
+      { action: "interrupt", body: {} },
+      { action: "reraise", body: {} },
+      { action: "lay_to_rest", body: { choice: "keep_commits" } },
+      { action: "send_instruction", body: { instruction: "keep edits minimal" } },
+      { action: "add_review_focus", body: { focus: "check auth edge cases" } },
+    ];
+    for (const item of cases) {
+      const res = await skeletonAction(
+        jsonRequest(
+          `http://test/api/runs/${runId}/skeletons/${skeletonId}/actions`,
+          { action: item.action, ...item.body }
+        ),
+        { params: Promise.resolve({ runId, skeletonId }) }
+      );
+      assert.equal(
+        res.status,
+        200,
+        `action ${item.action} should be accepted by the real dispatcher`
+      );
+    }
+
+    assert.equal(tracking.abortController.signal.aborted, true);
+    assert.equal(tracking.layToRestChoice, "keep_commits");
+    assert.ok((tracking.instructions?.length ?? 0) >= 1);
+    assert.ok(tracking.reviewFocus?.includes("check auth edge cases"));
   });
 });
 

@@ -178,9 +178,18 @@ function verifySkeletonOwnership(
 }
 
 /**
+ * Persistent MessageService per EventStore, used only when no injected or active
+ * orchestrator supplies one (isolated route tests). Caching by EventStore keeps
+ * mailbox state and the message sequence alive across POSTs, so message ids
+ * increment (`:msg:1`, `:msg:2`, ...) instead of resetting on every request.
+ */
+const fallbackMessageServices = new WeakMap<EventStore, MessageService>();
+
+/**
  * Reuses an injected/active MessageService when the request, context or active
- * orchestrator carries one. Otherwise builds a service whose event sink redacts
- * every appended event before it reaches the EventStore.
+ * orchestrator carries one. Otherwise builds (once per EventStore) a service
+ * whose event sink redacts every appended event before it reaches the
+ * EventStore.
  */
 function resolveMessageService(
   request: Request,
@@ -198,13 +207,20 @@ function resolveMessageService(
     return candidate as MessageService;
   }
 
+  const cached = fallbackMessageServices.get(eventStore);
+  if (cached) {
+    return cached;
+  }
+
   const sink: MessageEventSink = {
     append: (input) =>
       eventStore.append(
         redactEvent(input as unknown as Record<string, unknown>) as never
       ),
   };
-  return new MessageService({ eventStore: sink });
+  const service = new MessageService({ eventStore: sink });
+  fallbackMessageServices.set(eventStore, service);
+  return service;
 }
 
 export async function POST(

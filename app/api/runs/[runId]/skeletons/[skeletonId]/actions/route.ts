@@ -251,8 +251,20 @@ async function forwardToDispatcher(
       break;
     case "send_instruction":
       dispatched =
-        (await callFirst(dispatcher, ["sendInstruction"], skeletonId, body.instruction)) ||
-        (await callFirst(dispatcher, ["instruct"], skeletonId, body.instruction));
+        (await callFirst(
+          dispatcher,
+          ["sendInstruction"],
+          skeletonId,
+          body.instruction,
+          body.delivery
+        )) ||
+        (await callFirst(
+          dispatcher,
+          ["instruct"],
+          skeletonId,
+          body.instruction,
+          body.delivery
+        ));
       break;
     case "add_review_focus":
       dispatched =

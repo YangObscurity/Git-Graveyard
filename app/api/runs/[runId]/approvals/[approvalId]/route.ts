@@ -45,6 +45,35 @@ function isSafePathSegment(value: unknown): value is string {
 
 type ApprovalOwnership = "ok" | "mismatch" | "unknown";
 
+/**
+ * Maps the route's API-facing decision vocabulary onto the canonical resolution
+ * the ApprovalManager speaks: `approve_once` approves a single request,
+ * `approve_pattern` approves the request and records a run-scoped pattern (an
+ * explicit `pattern` or a command prefix derived from the request argv), and
+ * `deny` / `deny_and_lay_to_rest` deny it.
+ */
+function translateDecision(body: {
+  decision: "approve_once" | "approve_pattern" | "deny" | "deny_and_lay_to_rest";
+  scope?: string;
+  pattern?: string;
+}): Record<string, unknown> {
+  switch (body.decision) {
+    case "approve_once":
+      return { decision: "approved", scope: "once" };
+    case "approve_pattern":
+      return {
+        decision: "approved",
+        scope: body.scope ?? "run_pattern",
+        pattern: body.pattern,
+      };
+    case "deny_and_lay_to_rest":
+      return { decision: "denied", scope: "lay_to_rest" };
+    case "deny":
+    default:
+      return { decision: "denied" };
+  }
+}
+
 /** Reads an approval record from any accessor an approval manager exposes. */
 function readApprovalRecord(
   manager: unknown,
@@ -212,11 +241,10 @@ export async function POST(
     return authError;
   }
 
-  const resolution = {
-    decision: body.decision,
+  const translated = translateDecision(body);
+  const resolution: Record<string, unknown> = {
+    ...translated,
     reason: body.reason,
-    scope: body.scope,
-    pattern: body.pattern,
   };
 
   const orchestrator = resolveActiveOrchestrator(request, context);
@@ -328,11 +356,19 @@ export async function POST(
 
   // Persist an approved command pattern only when the approval actually
   // resolved; a failed resolution must never widen what the run may execute.
+  // The ApprovalManager may already have recorded the same run-scoped pattern
+  // while resolving, so an identical pattern is not duplicated.
   if (resolved && body.decision === "approve_pattern") {
-    const patternValue = (body.pattern ?? body.scope)?.trim();
+    const patternValue = body.pattern?.trim();
     if (patternValue && typeof runStore.addApprovedPattern === "function") {
       try {
-        runStore.addApprovedPattern(runId, patternValue);
+        const existing =
+          typeof runStore.getApprovedPatterns === "function"
+            ? runStore.getApprovedPatterns(runId)
+            : [];
+        if (!existing.some((p) => p.pattern === patternValue)) {
+          runStore.addApprovedPattern(runId, patternValue);
+        }
       } catch {}
     }
   }

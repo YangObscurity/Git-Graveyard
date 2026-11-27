@@ -44,24 +44,77 @@ interface GitPusher {
 const inFlightPushAsks = new Set<string>();
 
 /**
- * Resolves the GitService that performs the fork push: an explicit injection on
- * the request/context or the active orchestrator's service, else a fresh one
- * bound to this run's source repository.
+ * View of the push wiring an orchestrator exposes for a run. Only the fields
+ * the route forwards to a push are read; the values come from the active
+ * orchestrator's configured credentials and run directories.
  */
-function resolveGitService(
+interface PushForkConfigView {
+  gitService: unknown;
+  gitDir?: string;
+  runDir?: string;
+  ownerLogin?: string;
+  forkChecker?: unknown;
+  token?: string;
+}
+
+/**
+ * Resolves the GitService injected directly on the request/context. An isolated
+ * route test injects a mock here; when present it wins over the orchestrator so
+ * the test can observe the push without a live git remote.
+ */
+function readInjectedGitService(
   request: Request,
-  context: RouteContext | undefined,
-  orchestrator: unknown,
-  sourceUrl: string | undefined
-): GitPusher {
+  context: RouteContext | undefined
+): GitPusher | undefined {
   const req = request as unknown as { gitService?: unknown };
   const ctx = context as unknown as { gitService?: unknown } | undefined;
-  const orch = orchestrator as { gitService?: unknown } | null | undefined;
-  const candidate = req?.gitService ?? ctx?.gitService ?? orch?.gitService;
+  const candidate = req?.gitService ?? ctx?.gitService;
   if (candidate && typeof (candidate as GitPusher).pushToFork === "function") {
     return candidate as GitPusher;
   }
-  return new GitService({ sourceRepoUrl: sourceUrl }) as unknown as GitPusher;
+  return undefined;
+}
+
+/**
+ * Reads a GitService directly off an orchestrator that does not expose the
+ * dedicated push wiring. Preserves the legacy "orchestrator.gitService" path.
+ */
+function readOrchestratorGitService(
+  orchestrator: unknown
+): GitPusher | undefined {
+  const orch = orchestrator as { gitService?: unknown } | null | undefined;
+  const candidate = orch?.gitService;
+  if (candidate && typeof (candidate as GitPusher).pushToFork === "function") {
+    return candidate as GitPusher;
+  }
+  return undefined;
+}
+
+/**
+ * Reads the active orchestrator's push config (git service, run directories,
+ * owner login, fork checker and token). Returns `null` when no orchestrator (or
+ * no config accessor) is available so the route can fall back safely.
+ */
+function readPushForkConfig(
+  orchestrator: unknown,
+  runId: string
+): PushForkConfigView | null {
+  const orch = orchestrator as
+    | { getPushForkConfig?: (id: string) => unknown }
+    | null
+    | undefined;
+  if (!orch || typeof orch.getPushForkConfig !== "function") {
+    return null;
+  }
+  try {
+    const cfg = orch.getPushForkConfig(runId);
+    if (!cfg || typeof cfg !== "object") {
+      return null;
+    }
+    return cfg as PushForkConfigView;
+  } catch {
+    return null;
+  }
 }
 
 /** Maps a GitServiceError code onto the HTTP status the route returns. */
@@ -616,7 +669,8 @@ export async function POST(
 
   try {
     const orchestrator = resolveActiveOrchestrator(request, context);
-    const gitService = resolveGitService(request, context, orchestrator, sourceUrl);
+    const pushConfig = readPushForkConfig(orchestrator, runId);
+    const injectedGitService = readInjectedGitService(request, context);
 
     const sink: Pick<EventStore, "append"> = {
       append: (input) =>
@@ -625,15 +679,51 @@ export async function POST(
         ),
     };
 
-    const result = (await gitService.pushToFork(runId, {
-      targetRepoUrl: targetFork,
-      sourceRepoUrl: sourceUrl,
-      branchName: pushedBranch,
-      runPhase: "done",
-      invitePushFlag: true,
-      pushConfirm: true,
-      eventStore: sink,
-    })) as { commitSha?: string; branch?: string } | null;
+    let result: { commitSha?: string; branch?: string } | null;
+    if (
+      !injectedGitService &&
+      orchestrator &&
+      typeof orchestrator.pushRunToFork === "function"
+    ) {
+      // A real orchestrator owns the confirmed push: it supplies the configured
+      // fork checker, owner login, write token and run directories to its
+      // GitService so the target is verified as the owner's fork first.
+      result = (await orchestrator.pushRunToFork(runId, {
+        targetRepoUrl: targetFork,
+        sourceRepoUrl: sourceUrl,
+        branchName: pushedBranch,
+        pushConfirm: true,
+        eventStore: sink as unknown as EventStore,
+      })) as { commitSha?: string; branch?: string } | null;
+    } else {
+      // An injected mock GitService (isolated route tests) is called directly,
+      // while still receiving the orchestrator's fork-checker/owner/token/dir
+      // wiring whenever one is present.
+      const gitService =
+        injectedGitService ??
+        (pushConfig?.gitService as GitPusher | undefined) ??
+        readOrchestratorGitService(orchestrator) ??
+        (new GitService({ sourceRepoUrl: sourceUrl }) as unknown as GitPusher);
+
+      result = (await gitService.pushToFork(runId, {
+        targetRepoUrl: targetFork,
+        sourceRepoUrl: sourceUrl,
+        branchName: pushedBranch,
+        runPhase: "done",
+        invitePushFlag: true,
+        pushConfirm: true,
+        eventStore: sink,
+        ...(pushConfig
+          ? {
+              forkChecker: pushConfig.forkChecker,
+              ownerLogin: pushConfig.ownerLogin,
+              token: pushConfig.token,
+              gitDir: pushConfig.gitDir,
+              runDir: pushConfig.runDir,
+            }
+          : {}),
+      })) as { commitSha?: string; branch?: string } | null;
+    }
 
     // Consume the confirmation only after the push actually succeeded: a
     // transient git/network error must not burn a still-valid pending ask. The

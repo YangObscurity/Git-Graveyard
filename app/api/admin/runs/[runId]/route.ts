@@ -1,6 +1,7 @@
 import { resolveEventStore, resolveRunStore, resolveSettingsStore } from "@/lib/runtime/store-context";
 import { requireAdminAuth } from "@/lib/admin/admin-session";
 import { redactEvent } from "@/lib/security/redactor";
+import { ALLOWED_REDACTION_FIELDS } from "@/lib/events/event-tap";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -13,8 +14,16 @@ interface RunActionBody {
   action?: unknown;
   reason?: unknown;
   fields?: unknown;
+  targetSeqs?: unknown;
+  secrets?: unknown;
+  patterns?: unknown;
   note?: unknown;
 }
+
+// Single source of truth shared with the read path (lib/events/event-tap.ts): a requested field is
+// only accepted when it maps to a real scrub rule, so an admin redaction can never name a field the
+// read path would be unable to enforce.
+const ALLOWED_REDACTION_FIELD_SET = new Set(ALLOWED_REDACTION_FIELDS);
 
 async function readBody(request: Request): Promise<RunActionBody> {
   try {
@@ -54,9 +63,47 @@ function parseRedactionFields(
     if (name.length === 0) {
       return { ok: false };
     }
+    if (!ALLOWED_REDACTION_FIELD_SET.has(name)) {
+      return { ok: false };
+    }
     fields.push(name);
   }
   return { ok: true, fields };
+}
+
+/**
+ * Parses an optional list of sequence numbers (e.g. `targetSeqs`) from a redact body. Malformed
+ * entries are dropped; a value that is not a list is ignored entirely so the redaction itself still
+ * proceeds on the requested fields.
+ */
+function parseSeqList(value: unknown): number[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const seqs: number[] = [];
+  for (const entry of value) {
+    if (typeof entry === "number" && Number.isFinite(entry)) {
+      seqs.push(entry);
+    }
+  }
+  return seqs.length > 0 ? seqs : undefined;
+}
+
+/**
+ * Parses an optional list of non-empty strings (e.g. `secrets` / `patterns`) from a redact body.
+ * Malformed entries are dropped; a value that is not a list is ignored.
+ */
+function parseStringList(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const items: string[] = [];
+  for (const entry of value) {
+    if (typeof entry === "string" && entry.length > 0) {
+      items.push(entry);
+    }
+  }
+  return items.length > 0 ? items : undefined;
 }
 
 export async function POST(request: Request, context: RouteContext): Promise<Response> {
@@ -156,6 +203,9 @@ export async function POST(request: Request, context: RouteContext): Promise<Res
         return Response.json({ ok: false, error: "invalid_redaction_fields" }, { status: 400 });
       }
       const fields = parsedFields.fields;
+      const targetSeqs = parseSeqList(body.targetSeqs);
+      const secrets = parseStringList(body.secrets);
+      const patterns = parseStringList(body.patterns);
       const updated = runStore.updateRun(runId, {
         metadata: {
           ...metadata,
@@ -166,12 +216,23 @@ export async function POST(request: Request, context: RouteContext): Promise<Res
         },
       });
       // A single redaction event records the review inline (`reviewed: true`) so a partially-applied
-      // pair of appends can never leave the run row and the audit log out of sync.
+      // pair of appends can never leave the run row and the audit log out of sync. Any optional
+      // targetSeqs/secrets/patterns supplied alongside the fields are forwarded so the read path can
+      // scope and extend the redaction beyond the logical field map.
+      const redactionData: Record<string, unknown> = {
+        actor: auth.actor.id,
+        reason,
+        fields,
+        reviewed: true,
+      };
+      if (targetSeqs) redactionData.targetSeqs = targetSeqs;
+      if (secrets) redactionData.secrets = secrets;
+      if (patterns) redactionData.patterns = patterns;
       return commit(
         [
           {
             kind: "admin.redaction",
-            data: { actor: auth.actor.id, reason, fields, reviewed: true },
+            data: redactionData,
           },
         ],
         () => Response.json({ ok: true, action, run: updated })

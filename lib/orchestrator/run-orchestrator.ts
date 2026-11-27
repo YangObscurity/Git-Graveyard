@@ -72,6 +72,13 @@ import {
 } from "../lifecycle/run-finalizer";
 import type { SkeletonSupervisor } from "../supervisor/skeleton-supervisor";
 import {
+  MessageService,
+  type MessageEventSink,
+  type MessageRecord,
+  type MessageServiceOptions,
+  type SendMessageInput,
+} from "../messaging/message-service";
+import {
   CLAUDE_OPUS_5_5_MODEL_ID,
   getAssignedModelForRole,
 } from "../agents/model-allowlist";
@@ -286,6 +293,37 @@ function createFallbackDeathCertificate(
 }
 
 /**
+ * MessageService bound to a RunOrchestrator. Beyond persisting each message it
+ * hands the stored record back to the orchestrator, which routes it to the
+ * active run: an `interrupt_now` delivery reaches the live
+ * `TaskDispatcher.interruptSkeleton(...)` and a queued delivery steers the
+ * addressed Skeleton through `TaskDispatcher.sendInstruction(...)`.
+ */
+class OrchestratorMessageService extends MessageService {
+  private readonly onSent?: (record: MessageRecord) => void;
+
+  constructor(
+    options: MessageServiceOptions,
+    onSent?: (record: MessageRecord) => void
+  ) {
+    super(options);
+    this.onSent = onSent;
+  }
+
+  override send(input: SendMessageInput): MessageRecord {
+    const record = super.send(input);
+    if (this.onSent) {
+      try {
+        this.onSent(record);
+      } catch {
+        // Delivery is best-effort and must never fail the send itself.
+      }
+    }
+    return record;
+  }
+}
+
+/**
  * End-to-end production run lifecycle orchestrator coordinating
  * bounded live-run admission and the full pipeline:
  * queued -> exhume -> plan -> pact_review -> legion -> final_check -> report -> done.
@@ -296,6 +334,12 @@ export class RunOrchestrator extends EventEmitter {
   readonly runsDir: string;
   readonly options: RunOrchestratorOptions;
   readonly maxConcurrentRuns: number;
+  /**
+   * Runtime-consumed message service backed by the host EventStore. Kept on the
+   * orchestrator so message routes reuse one mailbox/sequence across requests
+   * and an `interrupt_now` delivery can reach the active dispatcher.
+   */
+  public readonly messageService: MessageService;
 
   private readonly queue: string[] = [];
   private readonly activeRuns: Map<string, RunExecutionHandle> = new Map();
@@ -322,9 +366,47 @@ export class RunOrchestrator extends EventEmitter {
         runsDir: this.runsDir,
       });
 
+    this.messageService = new OrchestratorMessageService(
+      {
+        // Backed by the host's event store, with a tolerant sink so a host
+        // without a usable store (isolated unit tests) still yields a working
+        // service instead of throwing at construction.
+        eventStore: {
+          append: (input) =>
+            this.host?.eventStore?.append?.(input as never) as never,
+        } as MessageEventSink,
+      },
+      (record) => this.routeMessageToActiveRun(record)
+    );
+
     // Register global hook
     const g = globalThis as unknown as { __runOrchestrator?: unknown };
     g.__runOrchestrator = this;
+  }
+
+  /**
+   * Routes a stored message to the run's active dispatcher: `interrupt_now`
+   * interrupts the addressed Skeleton, and any other delivery steers it. Runs
+   * with no active handle simply keep the message in the mailbox.
+   */
+  private routeMessageToActiveRun(record: MessageRecord): void {
+    const handle = this.activeRuns.get(record.runId);
+    const dispatcher = handle?.dispatcher;
+    if (!dispatcher) {
+      return;
+    }
+    const target = record.skeletonId ?? record.to;
+    try {
+      if (record.delivery === "interrupt_now") {
+        void dispatcher.interruptSkeleton(target).catch(() => {});
+      } else {
+        void dispatcher
+          .sendInstruction(target, record.text, record.delivery)
+          .catch(() => {});
+      }
+    } catch {
+      // The message is already stored; delivery is best-effort.
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -381,6 +463,7 @@ export class RunOrchestrator extends EventEmitter {
       });
     } catch {}
 
+    this.syncAdmissionQueue();
     void this.processQueue();
 
     return { queuePosition, runId };
@@ -415,6 +498,53 @@ export class RunOrchestrator extends EventEmitter {
       },
     });
 
+    this.syncAdmissionQueue();
+    return true;
+  }
+
+  /**
+   * Removes a run from the admission queue without cancelling its record: the
+   * run simply stops waiting for a slot. Returns false when the run is not
+   * queued here.
+   */
+  public removeQueuedRun(runId: string): boolean {
+    const idx = this.queue.indexOf(runId);
+    if (idx === -1) {
+      return false;
+    }
+
+    this.queue.splice(idx, 1);
+    this.updateQueuePositions();
+
+    try {
+      this.host.runStore.updateRun(runId, { queuePosition: null });
+    } catch {}
+
+    this.syncAdmissionQueue();
+    return true;
+  }
+
+  /**
+   * Moves a queued run to a 1-based position within the admission queue,
+   * clamped to the queue bounds, and renumbers every position. Returns false
+   * when the run is not queued here.
+   */
+  public moveQueuedRun(runId: string, position: number): boolean {
+    const from = this.queue.indexOf(runId);
+    if (from === -1) {
+      return false;
+    }
+    const target = Math.min(
+      Math.max(1, Math.floor(typeof position === "number" ? position : from + 1)),
+      this.queue.length
+    );
+    const to = target - 1;
+    if (to !== from) {
+      this.queue.splice(from, 1);
+      this.queue.splice(to, 0, runId);
+    }
+    this.updateQueuePositions();
+    this.syncAdmissionQueue();
     return true;
   }
 
@@ -424,6 +554,7 @@ export class RunOrchestrator extends EventEmitter {
       this.cancelQueuedRun(runId);
     }
     this.queue.length = 0;
+    this.syncAdmissionQueue();
     return drained;
   }
 
@@ -433,6 +564,45 @@ export class RunOrchestrator extends EventEmitter {
       try {
         this.host.runStore.updateRun(id, { queuePosition: i + 1 });
       } catch {}
+    }
+  }
+
+  /**
+   * Mirrors the orchestrator's internal admission queue into the shared
+   * `globalThis.__admissionQueue` the runtime host and diagnostics read,
+   * preserving any richer entry fields already present for a queued run and
+   * renumbering positions to match.
+   */
+  private syncAdmissionQueue(): void {
+    const g = globalThis as unknown as {
+      __admissionQueue?: Array<{ runId?: string; queuePosition?: number }>;
+    };
+    if (!Array.isArray(g.__admissionQueue)) {
+      return;
+    }
+    const existing = new Map<
+      string,
+      { runId?: string; queuePosition?: number }
+    >();
+    for (const entry of g.__admissionQueue) {
+      if (
+        entry &&
+        typeof entry === "object" &&
+        typeof entry.runId === "string" &&
+        !existing.has(entry.runId)
+      ) {
+        existing.set(entry.runId, entry);
+      }
+    }
+    const next = this.queue.map((runId, index) => {
+      const entry = existing.get(runId) ?? { runId };
+      entry.runId = runId;
+      entry.queuePosition = index + 1;
+      return entry;
+    });
+    g.__admissionQueue.length = 0;
+    for (const entry of next) {
+      g.__admissionQueue.push(entry);
     }
   }
 
@@ -450,6 +620,7 @@ export class RunOrchestrator extends EventEmitter {
       const nextRunId = this.queue.shift();
       if (nextRunId) {
         this.updateQueuePositions();
+        this.syncAdmissionQueue();
         try {
           this.startRun(nextRunId);
         } catch {
@@ -2642,12 +2813,78 @@ srv.listen(8080, "0.0.0.0");
     resolution?: any
   ): Promise<any> {
     if (this.host.gateway?.approvalManager) {
+      // Scope the resolution to this run so the ApprovalManager's own run
+      // binding is enforced even when the caller omits it, and a cross-run
+      // approval fails closed rather than resolving against the wrong run.
+      const scoped =
+        resolution && typeof resolution === "object"
+          ? { ...(resolution as Record<string, unknown>), runId }
+          : resolution;
       return this.host.gateway.approvalManager.resolveApproval(
         approvalId,
-        resolution
+        scoped
       );
     }
     return null;
+  }
+
+  /**
+   * Push configuration the push-fork route needs to hand a confirmed push to
+   * the real GitService: the service, the run's git/runtime directories, and
+   * the owner/checker/token credentials configured on the orchestrator. The
+   * route reads this so a confirmed push is never left without a fork checker.
+   */
+  public getPushForkConfig(runId: string): {
+    gitService: GitService;
+    gitDir: string;
+    runDir: string;
+    ownerLogin: string | undefined;
+    forkChecker: ForkChecker | undefined;
+    token: string | undefined;
+  } {
+    const runDir = path.join(this.runsDir, runId);
+    const gitDir = path.join(runDir, "git");
+    return {
+      gitService: this.gitService,
+      gitDir,
+      runDir,
+      ownerLogin: this.options.ownerLogin,
+      forkChecker: this.options.forkChecker,
+      token: this.options.githubToken,
+    };
+  }
+
+  /**
+   * Performs a confirmed push of the run's branch to its fork through the
+   * orchestrator's GitService, wiring the configured owner login, fork checker,
+   * token and run git/runtime directories so the GitService can verify the
+   * target really is the owner's fork before touching the network.
+   */
+  public async pushRunToFork(
+    runId: string,
+    params: {
+      targetRepoUrl: string;
+      sourceRepoUrl: string;
+      branchName: string;
+      pushConfirm: boolean;
+      eventStore?: EventStore;
+    }
+  ): Promise<unknown> {
+    const { gitDir, runDir } = this.getPushForkConfig(runId);
+    return this.gitService.pushToFork(runId, {
+      targetRepoUrl: params.targetRepoUrl,
+      sourceRepoUrl: params.sourceRepoUrl,
+      branchName: params.branchName,
+      runPhase: "done",
+      invitePushFlag: true,
+      pushConfirm: params.pushConfirm,
+      ownerLogin: this.options.ownerLogin,
+      forkChecker: this.options.forkChecker,
+      token: this.options.githubToken,
+      gitDir,
+      runDir,
+      eventStore: params.eventStore as never,
+    });
   }
 
   public async answerAsk(

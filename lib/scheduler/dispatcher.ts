@@ -129,6 +129,10 @@ export interface ActiveTaskTracking {
   supervisor?: SkeletonSupervisor;
   abortController: AbortController;
   startedAt: number;
+  /** Skeleton-scoped control state recorded while the task is live. */
+  layToRestChoice?: "keep_commits" | "discard";
+  instructions?: Array<{ text: string; delivery: string; at: number }>;
+  reviewFocus?: string[];
 }
 
 /**
@@ -286,6 +290,199 @@ export class TaskDispatcher {
 
   public getActiveTask(taskId: string): ActiveTaskTracking | undefined {
     return this.activeTasks.get(taskId);
+  }
+
+  /**
+   * Resolves the live tracking entry addressed by a Skeleton-scoped control.
+   * A caller may name the Skeleton by its generated id, by its task id, or by
+   * the stable `skeleton-<taskId>` alias.
+   */
+  private findActiveBySkeleton(
+    skeletonId: string
+  ): ActiveTaskTracking | undefined {
+    if (typeof skeletonId !== "string" || skeletonId.length === 0) {
+      return undefined;
+    }
+    for (const active of this.activeTasks.values()) {
+      if (
+        active.skeletonId === skeletonId ||
+        active.taskId === skeletonId ||
+        `skeleton-${active.taskId}` === skeletonId
+      ) {
+        return active;
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Interrupts one Skeleton: aborts its in-flight turn and cancels its session
+   * without touching the rest of the run. Returns false when no live Skeleton
+   * matches, so the caller can fail closed.
+   */
+  public async interruptSkeleton(skeletonId: string): Promise<boolean> {
+    const active = this.findActiveBySkeleton(skeletonId);
+    if (!active) {
+      return false;
+    }
+    active.abortController.abort();
+    if (active.supervisor) {
+      try {
+        await active.supervisor.cancel("Skeleton interrupted by user");
+      } catch {
+        // A cancel failure must not erase the interrupt already recorded.
+      }
+    }
+    this.emitControlEvent(active, "interrupt");
+    return true;
+  }
+
+  /**
+   * Re-raises one Skeleton so it continues from its current worktree. Returns
+   * false when no live Skeleton matches.
+   */
+  public async reraiseSkeleton(skeletonId: string): Promise<boolean> {
+    const active = this.findActiveBySkeleton(skeletonId);
+    if (!active) {
+      return false;
+    }
+    if (active.supervisor && typeof active.supervisor.raise === "function") {
+      try {
+        await active.supervisor.raise();
+      } catch {
+        // A raise failure leaves the task tracked; the control is still
+        // considered delivered so the operator can retry.
+      }
+    }
+    this.emitControlEvent(active, "reraise");
+    return true;
+  }
+
+  /**
+   * Lays one Skeleton to rest, recording whether its commits are kept or
+   * discarded. Accepted choice spellings are `keep_commits` and `discard`
+   * (with `discard_work` treated as `discard`). Returns false when no live
+   * Skeleton matches.
+   */
+  public async layToRest(
+    skeletonId: string,
+    choice?: "keep_commits" | "discard" | string
+  ): Promise<boolean> {
+    const active = this.findActiveBySkeleton(skeletonId);
+    if (!active) {
+      return false;
+    }
+    const normalized: "keep_commits" | "discard" =
+      choice === "discard" || choice === "discard_work"
+        ? "discard"
+        : "keep_commits";
+    active.layToRestChoice = normalized;
+    active.abortController.abort();
+    if (active.supervisor) {
+      try {
+        await active.supervisor.cancel(
+          normalized === "discard"
+            ? "Skeleton laid to rest (work discarded)"
+            : "Skeleton laid to rest (work kept)"
+        );
+      } catch {
+        // A cancel failure must not erase the recorded choice.
+      }
+    }
+    this.emitControlEvent(active, "lay_to_rest", { choice: normalized });
+    return true;
+  }
+
+  /**
+   * Delivers an instruction to one Skeleton. `interrupt_now` (or `interrupt`)
+   * aborts the in-flight turn and cancels it; any other delivery steers the
+   * live turn. Returns false when no live Skeleton matches or the text is
+   * blank.
+   */
+  public async sendInstruction(
+    skeletonId: string,
+    text: string,
+    delivery?: string
+  ): Promise<boolean> {
+    const active = this.findActiveBySkeleton(skeletonId);
+    if (!active) {
+      return false;
+    }
+    const trimmed = typeof text === "string" ? text.trim() : "";
+    if (!trimmed) {
+      return false;
+    }
+    const strategy =
+      delivery === "interrupt_now" || delivery === "interrupt"
+        ? "interrupt"
+        : "steer";
+    if (!active.instructions) {
+      active.instructions = [];
+    }
+    active.instructions.push({ text: trimmed, delivery: strategy, at: Date.now() });
+    if (active.supervisor) {
+      try {
+        if (strategy === "interrupt") {
+          active.abortController.abort();
+          await active.supervisor.cancel("Skeleton instructed to stop now");
+        } else if (typeof active.supervisor.steer === "function") {
+          await active.supervisor.steer(trimmed);
+        }
+      } catch {
+        // The instruction is still queued for the Skeleton.
+      }
+    }
+    this.emitControlEvent(active, "send_instruction", { delivery: strategy });
+    return true;
+  }
+
+  /**
+   * Adds a review focus to one Skeleton's Warden review. Returns false when no
+   * live Skeleton matches or the text is blank.
+   */
+  public async addReviewFocus(
+    skeletonId: string,
+    text: string
+  ): Promise<boolean> {
+    const active = this.findActiveBySkeleton(skeletonId);
+    if (!active) {
+      return false;
+    }
+    const trimmed = typeof text === "string" ? text.trim() : "";
+    if (!trimmed) {
+      return false;
+    }
+    if (!active.reviewFocus) {
+      active.reviewFocus = [];
+    }
+    active.reviewFocus.push(trimmed);
+    this.emitControlEvent(active, "add_review_focus");
+    return true;
+  }
+
+  /** Records a skeleton-scoped control on the run event stream. */
+  private emitControlEvent(
+    active: ActiveTaskTracking,
+    action: string,
+    extra?: Record<string, unknown>
+  ): void {
+    try {
+      this.emitEvent({
+        runId: this.runId,
+        kind: "skeleton.control",
+        actor: "user",
+        skeletonId: active.skeletonId,
+        taskId: active.taskId,
+        data: {
+          skeletonId: active.skeletonId,
+          taskId: active.taskId,
+          action,
+          ...(extra ?? {}),
+        },
+      });
+    } catch {
+      // Control delivery already happened; the audit write is best-effort.
+    }
   }
 
   public async getIntegrationHeadSha(): Promise<string> {
