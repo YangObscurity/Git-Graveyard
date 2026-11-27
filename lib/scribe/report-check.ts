@@ -51,8 +51,9 @@ const NUMERAL_REGEX = /\d/;
 /**
  * Strips a trailing sentence terminator from a marker so that the punctuation at
  * the end of a sentence (e.g. the `.` in `cmd:abc.`) is never captured as part of
- * the marker id. Dots inside a `file:<path>` payload are preserved because path
- * extensions are meaningful.
+ * the marker id. A single trailing sentence period is also stripped from
+ * `file:<path>` payloads so `file:src/a.ts.` resolves, while dots inside the path
+ * (path extensions) are preserved because they are meaningful.
  */
 export function normalizeMarkerToken(marker: string): string {
   if (typeof marker !== "string" || marker.length === 0) {
@@ -64,7 +65,10 @@ export function normalizeMarkerToken(marker: string): string {
   }
   const prefix = marker.slice(0, colon).toLowerCase();
   if (prefix === "file") {
-    return marker;
+    // Strip a single trailing sentence period so a sentence-ending file citation
+    // such as `file:src/a.ts.` resolves, while internal dots (path extensions)
+    // are preserved.
+    return marker.replace(/\.$/, "");
   }
   return marker.replace(/\.+$/, "");
 }
@@ -465,21 +469,28 @@ export interface ReportCheckRetryResult {
   readonly reportCheckedEvent: EventEnvelope | null;
 }
 
-function redactAllStringLeaves(
+/**
+ * Fail-closed redaction helper: replaces every string leaf value with the
+ * redaction mask, and is cycle-safe for both objects and arrays. Arrays are added
+ * to `seen` before their children are mapped, and any already-seen value collapses
+ * to the mask, so a self-referential structure can never recurse infinitely or
+ * leak original values.
+ */
+export function redactAllStringLeaves(
   value: unknown,
   seen: WeakSet<object> = new WeakSet()
 ): unknown {
   if (typeof value === "string") {
     return "[REDACTED]";
   }
-  if (Array.isArray(value)) {
-    return value.map((item) => redactAllStringLeaves(item, seen));
-  }
   if (value !== null && typeof value === "object") {
     if (seen.has(value)) {
-      return value;
+      return "[REDACTED]";
     }
     seen.add(value);
+    if (Array.isArray(value)) {
+      return value.map((item) => redactAllStringLeaves(item, seen));
+    }
     const out: Record<string, unknown> = {};
     for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
       out[key] = redactAllStringLeaves(item, seen);
@@ -592,8 +603,9 @@ export async function runReportCheckWithRetry(
     retriedReading = null;
   }
 
+  let second: ReportCheckResult | null = null;
   if (typeof retriedReading === "string" && retriedReading.trim().length > 0) {
-    const second = checkReading(retriedReading, index);
+    second = checkReading(retriedReading, index);
     if (second.passed) {
       const event = emit(second, retriedReading, false, true);
       return {
@@ -609,11 +621,15 @@ export async function runReportCheckWithRetry(
   }
 
   const fallbackReading = SCRIBE_NARRATIVE_FALLBACK_NOTICE;
+  // Report the second check's details whenever a retry reading was actually
+  // produced, so the fallback reflects the latest verification attempt instead of
+  // stale first-attempt values.
+  const droppedCheckBase = second ?? first;
   const droppedCheck: ReportCheckResult = {
     passed: false,
-    unbackedClaims: first.unbackedClaims,
-    checkedCount: first.checkedCount,
-    resolvedMarkers: first.resolvedMarkers,
+    unbackedClaims: droppedCheckBase.unbackedClaims,
+    checkedCount: droppedCheckBase.checkedCount,
+    resolvedMarkers: droppedCheckBase.resolvedMarkers,
   };
   const event = emit(droppedCheck, fallbackReading, true, true);
   return {

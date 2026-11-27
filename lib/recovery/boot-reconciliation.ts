@@ -113,6 +113,12 @@ export interface BoxFailureInput {
     | string
     | null
     | Promise<{ sandboxId?: string } | string | null>;
+  /**
+   * Explicit opt-in allowing the failed command to be re-run against the original
+   * (already-failed) sandbox when no fresh sandbox was created. Omitted or false
+   * means the command is only re-run once a fresh sandbox actually exists.
+   */
+  readonly allowSameBoxRerun?: boolean;
   readonly rerunCommand?: (params: {
     runId: string;
     sandboxId: string;
@@ -337,8 +343,18 @@ export class BootReconciliationService {
     if (!Number.isInteger(pid) || pid <= 0) {
       return false;
     }
-    if (typeof processOps.isAlive === "function" && !processOps.isAlive(pid)) {
-      return false;
+    if (typeof processOps.isAlive === "function") {
+      let alive = false;
+      try {
+        alive = processOps.isAlive(pid) === true;
+      } catch {
+        // A probe failure must never abort boot reconciliation: treat the pid as
+        // not reapable and skip it.
+        alive = false;
+      }
+      if (!alive) {
+        return false;
+      }
     }
     const readCommand = processOps.readCommand;
     if (typeof readCommand !== "function") {
@@ -668,7 +684,14 @@ export class BootReconciliationService {
 
     const spec = normalizeCommand(input.failedCommand);
     let commandOutcome: CommandOutcome = { ...flags };
-    if (!capReached && !recreationFailed && typeof input.rerunCommand === "function") {
+    // The failed command is only re-run once a fresh sandbox actually exists (or
+    // when the caller explicitly opts into rerunning against the same, already
+    // failed box). Otherwise the command is never re-run against input.sandboxId.
+    const mayRerun =
+      !capReached &&
+      !recreationFailed &&
+      (recreated || input.allowSameBoxRerun === true);
+    if (mayRerun && typeof input.rerunCommand === "function") {
       try {
         const outcome = await input.rerunCommand({
           runId: input.runId,

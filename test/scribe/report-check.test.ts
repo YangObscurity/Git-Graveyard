@@ -11,6 +11,7 @@ import {
   extractMarkers,
   splitSentences,
   runReportCheckWithRetry,
+  redactAllStringLeaves,
   assignRunOutcomeWithInstallComparison,
 } from "../../lib/scribe/report-check";
 import {
@@ -565,15 +566,70 @@ test("report-check: only command.result events resolve cmd: markers", () => {
   assert.equal(completed.resolve("cmd:completed"), true);
 });
 
-test("report-check: a trailing sentence period is stripped from non-file markers", () => {
+test("report-check: a trailing sentence period is stripped from markers", () => {
   assert.deepEqual(extractMarkers("See cmd:abc."), ["cmd:abc"]);
   assert.deepEqual(extractMarkers("See ev:7."), ["ev:7"]);
-  // Dots inside a file path are preserved so extensions stay intact.
-  assert.deepEqual(extractMarkers("See file:src/a.ts."), ["file:src/a.ts."]);
+  // A single trailing sentence period is stripped from a file citation while the
+  // internal dots (the `.ts` extension) are preserved.
+  assert.deepEqual(extractMarkers("See file:src/a.ts."), ["file:src/a.ts"]);
 
-  const index = buildEvidenceIndex({ commandResults: [{ id: "abc" }] });
+  const index = buildEvidenceIndex({
+    commandResults: [{ id: "abc" }],
+    files: ["src/a.ts"],
+  });
   assert.equal(index.resolve("cmd:abc."), true);
   assert.equal(checkReading("See cmd:abc.", index).passed, true);
+  assert.equal(index.resolve("file:src/a.ts."), true);
+  assert.equal(checkReading("See file:src/a.ts.", index).passed, true);
+});
+
+test("report-check: fallback redaction is cycle-safe for arrays and objects", () => {
+  const arr: unknown[] = ["secret"];
+  arr.push(arr);
+  const outArr = redactAllStringLeaves(arr) as unknown[];
+  assert.equal(outArr[0], "[REDACTED]");
+  assert.equal(outArr[1], "[REDACTED]");
+
+  const obj: Record<string, unknown> = { secret: "value" };
+  obj.self = obj;
+  const outObj = redactAllStringLeaves(obj) as Record<string, unknown>;
+  assert.equal(outObj.secret, "[REDACTED]");
+  assert.equal(outObj.self, "[REDACTED]");
+});
+
+test("report-check: the fallback report.checked reports the second check's details", async () => {
+  const { eventStore } = makeStores();
+  const index = buildEvidenceIndex({ commandResults: [{ id: "build" }] });
+
+  const result = await runReportCheckWithRetry({
+    reading: "Build passed.",
+    index,
+    // The retry produces a different (still unbacked) reading whose resolved
+    // marker and two checked clauses differ from the first attempt.
+    retry: () => "Build passed (cmd:build); there were 9 tests.",
+    eventStore,
+    runId: "run-second-fallback",
+  });
+
+  assert.equal(result.narrativeDropped, true);
+  assert.equal(result.passed, false);
+  // The fallback reflects the SECOND check, not the stale first attempt.
+  assert.equal(result.reportCheck.checkedCount, 2);
+  assert.deepEqual([...result.reportCheck.resolvedMarkers], ["cmd:build"]);
+  assert.equal(result.reportCheck.unbackedClaims.length, 1);
+  assert.equal(result.reportCheck.unbackedClaims[0].claim, "numeral");
+  assert.equal(result.reportCheck.unbackedClaims[0].text, "there were 9 tests.");
+
+  const events = eventStore.getEvents("run-second-fallback", {
+    kind: "report.checked",
+  });
+  assert.equal(events.length, 1);
+  assert.equal(events[0].data.checkedCount, 2);
+  assert.deepEqual(events[0].data.resolvedMarkers, ["cmd:build"]);
+  const claims = events[0].data.unbackedClaims as { claim: string; text: string }[];
+  assert.equal(claims.length, 1);
+  assert.equal(claims[0].claim, "numeral");
+  assert.equal(claims[0].text, "there were 9 tests.");
 });
 
 test("report-check: install error ref is redacted while plain refs pass through", () => {

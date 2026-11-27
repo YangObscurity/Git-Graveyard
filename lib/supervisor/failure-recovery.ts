@@ -201,6 +201,12 @@ export interface FailureRecoveryDeps {
     readonly worktreeDir?: string;
     readonly reason: QuarantineReason;
   }) => boolean | void;
+  /**
+   * Optional override for the recursive read-only containment pass. When supplied
+   * it replaces the built-in pass, letting a caller (or test) exercise the
+   * post-rename containment failure path deterministically.
+   */
+  readonly readOnlyPass?: (root: string) => void;
   readonly now?: () => number;
 }
 
@@ -304,6 +310,44 @@ export class FailureRecoveryHandler {
     const logRef = input.logRef ?? null;
     const crashCount = input.crashCount ?? 0;
 
+    const appendFailed = (): EventEnvelope =>
+      this.deps.eventStore.append({
+        runId: input.runId,
+        kind: "skeleton.state",
+        actor: "FailureRecoveryHandler",
+        skeletonId: input.skeletonId,
+        data: this.redact({
+          state: "failed",
+          skeletonId: input.skeletonId,
+          role: input.role ?? null,
+          reason: input.reason ?? "crash",
+          worktree: preservedWorktree,
+          logRef,
+          terminal: true,
+          attempts: 1,
+          refs: [],
+        }),
+      });
+
+    // When the crash budget is exhausted, the terminal failed state is emitted
+    // directly: no intermediate `recovering` state is recorded first.
+    if (crashCount >= 1) {
+      return {
+        runId: input.runId,
+        skeletonId: input.skeletonId,
+        status: "failed",
+        respawned: false,
+        respawnMessage: "Restarted from its last commit",
+        preservedWorktree,
+        logRef,
+        promptResent: false,
+        sessionLoaded: false,
+        attempts: 1,
+        recoveringEvent: null,
+        failedEvent: appendFailed(),
+      };
+    }
+
     const recoveringEvent = this.deps.eventStore.append({
       runId: input.runId,
       kind: "skeleton.state",
@@ -328,37 +372,6 @@ export class FailureRecoveryHandler {
       promptResent: false as const,
       recoveringEvent,
     };
-
-    const appendFailed = (): EventEnvelope =>
-      this.deps.eventStore.append({
-        runId: input.runId,
-        kind: "skeleton.state",
-        actor: "FailureRecoveryHandler",
-        skeletonId: input.skeletonId,
-        data: this.redact({
-          state: "failed",
-          skeletonId: input.skeletonId,
-          role: input.role ?? null,
-          reason: input.reason ?? "crash",
-          worktree: preservedWorktree,
-          logRef,
-          terminal: true,
-          attempts: 1,
-          refs: [],
-        }),
-      });
-
-    if (crashCount >= 1) {
-      return {
-        ...base,
-        status: "failed",
-        respawned: false,
-        respawnMessage: "Restarted from its last commit",
-        sessionLoaded: false,
-        attempts: 1,
-        failedEvent: appendFailed(),
-      };
-    }
 
     let sessionLoaded = false;
     if (input.loadSession) {
@@ -434,7 +447,9 @@ export class FailureRecoveryHandler {
       if (state !== "pending" && state !== "ready") {
         continue;
       }
-      const deps = task.blockedBy ?? task.deps ?? [];
+      // Resolve dependencies defensively: an empty `blockedBy: []` must never hide
+      // unmet `deps`, so a non-empty blockedBy wins and otherwise deps are used.
+      const deps = task.blockedBy?.length ? task.blockedBy : task.deps ?? [];
       const isBlocked =
         task.blocked === true || deps.some((dep) => !completed.has(dep));
       if (isBlocked) {
@@ -528,9 +543,10 @@ export class FailureRecoveryHandler {
     if (input.worktreeDir) {
       requestedSteps++;
       const contained = this.containWorktreeOnDisk(input.worktreeDir, input);
-      if (contained !== null) {
+      // Always report the accurate final path, even when containment failed.
+      finalWorktreeDir = contained.finalPath;
+      if (contained.isolated) {
         succeededSteps++;
-        finalWorktreeDir = contained;
       }
     }
 
@@ -566,24 +582,25 @@ export class FailureRecoveryHandler {
    * Performs real on-disk containment for a quarantined worktree: writes a
    * symlink-safe lock marker, restricts the worktree and its files to read-only,
    * and moves it under the configured quarantine root when one is set. Returns the
-   * final worktree path on success, or null whenever a requested containment step
-   * cannot be completed.
+   * containment outcome together with the accurate final path so a caller can
+   * distinguish a fully isolated worktree from one whose post-rename read-only pass
+   * or realpath validation failed.
    */
   private containWorktreeOnDisk(
     worktreeDir: string,
     input: QuarantineWorktreeInput
-  ): string | null {
+  ): { isolated: boolean; finalPath: string; error?: string } {
     let realWorktree: string;
     try {
       // lstat does not follow the final path component, so a symlinked worktree
       // root is rejected outright instead of being followed.
       const lstat = fs.lstatSync(worktreeDir);
       if (lstat.isSymbolicLink() || !lstat.isDirectory()) {
-        return null;
+        return { isolated: false, finalPath: worktreeDir };
       }
       realWorktree = fs.realpathSync(worktreeDir);
     } catch {
-      return null;
+      return { isolated: false, finalPath: worktreeDir };
     }
 
     const quarantineRoot = input.quarantineRoot ?? this.deps.quarantineRoot;
@@ -596,11 +613,11 @@ export class FailureRecoveryHandler {
         fs.mkdirSync(quarantineRoot as string, { recursive: true });
         realQuarantineRoot = fs.realpathSync(quarantineRoot as string);
       } catch {
-        return null;
+        return { isolated: false, finalPath: worktreeDir };
       }
       // Refuse to quarantine the quarantine base onto itself.
       if (realWorktree === realQuarantineRoot) {
-        return null;
+        return { isolated: false, finalPath: worktreeDir };
       }
     }
 
@@ -655,7 +672,10 @@ export class FailureRecoveryHandler {
         this.quarantinedWorktrees.add(target);
       }
 
-      this.makeWorktreeReadOnly(finalPath);
+      const readOnly =
+        this.deps.readOnlyPass ??
+        ((root: string): void => this.makeWorktreeReadOnly(root));
+      readOnly(finalPath);
 
       // Validate realpath containment so the moved worktree can never resolve
       // outside the configured quarantine base.
@@ -666,27 +686,36 @@ export class FailureRecoveryHandler {
           !realTarget.startsWith(realQuarantineRoot + path.sep)
         ) {
           // Verification failed: roll the rename back cleanly when possible so no
-          // stale path is reported; otherwise report the real moved path.
+          // stale path is reported; otherwise report the real moved path. Either
+          // way the worktree is not isolated.
           if (movedTo !== null) {
             try {
               fs.renameSync(movedTo, worktreeDir);
               this.quarantinedWorktrees.delete(movedTo);
               movedTo = null;
             } catch {
-              // Keep the moved path below.
+              // Rollback failed: the worktree stays at the moved path.
             }
           }
-          return movedTo;
+          return {
+            isolated: false,
+            finalPath: movedTo ?? worktreeDir,
+            error: "quarantine containment escaped the quarantine root",
+          };
         }
       }
 
-      return finalPath;
-    } catch {
+      return { isolated: true, finalPath };
+    } catch (error) {
       // A post-rename failure (e.g. the read-only pass or realpath verification
       // throwing) must not report the stale pre-rename path. The worktree stays
       // contained and the actual moved path is returned so the result and the
-      // emitted event stay accurate.
-      return movedTo;
+      // emitted event stay accurate, and the worktree is never reported isolated.
+      return {
+        isolated: false,
+        finalPath: movedTo ?? finalPath,
+        error: error instanceof Error ? error.message : String(error),
+      };
     }
   }
 
@@ -765,13 +794,18 @@ export class FailureRecoveryHandler {
         return true;
       }
     } catch {
-      // Ignore store errors and fall through to the on-disk marker check.
+      // Fail closed: a store error means the block cannot be disproven, so the
+      // merge stays blocked instead of silently falling through to false.
+      this.blockedMerges.add(runId);
+      return true;
     }
     if (typeof worktreeDir === "string" && worktreeDir.length > 0) {
       if (
         this.quarantinedWorktrees.has(worktreeDir) ||
         this.hasQuarantineMarker(worktreeDir)
       ) {
+        // Persist the block so later calls without a worktreeDir stay blocked.
+        this.blockedMerges.add(runId);
         return true;
       }
     }
