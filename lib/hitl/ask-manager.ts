@@ -14,6 +14,32 @@ import { removeQuotes, tokenizeSimpleCommand } from "../gateway/command-policy";
 
 export type HitlEventSink = Pick<EventStore, "append">;
 
+/** Safe unquoted argv tokens: non-empty and free of shell metacharacters. */
+const SAFE_ARGV_TOKEN = /^[A-Za-z0-9_@%+=:,./-]+$/;
+
+/**
+ * Formats a single argv token as a POSIX shell word that round-trips through
+ * `tokenizeSimpleCommand(text).map((w) => removeQuotes(w))`.
+ */
+function formatArgvToken(arg: string): string {
+  if (arg === "") {
+    return '""';
+  }
+  if (SAFE_ARGV_TOKEN.test(arg)) {
+    return arg;
+  }
+  return `'${arg.replace(/'/g, "'\\''")}'`;
+}
+
+/**
+ * Formats an argv array into a canonical shell command string that preserves
+ * argument boundaries: whitespace, quotes and empty arguments are quoted so the
+ * displayed command tokenizes back to the exact argv.
+ */
+function formatArgvCommand(argv: readonly string[]): string {
+  return argv.map(formatArgvToken).join(" ");
+}
+
 export type AskKind =
   | "approve_command"
   | "exceed_budget"
@@ -262,7 +288,8 @@ export class AskManager {
     // `commandText` is omitted it is derived canonically from that `argv`.
     const suppliedArgv =
       Array.isArray(input.argv) && input.argv.length > 0 ? [...input.argv] : undefined;
-    const canonicalCommandText = input.commandText || suppliedArgv?.join(" ");
+    const canonicalCommandText =
+      input.commandText || (suppliedArgv ? formatArgvCommand(suppliedArgv) : undefined);
     if (!input.runId || !canonicalCommandText || !input.cwd || !input.skeletonId) {
       throw new AskManagerError(
         "requestApproval requires runId, commandText (or argv), cwd and skeletonId",

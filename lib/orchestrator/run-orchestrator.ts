@@ -1332,15 +1332,26 @@ export class RunOrchestrator extends EventEmitter {
       await this.teardownRunResources(runId);
     }
   }
-  /** True when an `ask.answered` event recorded a `push_confirm` -> "Push". */
+  /**
+   * True when the latest `ask.answered` event for a `push_confirm` ask recorded
+   * "Push". Earlier answers are superseded, so a later "Do not push" blocks the
+   * push even when an earlier answer was "Push".
+   */
   private hasPushConfirmAnswer(runId: string): boolean {
     const store = this.host.eventStore;
     if (!store || typeof store.getEvents !== "function") return false;
     try {
-      return store.getEvents(runId, { kind: "ask.answered" }).some((evt) => {
-        const data = evt.data as Record<string, unknown>;
-        return data?.kind === "push_confirm" && data?.answer === "Push";
-      });
+      const events = store.getEvents(runId);
+      let latest: EventEnvelope | undefined;
+      for (const evt of events) {
+        if (evt.kind !== "ask.answered") continue;
+        const data = evt.data as Record<string, unknown> | undefined;
+        if (data?.kind === "push_confirm") {
+          latest = evt;
+        }
+      }
+      const latestData = latest?.data as Record<string, unknown> | undefined;
+      return latestData?.answer === "Push";
     } catch {
       return false;
     }
