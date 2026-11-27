@@ -587,7 +587,7 @@ Implementation plan for the resurrection engine (design Revision 4). It follows 
 
 - [ ] 18. [Owner — Kiro CLI + Docker Sandbox Live Runs] Checkpoint - Three recorded runs and calibrated settings. Run npm run test:props and npm run test:golden, ask the user if questions arise.
 
-- [ ] 19. [Teammate — Pure Code, Local Python 3 AST & Property Tests] Grimoire Python: M1 rules, Python gate, CPython oracle, Grimoire bundle and deterministic output
+- [x] 19. [Teammate — Pure Code, Local Python 3 AST & Property Tests] Grimoire Python: M1 rules, Python gate, CPython oracle, Grimoire bundle and deterministic output
   - [x] 19.1 Implement M1 Python 2 to 3 rewrite rules and AST transform engine
     - Implement AST transforms and token rewrites in lib/rules/m1-python.ts for print statements, except clauses, unicode conversions, and dictionary iterator methods citing rule M1
     - Detect unhandled Python 2 residue constructs including exec, <>, backticks, ur prefixes, octals, L suffixes, tuple params, and raise E, msg, recording unknown with reason py2_residue
@@ -600,39 +600,39 @@ Implementation plan for the resurrection engine (design Revision 4). It follows 
     - Assign m1-clean label when residue is zero and m1-partial otherwise, marking patch steps reverted when all edits are rejected
     - Verify Builder Candidates against Integration_Head ensuring Python error and residue counts do not increase, emit gate.result event, and return failure feedback to Builder
     - _Requirements: 9.1, 9.2, 9.3, 9.4, 9.10, 9.11, 9.13_
-  - [ ] 19.3 Implement CPython oracle test harness for verified Python outputs
+  - [x] 19.3 Implement CPython oracle test harness for verified Python outputs
     - Create Python oracle script in scripts/test-oracle.py invoking ast.parse with feature_version=(3, 13) to validate clean Python modernizations
     - Implement Jest test in test/oracle/cpython-oracle.test.ts running the oracle script as npm run test:oracle against golden outputs
     - Assert zero SyntaxError exceptions on all files marked m1-clean while confirming SyntaxError detection on unmigrated Python 2 syntax
     - _Requirements: 9.3, 10.7_
-  - [ ] 19.4 Implement Grimoire bundle generator and deterministic output serializer
+  - [x] 19.4 Implement Grimoire bundle generator and deterministic output serializer
     - Implement template-only bundle writer in lib/grimoire/bundle.ts generating requirements.md, design.md, and tasks.md with mandatory M1 to M6 citations and mapping rows
     - Enforce 1:1 mapping between patch tasks and patch steps, checking tasks only when steps are unreverted and appending Outcome revert reasons
     - Append Outcome summary section to design.md with task status counts and m1-clean or m1-partial file labels
     - Derive deterministic engineVersion from rule engine source hashes and exclude timestamps, GitHub metadata, and model text from generated bundles
     - Extend scripts/fixtures/bake.ts from 5.10 to write each fixture's bundle to .kiro/specs/resurrection/<owner>-<repo>/ and the remaining golden files listed in design R3-12 under test/golden/<owner>-<repo>/
     - _Requirements: 6.1, 6.2, 10.1, 10.2, 10.3, 10.4, 10.5, 10.6, 10.7, 10.8, 10.9, 10.10, 10.11_
-  - [ ]* 19.5 Write property test for M1 idempotence
+  - [x]* 19.5 Write property test for M1 idempotence
     - **Property 2: M1 idempotence (P2)**
     - Implement fast-check property test in test/props/m1-idempotence.test.ts verifying applyM1(applyM1(f)) = applyM1(f) across generated Python files
     - **Validates: Requirements 6.15**
-  - [ ]* 19.6 Write property test for Syntax gate
+  - [x]* 19.6 Write property test for Syntax gate
     - **Property 4: Syntax gate (P4)**
     - Implement fast-check property test in test/props/syntax-gate.test.ts verifying parses(f, mode(f)) holds for all modified JS/TS files or the failing step is marked reverted
     - **Validates: Requirements 9.5, 9.7, 9.8**
-  - [ ]* 19.7 Write property test for Mapping rows
+  - [x]* 19.7 Write property test for Mapping rows
     - **Property 5: Mapping rows (P5)**
     - Implement fast-check property test in test/props/mapping-rows.test.ts verifying every row in design output cites a valid rule ID from M1 to M6
     - **Validates: Requirements 6.2**
-  - [ ]* 19.8 Write property test for Tasks equal steps
+  - [x]* 19.8 Write property test for Tasks equal steps
     - **Property 7: Tasks equal steps (P7)**
     - Implement fast-check property test in test/props/tasks-equal-steps.test.ts verifying bijection T = S between patch tasks and patch steps, with completion tracking non-reverted state
     - **Validates: Requirements 10.4, 10.5**
-  - [ ]* 19.9 Write property test for Monotone Python gate
+  - [x]* 19.9 Write property test for Monotone Python gate
     - **Property 8: Monotone Python gate (P8)**
     - Implement fast-check property test in test/props/python-gate.test.ts verifying parse error count is non-increasing and residue strictly falls for accepted edits
     - **Validates: Requirements 9.1, 9.3**
-  - [ ]* 19.10 Write property test for Deterministic Grimoire output
+  - [x]* 19.10 Write property test for Deterministic Grimoire output
     - **Property 9: Deterministic Grimoire output (P9)**
     - Implement fast-check property test in test/props/deterministic-output.test.ts verifying byte-identical Grimoire bundle and signal artifacts across identical inputs and frozen registry responses
     - **Validates: Requirements 10.8, 10.10**
@@ -650,32 +650,32 @@ Implementation plan for the resurrection engine (design Revision 4). It follows 
     - Map process exit codes with 0 to success, 1 to failure, 3 to gateway_missing, and 4 to missing agent with output discard
     - Handle approval interrupts with approval IDs and session resumption via --resume-id, outright refusing needs_approval if S2 resume failed, and auto-denying ask calls
     - _Requirements: 17.1, 17.2, 17.3, 17.4, 17.5, 17.6, 17.7, 17.8, 17.9, 17.10, 17.11, 17.12, 45.15, 45.18_
-  - [ ] 20.3 Implement parallel Soul-stitcher dispatch and concurrency scheduling
+  - [x] 20.3 Implement parallel Soul-stitcher dispatch and concurrency scheduling
     - Extend Scheduler in lib/scheduler/parallel-scheduler.ts to manage concurrent Soul-stitcher slots bounded by parallel cap, global cap, and backend runningMax
     - Dispatch ready tasks in priority order from approved tasks.md, provisioning isolated branches and worktrees via lib/git/git-service.ts
     - Assign Claude Opus 5.5 to tasks marked hard: yes and Claude Sonnet 5.5 to standard tasks
     - Queue completed candidate branches for serialized Warden review while active parallel Soul-stitchers continue in other worktrees
     - _Requirements: 23.5, 23.6, 23.14_
-  - [ ] 20.4 Write integration tests for Bonesetter, Headless Fallback, and parallel scheduling
+  - [x] 20.4 Write integration tests for Bonesetter, Headless Fallback, and parallel scheduling
     - Test Bonesetter worktree operations in test/scheduler/parallel-bonesetter.test.ts verifying write permissions on lockfiles and denial on repository code
     - Test Headless Fallback execution in test/scheduler/parallel-bonesetter.test.ts asserting stream-json parsing, exit code mapping, and approval resume flow
     - Verify parallel Scheduler dispatch enforces slot concurrency limits, priority order, and independent git worktree isolation
     - _Requirements: 14.5, 17.8, 23.5, 23.14_
 
 - [ ] 21. [Teammate — Pure Code, API Routes & Property Tests] Messaging, human-in-the-loop tiers, hard blocks, fork push and their mutating API routes for messages, approvals, asks, skeleton actions and run control
-  - [ ] 21.1 Implement two-way messaging service and Skeleton mailbox management
+  - [x] 21.1 Implement two-way messaging service and Skeleton mailbox management
     - Implement MessageService in lib/messaging/message-service.ts storing message events in EventStore and maintaining per-skeleton mailboxes
     - Handle delivery strategies by queueing for _session/steer or post-command prompt injection, or immediate turn cancellation for Interrupt now
     - Track message states from Sent to Delivered and Acknowledged, and duplicate user-to-skeleton messages to the Necromancer channel with cc: necromancer
     - Validate role-specific intents, rejecting unauthorized actions on Wardens or Scribes, and issue nudges when skeletons exceed silence limits
     - _Requirements: 27.1, 27.2, 27.3, 27.5, 27.6, 27.7, 27.8, 27.9, 27.10, 27.11, 27.12, 27.16_
-  - [ ] 21.2 Implement human-in-the-loop tier orchestration and AskManager
+  - [x] 21.2 Implement human-in-the-loop tier orchestration and AskManager
     - Implement AskManager in lib/hitl/ask-manager.ts enforcing Tier 1 user approvals and emitting Tier 2 necromancer.decision events with explicit evidence refs
     - Route runtime asks, task splits, and Pact revisions to active Planner sessions during Legion phase
     - Render approval cards with command text, cwd, risk class, requesting skeleton, and expiry timestamp
     - Manage ask deadlines enforcing design-specified timeout defaults including denying commands and stopping on exceeded budgets
     - _Requirements: 28.1, 28.2, 28.4, 28.5, 28.6, 28.7, 28.8, 28.9, 28.10_
-  - [ ] 21.3 Implement code-enforced hard blocks and GitService fork push
+  - [x] 21.3 Implement code-enforced hard blocks and GitService fork push
     - Enforce unbypassable Tier 3 hard block checks in lib/policy/hard-blocks.ts rejecting forbidden command argvs, sudo, container sockets, and unauthorized budget increases
     - Validate candidate diffs in lib/policy/hard-blocks.ts rejecting any modifications inside .kiro/ or .git/ directories
     - Implement pushToFork(runId) in lib/git/git-service.ts holding exclusive write tokens and validating fork ownership, done run phase, and invite push flag
@@ -687,7 +687,7 @@ Implementation plan for the resurrection engine (design Revision 4). It follows 
     - Implement app/api/runs/[runId]/skeletons/[skeletonId]/actions/route.ts and app/api/runs/[runId]/control/route.ts executing skeleton management and run pausing and stopping
     - Implement app/api/runs/[runId]/push-fork/route.ts asking push_confirm and invoking GitService pushToFork upon confirmation
     - _Requirements: 27.1, 27.8, 27.9, 28.1, 28.9, 29.1, 29.5, 31.13_
-  - [ ]* 21.5 Write property test for No upstream writes
+  - [x]* 21.5 Write property test for No upstream writes
     - **Property 15: No upstream writes (P15)**
     - Implement fast-check property test in test/props/no-upstream-writes.test.ts verifying all Git write operations target only verified owner forks on graveyard/<runId> branches with push flag enabled, never targeting source repository
     - **Validates: Requirements 29.1, 29.2, 29.3, 29.7**
