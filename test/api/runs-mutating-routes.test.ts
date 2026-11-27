@@ -1,5 +1,6 @@
 import test, { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import * as childProcess from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -10,7 +11,12 @@ import { EventStore } from "@/lib/events/event-store";
 import { LogStore } from "@/lib/events/log-store";
 import { GitService } from "@/lib/git/git-service";
 import { Scheduler } from "@/lib/scheduler/scheduler";
-import { TaskDispatcher } from "@/lib/scheduler/dispatcher";
+import {
+  TaskDispatcher,
+  type WardenReviewContext,
+  type WorkerContext,
+} from "@/lib/scheduler/dispatcher";
+import { buildVerdictRecord } from "@/lib/warden/warden-review";
 import { parsePact } from "@/lib/pact/pact-parser";
 import { renderPact } from "@/lib/pact/pact-renderer";
 import { RunOrchestrator } from "@/lib/orchestrator/run-orchestrator";
@@ -2612,6 +2618,66 @@ describe("mutating run routes against real objects", () => {
     return dir;
   }
 
+  /** Polls `predicate` until it is true or the timeout elapses. */
+  async function waitFor(
+    predicate: () => boolean,
+    timeoutMs = 5000
+  ): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (predicate()) {
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    throw new Error("waitFor timed out");
+  }
+
+  /**
+   * Creates a real git repository plus its `graveyard/<runId>` integration
+   * branch, so a Dispatcher can create and merge task worktrees for real.
+   */
+  function createGitRepo(runId: string): {
+    runsDir: string;
+    gitDir: string;
+    baseSha: string;
+  } {
+    const runsDir = makeTempDir();
+    const gitDir = path.join(runsDir, "git");
+    fs.mkdirSync(gitDir, { recursive: true });
+
+    const runGit = (args: string[]): string =>
+      childProcess
+        .execFileSync("git", args, {
+          cwd: gitDir,
+          encoding: "utf8",
+          env: {
+            PATH: process.env.PATH,
+            LANG: "C.UTF-8",
+            HOME: runsDir,
+            GIT_CONFIG_NOSYSTEM: "1",
+            GIT_TERMINAL_PROMPT: "0",
+          } as unknown as NodeJS.ProcessEnv,
+        })
+        .trim();
+
+    runGit(["init", "--initial-branch=main", "."]);
+    runGit(["config", "user.name", "Test Runner"]);
+    runGit(["config", "user.email", "runner@example.test"]);
+    fs.writeFileSync(
+      path.join(gitDir, "package.json"),
+      JSON.stringify({ name: "graveyard-test", version: "1.0.0" }, null, 2),
+      "utf8"
+    );
+    fs.writeFileSync(path.join(gitDir, "index.js"), "module.exports = 1;\n", "utf8");
+    runGit(["add", "."]);
+    runGit(["commit", "-m", "Initial commit"]);
+    const baseSha = runGit(["rev-parse", "HEAD"]);
+    runGit(["branch", `graveyard/${runId}`, baseSha]);
+
+    return { runsDir, gitDir, baseSha };
+  }
+
   function makeRealHost(stores: {
     runStore: RunStore;
     eventStore: EventStore;
@@ -3151,6 +3217,194 @@ describe("mutating run routes against real objects", () => {
     assert.equal(dispatcher.getLiveCount(), 1);
   });
 
+  it("re-runs executeTaskPipeline with a fresh non-aborted signal when a Skeleton is re-raised", async () => {
+    const { runStore, eventStore } = makeStores();
+    const runId = "run-reraise-restart";
+    makeRun(runStore, runId);
+    const repo = createGitRepo(runId);
+    const host = makeRealHost({ runStore, eventStore });
+    const gitService = new GitService({ runsDir: repo.runsDir });
+
+    const tasks = parsePact(
+      `- [ ] T1. Repair add()\n  - role: bonesetter\n  - files: index.js\n  - accept: npm test\n`
+    ).tasks;
+    const scheduler = new Scheduler({
+      pact: renderPact(tasks),
+      tasks,
+      runId,
+      approvedTaskIds: ["T1"],
+      pactApproved: true,
+      runParallelCap: 1,
+    });
+
+    const signals: Array<AbortSignal | undefined> = [];
+    const worktreeDirs: string[] = [];
+    const firstTurn = { entered: false, started: false, aborted: false };
+    const partialFile = { path: "" };
+
+    const workerRunner = async (ctx: WorkerContext) => {
+      signals.push(ctx.signal);
+      worktreeDirs.push(ctx.worktreeDir);
+      if (!firstTurn.entered) {
+        firstTurn.entered = true;
+        firstTurn.started = true;
+        // Write in-progress work, then block until the interrupt aborts the turn.
+        partialFile.path = path.join(ctx.worktreeDir, "partial.txt");
+        fs.writeFileSync(partialFile.path, "wip\n", "utf8");
+        await new Promise<void>((resolve) => {
+          if (ctx.signal?.aborted) {
+            resolve();
+            return;
+          }
+          ctx.signal?.addEventListener("abort", () => resolve(), { once: true });
+        });
+        firstTurn.aborted = ctx.signal?.aborted === true;
+        throw new Error("interrupted by the re-raise regression test");
+      }
+      // Second turn: the work written before the interrupt must still be here.
+      assert.equal(fs.existsSync(partialFile.path), true);
+      fs.writeFileSync(
+        path.join(ctx.worktreeDir, "index.js"),
+        "module.exports = 2;\n",
+        "utf8"
+      );
+      childProcess.execFileSync("git", ["add", "index.js"], {
+        cwd: ctx.worktreeDir,
+      });
+      childProcess.execFileSync("git", ["commit", "-m", "Implement T1"], {
+        cwd: ctx.worktreeDir,
+      });
+      return { ok: true, taskId: ctx.taskId };
+    };
+
+    const wardenRunner = async (ctx: WardenReviewContext) =>
+      buildVerdictRecord(ctx.candidateSha, {
+        diff: ctx.diff,
+        candidateSha256: ctx.candidateSha256,
+        tree: ctx.candidateTree,
+        install: { ok: true, ref: "cmd:install" },
+        build: { ok: true, ref: "cmd:build" },
+        accept: { ok: true, ref: "cmd:accept", exitCode: 0 },
+        tests: { ok: true, ref: "cmd:tests" },
+        noTestWeakening: true,
+      });
+
+    const dispatcher = new TaskDispatcher({
+      runId,
+      scheduler,
+      gitService,
+      host,
+      runDir: repo.runsDir,
+      gitDir: repo.gitDir,
+      baseSha: repo.baseSha,
+      workerRunner,
+      wardenRunner,
+      pollIntervalMs: 5,
+    });
+
+    // One manual step starts T1; the worker blocks until the interrupt.
+    const stepPromise = dispatcher.step();
+    await waitFor(() => firstTurn.started);
+    assert.equal(scheduler.getTask("T1")?.state, "running");
+
+    const skeletonId = "skeleton-T1";
+    assert.equal(await dispatcher.interruptSkeleton(skeletonId), true);
+    await stepPromise;
+    assert.equal(firstTurn.aborted, true);
+    assert.equal(dispatcher.getLiveCount(), 0);
+    assert.notEqual(scheduler.getTask("T1")?.state, "running");
+
+    // An instruction recorded before the re-raise must survive it.
+    assert.equal(
+      await dispatcher.sendInstruction(skeletonId, "keep edits minimal"),
+      true
+    );
+
+    const reraised = await dispatcher.reraiseSkeleton(skeletonId);
+    assert.equal(reraised, true);
+    assert.equal(scheduler.getTask("T1")?.state, "running");
+    assert.equal(dispatcher.getLiveCount(), 1);
+    const slot = dispatcher.getActiveTask("T1");
+    assert.ok(slot);
+    // The restarted slot carries a fresh, non-aborted controller and the kept
+    // control state, rather than the stale aborted one.
+    assert.equal(slot.abortController.signal.aborted, false);
+    assert.ok((slot.instructions?.length ?? 0) >= 1);
+
+    await waitFor(() => signals.length === 2);
+    assert.equal(signals[1]?.aborted, false);
+    // The re-raise resumed the same preserved worktree instead of recreating it.
+    assert.equal(worktreeDirs[1], worktreeDirs[0]);
+
+    await waitFor(
+      () =>
+        scheduler.getTask("T1")?.state === "merged" &&
+        dispatcher.getActiveTask("T1") === undefined
+    );
+    assert.equal(dispatcher.getLiveCount(), 0);
+  });
+
+  it("skips a queued run whose RunStore record was finalized to done instead of starting it", async () => {
+    const { runStore, eventStore } = makeStores();
+    const runId = "run-terminal-queued";
+    makeRun(runStore, runId, { phase: "queued" });
+    const host = makeRealHost({ runStore, eventStore });
+
+    const g = globalThis as Record<string, any>;
+    g.__admissionQueue = [];
+
+    let exhumeCalls = 0;
+    const orchestrator = trackOrchestrator(
+      new RunOrchestrator({
+        host,
+        runStore,
+        eventStore,
+        runsDir: makeTempDir(),
+        exhumeRunner: async () => {
+          exhumeCalls += 1;
+          throw new Error("a terminal run must never exhume");
+        },
+      })
+    );
+    (globalThis as Record<string, unknown>).__runOrchestrator = orchestrator;
+
+    // Queue the run while admission is paused, then finalize its record to
+    // `done` - exactly what idle eviction or a kill-while-queued does.
+    orchestrator.pauseAdmission();
+    orchestrator.enqueueRun(runId);
+    assert.ok(orchestrator.getQueueSnapshot().queued.includes(runId));
+    runStore.updateRun(runId, {
+      phase: "done",
+      outcome: "cancelled",
+      queuePosition: null,
+    });
+    assert.ok(
+      (g.__admissionQueue as Array<{ runId?: string }>).some(
+        (entry) => entry && entry.runId === runId
+      )
+    );
+
+    // Resuming admission must skip the terminal run and clean it up rather than
+    // start it.
+    orchestrator.resumeAdmission();
+    await waitFor(() => orchestrator.getQueueSnapshot().queued.length === 0);
+
+    assert.equal(exhumeCalls, 0);
+    assert.equal(orchestrator.getActiveRun(runId), undefined);
+    assert.equal(
+      (g.__admissionQueue as Array<{ runId?: string }>).some(
+        (entry) => entry && entry.runId === runId
+      ),
+      false
+    );
+    assert.equal(runStore.getRun(runId)?.phase, "done");
+
+    // `startRun` also fails closed for an already-terminal record.
+    const handle = orchestrator.startRun(runId);
+    await handle.promise;
+    assert.equal(exhumeCalls, 0);
+    assert.equal(orchestrator.getActiveRun(runId), undefined);
+  });
 
 });
 

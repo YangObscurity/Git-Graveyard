@@ -277,6 +277,27 @@ function removeFromOrchestrator(orchestrator: Record<string, unknown> | null, ru
   }
 }
 
+/**
+ * Expires every idle entry from the resolved FIFO queue and propagates each eviction to the live
+ * surfaces: the shared `globalThis.__admissionQueue` and the active orchestrator's queue. Without
+ * this the RunStore row is finalized (`phase: "done"`, `outcome: "cancelled"`) but the run keeps
+ * lingering in both the admission queue and the orchestrator queue. `evictIdle()` already finalized
+ * the RunStore row, so removing the run from the orchestrator (which only nulls `queuePosition`) is
+ * a clean no-op on the terminal state.
+ */
+function evictExpiredFromLiveQueue(request: Request, queue: FifoQueue): QueueEntry[] {
+  const evicted = queue.evictIdle();
+  if (evicted.length === 0) {
+    return evicted;
+  }
+  const orchestrator = resolveLiveOrchestrator(request);
+  for (const entry of evicted) {
+    removeFromAdmissionQueue(entry.runId);
+    removeFromOrchestrator(orchestrator, entry.runId);
+  }
+  return evicted;
+}
+
 
 /**
  * Persists a queue mutation to the RunStore BEFORE the in-memory queue is mutated. A failed write is
@@ -312,7 +333,7 @@ export async function GET(request: Request): Promise<Response> {
   const runStore = resolveRunStore(request);
   const queue = buildQueue(request);
   hydrateQueue(request, queue, runStore);
-  queue.evictIdle();
+  evictExpiredFromLiveQueue(request, queue);
   return Response.json({ ok: true, queue: queue.snapshot() });
 }
 
@@ -333,6 +354,9 @@ export async function POST(request: Request): Promise<Response> {
   const orchestrator = resolveLiveOrchestrator(request);
   const queue = buildQueue(request);
   hydrateQueue(request, queue, runStore);
+  // Expire idle entries (and propagate the eviction to every live surface) before acting on the
+  // requested mutation, so a stale/expired run is never moved, removed or cancelled as if live.
+  evictExpiredFromLiveQueue(request, queue);
   const previousPosition = queue.getPosition(runId);
 
   switch (action) {

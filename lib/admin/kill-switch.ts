@@ -67,6 +67,13 @@ export interface KillSwitchRuntimeControls {
   stopRun?: (runId: string, reason?: string) => void | Promise<void>;
   killRun?: (runId: string, reason?: string) => void | Promise<void>;
   cancelQueuedRun?: (runId: string) => boolean;
+  /**
+   * Removes a queued run from the live orchestrator queue WITHOUT cancelling its record (it only
+   * clears the run's queue membership). Preferred over {@link cancelQueuedRun} for `hard_kill`,
+   * because `cancelQueuedRun` overwrites the terminal `outcome` with `"cancelled"` and emits a
+   * contradictory `run.phase` event that would clobber the `"killed"` outcome.
+   */
+  removeQueuedRun?: (runId: string) => boolean;
 }
 
 export interface KillSwitchOptions {
@@ -251,12 +258,6 @@ export class KillSwitchService {
         for (const runId of preview.affectedRunIds) {
           const run = this.runStore.getRun(runId);
           const queued = run !== null && isQueued(run);
-          // A queued run has no live `killRun` to await, so it is finalized synchronously. An active
-          // run is only finalized as `"killed"` once its live `killRun` settles successfully (in the
-          // `waitForRuntime` closure below), so a rejected kill leaves it retryable.
-          if (run && run.phase !== "done" && queued) {
-            this.finalizeKilled(runId, at);
-          }
           if (this.queue) {
             try {
               if (queued) {
@@ -276,6 +277,23 @@ export class KillSwitchService {
     }
 
     const pending = this.applyRuntimeControls(level, preview.affectedRunIds, queuedRunIds, reason);
+
+    if (level === "hard_kill") {
+      // A queued run has no live `killRun` to await, so it is finalized synchronously. This runs
+      // AFTER the live queue removal: the orchestrator's `cancelQueuedRun` fallback writes
+      // `outcome: "cancelled"`, so the kill must force `outcome: "killed"` back over it. An active
+      // run is only finalized as `"killed"` once its live `killRun` settles (in `waitForRuntime`
+      // below), so a rejected kill leaves it retryable.
+      for (const runId of preview.affectedRunIds) {
+        if (queuedRunIds.has(runId)) {
+          try {
+            this.finalizeKilled(runId, at, true);
+          } catch {
+            // A failed terminal write leaves the run unfinalized and retryable.
+          }
+        }
+      }
+    }
 
     if (preview.affectedRunIds.length === 0) {
       this.emit(SYSTEM_RUN_ID, "admin.kill", actor, { level, actor, reason, affectedRunCount: 0 });
@@ -377,7 +395,17 @@ export class KillSwitchService {
     } else if (level === "hard_kill") {
       for (const runId of affectedRunIds) {
         if (queuedRunIds.has(runId)) {
-          if (typeof controls.cancelQueuedRun === "function") {
+          // Prefer `removeQueuedRun` (which leaves the terminal outcome intact) over
+          // `cancelQueuedRun` (which would overwrite `outcome: "killed"` with `"cancelled"` and emit
+          // a contradictory `run.phase` event). `cancelQueuedRun` is only the backwards-compatible
+          // fallback for a caller/test that wires that hook alone.
+          if (typeof controls.removeQueuedRun === "function") {
+            try {
+              controls.removeQueuedRun(runId);
+            } catch {
+              // A failed queue removal must not block the kill.
+            }
+          } else if (typeof controls.cancelQueuedRun === "function") {
             try {
               controls.cancelQueuedRun(runId);
             } catch {
@@ -433,10 +461,17 @@ export class KillSwitchService {
     return Promise.resolve();
   }
 
-  /** Finalizes a run as `"killed"` in the RunStore once (guarded so a retry cannot double-write). */
-  private finalizeKilled(runId: string, at: number): void {
+  /**
+   * Finalizes a run as `"killed"` in the RunStore once (guarded so a retry cannot double-write).
+   * `force` bypasses the `phase === "done"` guard so a hard kill can correct a run a fallback
+   * `cancelQueuedRun` already finalized as `"cancelled"` back to its true `"killed"` outcome.
+   */
+  private finalizeKilled(runId: string, at: number, force = false): void {
     const run = this.runStore.getRun(runId);
-    if (!run || run.phase === "done") {
+    if (!run) {
+      return;
+    }
+    if (run.phase === "done" && !force) {
       return;
     }
     this.runStore.updateRun(runId, { outcome: "killed", phase: "done", endedAt: at });

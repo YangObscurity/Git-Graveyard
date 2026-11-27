@@ -133,6 +133,28 @@ export interface ActiveTaskTracking {
   layToRestChoice?: "keep_commits" | "discard";
   instructions?: Array<{ text: string; delivery: string; at: number }>;
   reviewFocus?: string[];
+  /**
+   * True when an interrupt kept this task's worktree on disk so a later
+   * `reraiseSkeleton` resumes the same work instead of recreating it.
+   */
+  preserveWorktree?: boolean;
+}
+
+/**
+ * Optional context for one `executeTaskPipeline` run.
+ */
+export interface TaskPipelineRunOptions {
+  /**
+   * Pre-registered tracking entry to resume in place (the `reraiseSkeleton`
+   * path). Its fresh `abortController` and preserved `instructions` /
+   * `reviewFocus` are carried into the restarted pipeline.
+   */
+  tracking?: ActiveTaskTracking;
+  /**
+   * Worktree an interrupt kept for this task. When it still exists on disk the
+   * pipeline resumes in it rather than recreating (and resetting) the branch.
+   */
+  preservedWorktree?: TaskWorktreeResult;
 }
 
 /**
@@ -218,6 +240,19 @@ export class TaskDispatcher {
    */
   private readonly knownSkeletonTasks: Map<string, ActiveTaskTracking> =
     new Map();
+  /**
+   * Worktrees an interrupt deliberately kept on disk, keyed by `taskId`, so a
+   * later `reraiseSkeleton` resumes the same task in place instead of recreating
+   * it (and losing in-progress work).
+   */
+  private readonly preservedWorktrees: Map<string, TaskWorktreeResult> =
+    new Map();
+  /**
+   * In-flight `executeTaskPipeline` promises keyed by `taskId`. A re-raise can
+   * await a cancelled run's cleanup before restarting the slot, and `run()`
+   * cannot exit while a restarted pipeline is still executing.
+   */
+  private readonly pipelinePromises: Map<string, Promise<void>> = new Map();
   private readonly eventStore?: EventStore | any;
 
   private mergeLock: Promise<void> = Promise.resolve();
@@ -424,6 +459,27 @@ export class TaskDispatcher {
   }
 
   /**
+   * Decides whether an abort should keep the task's worktree for a possible
+   * re-raise. Only a task that stays re-raisable keeps its worktree on disk: a
+   * `keep_commits` lay-to-rest still abandons the task (its commits stay on the
+   * branch), a `discard` lay-to-rest and a stop clean the worktree up as before.
+   */
+  private shouldPreserveWorktreeOnAbort(active: ActiveTaskTracking): boolean {
+    if (this.isStoppedState || active.layToRestChoice === "discard") {
+      return false;
+    }
+    const live = this.scheduler.getTask(active.taskId);
+    if (!live) {
+      return false;
+    }
+    return (
+      live.state === "running" ||
+      live.state === "ready" ||
+      live.state === "rejected"
+    );
+  }
+
+  /**
    * Interrupts one Skeleton: aborts its in-flight turn and cancels its session
    * without touching the rest of the run. Returns false when no live Skeleton
    * matches, so the caller can fail closed.
@@ -451,9 +507,14 @@ export class TaskDispatcher {
 
   /**
    * Re-raises one Skeleton so it continues from its current worktree. Returns
-   * false when no live Skeleton matches.
+   * true only when the task is running again on a fresh, non-aborted slot with
+   * its `executeTaskPipeline` actually restarted. Returns false when no live
+   * Skeleton matches or the run is stopping/stopped.
    */
   public async reraiseSkeleton(skeletonId: string): Promise<boolean> {
+    if (this.isStoppedState || this.scheduler.isStopRequested) {
+      return false;
+    }
     const active = this.resolveTrackedSkeleton(skeletonId);
     if (!active) {
       return false;
@@ -467,26 +528,59 @@ export class TaskDispatcher {
       }
     }
     // Re-queue the interrupted task: a rejected task returns to ready and a
-    // ready task is dispatched back to running, then its live slot is restored.
+    // ready task is dispatched back to running.
     const live = this.scheduler.getTask(active.taskId);
-    if (live) {
-      try {
-        if (live.state === "rejected") {
-          this.scheduler.retryTask(live.id);
-        }
-        if (live.state === "ready") {
-          this.scheduler.dispatchTask(live.id);
-        }
-      } catch {
-        // The Skeleton slot is still restored below so the control lands.
+    if (!live) {
+      return false;
+    }
+    try {
+      if (live.state === "rejected") {
+        this.scheduler.retryTask(live.id);
       }
+      if (live.state === "ready") {
+        this.scheduler.dispatchTask(live.id);
+      }
+    } catch {
+      // The state check below fails closed if the move was refused.
     }
+    if (live.state !== "running" || this.isStoppedState || this.scheduler.isStopRequested) {
+      return false;
+    }
+
+    // Wait for any in-flight (cancelled) pipeline cleanup before restarting, so
+    // worktree handling cannot race the aborted run.
+    const inFlight = this.pipelinePromises.get(active.taskId);
+    if (inFlight) {
+      await inFlight.catch(() => {});
+    }
+    if (this.isStoppedState || this.scheduler.isStopRequested) {
+      return false;
+    }
+
+    // Never leave the stale aborted AbortController on the slot: a fresh
+    // controller plus a restarted pipeline is what makes the task live again.
+    // The same tracking object is reused so recorded `instructions`,
+    // `reviewFocus` and the Skeleton id survive the re-raise.
+    const abortController = new AbortController();
+    active.task = live;
+    active.abortController = abortController;
+    active.startedAt = Date.now();
+    this.activeTasks.set(active.taskId, active);
     this.rememberSkeletonTask(active);
-    if (!this.activeTasks.has(active.taskId)) {
-      this.activeTasks.set(active.taskId, active);
-    }
     this.emitControlEvent(active, "reraise");
-    return true;
+
+    const preserved = this.preservedWorktrees.get(active.taskId);
+    void this.executeTaskPipeline(live, {
+      tracking: active,
+      preservedWorktree: preserved,
+    });
+
+    const slot = this.activeTasks.get(active.taskId);
+    return (
+      slot !== undefined &&
+      slot.abortController === abortController &&
+      !abortController.signal.aborted
+    );
   }
 
   /**
@@ -700,6 +794,15 @@ export class TaskDispatcher {
       );
     }
 
+    // A stopped dispatcher can never re-raise, so any worktree an interrupt kept
+    // for a possible re-raise is cleaned up now.
+    for (const [taskId, preserved] of this.preservedWorktrees.entries()) {
+      activePromises.push(
+        this.cleanupWorktree(preserved.worktreeDir, taskId).catch(() => {})
+      );
+    }
+    this.preservedWorktrees.clear();
+
     await Promise.allSettled(activePromises);
     this.activeTasks.clear();
   }
@@ -810,17 +913,43 @@ export class TaskDispatcher {
     );
   }
 
-  private async executeTaskPipeline(task: ScheduledTask): Promise<void> {
+  /**
+   * Wraps `runTaskPipeline` with per-task promise tracking. The in-flight run is
+   * recorded so a re-raise can await a cancelled run's cleanup before restarting
+   * the slot, and so no rejection escapes unhandled.
+   */
+  private executeTaskPipeline(
+    task: ScheduledTask,
+    options?: TaskPipelineRunOptions
+  ): Promise<void> {
+    const run = this.runTaskPipeline(task, options)
+      .catch(() => {})
+      .finally(() => {
+        if (this.pipelinePromises.get(task.id) === run) {
+          this.pipelinePromises.delete(task.id);
+        }
+      });
+    this.pipelinePromises.set(task.id, run);
+    return run;
+  }
+
+  private async runTaskPipeline(
+    task: ScheduledTask,
+    options?: TaskPipelineRunOptions
+  ): Promise<void> {
     if (this.isStoppedState) {
       return;
     }
 
+    const resume = options?.tracking;
     const cleanTaskId = task.id.replace(/[^A-Za-z0-9_.-]/g, "_");
-    const skeletonId = `skel-${cleanTaskId}-${task.attempts}-${Date.now()}`;
+    const skeletonId =
+      resume?.skeletonId ?? `skel-${cleanTaskId}-${task.attempts}-${Date.now()}`;
 
     try {
       await this.ensureIntegrationBranch();
     } catch (err: any) {
+      this.preservedWorktrees.delete(task.id);
       this.scheduler.failTask(
         task.id,
         `Failed to initialize integration branch: ${err?.message ?? String(err)}`
@@ -831,34 +960,52 @@ export class TaskDispatcher {
     }
 
     let worktreeRes: TaskWorktreeResult;
-    try {
-      worktreeRes = await this.gitService.createTaskWorktree({
-        runId: this.runId,
-        taskId: task.id,
-        gitDir: this.gitDir,
-        runDir: this.runDir,
-        baseBranch: `graveyard/${this.runId}`,
-      });
-    } catch (err: any) {
-      this.scheduler.failTask(
-        task.id,
-        `Failed to create task worktree: ${err?.message ?? String(err)}`
-      );
-      this.tasksFailed++;
-      this.tasksProcessed++;
-      return;
+    const preserved = options?.preservedWorktree;
+    if (preserved && fs.existsSync(preserved.worktreeDir)) {
+      // A re-raise resumes in the worktree an interrupt kept for this task,
+      // rather than recreating (and resetting) it and losing in-progress work.
+      worktreeRes = preserved;
+    } else {
+      try {
+        worktreeRes = await this.gitService.createTaskWorktree({
+          runId: this.runId,
+          taskId: task.id,
+          gitDir: this.gitDir,
+          runDir: this.runDir,
+          baseBranch: `graveyard/${this.runId}`,
+        });
+      } catch (err: any) {
+        this.preservedWorktrees.delete(task.id);
+        this.scheduler.failTask(
+          task.id,
+          `Failed to create task worktree: ${err?.message ?? String(err)}`
+        );
+        this.tasksFailed++;
+        this.tasksProcessed++;
+        return;
+      }
     }
+    // The preserved worktree is owned by the live run again.
+    this.preservedWorktrees.delete(task.id);
 
-    const abortController = new AbortController();
-    const activeTracking: ActiveTaskTracking = {
-      task,
-      taskId: task.id,
-      skeletonId,
-      worktreeDir: worktreeRes.worktreeDir,
-      branch: worktreeRes.branch,
-      abortController,
-      startedAt: Date.now(),
-    };
+    const abortController = resume?.abortController ?? new AbortController();
+    const activeTracking: ActiveTaskTracking =
+      resume ??
+      ({
+        task,
+        taskId: task.id,
+        skeletonId,
+        worktreeDir: worktreeRes.worktreeDir,
+        branch: worktreeRes.branch,
+        abortController,
+        startedAt: Date.now(),
+      } as ActiveTaskTracking);
+    activeTracking.task = task;
+    activeTracking.skeletonId = skeletonId;
+    activeTracking.worktreeDir = worktreeRes.worktreeDir;
+    activeTracking.branch = worktreeRes.branch;
+    activeTracking.abortController = abortController;
+    activeTracking.preserveWorktree = false;
     this.activeTasks.set(task.id, activeTracking);
     this.rememberSkeletonTask(activeTracking);
 
@@ -1015,7 +1162,16 @@ export class TaskDispatcher {
         activeTracking,
         this.stopReason ?? "Skeleton interrupted"
       );
-      await this.cleanupWorktree(worktreeRes.worktreeDir, task.id);
+      if (this.shouldPreserveWorktreeOnAbort(activeTracking)) {
+        // Keep the worktree (and the commits on its branch) so a later
+        // `reraiseSkeleton` resumes this work in place instead of recreating it.
+        activeTracking.preserveWorktree = true;
+        this.preservedWorktrees.set(task.id, worktreeRes);
+      } else {
+        activeTracking.preserveWorktree = false;
+        this.preservedWorktrees.delete(task.id);
+        await this.cleanupWorktree(worktreeRes.worktreeDir, task.id);
+      }
       this.releaseActiveSkeletonSlot(activeTracking);
       return;
     }
@@ -1920,6 +2076,12 @@ export class TaskDispatcher {
         this.cleanupWorktree(active.worktreeDir, taskId).catch(() => {})
       );
     }
+    for (const [taskId, preserved] of this.preservedWorktrees.entries()) {
+      promises.push(
+        this.cleanupWorktree(preserved.worktreeDir, taskId).catch(() => {})
+      );
+    }
+    this.preservedWorktrees.clear();
     await Promise.allSettled(promises);
     this.activeTasks.clear();
   }

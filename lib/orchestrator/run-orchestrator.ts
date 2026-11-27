@@ -665,17 +665,32 @@ export class RunOrchestrator extends EventEmitter {
       !this.isAdmissionPausedState &&
       !this.isStoppedState
     ) {
-      const nextRunId = this.queue.shift();
-      if (nextRunId) {
-        this.updateQueuePositions();
-        // `startRun` removes the dequeued run from the shared admission queue
-        // and re-syncs, so the managed entries stay correct without wiping the
-        // entries this orchestrator does not own.
-        try {
-          this.startRun(nextRunId);
-        } catch {
-          // ignore run start errors in queue drain
-        }
+      const nextRunId = this.queue[0];
+      if (!nextRunId) {
+        break;
+      }
+
+      // A queued run whose record was already finalized (`phase: "done"`, e.g.
+      // idle eviction via `FifoQueue.evictIdle()` or a kill while queued) must
+      // never start. Drop it from both the internal and the shared admission
+      // queues, then keep draining the next non-terminal queued run.
+      const queuedRecord = this.host.runStore.getRun(nextRunId);
+      if (queuedRecord && queuedRecord.phase === "done") {
+        this.removeQueuedRun(nextRunId);
+        this.removeRunFromAdmissionQueue(nextRunId);
+        this.syncAdmissionQueue();
+        continue;
+      }
+
+      this.queue.shift();
+      this.updateQueuePositions();
+      // `startRun` removes the dequeued run from the shared admission queue
+      // and re-syncs, so the managed entries stay correct without wiping the
+      // entries this orchestrator does not own.
+      try {
+        this.startRun(nextRunId);
+      } catch {
+        // ignore run start errors in queue drain
       }
     }
   }
@@ -686,6 +701,36 @@ export class RunOrchestrator extends EventEmitter {
 
   public getActiveRun(runId: string): RunExecutionHandle | undefined {
     return this.activeRuns.get(runId);
+  }
+
+  /**
+   * Builds the inert handle returned for a run whose record is already terminal
+   * (`phase: "done"`). It starts no pipeline, owns no boxes, and resolves
+   * immediately, so `startRun` can fail closed without ever executing a
+   * finished run.
+   */
+  private buildTerminalRunHandle(runId: string): RunExecutionHandle {
+    const lm = new LifecycleManager({
+      runId,
+      initialPhase: "done",
+      emit: (evt) => {
+        this.emitEvent(evt as any);
+      },
+    });
+    return {
+      runId,
+      lifecycleManager: lm,
+      getPhase: () => lm.phase,
+      pause: () => {},
+      resume: () => {},
+      stop: async () => {},
+      kill: async () => {},
+      approvePact: async () => {},
+      revisePact: async () => ({}) as never,
+      resolveApproval: async () => null,
+      answerAsk: async () => null,
+      promise: Promise.resolve({} as FinalizeRunResult),
+    };
   }
 
   public startRun(runId: string): RunExecutionHandle {
@@ -699,6 +744,22 @@ export class RunOrchestrator extends EventEmitter {
     const existingHandle = this.activeRuns.get(runId);
     if (existingHandle) {
       return existingHandle;
+    }
+
+    // A run whose record already finished (`phase: "done"`, e.g. idle eviction
+    // or a kill while queued) must never be started: drop it from the internal
+    // and shared admission queues, spawn no LifecycleManager / run execution,
+    // and hand back an inert terminal handle.
+    const preStartRecord = this.host.runStore.getRun(runId);
+    if (preStartRecord && preStartRecord.phase === "done") {
+      const qIdx = this.queue.indexOf(runId);
+      if (qIdx >= 0) {
+        this.queue.splice(qIdx, 1);
+        this.updateQueuePositions();
+      }
+      this.removeRunFromAdmissionQueue(runId);
+      this.syncAdmissionQueue();
+      return this.buildTerminalRunHandle(runId);
     }
 
     // Remove from queue if present

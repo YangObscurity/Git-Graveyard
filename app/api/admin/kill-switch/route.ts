@@ -195,6 +195,28 @@ function buildRuntimeControls(request: Request): KillSwitchRuntimeControls {
       }
       return cancelled;
     },
+    // Preferred over `cancelQueuedRun` for `hard_kill`: `orchestrator.removeQueuedRun` drops the run
+    // from the live queue WITHOUT rewriting its terminal outcome to `"cancelled"`, so the kill's
+    // `outcome: "killed"` survives. It also clears the run from `globalThis.__admissionQueue`.
+    removeQueuedRun: (runId: string) => {
+      let removed = false;
+      const orchestrator = asRecord(resolveLiveOrchestrator(request));
+      if (orchestrator && typeof orchestrator.removeQueuedRun === "function") {
+        try {
+          if (
+            (orchestrator.removeQueuedRun as (id: string) => boolean).call(orchestrator, runId) !== false
+          ) {
+            removed = true;
+          }
+        } catch {
+          // ignore
+        }
+      }
+      if (removeFromAdmissionQueue(runId)) {
+        removed = true;
+      }
+      return removed;
+    },
   };
 }
 

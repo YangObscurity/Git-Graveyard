@@ -23,6 +23,8 @@ import {
   resetKillSwitchRegistry,
   type KillSwitchLevel,
 } from "@/lib/admin/kill-switch";
+import { RunOrchestrator } from "@/lib/orchestrator/run-orchestrator";
+import type { RuntimeHost } from "@/lib/runtime/runtime-host";
 
 import {
   GET as sessionGet,
@@ -1798,6 +1800,7 @@ describe("Kill switch live runtime wiring (Task 22.5)", () => {
     const stopped: string[] = [];
     const killed: string[] = [];
     const cancelledQueued: string[] = [];
+    const removedQueued: string[] = [];
 
     (globalThis as unknown as { __admission?: unknown }).__admission = {
       isPaused: () => hostPaused || admissionPaused,
@@ -1820,6 +1823,10 @@ describe("Kill switch live runtime wiring (Task 22.5)", () => {
       },
       killRun: async (runId: string) => {
         killed.push(runId);
+      },
+      removeQueuedRun: (runId: string) => {
+        removedQueued.push(runId);
+        return true;
       },
       cancelQueuedRun: (runId: string) => {
         cancelledQueued.push(runId);
@@ -1889,13 +1896,17 @@ describe("Kill switch live runtime wiring (Task 22.5)", () => {
     assert.equal(admissionPaused, true);
     assert.equal(hostPaused, true);
 
-    // 3. hard_kill -> pauseAdmission + pauseHost + cancelQueuedRun(queued) + killRun(active)
+    // 3. hard_kill -> pauseAdmission + pauseHost + removeQueuedRun(queued) + killRun(active)
     hostPaused = false;
     admissionPaused = false;
     const hard = await killPostJson("hard_kill");
     assert.equal(hard.status, 200);
     assert.ok(killed.includes("kill-active"));
-    assert.ok(cancelledQueued.includes("kill-queued"));
+    // The preferred `removeQueuedRun` hook drops the queued run; `cancelQueuedRun` (which would
+    // overwrite `outcome: "killed"` with `"cancelled"`) must NOT be used.
+    assert.ok(removedQueued.includes("kill-queued"));
+    assert.ok(!cancelledQueued.includes("kill-queued"));
+    assert.equal(stores.runStore.getRun("kill-queued")?.outcome, "killed");
     assert.ok(
       !admissionQueue?.some((entry) => (entry as { runId?: string }).runId === "kill-queued")
     );
@@ -2159,6 +2170,97 @@ describe("Admin queue synchronization (regressions)", () => {
     for (const runId of runIds) {
       assert.equal(visible.has(runId), true, `expected ${runId} to be visible in the admin queue`);
     }
+  });
+  it("propagates GET idle eviction to the admission queue and the live orchestrator queue", async () => {
+    // A tiny idle limit so the queued run expires on the very first snapshot it hydrates into.
+    stores.settingsStore.setSettingsBatch({ queueIdleLimitMs: 1 }, { actor: "test" });
+    const orchestrator = installMockOrchestrator();
+    const runId = "q-evict-run";
+    stores.runStore.createRun({
+      runId,
+      url: "https://example.test/a/b",
+      sha: "a".repeat(40),
+      phase: "queued",
+      queuePosition: 1,
+      createdAt: 0,
+    });
+    const admission = globalThis as unknown as {
+      __admissionQueue?: Array<{ runId: string; queuePosition: number }>;
+    };
+    admission.__admissionQueue = [{ runId, queuePosition: 1 }];
+    // The run is also held by the live orchestrator queue, as a live process would hold it.
+    orchestrator.snapshotQueued.push(runId);
+
+    const res = await queueGetSnapshot();
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as { queue: { entries: Array<{ runId: string }> } };
+    // `evictIdle()` finalized the run and it is gone from the returned snapshot...
+    assert.equal(body.queue.entries.some((entry) => entry.runId === runId), false);
+    const run = stores.runStore.getRun(runId);
+    assert.equal(run?.phase, "done");
+    assert.equal(run?.outcome, "cancelled");
+    // ...and the eviction propagated to BOTH live surfaces, not just the FIFO queue.
+    assert.ok(!admission.__admissionQueue?.some((entry) => entry.runId === runId));
+    assert.ok(!orchestrator.snapshotQueued.includes(runId));
+    assert.ok(orchestrator.removeCalls.includes(runId));
+  });
+
+
+});
+
+// ---------------------------------------------------------------------------------------------
+// Real RunOrchestrator: hard_kill of a queued run preserves the "killed" outcome
+// ---------------------------------------------------------------------------------------------
+
+describe("Kill switch hard_kill against a live RunOrchestrator (regressions)", () => {
+  it("removes a queued run from the orchestrator + admission queues and preserves outcome killed without a cancelled event", async () => {
+    const runId = "live-queued-kill";
+    // A minimal host is enough: enqueue / remove / snapshot only touch the RunStore.
+    const host = {
+      runStore: stores.runStore,
+      eventStore: stores.eventStore,
+    } as unknown as RuntimeHost;
+    const orchestrator = new RunOrchestrator({ host, maxConcurrentRuns: 1 });
+    // Keep the run queued instead of immediately starting it.
+    orchestrator.pauseAdmission();
+
+    stores.runStore.createRun({
+      runId,
+      url: "https://example.test/a/b",
+      sha: "b".repeat(40),
+      phase: "queued",
+      createdAt: Date.now(),
+    });
+    const admission = globalThis as unknown as {
+      __admissionQueue?: Array<{ runId: string }>;
+    };
+    admission.__admissionQueue = [];
+    orchestrator.enqueueRun(runId);
+
+    // Preconditions: the run waits in both the orchestrator queue and the admission queue.
+    assert.ok(orchestrator.getQueueSnapshot().queued.includes(runId));
+    assert.ok(admission.__admissionQueue?.some((entry) => entry.runId === runId));
+
+    const res = await killPostLevel("hard_kill");
+    assert.equal(res.status, 200);
+
+    // The queued run is removed from the live orchestrator queue and the admission queue.
+    assert.ok(!orchestrator.getQueueSnapshot().queued.includes(runId));
+    assert.ok(!admission.__admissionQueue?.some((entry) => entry.runId === runId));
+
+    // The durable RunStore record is "killed", NOT the contradictory "cancelled".
+    const run = stores.runStore.getRun(runId);
+    assert.equal(run?.phase, "done");
+    assert.equal(run?.outcome, "killed");
+
+    // No terminal event carrying `outcome: "cancelled"` was emitted for the run.
+    const phaseEvents = stores.eventStore.getEvents(runId, { kind: "run.phase" });
+    assert.equal(
+      phaseEvents.some(
+        (event) => (event.data as { outcome?: string }).outcome === "cancelled"
+      ),
+      false
+    );
   });
 });
 
