@@ -2257,7 +2257,7 @@ describe("ParallelScheduler merge reason propagation, large diffs & nested misma
 
 
 describe("ParallelScheduler merge lock, drift & rebase hardening (Task 20.4)", () => {
-  it("serializes concurrent merges so a drifting task never wipes a sibling's merge", async () => {
+  it("serializes concurrent merges so a drifting task re-queues for re-review without wiping a sibling's merge", async () => {
     const fixture = createRepoFixture("drift");
     try {
       const tasks = [
@@ -2313,15 +2313,25 @@ describe("ParallelScheduler merge lock, drift & rebase hardening (Task 20.4)", (
 
       const summary = await drainRun(scheduler.run(), controller);
 
-      // A merged cleanly; B drifted against A's freshly merged head and was
-      // refused fail-closed without being merged.
+      // A merged cleanly. B drifted against A's freshly merged head, but instead
+      // of being refused fail-closed (which would burn B's single attempt) it was
+      // re-queued for a rebase + re-review against the new head, then merged.
       assert.equal(summary.taskStates.A, "merged");
-      assert.equal(summary.merged, 1);
+      assert.equal(summary.taskStates.B, "merged");
+      assert.equal(summary.merged, 2);
       const records = scheduler.getReviewRecords();
       const bRecord = records.find((record) => record.taskId === "B");
       assert.ok(bRecord, "B must have produced a review record");
-      assert.equal(bRecord!.approved, false);
-      assert.equal(bRecord!.reason, "integration_head_changed");
+      assert.equal(bRecord!.approved, true);
+      // The base-drift re-queue is NOT a rejected attempt: B never burned its
+      // single attempt, the builder never re-ran, and no retry was counted.
+      assert.equal(scheduler.getScheduler().getTask("B")!.attempts, 1);
+      assert.equal(summary.retried, 0);
+      // Exactly one review record per task: the requeue did not record a decision.
+      assert.equal(
+        records.filter((record) => record.taskId === "B").length,
+        1
+      );
 
       // A's commit and its files are fully intact: the integration ref still
       // descends from A's candidate commit and A's file was never wiped out by a
@@ -2372,13 +2382,24 @@ describe("ParallelScheduler merge lock, drift & rebase hardening (Task 20.4)", (
       const aQueued = new Promise<void>((resolve) => {
         aQueuedResolve = resolve;
       });
+      // A must not merge until B's worktree base commit has been fixed by
+      // `createTaskWorktree`, otherwise B could be cut from the already-merged
+      // head and its rebase would no longer conflict.
+      let bDispatchedResolve: (() => void) | undefined;
+      const bDispatched = new Promise<void>((resolve) => {
+        bDispatchedResolve = resolve;
+      });
 
       const runner: ParallelSchedulerRunner = async (context) => {
         worktrees.set(context.taskId, context.worktreeDir);
         // Hold B until A's candidate is queued so A is reviewed (and merged)
         // first; B is then rebased onto A and conflicts on the shared file.
+        // Hold A until B has been dispatched (its base commit fixed) so A can
+        // never merge before B's worktree exists.
         if (context.taskId === "B") {
           await aQueued;
+        } else {
+          await bDispatched;
         }
         const srcDir = path.join(context.worktreeDir, "src");
         fs.mkdirSync(srcDir, { recursive: true });
@@ -2412,6 +2433,11 @@ describe("ParallelScheduler merge lock, drift & rebase hardening (Task 20.4)", (
         maxAttempts: 1,
         wardenReview: harness.wardenReview,
         mergeCandidate: harness.mergeCandidate,
+        onDispatch: (context) => {
+          if (context.taskId === "B") {
+            bDispatchedResolve?.();
+          }
+        },
         onCandidate: (candidate) => {
           if (candidate.taskId === "A") {
             aQueuedResolve?.();
@@ -2460,11 +2486,20 @@ describe("ParallelScheduler merge lock, drift & rebase hardening (Task 20.4)", (
       const aQueued = new Promise<void>((resolve) => {
         aQueuedResolve = resolve;
       });
+      // A must not merge until B's worktree base commit has been fixed by
+      // `createTaskWorktree`, otherwise B could be cut from the already-merged
+      // head and produce no rebase conflict at all.
+      let bDispatchedResolve: (() => void) | undefined;
+      const bDispatched = new Promise<void>((resolve) => {
+        bDispatchedResolve = resolve;
+      });
 
       const runner: ParallelSchedulerRunner = async (context) => {
         worktrees.set(context.taskId, context.worktreeDir);
         if (context.taskId === "B") {
           await aQueued;
+        } else {
+          await bDispatched;
         }
         const srcDir = path.join(context.worktreeDir, "src");
         fs.mkdirSync(srcDir, { recursive: true });
@@ -2497,6 +2532,11 @@ describe("ParallelScheduler merge lock, drift & rebase hardening (Task 20.4)", (
         maxAttempts: 1,
         wardenReview: harness.wardenReview,
         mergeCandidate: harness.mergeCandidate,
+        onDispatch: (context) => {
+          if (context.taskId === "B") {
+            bDispatchedResolve?.();
+          }
+        },
         onCandidate: (candidate) => {
           if (candidate.taskId === "A") {
             aQueuedResolve?.();
@@ -2526,6 +2566,7 @@ describe("ParallelScheduler merge lock, drift & rebase hardening (Task 20.4)", (
     try {
       const home = fixture.tmpDir;
       const integrationRef = `graveyard/${fixture.runId}`;
+      let bigHead = "";
       const runner: ParallelSchedulerRunner = async (context) => {
         // A tiny candidate on top of the worktree base.
         fs.writeFileSync(
@@ -2552,7 +2593,7 @@ describe("ParallelScheduler merge lock, drift & rebase hardening (Task 20.4)", (
         // worktree was cut from its base. A pre-rebase diff against the live
         // integration head would now be a >20 MiB deletion and overflow the
         // capture buffer; against the captured base it stays tiny.
-        commitBigFileToIntegration(fixture, "big.txt", 24 * 1024 * 1024);
+        bigHead = commitBigFileToIntegration(fixture, "big.txt", 24 * 1024 * 1024);
         return { ok: true, candidateSha: sha };
       };
 
@@ -2592,17 +2633,20 @@ describe("ParallelScheduler merge lock, drift & rebase hardening (Task 20.4)", (
           .some((record) => record.reason === "candidate_diff_too_large"),
         false
       );
-      // The pre-rebase diff was anchored at the captured worktree base — never at
-      // the bloated integration head.
+      // The worker's pre-rebase diff was anchored at the captured worktree base
+      // — never at the bloated integration head (which would have overflowed the
+      // capture buffer with a >24 MiB spurious deletion).
       assert.ok(
         diffBases.includes(fixture.baseSha),
         "worker diff must be measured against the worktree base"
       );
-      assert.ok(
-        diffBases
-          .filter((base): base is string => base !== undefined)
-          .every((base) => base === fixture.baseSha),
-        "non-post-rebase diffs must always use the captured base"
+      // The post-rebase diff is anchored at the EXACT integration head captured
+      // once inside `reviewLoop` (not re-read from the live ref), and no other
+      // diff base is used.
+      assert.deepEqual(
+        diffBases.filter((base): base is string => base !== undefined),
+        [fixture.baseSha, bigHead],
+        "pre-rebase uses the captured base; post-rebase uses the exact integration head"
       );
       // The bloated integration head and the tiny candidate both survived.
       const bigSize = Number(
@@ -2625,5 +2669,282 @@ describe("ParallelScheduler merge lock, drift & rebase hardening (Task 20.4)", (
       fixture.cleanup();
     }
   });
+});
+
+
+describe("ParallelScheduler pending emission & base-drift requeue (Task 20.4)", () => {
+  it("never dispatches a dependent while a verified merge emission is pending or rolled back", async () => {
+    const fixture = createRepoFixture("pendingemission");
+    try {
+      const home = fixture.tmpDir;
+      const tasks = [
+        makePactTask("A", { filesInScope: ["src/a.ts"], line: 1 }),
+        makePactTask("C", {
+          filesInScope: ["src/c.ts"],
+          line: 2,
+          dependencies: ["A"],
+        }),
+      ];
+      const harness = makeMergeHarness(fixture);
+      const dispatched: string[] = [];
+      const runner: ParallelSchedulerRunner = async (context) => {
+        dispatched.push(context.taskId);
+        const sha = commitWorktree(context.worktreeDir, context.taskId, home);
+        return { ok: true, candidateSha: sha };
+      };
+
+      // Hold A's `merged` state emission open, then reject it to force the
+      // composed Scheduler to compensate (roll back) A's merge and its eager
+      // release of the dependent C.
+      let mergedEmitStarted = false;
+      let rejectMergedEmit: ((err: unknown) => void) | undefined;
+      const mergedEmitGate = new Promise<void>((_resolve, reject) => {
+        rejectMergedEmit = reject;
+      });
+      const emit = (envelope: any): void | Promise<void> => {
+        if (
+          envelope?.kind === "task.state" &&
+          envelope?.taskId === "A" &&
+          envelope?.data?.state === "merged"
+        ) {
+          mergedEmitStarted = true;
+          return mergedEmitGate;
+        }
+        return undefined;
+      };
+
+      const scheduler = makeScheduler(fixture, tasks, runner, {
+        parallelCap: 1,
+        maxAttempts: 1,
+        emit,
+        wardenReview: harness.wardenReview,
+        mergeCandidate: harness.mergeCandidate,
+      });
+
+      const runPromise = scheduler.run();
+      await waitFor(() => mergedEmitStarted);
+
+      // The composed Scheduler applied the merged state and eagerly marked C
+      // `ready`, but A's merge emission is still in flight.
+      assert.equal(scheduler.getScheduler().getTask("A")!.state, "merged");
+      assert.equal(scheduler.getScheduler().getTask("C")!.state, "ready");
+      assert.equal(scheduler.getStatus().activeSlots, 0);
+      assert.equal(
+        scheduler.selectReadyTasks(10).some((task) => task.id === "C"),
+        false,
+        "a dependent of a pending merge must not be selected"
+      );
+      // Simulate the run loop waking mid-emission: C must still never launch.
+      (scheduler as any).dispatchReady();
+      assert.equal(dispatched.includes("C"), false);
+      assert.equal(scheduler.getDispatchSequence().includes("C"), false);
+
+      // Reject the emission: the merge rolls back and C returns to a non-running
+      // state instead of being launched against rolled-back state.
+      rejectMergedEmit!(new Error("merge emission rejected"));
+
+      const summary = await runPromise;
+
+      assert.deepEqual(dispatched, ["A"]);
+      assert.equal(scheduler.getDispatchSequence().includes("C"), false);
+      assert.equal(summary.taskStates.A, "failed");
+      assert.notEqual(summary.taskStates.C, "running");
+      assert.notEqual(summary.taskStates.C, "merged");
+      assert.equal(summary.merged, 0);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("re-queues a post-approval base drift for re-review without burning the single attempt", async () => {
+    const fixture = createRepoFixture("driftrequeue");
+    try {
+      const tasks = [
+        makePactTask("A", { filesInScope: ["src/a.ts"], line: 1 }),
+        makePactTask("B", { filesInScope: ["src/b.ts"], line: 2 }),
+      ];
+      const controller = makeControlledRunner(fixture.tmpDir);
+      const harness = makeMergeHarness(fixture);
+
+      // Force the interleaving that produces post-approval drift: B reaches the
+      // Warden, THEN A merges, and only then is B approved against the stale head
+      // it was rebased onto.
+      let bReachedWarden!: () => void;
+      const bAtWarden = new Promise<void>((resolve) => {
+        bReachedWarden = resolve;
+      });
+      let aMerged!: () => void;
+      const aMergedPromise = new Promise<void>((resolve) => {
+        aMerged = resolve;
+      });
+      const wardenCalls = new Map<string, number>();
+      const wardenReview: ParallelSchedulerWardenReview = async (candidate) => {
+        wardenCalls.set(
+          candidate.taskId,
+          (wardenCalls.get(candidate.taskId) ?? 0) + 1
+        );
+        if (candidate.taskId === "A") {
+          await bAtWarden;
+        } else {
+          bReachedWarden();
+          await aMergedPromise;
+        }
+        harness.reviewedShas.set(candidate.taskId, candidate.candidateSha);
+        return { approved: true, candidateSha256: candidate.candidateSha256 };
+      };
+      const mergeCandidate: NonNullable<
+        ParallelSchedulerOptions["mergeCandidate"]
+      > = async (candidate, decision) => {
+        const result = await harness.mergeCandidate(candidate, decision);
+        if (candidate.taskId === "A") {
+          aMerged();
+        }
+        return result;
+      };
+
+      const scheduler = makeScheduler(fixture, tasks, controller.runner, {
+        parallelCap: 2,
+        maxConcurrentWarden: 2,
+        maxAttempts: 1,
+        wardenReview,
+        mergeCandidate,
+      });
+
+      const summary = await drainRun(scheduler.run(), controller);
+
+      // B hit post-approval drift, was re-queued and re-reviewed (Warden called
+      // twice), yet never burned its single attempt and produced no rejection.
+      assert.equal(summary.taskStates.A, "merged");
+      assert.equal(summary.taskStates.B, "merged");
+      assert.equal(summary.merged, 2);
+      assert.equal(wardenCalls.get("B"), 2);
+      assert.equal(scheduler.getScheduler().getTask("B")!.attempts, 1);
+      assert.equal(summary.retried, 0);
+      const bRecords = scheduler
+        .getReviewRecords()
+        .filter((record) => record.taskId === "B");
+      assert.equal(bRecords.length, 1);
+      assert.equal(bRecords[0].approved, true);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+
+  it("hashes a fast-forwarded candidate against the exact integration head so evidence matches", async () => {
+    const fixture = createRepoFixture("ffhash");
+    try {
+      const home = fixture.tmpDir;
+      const integrationRef = `graveyard/${fixture.runId}`;
+      const tasks = [
+        makePactTask("A", { filesInScope: ["src/a.ts"], line: 1 }),
+        makePactTask("B", { filesInScope: ["src/b.ts"], line: 2 }),
+      ];
+      const harness = makeMergeHarness(fixture);
+
+      let bDispatchedResolve: (() => void) | undefined;
+      const bDispatched = new Promise<void>((resolve) => {
+        bDispatchedResolve = resolve;
+      });
+      let aSha = "";
+      const runner: ParallelSchedulerRunner = async (context) => {
+        if (context.taskId === "A") {
+          // Do not let A merge before B's worktree base commit is fixed.
+          await bDispatched;
+          aSha = commitWorktree(context.worktreeDir, context.taskId, home);
+          return { ok: true, candidateSha: aSha };
+        }
+        // B: wait for A to merge, then FAST-FORWARD the worktree branch to the
+        // NEWER integration head before committing. The runner never rewound to
+        // its own base, so `candidate.baseSha` (captured at worktree creation)
+        // stays the OLD head while B's candidate descends from the new one.
+        const deadline = Date.now() + 10000;
+        let head = fixture.baseSha;
+        while (head === fixture.baseSha) {
+          if (Date.now() > deadline) {
+            throw new Error("A never merged");
+          }
+          await new Promise<void>((resolve) => setTimeout(resolve, 5));
+          head = runGit(["rev-parse", integrationRef], fixture.gitDir, home);
+        }
+        runGit(
+          [
+            "-c",
+            "user.name=Test Runner",
+            "-c",
+            "user.email=runner@example.test",
+            "reset",
+            "--hard",
+            head,
+          ],
+          context.worktreeDir,
+          home
+        );
+        const sha = commitWorktree(context.worktreeDir, context.taskId, home);
+        return { ok: true, candidateSha: sha };
+      };
+
+      const scheduler = makeScheduler(fixture, tasks, runner, {
+        parallelCap: 2,
+        maxAttempts: 1,
+        wardenReview: harness.wardenReview,
+        mergeCandidate: harness.mergeCandidate,
+        onDispatch: (context) => {
+          if (context.taskId === "B") {
+            bDispatchedResolve?.();
+          }
+        },
+      });
+
+      const summary = await scheduler.run();
+
+      assert.equal(summary.taskStates.A, "merged");
+      assert.equal(summary.taskStates.B, "merged");
+      assert.equal(summary.merged, 2);
+
+      const bRecord = scheduler
+        .getReviewRecords()
+        .find((record) => record.taskId === "B");
+      assert.ok(bRecord, "B must have produced a review record");
+      assert.equal(bRecord!.approved, true);
+      const bCandidateSha = bRecord!.candidateSha;
+
+      const runDiff = (base: string, head: string): string =>
+        childProcess
+          .execFileSync(
+            "git",
+            [
+              "diff",
+              "--binary",
+              "--no-color",
+              "--end-of-options",
+              `${base}..${head}`,
+            ],
+            {
+              cwd: fixture.gitDir,
+              encoding: "utf8",
+              env: gitEnv(home),
+              maxBuffer: 20 * 1024 * 1024,
+            }
+          )
+          .toString();
+
+      // The reviewed hash binds to `integrationHead..candidateSha` (the head A
+      // merged), NOT the stale base the runner fast-forwarded past. If B had not
+      // been re-hashed the Warden evidence would have mismatched and the merge
+      // would have failed closed.
+      assert.equal(
+        bRecord!.candidateSha256,
+        candidateSha256FromDiff(runDiff(aSha, bCandidateSha))
+      );
+      assert.notEqual(
+        bRecord!.candidateSha256,
+        candidateSha256FromDiff(runDiff(fixture.baseSha, bCandidateSha))
+      );
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
 });
 

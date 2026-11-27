@@ -81,6 +81,13 @@ export interface ParallelSchedulerCandidate {
   readonly candidateSha: string;
   readonly candidateSha256?: string;
   /**
+   * The integration head this candidate's worktree was cut from, captured when
+   * `workerLoop` provisioned the worktree. Used to detect a runner that
+   * fast-forwarded its worktree to a newer integration head before committing,
+   * so the reviewed diff is recomputed against the exact integration head.
+   */
+  readonly baseSha?: string;
+  /**
    * The candidate diff against the integration branch, when it could be read.
    * The verified merge recomputes `candidateSha256` from these exact bytes.
    */
@@ -439,6 +446,21 @@ export class ParallelScheduler {
    * review.
    */
   private readonly _reviewWorktrees: Map<string, TaskWorktreeResult> = new Map();
+  /**
+   * Task ids whose verified merge has been applied through `Scheduler.mergeTask`
+   * but whose state-emission promise has not yet settled. The composed Scheduler
+   * eagerly marks dependents `ready` before the emission commits, so a dependent
+   * is NOT dispatched while its dependency is in this set (see `selectReadyTasks`)
+   * and the run loop never exits while it is non-empty (see `isBusy`). The entry
+   * is deleted only after `emissionPromise` settles (or is rolled back).
+   */
+  private readonly _pendingMergeCommits: Set<string> = new Set();
+  /**
+   * Per-task count of post-approval base-drift re-queues, capped so a
+   * pathologically repeated drift can never spin the review queue forever. The
+   * cap `max(10, taskCount * 2)` is applied in `reviewLoop`.
+   */
+  private readonly _reviewRequeueCounts = new Map<string, number>();
   private readonly _freeSlots: Set<number> = new Set();
   private _slotCounter = 0;
 
@@ -726,6 +748,15 @@ export class ParallelScheduler {
     for (const task of this.scheduler.getReadyTasks()) {
       if (selected.length >= capacity) break;
       const files = task.filesInScope ?? [];
+      // A dependency whose verified merge is still awaiting its state emission
+      // (or rolling back) must gate this dependent: the composed Scheduler
+      // eagerly marked it `ready` before the emission committed, so dispatching
+      // now would launch work against state that may yet roll back.
+      if (
+        task.dependencies.some((dep) => this._pendingMergeCommits.has(dep))
+      ) {
+        continue;
+      }
       if (parallelScopesConflict(files, claimed)) {
         continue;
       }
@@ -821,7 +852,10 @@ export class ParallelScheduler {
     return (
       this._active.size > 0 ||
       this._wardenActive > 0 ||
-      this._reviewQueue.length > 0
+      this._reviewQueue.length > 0 ||
+      // A verified merge whose state emission is still in flight keeps the loop
+      // alive so it never exits before the transition (or its rollback) commits.
+      this._pendingMergeCommits.size > 0
     );
   }
 
@@ -1068,6 +1102,7 @@ export class ParallelScheduler {
         gitDir: worktree.gitDir,
         candidateSha: trimmedSha,
         candidateSha256,
+        baseSha,
         diff,
         modelId,
         hard: task.hard,
@@ -1150,11 +1185,6 @@ export class ParallelScheduler {
     } catch {
       return undefined;
     }
-  }
-
-  /** True when `ref` exists in the repository containing `cwd`. */
-  private async gitRefExists(cwd: string, ref: string): Promise<boolean> {
-    return (await this.resolveGitRef(cwd, ref)) !== undefined;
   }
 
   /** True when `ancestorRef` is an ancestor of `descendantRef`. */
@@ -1340,12 +1370,19 @@ export class ParallelScheduler {
       // -------------------------------------------------------------------
       let effectiveCandidate: ParallelSchedulerCandidate = candidate;
       const integrationRef = `refs/heads/${this._integrationBranch}`;
+      // Resolve the integration head ONCE and reuse that exact sha for the diff
+      // endpoints and the rebase target below, so a concurrent merge that lands
+      // mid-review can never shift the endpoint between two reads of the ref.
+      const integrationHead = await this.resolveGitRef(
+        candidate.worktreeDir,
+        integrationRef
+      );
       // Only rebase when the integration ref actually exists: purely mocked
       // non-git unit tests have no such ref and are skipped cleanly.
-      if (await this.gitRefExists(candidate.worktreeDir, integrationRef)) {
+      if (integrationHead) {
         const alreadyDescendant = await this.isAncestor(
           candidate.worktreeDir,
-          integrationRef,
+          integrationHead,
           candidate.candidateSha
         );
         if (!alreadyDescendant) {
@@ -1430,7 +1467,8 @@ export class ParallelScheduler {
           try {
             newDiff = await this.readCandidateDiff(
               candidate.worktreeDir,
-              newSha
+              newSha,
+              integrationHead
             );
           } catch {
             await this.failReviewedCandidate(
@@ -1452,6 +1490,39 @@ export class ParallelScheduler {
             candidateSha: newSha,
             candidateSha256: candidateSha256FromDiff(newDiff),
             diff: newDiff,
+          };
+        } else if (candidate.baseSha && integrationHead !== candidate.baseSha) {
+          // The candidate is already a descendant of the integration head, so no
+          // rebase is needed — but the runner fast-forwarded its worktree to a
+          // NEWER integration head than the `baseSha` this candidate was cut from
+          // before committing. Recompute the diff and hash against the exact
+          // `${integrationHead}..${candidateSha}` range so the reviewed snapshot
+          // (and the merge evidence bound to it) names the real candidate bytes
+          // instead of a stale, base-relative diff.
+          let driftedDiff: string | undefined;
+          try {
+            driftedDiff = await this.readCandidateDiff(
+              candidate.worktreeDir,
+              candidate.candidateSha,
+              integrationHead
+            );
+          } catch {
+            await this.failReviewedCandidate(
+              candidate,
+              "candidate_diff_too_large"
+            );
+            return;
+          }
+          // Fail closed on an empty diff (e.g. the integration head already
+          // carries the exact same edit): NEVER reuse a stale `candidateSha256`.
+          if (!driftedDiff || driftedDiff.trim().length === 0) {
+            await this.failReviewedCandidate(candidate, "empty_rebased_diff");
+            return;
+          }
+          effectiveCandidate = {
+            ...candidate,
+            candidateSha256: candidateSha256FromDiff(driftedDiff),
+            diff: driftedDiff,
           };
         }
       }
@@ -1527,6 +1598,27 @@ export class ParallelScheduler {
           decision
         );
         if (!mergeOutcome.ok) {
+          // A post-approval base drift (`integration_head_changed`) detected by
+          // `performVerifiedMerge`'s own ancestry check is NOT a rejection: the
+          // integration head merely advanced after this candidate was approved.
+          // Re-queue the ORIGINAL candidate for a rebase + re-review against the
+          // new head WITHOUT recording a decision, rejecting the task, or
+          // tearing down its retained worktree — so `task.attempts` is untouched
+          // and the builder never re-runs. The `finally` below automatically
+          // releases the Warden slot and pumps the re-queued candidate.
+          if (
+            mergeOutcome.requeueReview === true &&
+            !this._aborted &&
+            this.scheduler.getTask(candidate.taskId)?.state === "in_review"
+          ) {
+            const cap = Math.max(10, this.scheduler.getTasks().length * 2);
+            const count = this._reviewRequeueCounts.get(candidate.taskId) ?? 0;
+            if (count < cap) {
+              this._reviewRequeueCounts.set(candidate.taskId, count + 1);
+              this._reviewQueue.push(candidate);
+              return;
+            }
+          }
           decision = {
             approved: false,
             reason: mergeOutcome.reason ?? "merge_gate_failed",
@@ -1630,7 +1722,7 @@ export class ParallelScheduler {
   private async performVerifiedMerge(
     candidate: ParallelSchedulerCandidate,
     decision: ParallelWardenDecision
-  ): Promise<{ ok: boolean; reason?: string }> {
+  ): Promise<{ ok: boolean; reason?: string; requeueReview?: boolean }> {
     // Serialize the whole integration-branch choreography under the merge lock so
     // concurrent reviews (`maxConcurrentWarden > 1`) never interleave on the
     // shared ref.
@@ -1665,7 +1757,22 @@ export class ParallelScheduler {
           candidate.candidateSha
         ))
       ) {
-        return { ok: false, reason: "integration_head_changed" };
+        // The candidate is no longer a descendant of the integration head, so
+        // the merge is refused WITHOUT invoking the executor (a concurrently
+        // merged ref is preserved). Flag `requeueReview` so the caller re-queues
+        // this candidate for a rebase + re-review against the new head WITHOUT
+        // burning a task attempt.
+        return {
+          ok: false,
+          reason: "integration_head_changed",
+          requeueReview: true,
+        };
+      }
+
+      // The run may have been aborted while the ancestry check was in flight.
+      // Bail out BEFORE invoking the executor so nothing moves a git ref.
+      if (this._aborted) {
+        return { ok: false, reason: "aborted" };
       }
 
       let evidence: TaskMergeEvidence | undefined;
@@ -1707,34 +1814,48 @@ export class ParallelScheduler {
         return { ok: false, reason: "merge_evidence_candidate_mismatch" };
       }
 
-      let mergeRes: MergeTaskResult | undefined;
+      // Mark this task's verified merge as pending BEFORE `Scheduler.mergeTask`
+      // eagerly marks dependents `ready`, so `selectReadyTasks` never dispatches
+      // a dependent while its dependency's state emission is still in flight (or
+      // rolling back). Cleared in the `finally` once `emissionPromise` settles.
+      this._pendingMergeCommits.add(candidate.taskId);
       try {
-        mergeRes = this.scheduler.mergeTask(candidate.taskId, evidence);
-      } catch (err) {
-        await this.rollbackIfMoved(worktreeDir, preMergeHead);
-        return {
-          ok: false,
-          reason: err instanceof Error ? err.message : String(err),
-        };
-      }
-
-      if (!mergeRes || !mergeRes.ok || !mergeRes.merged) {
-        await this.rollbackIfMoved(worktreeDir, preMergeHead);
-        return { ok: false, reason: mergeRes?.reason ?? "merge_gate_failed" };
-      }
-
-      // Wait for the task-state emissions so the run loop only observes the
-      // merged state once the transition (and dependent releases) are committed.
-      // A failed emission compensates (rolls back) the merge; swallow the
-      // rejection here and re-read the task state so the caller ALWAYS reaches
-      // `cleanupReviewedWorktree()` and `recordDecision()`.
-      if (mergeRes.emissionPromise) {
+        let mergeRes: MergeTaskResult | undefined;
         try {
-          await mergeRes.emissionPromise;
-        } catch {
-          // The scheduler already rolled back the merge; detected via state below.
+          mergeRes = this.scheduler.mergeTask(candidate.taskId, evidence);
+        } catch (err) {
+          await this.rollbackIfMoved(worktreeDir, preMergeHead);
+          return {
+            ok: false,
+            reason: err instanceof Error ? err.message : String(err),
+          };
         }
+
+        if (!mergeRes || !mergeRes.ok || !mergeRes.merged) {
+          await this.rollbackIfMoved(worktreeDir, preMergeHead);
+          return { ok: false, reason: mergeRes?.reason ?? "merge_gate_failed" };
+        }
+
+        // Wait for the task-state emissions so the run loop only observes the
+        // merged state once the transition (and dependent releases) are
+        // committed. A failed emission compensates (rolls back) the merge;
+        // swallow the rejection here and re-read the task state so the caller
+        // ALWAYS reaches `cleanupReviewedWorktree()` and `recordDecision()`.
+        if (mergeRes.emissionPromise) {
+          try {
+            await mergeRes.emissionPromise;
+          } catch {
+            // The scheduler already rolled back the merge; detected via state below.
+          }
+        }
+      } finally {
+        // Release the dependent-dispatch gate only AFTER the emission settles
+        // (committed or rolled back), then wake the run loop so a dependent that
+        // was held back is now eligible for dispatch.
+        this._pendingMergeCommits.delete(candidate.taskId);
+        this.notify();
       }
+
       if (this.scheduler.getTask(candidate.taskId)?.state !== "merged") {
         await this.rollbackIfMoved(worktreeDir, preMergeHead);
         return { ok: false, reason: "merge_emission_failed" };
