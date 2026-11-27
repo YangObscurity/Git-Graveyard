@@ -513,7 +513,7 @@ test("AskManager: delegates grant tracking to a supplied ApprovalManager", () =>
     skeletonId: "sk-d",
   });
   manager.resolveApproval(once.approvalId, "Approve once");
-  assert.equal(approvalManager.consumeGrant("sk-d", ["npm ci"], "/w"), true);
+  assert.equal(approvalManager.consumeGrant("sk-d", ["npm", "ci"], "/w"), true);
 
   const pattern = manager.requestApproval({
     runId: "run-deleg",
@@ -523,6 +523,63 @@ test("AskManager: delegates grant tracking to a supplied ApprovalManager", () =>
     skeletonId: "sk-d",
   });
   manager.resolveApproval(pattern.approvalId, "Approve this pattern for the run");
-  assert.equal(approvalManager.isPatternApproved("run-deleg", ["npm test"]), true);
+  assert.equal(
+    approvalManager.isPatternApproved("run-deleg", ["npm", "test"]),
+    true
+  );
+});
+
+test("AskManager: grant tracking preserves unredacted multi-token argv and raw cwd", () => {
+  const approvalManager = new ApprovalManager({ defaultWaitMs: 60_000 });
+  const store = new EventStore(":memory:");
+  const manager = new AskManager({ eventStore: store, approvalManager });
+
+  // A home-directory cwd is altered by redactText, so the stored card is
+  // redacted while grant tracking must match on the raw cwd.
+  const rawCwd = "/home/alice/work";
+
+  const explicitArgv = manager.requestApproval({
+    runId: "run-deleg-argv",
+    commandText: "npm ci",
+    argv: ["npm", "ci"],
+    cwd: rawCwd,
+    riskClass: "safe",
+    skeletonId: "sk-deleg-a",
+  });
+  assert.ok(explicitArgv.cwd.includes("[REDACTED]"));
+  manager.resolveApproval(explicitArgv.approvalId, "Approve once");
+  assert.equal(
+    approvalManager.consumeGrant("sk-deleg-a", ["npm", "ci"], rawCwd),
+    true
+  );
+
+  // Without an explicit argv the raw commandText is tokenized into multi-token
+  // argv so the same multi-token consumeGrant succeeds.
+  const parsedArgv = manager.requestApproval({
+    runId: "run-deleg-parsed",
+    commandText: "npm ci",
+    cwd: rawCwd,
+    riskClass: "safe",
+    skeletonId: "sk-deleg-b",
+  });
+  manager.resolveApproval(parsedArgv.approvalId, "Approve once");
+  assert.equal(
+    approvalManager.consumeGrant("sk-deleg-b", ["npm", "ci"], rawCwd),
+    true
+  );
+
+  // Pattern approvals register the raw command text for the run.
+  const pattern = manager.requestApproval({
+    runId: "run-deleg-pattern",
+    commandText: "npm run build",
+    cwd: rawCwd,
+    riskClass: "safe",
+    skeletonId: "sk-deleg-c",
+  });
+  manager.resolveApproval(pattern.approvalId, "Approve this pattern for the run");
+  assert.equal(
+    approvalManager.isPatternApproved("run-deleg-pattern", ["npm", "run", "build"]),
+    true
+  );
 });
 
