@@ -922,6 +922,36 @@ describe("M1 remediation: all-zero integers, unicode splats, PEP 440 exclusives"
     assert.ok(!ambiguousLines.includes(7), "!= must not look like a keyword arg");
   });
 
+  // A top-level `*` is an argument-unpacking splat only at the start of an
+  // argument: binary multiplication (`a * b`) and the power operator (`a ** b`)
+  // must not be mistaken for `*args` / `**kwargs`.
+  it("does not flag unicode(a * b) / unicode(a ** b) as ambiguous but keeps unicode(*args) / unicode(**kwargs)", () => {
+    const content = "x = unicode(a * b)\ny = unicode(a ** b)\n";
+
+    const sync = detectSignals([{ path: "a.py", content }]);
+    assert.equal(
+      sync.unknowns.filter((u) => u.reason === "unicode_decoding_ambiguous").length,
+      0
+    );
+
+    const lexical = detectPythonSignalsLexical([{ path: "a.py", content }]);
+    assert.equal(
+      lexical.unknowns.filter((u) => u.reason === "unicode_decoding_ambiguous").length,
+      0
+    );
+
+    // Genuine splats still forward an arbitrary Py2 arity and stay ambiguous.
+    const splat = detectSignals([
+      { path: "a.py", content: "x = unicode(*args)\ny = unicode(**kwargs)\n" },
+    ]);
+    assert.deepEqual(
+      splat.unknowns
+        .filter((u) => u.reason === "unicode_decoding_ambiguous")
+        .map((u) => u.line),
+      [1, 2]
+    );
+  });
+
   // A digit run inside a Unicode identifier is not a Py2 octal literal.
   it("lexical fallback does not flag octal digits inside a Unicode identifier", () => {
     const content = ["\u53d8\u91cf0755 = 1", "x = 0755", ""].join("\n");
