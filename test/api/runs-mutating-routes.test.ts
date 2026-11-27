@@ -22,6 +22,12 @@ import { renderPact } from "@/lib/pact/pact-renderer";
 import { RunOrchestrator } from "@/lib/orchestrator/run-orchestrator";
 import { deriveCommandPrefix } from "@/lib/gateway/approval-manager";
 import { RuntimeHost, resetRuntimeHost } from "@/lib/runtime/runtime-host";
+import { SettingsStore } from "@/lib/admin/settings-store";
+import {
+  ADMIN_SESSION_COOKIE,
+  resetAdminSessionState,
+  signAdminSession,
+} from "@/lib/admin/admin-session";
 
 import { POST as postMessage, GET as getMessages } from "@/app/api/runs/[runId]/messages/route";
 import { POST as resolveApproval } from "@/app/api/runs/[runId]/approvals/[approvalId]/route";
@@ -29,6 +35,10 @@ import { POST as answerAsk } from "@/app/api/runs/[runId]/asks/[askId]/route";
 import { POST as skeletonAction } from "@/app/api/runs/[runId]/skeletons/[skeletonId]/actions/route";
 import { POST as controlRun } from "@/app/api/runs/[runId]/control/route";
 import { POST as pushFork } from "@/app/api/runs/[runId]/push-fork/route";
+import {
+  POST as adminSessionPost,
+  DELETE as adminSessionDelete,
+} from "@/app/api/admin/session/route";
 
 import {
   postMessage as apiPostMessage,
@@ -2561,6 +2571,244 @@ describe("mutating run API routes", () => {
       assert.equal(calls[0].url, "/api/runs/run-x/control");
       assert.equal(headersOf(calls[0])["x-invite-code"], "code-123");
       assert.deepEqual(JSON.parse(String(calls[0].init.body)), { action: "pause" });
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Signed admin session cookie (gg_admin_session) authorization on mutating
+  // invite-owned run routes.
+  // -------------------------------------------------------------------------
+  describe("signed admin session cookie authorization", () => {
+    const ADMIN_SECRET = "test-admin-session-secret";
+
+    beforeEach(() => {
+      process.env.ADMIN_SECRET = ADMIN_SECRET;
+      resetAdminSessionState();
+    });
+
+    afterEach(() => {
+      resetAdminSessionState();
+    });
+
+    function makeSessionStores(): {
+      runStore: RunStore;
+      eventStore: EventStore;
+      settingsStore: SettingsStore;
+    } {
+      const runStore = new RunStore(":memory:");
+      const eventStore = new EventStore(":memory:");
+      const settingsStore = new SettingsStore(":memory:");
+      const g = globalThis as Record<string, unknown>;
+      g.__runStore = runStore;
+      g.__eventStore = eventStore;
+      return { runStore, eventStore, settingsStore };
+    }
+
+    function attachSettingsStore<T extends Request>(
+      request: T,
+      settingsStore: SettingsStore
+    ): T {
+      (request as unknown as Record<string, unknown>).settingsStore = settingsStore;
+      return request;
+    }
+
+    function cookieHeader(token: string): Record<string, string> {
+      return { cookie: `${ADMIN_SESSION_COOKIE}=${token}` };
+    }
+
+    /**
+     * Issues a real signed cookie through POST /api/admin/session, exactly as an
+     * administrator signing in would obtain one.
+     */
+    async function issueSessionCookie(settingsStore: SettingsStore): Promise<string> {
+      const signIn = await adminSessionPost(
+        attachSettingsStore(
+          jsonRequest("http://test/api/admin/session", { token: ADMIN_SECRET }),
+          settingsStore
+        )
+      );
+      assert.equal(signIn.status, 200);
+      const setCookie = signIn.headers.get("set-cookie") ?? "";
+      assert.ok(setCookie.startsWith(`${ADMIN_SESSION_COOKIE}=`));
+      return setCookie.split(";")[0].trim();
+    }
+
+    it("authorizes a valid unrevoked signed cookie without an invite code (never 401/403)", async () => {
+      const { runStore, eventStore, settingsStore } = makeSessionStores();
+      const cookie = await issueSessionCookie(settingsStore);
+      const token = cookie.slice(`${ADMIN_SESSION_COOKIE}=`.length);
+
+      // POST /api/runs/[runId]/approvals/[approvalId]
+      const approvalRunId = "run-admin-cookie-approval";
+      makeRun(runStore, approvalRunId, { inviteCodeHash: OWNER_INVITE_HASH });
+      eventStore.append({
+        runId: approvalRunId,
+        kind: "approval.requested",
+        actor: "warden",
+        data: { approvalId: "appr-admin-cookie" },
+      });
+      (globalThis as Record<string, unknown>).__runOrchestrator = {
+        resolveApproval: async () => ({ ok: true }),
+      };
+      const approvalRes = await resolveApproval(
+        attachSettingsStore(
+          jsonRequest(
+            `http://test/api/runs/${approvalRunId}/approvals/appr-admin-cookie`,
+            { decision: "approve_once" },
+            cookieHeader(token)
+          ),
+          settingsStore
+        ),
+        { params: Promise.resolve({ runId: approvalRunId, approvalId: "appr-admin-cookie" }) }
+      );
+      assert.notEqual(approvalRes.status, 401);
+      assert.notEqual(approvalRes.status, 403);
+      assert.equal(approvalRes.status, 200);
+
+      // POST /api/runs/[runId]/messages
+      delete (globalThis as Record<string, unknown>).__runOrchestrator;
+      const messageRunId = "run-admin-cookie-message";
+      makeRun(runStore, messageRunId, { inviteCodeHash: OWNER_INVITE_HASH });
+      const messageRes = await postMessage(
+        attachSettingsStore(
+          jsonRequest(
+            `http://test/api/runs/${messageRunId}/messages`,
+            { to: "exhumer", intent: "instruct" },
+            cookieHeader(token)
+          ),
+          settingsStore
+        ),
+        runParams(messageRunId)
+      );
+      assert.notEqual(messageRes.status, 401);
+      assert.notEqual(messageRes.status, 403);
+      assert.equal(messageRes.status, 200);
+
+      // POST /api/runs/[runId]/skeletons/[skeletonId]/actions
+      const skeletonRunId = "run-admin-cookie-skeleton";
+      makeRun(runStore, skeletonRunId, { inviteCodeHash: OWNER_INVITE_HASH });
+      eventStore.append({
+        runId: skeletonRunId,
+        kind: "skeleton.raised",
+        actor: "necromancer",
+        skeletonId: "skel-admin-cookie",
+        data: { skeletonId: "skel-admin-cookie" },
+      });
+      (globalThis as Record<string, unknown>).__runOrchestrator = {
+        getActiveRun: (id: string) =>
+          id === skeletonRunId
+            ? {
+                dispatcher: {
+                  interruptSkeleton: () => true,
+                  reraiseSkeleton: () => true,
+                  layToRest: () => true,
+                  sendInstruction: () => true,
+                  addReviewFocus: () => true,
+                },
+                warden: { addReviewFocus: () => true },
+              }
+            : undefined,
+      };
+      const skeletonRes = await skeletonAction(
+        attachSettingsStore(
+          jsonRequest(
+            `http://test/api/runs/${skeletonRunId}/skeletons/skel-admin-cookie/actions`,
+            { action: "interrupt" },
+            cookieHeader(token)
+          ),
+          settingsStore
+        ),
+        { params: Promise.resolve({ runId: skeletonRunId, skeletonId: "skel-admin-cookie" }) }
+      );
+      assert.notEqual(skeletonRes.status, 401);
+      assert.notEqual(skeletonRes.status, 403);
+      assert.equal(skeletonRes.status, 200);
+    });
+
+    it("rejects a revoked signed cookie (persisted revocation) with 401", async () => {
+      const { runStore, settingsStore } = makeSessionStores();
+      const cookie = await issueSessionCookie(settingsStore);
+
+      // Revoke through DELETE /api/admin/session, which persists the revocation.
+      const signOut = await adminSessionDelete(
+        attachSettingsStore(
+          new Request("http://test/api/admin/session", {
+            method: "DELETE",
+            headers: { cookie },
+          }),
+          settingsStore
+        )
+      );
+      assert.equal(signOut.status, 200);
+
+      // Drop the in-memory revocation so only the SettingsStore-backed entry remains.
+      resetAdminSessionState();
+
+      const runId = "run-admin-cookie-revoked";
+      makeRun(runStore, runId, { inviteCodeHash: OWNER_INVITE_HASH });
+      const res = await postMessage(
+        attachSettingsStore(
+          jsonRequest(
+            `http://test/api/runs/${runId}/messages`,
+            { to: "exhumer", intent: "instruct" },
+            { cookie }
+          ),
+          settingsStore
+        ),
+        runParams(runId)
+      );
+      assert.equal(res.status, 401);
+    });
+
+    it("rejects a tampered signed cookie with 401", async () => {
+      const { runStore, settingsStore } = makeSessionStores();
+      const cookie = await issueSessionCookie(settingsStore);
+      const token = cookie.slice(`${ADMIN_SESSION_COOKIE}=`.length);
+      const tamperedToken = `${token.slice(0, -1)}${token.endsWith("A") ? "B" : "A"}`;
+
+      const runId = "run-admin-cookie-tampered";
+      makeRun(runStore, runId, { inviteCodeHash: OWNER_INVITE_HASH });
+      const res = await postMessage(
+        attachSettingsStore(
+          jsonRequest(
+            `http://test/api/runs/${runId}/messages`,
+            { to: "exhumer", intent: "instruct" },
+            cookieHeader(tamperedToken)
+          ),
+          settingsStore
+        ),
+        runParams(runId)
+      );
+      assert.equal(res.status, 401);
+    });
+
+    it("rejects an expired signed cookie with 401", async () => {
+      const { runStore, settingsStore } = makeSessionStores();
+      const expiredToken = signAdminSession(
+        {
+          sub: "owner",
+          sid: "sid-expired-cookie",
+          role: "owner",
+          iat: Date.now() - 60_000,
+          exp: Date.now() - 1_000,
+        },
+        ADMIN_SECRET
+      );
+
+      const runId = "run-admin-cookie-expired";
+      makeRun(runStore, runId, { inviteCodeHash: OWNER_INVITE_HASH });
+      const res = await postMessage(
+        attachSettingsStore(
+          jsonRequest(
+            `http://test/api/runs/${runId}/messages`,
+            { to: "exhumer", intent: "instruct" },
+            cookieHeader(expiredToken)
+          ),
+          settingsStore
+        ),
+        runParams(runId)
+      );
+      assert.equal(res.status, 401);
     });
   });
 });
