@@ -555,20 +555,22 @@ export class BudgetGovernor {
     if (!this.exceededDimensions.has(dim)) {
       this.exceededDimensions.set(dim, value);
       this.pendingAsk = "exceed_budget";
-      this.contextEscalated = action === "cancel_turn";
-      this.emit("budget.exceeded", {
-        dimension: dim,
-        usage: value,
-        cap,
-        ask: "exceed_budget",
-        action,
-      });
+      // Only latch the escalation once the `cancel_turn` event is actually recorded: if the append
+      // failed, a later evaluation must be able to retry the escalation.
+      this.contextEscalated =
+        this.emit("budget.exceeded", {
+          dimension: dim,
+          usage: value,
+          cap,
+          ask: "exceed_budget",
+          action,
+        }) && action === "cancel_turn";
       return;
     }
     if (action === "cancel_turn" && !this.contextEscalated) {
-      this.contextEscalated = true;
       this.exceededDimensions.set(dim, value);
-      this.emit("budget.exceeded", {
+      // Re-arm the latch only on a successful append so a transient append failure triggers a retry.
+      this.contextEscalated = this.emit("budget.exceeded", {
         dimension: dim,
         usage: value,
         cap,
@@ -681,9 +683,15 @@ export class BudgetGovernor {
     return { ok: true, dimension, previousCap, newCap };
   }
 
-  private emit(kind: string, data: Record<string, unknown>): void {
+  /**
+   * Best-effort telemetry append. Returns `true` when there is no event store or the append
+   * succeeded, and `false` when the append threw. The failure is swallowed so dispatch never breaks,
+   * but callers that latch state on the event (the context escalation) can retry when it returns
+   * `false`.
+   */
+  private emit(kind: string, data: Record<string, unknown>): boolean {
     if (!this.eventStore) {
-      return;
+      return true;
     }
     try {
       this.eventStore.append(
@@ -694,8 +702,10 @@ export class BudgetGovernor {
           data: { refs: [], ...data },
         })
       );
+      return true;
     } catch {
       // Telemetry is best-effort and must never break dispatch.
+      return false;
     }
   }
 }

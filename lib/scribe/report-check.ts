@@ -534,20 +534,52 @@ function emitReportChecked(
 }
 
 /**
- * Redacts the Scribe draft with the injected redactor before citation
- * verification. Fails closed with the redaction mask when the redactor throws so
- * a partially redacted reading is never verified or returned. When no redactor is
- * injected the reading passes through unchanged.
+ * Redacts the Scribe draft before citation verification. The security
+ * `redactionOptions` are always applied first, so registered secrets are masked
+ * even when no redactor is injected, and an optional redactor is applied on top
+ * of the already-redacted text. Returns `{ ok: false }` when any redaction step
+ * throws so the caller fails closed instead of verifying a mask.
  */
-function redactReadingText(text: string, redactor?: Redactor): string {
-  if (!redactor || typeof redactor.redactText !== "function") {
-    return text;
-  }
+type ReadingRedactionResult =
+  | { readonly ok: true; readonly text: string }
+  | { readonly ok: false };
+
+function redactReadingText(
+  text: string,
+  redactor?: Redactor,
+  redactionOptions?: RedactionOptions
+): ReadingRedactionResult {
   try {
-    return redactor.redactText(text);
+    const byOptions = redactText(text, redactionOptions);
+    if (!redactor || typeof redactor.redactText !== "function") {
+      return { ok: true, text: byOptions };
+    }
+    return { ok: true, text: redactor.redactText(byOptions) };
   } catch {
-    return "[REDACTED]";
+    return { ok: false };
   }
+}
+
+/**
+ * Fails an attempt when the draft could not be redacted. Feeding a mask into
+ * `checkReading` would falsely pass (no numeral, status keyword or marker), so a
+ * redaction failure is reported as an unbacked claim instead, which lets the
+ * retry run and the narrative be dropped cleanly.
+ */
+function redactionFailureCheck(): ReportCheckResult {
+  return {
+    passed: false,
+    unbackedClaims: [
+      {
+        claim: "redaction",
+        text: "",
+        reason:
+          "Redaction failed: the Scribe reading could not be safely redacted",
+      },
+    ],
+    checkedCount: 0,
+    resolvedMarkers: [],
+  };
 }
 
 /**
@@ -562,8 +594,15 @@ export async function runReportCheckWithRetry(
   const actor = options.actor ?? "ScribeService";
   const index = options.index;
 
-  const firstReading = redactReadingText(options.reading, options.redactor);
-  const first = checkReading(firstReading, index);
+  const firstRedaction = redactReadingText(
+    options.reading,
+    options.redactor,
+    options.redactionOptions
+  );
+  const firstReading = firstRedaction.ok ? firstRedaction.text : "";
+  const first = firstRedaction.ok
+    ? checkReading(firstReading, index)
+    : redactionFailureCheck();
 
   const emit = (
     result: ReportCheckResult,
@@ -624,19 +663,29 @@ export async function runReportCheckWithRetry(
   let second: ReportCheckResult | null = null;
   let secondReading: string | null = null;
   if (typeof retriedReading === "string" && retriedReading.trim().length > 0) {
-    secondReading = redactReadingText(retriedReading, options.redactor);
-    second = checkReading(secondReading, index);
-    if (second.passed) {
-      const event = emit(second, secondReading, false, true);
-      return {
-        passed: true,
-        reading: secondReading,
-        narrativeDropped: false,
-        fallbackNotice: null,
-        reportCheck: second,
-        retried: true,
-        reportCheckedEvent: event,
-      };
+    const secondRedaction = redactReadingText(
+      retriedReading,
+      options.redactor,
+      options.redactionOptions
+    );
+    if (secondRedaction.ok) {
+      secondReading = secondRedaction.text;
+      second = checkReading(secondReading, index);
+      if (second.passed) {
+        const event = emit(second, secondReading, false, true);
+        return {
+          passed: true,
+          reading: secondReading,
+          narrativeDropped: false,
+          fallbackNotice: null,
+          reportCheck: second,
+          retried: true,
+          reportCheckedEvent: event,
+        };
+      }
+    } else {
+      second = redactionFailureCheck();
+      secondReading = null;
     }
   }
 

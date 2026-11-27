@@ -557,4 +557,47 @@ describe("Property 20: context cap steering escalates to cancellation (Requireme
       db.close();
     }
   });
+
+  it("retries cancel_turn once eventStore.append recovers after a transient failure", () => {
+    const db = new DatabaseSync(":memory:");
+    const eventStore = new EventStore(db);
+    // The first append fails, every append afterwards is delegated to the real store.
+    let appendAttempts = 0;
+    const flakyStore = {
+      append: (input: Parameters<EventStore["append"]>[0]) => {
+        appendAttempts += 1;
+        if (appendAttempts === 1) {
+          throw new Error("event store unavailable");
+        }
+        return eventStore.append(input);
+      },
+    } as unknown as EventStore;
+    const governor = new BudgetGovernor({
+      runId: "ctx-retry",
+      eventStore: flakyStore,
+      caps: { contextPressurePercent: 40 },
+      codeCeiling: { contextPressurePercent: 100 },
+      contextCancelMarginPercent: 10,
+      now: () => 0,
+    });
+    try {
+      // First breach is already past the cancel boundary, but the escalation append fails.
+      governor.recordContextPressure(80);
+      governor.evaluate();
+      assert.equal(eventStore.getEvents("ctx-retry", { kind: "budget.exceeded" }).length, 0);
+
+      // The failed append did not latch the escalation, so the next evaluation retries and succeeds.
+      governor.evaluate();
+      const exceeded = eventStore.getEvents("ctx-retry", { kind: "budget.exceeded" });
+      assert.equal(exceeded.length, 1);
+      assert.equal(exceeded[0].data.action, "cancel_turn");
+      assert.equal(governor.canDispatchSandboxExec().allowed, false);
+
+      // The escalation is now latched, so a further evaluation does not re-emit it.
+      governor.evaluate();
+      assert.equal(eventStore.getEvents("ctx-retry", { kind: "budget.exceeded" }).length, 1);
+    } finally {
+      db.close();
+    }
+  });
 });

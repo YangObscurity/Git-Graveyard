@@ -362,8 +362,8 @@ test("report-check: install error rows redact secret tokens and keys", () => {
 
 test("report-check: a caller-supplied redactor is honored for install error text", () => {
   const redactor = new Redactor({ autoRegisterEnvSecrets: false });
-  const customSecret = "custom-install-secret-value";
-  redactor.registerSecret(customSecret);
+  const canaryMarker = "CANARY-install-redaction-sample";
+  redactor.registerSecret(canaryMarker);
 
   const result = assignRunOutcomeWithInstallComparison({
     tasks: [{ id: "task-1", state: "merged" }],
@@ -371,13 +371,13 @@ test("report-check: a caller-supplied redactor is honored for install error text
     newInstallError: {
       command: "npm ci",
       exitCode: 1,
-      stderr: `leaked ${customSecret} while installing`,
+      stderr: `leaked ${canaryMarker} while installing`,
     },
     redactor,
   });
 
   assert.equal(result.installComparison.hasInstallErrors, true);
-  assert.ok(!String(result.installComparison.new?.error).includes(customSecret));
+  assert.ok(!String(result.installComparison.new?.error).includes(canaryMarker));
   assert.ok(String(result.installComparison.new?.error).includes("[REDACTED]"));
 });
 
@@ -483,33 +483,33 @@ test("report-check: ScribeService applies the injected redactor to installCompar
   });
 
   const redactor = new Redactor({ autoRegisterEnvSecrets: false });
-  const secret = "scribe-custom-secret-xyz-987654";
-  redactor.registerSecret(secret);
+  const canaryMarker = "CANARY-scribe-custom-sample";
+  redactor.registerSecret(canaryMarker);
 
   const service = new ScribeService({
     runStore,
     eventStore,
     redactor,
-    scribeRunner: () => `Build failed with ${secret} (cmd:missing).`,
+    scribeRunner: () => `Build failed with ${canaryMarker} (cmd:missing).`,
   });
   const result = await service.run({
     runId: "run-svc-redactor",
     newInstallError: {
-      command: `npm ci --secret ${secret}`,
+      command: `npm ci --secret ${canaryMarker}`,
       exitCode: 1,
-      error: `install failed with ${secret}`,
+      error: `install failed with ${canaryMarker}`,
     },
   });
 
   assert.equal(result.installComparison.hasInstallErrors, true);
-  assert.ok(!String(result.installComparison.new?.error).includes(secret));
-  assert.ok(!String(result.installComparison.new?.command).includes(secret));
+  assert.ok(!String(result.installComparison.new?.error).includes(canaryMarker));
+  assert.ok(!String(result.installComparison.new?.command).includes(canaryMarker));
   assert.ok(String(result.installComparison.new?.error).includes("[REDACTED]"));
 
   const events = eventStore.getEvents("run-svc-redactor", { kind: "report.checked" });
   assert.equal(events.length, 1);
   const serialized = JSON.stringify(events[0].data);
-  assert.ok(!serialized.includes(secret));
+  assert.ok(!serialized.includes(canaryMarker));
   assert.ok(serialized.includes("[REDACTED]"));
 });
 
@@ -661,8 +661,8 @@ test("report-check: install error ref is redacted while plain refs pass through"
   assert.equal(plain.installComparison.new?.ref, "cmd:install");
 
   const redactor = new Redactor({ autoRegisterEnvSecrets: false });
-  const custom = "custom-ref-secret-abc-123456";
-  redactor.registerSecret(custom);
+  const canary = "CANARY-ref-redaction-sample";
+  redactor.registerSecret(canary);
   const withRedactor = assignRunOutcomeWithInstallComparison({
     tasks: [{ id: "task-1", state: "merged" }],
     finalCheck: { installPassed: false },
@@ -670,11 +670,11 @@ test("report-check: install error ref is redacted while plain refs pass through"
       command: "npm ci",
       exitCode: 1,
       error: "install failed",
-      ref: `cmd:${custom}`,
+      ref: `cmd:${canary}`,
     },
     redactor,
   });
-  assert.ok(!String(withRedactor.installComparison.new?.ref).includes(custom));
+  assert.ok(!String(withRedactor.installComparison.new?.ref).includes(canary));
 });
 
 test("report-check: inline backtick citations resolve without the trailing backtick", () => {
@@ -703,9 +703,10 @@ test("report-check: inline backtick citations resolve without the trailing backt
   assert.equal(checkReading("See file:src/app.ts.", index).passed, true);
 });
 
-test("report-check: runReportCheckWithRetry fails closed when redactor.redactText throws", async () => {
+test("report-check: runReportCheckWithRetry drops the narrative when redactor.redactText throws", async () => {
   const { eventStore } = makeStores();
   const index = buildEvidenceIndex({ commandResults: [{ id: "build" }] });
+  const canaryMarker = "CANARY-scribe-redaction-sample";
   const throwing = {
     redactText: () => {
       throw new Error("redact exploded");
@@ -713,23 +714,34 @@ test("report-check: runReportCheckWithRetry fails closed when redactor.redactTex
   } as unknown as Redactor;
 
   const result = await runReportCheckWithRetry({
-    reading: "Build passed with top-secret-value (cmd:build).",
+    reading: `Build passed with ${canaryMarker} (cmd:build).`,
     index,
     retry: () => null,
     eventStore,
     runId: "run-redact-fail",
     redactor: throwing,
+    redactionOptions: { secrets: [canaryMarker] },
   });
 
-  // A throwing redactor never leaks the original draft: the reading fails closed
-  // to the mask before any verification.
-  assert.equal(result.reading, "[REDACTED]");
+  // A throwing redactor marks the attempt failed instead of verifying a mask that
+  // would falsely pass, so the narrative is dropped and the fallback emitted.
+  assert.equal(result.passed, false);
+  assert.equal(result.narrativeDropped, true);
+  assert.equal(result.reading, SCRIBE_NARRATIVE_FALLBACK_NOTICE);
+  assert.equal(result.fallbackNotice, SCRIBE_NARRATIVE_FALLBACK_NOTICE);
+  assert.ok(!result.reading.includes(canaryMarker));
   assert.ok(!result.reading.includes("cmd:build"));
-  assert.ok(!result.reading.includes("top-secret-value"));
+  assert.ok(
+    result.reportCheck.unbackedClaims.some((c) => c.claim === "redaction")
+  );
 
   const events = eventStore.getEvents("run-redact-fail", { kind: "report.checked" });
   assert.equal(events.length, 1);
-  assert.ok(!JSON.stringify(events[0].data).includes("top-secret-value"));
+  const serialized = JSON.stringify(events[0].data);
+  assert.ok(!serialized.includes(canaryMarker));
+  assert.equal(events[0].data.passed, false);
+  assert.equal(events[0].data.narrativeDropped, true);
+  assert.equal(events[0].data.fallbackNotice, SCRIBE_NARRATIVE_FALLBACK_NOTICE);
 });
 
 test("report-check: install error text fails closed when the redactor throws", () => {
@@ -774,14 +786,14 @@ test("report-check: ScribeService returns a redacted scribeReading with citation
   });
 
   const redactor = new Redactor({ autoRegisterEnvSecrets: false });
-  const secret = "scribe-leak-secret-abc-123456";
-  redactor.registerSecret(secret);
+  const canaryMarker = "CANARY-scribe-redaction-sample";
+  redactor.registerSecret(canaryMarker);
 
   const service = new ScribeService({
     runStore,
     eventStore,
     redactor,
-    scribeRunner: () => `Build passed with ${secret} (cmd:build).`,
+    scribeRunner: () => `Build passed with ${canaryMarker} (cmd:build).`,
   });
   const result = await service.run({
     runId: "run-svc-leak",
@@ -790,11 +802,66 @@ test("report-check: ScribeService returns a redacted scribeReading with citation
 
   assert.equal(result.narrativeDropped, false);
   assert.equal(result.reportCheck.passed, true);
-  assert.ok(!result.scribeReading.includes(secret));
+  assert.ok(!result.scribeReading.includes(canaryMarker));
   assert.ok(result.scribeReading.includes("[REDACTED]"));
   assert.ok(result.scribeReading.includes("cmd:build"));
 
   const events = eventStore.getEvents("run-svc-leak", { kind: "report.checked" });
-  assert.ok(!JSON.stringify(events.map((e) => e.data)).includes(secret));
+  assert.ok(!JSON.stringify(events.map((e) => e.data)).includes(canaryMarker));
+});
+
+test("report-check: redactionOptions.secrets are honored with and without a redactor", async () => {
+  const { eventStore } = makeStores();
+  const index = buildEvidenceIndex({ commandResults: [{ id: "build" }] });
+  const canaryMarker = "CANARY-scribe-redaction-sample";
+
+  // Initial attempt passes: the security option redacts the canary even with no
+  // redactor injected.
+  const withoutRedactor = await runReportCheckWithRetry({
+    reading: `Build passed with ${canaryMarker} (cmd:build).`,
+    index,
+    retry: () => null,
+    eventStore,
+    runId: "run-opt-none",
+    redactionOptions: { secrets: [canaryMarker] },
+  });
+  assert.equal(withoutRedactor.passed, true);
+  assert.equal(withoutRedactor.narrativeDropped, false);
+  assert.ok(!withoutRedactor.reading.includes(canaryMarker));
+  assert.ok(withoutRedactor.reading.includes("[REDACTED]"));
+  assert.ok(withoutRedactor.reading.includes("cmd:build"));
+
+  // The same security option is applied before the redactor when both are present.
+  const redactor = new Redactor({ autoRegisterEnvSecrets: false });
+  const withRedactor = await runReportCheckWithRetry({
+    reading: `Build passed with ${canaryMarker} (cmd:build).`,
+    index,
+    retry: () => null,
+    eventStore,
+    runId: "run-opt-redactor",
+    redactor,
+    redactionOptions: { secrets: [canaryMarker] },
+  });
+  assert.equal(withRedactor.passed, true);
+  assert.ok(!withRedactor.reading.includes(canaryMarker));
+  assert.ok(withRedactor.reading.includes("[REDACTED]"));
+
+  // Retry path: the first reading fails and the repaired reading is redacted too.
+  const retryRedacted = await runReportCheckWithRetry({
+    reading: "Build passed.",
+    index,
+    retry: () => `Build passed with ${canaryMarker} (cmd:build).`,
+    eventStore,
+    runId: "run-opt-retry",
+    redactionOptions: { secrets: [canaryMarker] },
+  });
+  assert.equal(retryRedacted.passed, true);
+  assert.equal(retryRedacted.retried, true);
+  assert.ok(!retryRedacted.reading.includes(canaryMarker));
+  assert.ok(retryRedacted.reading.includes("[REDACTED]"));
+
+  const events = eventStore.getEvents("run-opt-retry", { kind: "report.checked" });
+  assert.equal(events.length, 1);
+  assert.ok(!JSON.stringify(events[0].data).includes(canaryMarker));
 });
 

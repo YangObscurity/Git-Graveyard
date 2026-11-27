@@ -912,6 +912,32 @@ describe("FifoQueue cap normalization and caps isolation (Task 22.2)", () => {
     assert.deepEqual(queue.list()[0].caps, { maxMinutes: 30, nested: { tool: 5 } });
     assert.deepEqual(queue.snapshot().entries[0].caps, { maxMinutes: 30, nested: { tool: 5 } });
   });
+
+  it("isolates non-cloneable caps so no nested reference is shared with the queue", () => {
+    const { eventStore } = makeHarness();
+    const queue = new FifoQueue({ eventStore });
+    // A function property makes `structuredClone` throw, forcing the recursive fallback path.
+    const caps: Record<string, unknown> = { nested: { tool: 5 }, extra: () => "nope" };
+    const result = queue.enqueue({ runId: "nonclone-run", caps });
+    assert.equal(result.ok, true);
+
+    // The non-cloneable leaf is dropped and the cloneable nesting survives in isolation.
+    const queued = queue.list()[0].caps as Record<string, unknown>;
+    assert.deepEqual(queued.nested, { tool: 5 });
+    assert.equal("extra" in queued, false);
+
+    // Mutating the caller's nested object after enqueue must not change the queued caps.
+    (caps.nested as Record<string, unknown>).tool = 999;
+    assert.deepEqual(queue.list()[0].caps, { nested: { tool: 5 } });
+
+    // Mutating a returned snapshot (or an enqueue result) must not change the queued caps either.
+    const snapshotCaps = queue.snapshot().entries[0].caps as Record<string, unknown>;
+    (snapshotCaps.nested as Record<string, unknown>).tool = 777;
+    const resultCaps = result.ok ? (result.entry.caps as Record<string, unknown>) : {};
+    (resultCaps.nested as Record<string, unknown>).tool = 555;
+    assert.deepEqual(queue.list()[0].caps, { nested: { tool: 5 } });
+    assert.deepEqual(queue.snapshot().entries[0].caps, { nested: { tool: 5 } });
+  });
 });
 
 

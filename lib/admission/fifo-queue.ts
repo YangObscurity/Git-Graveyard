@@ -79,9 +79,68 @@ function resolveDefaultQueueDepth(): number {
   return Number.isFinite(raw) && raw > 0 ? Math.max(1, Math.floor(raw)) : 5;
 }
 
+/** Sentinel returned by {@link deepCloneCapsValue} for a value that cannot be cloned at all. */
+const DROP_UNCLONEABLE = Symbol("drop-uncloneable");
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== "object") {
+    return false;
+  }
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+/**
+ * Recursively clones a value that {@link structuredClone} could not copy, so no nested reference is
+ * ever shared with the caller. Cloneable subtrees are still deep-copied with `structuredClone`; plain
+ * nested objects/arrays are rebuilt depth-first; values that cannot be cloned at all (functions,
+ * symbols, exotic class instances) are dropped.
+ */
+function deepCloneCapsValue(value: unknown, seen: WeakMap<object, unknown>): unknown {
+  // Any subtree `structuredClone` can copy is copied whole, exactly like the success path.
+  try {
+    return structuredClone(value);
+  } catch {
+    // Fall through: the subtree contains a value `structuredClone` refuses to copy.
+  }
+  if (Array.isArray(value)) {
+    if (seen.has(value)) {
+      return seen.get(value);
+    }
+    const out: unknown[] = [];
+    seen.set(value, out);
+    for (const item of value) {
+      const cloned = deepCloneCapsValue(item, seen);
+      if (cloned !== DROP_UNCLONEABLE) {
+        out.push(cloned);
+      }
+    }
+    return out;
+  }
+  if (isPlainObject(value)) {
+    if (seen.has(value)) {
+      return seen.get(value);
+    }
+    const out: Record<string, unknown> = {};
+    seen.set(value, out);
+    for (const [key, item] of Object.entries(value)) {
+      const cloned = deepCloneCapsValue(item, seen);
+      if (cloned !== DROP_UNCLONEABLE) {
+        out[key] = cloned;
+      }
+    }
+    return out;
+  }
+  return DROP_UNCLONEABLE;
+}
+
 /**
  * Deep-clones a queued run's `caps` so a caller cannot mutate a queued entry through the object it
  * passed in, and a consumer of a returned snapshot cannot mutate the queue's stored caps.
+ *
+ * The cloneable success path is `structuredClone`. When it throws (for example because a function or
+ * symbol is present) the object is cloned recursively instead, dropping the non-cloneable values, so
+ * that no nested reference is ever shared with the caller.
  */
 function cloneCaps(
   caps: Record<string, unknown> | null | undefined
@@ -89,12 +148,13 @@ function cloneCaps(
   if (!caps || typeof caps !== "object") {
     return null;
   }
-  try {
-    return structuredClone(caps);
-  } catch {
-    // A value that cannot be structured-cloned still must not be shared by reference.
-    return { ...caps };
+  const cloned = deepCloneCapsValue(caps, new WeakMap());
+  if (cloned === DROP_UNCLONEABLE || cloned === null || typeof cloned !== "object") {
+    // The whole record is not cloneable and not a plain object/array: reject it by returning an
+    // isolated empty record rather than sharing the caller's object by reference.
+    return {};
   }
+  return cloned as Record<string, unknown>;
 }
 
 /** Copies a queued entry with an isolated `caps` object so returned entries never alias the queue. */

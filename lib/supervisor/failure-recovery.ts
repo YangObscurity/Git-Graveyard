@@ -263,6 +263,24 @@ export interface FailureRecoveryDeps {
 }
 
 /**
+ * Extracts the persisted message id from the record returned by a message
+ * service, accepting either the `MessageRecord.id` or a `msgId` shaped record so
+ * the handler references the service-created event instead of a fabricated id.
+ */
+function extractMessageRecordId(sent: unknown): string | null {
+  if (sent && typeof sent === "object") {
+    const record = sent as { id?: unknown; msgId?: unknown };
+    if (typeof record.id === "string" && record.id.length > 0) {
+      return record.id;
+    }
+    if (typeof record.msgId === "string" && record.msgId.length > 0) {
+      return record.msgId;
+    }
+  }
+  return null;
+}
+
+/**
  * Coordinates supervisor failure recovery: pre-prompt invariant verification,
  * kiro-cli crash handling, Warden rejection overflow, silence nudges, worktree
  * quarantine and PermissionBroker watchdog timeouts.
@@ -296,6 +314,31 @@ export class FailureRecoveryHandler {
       // rather than returning partially redacted data.
       return redactAllStringLeaves(byOptions) as Record<string, unknown>;
     }
+  }
+
+  /**
+   * Looks up the `message.sent` event an injected message service appended for
+   * `msgId`, so the nudge result points at the persisted record rather than a
+   * locally fabricated id.
+   */
+  private findMessageSentEvent(
+    runId: string,
+    msgId: string
+  ): EventEnvelope | null {
+    const getEvents = this.deps.eventStore.getEvents;
+    if (typeof getEvents !== "function") {
+      return null;
+    }
+    const events = getEvents.call(this.deps.eventStore, runId, {
+      kind: "message.sent",
+    });
+    for (let i = events.length - 1; i >= 0; i--) {
+      const data = events[i].data as Record<string, unknown>;
+      if (data && data.msgId === msgId) {
+        return events[i];
+      }
+    }
+    return null;
   }
 
   /**
@@ -552,10 +595,15 @@ export class FailureRecoveryHandler {
 
     // Optional delivery: an explicit hook is preferred over an injected message
     // service. A throw or an explicit `false` means delivery failed, so the
-    // handler reports `nudged: false` and records no `message.sent` event. When
-    // neither hook is injected the nudge is emitted directly, preserving the
-    // existing event-append behavior.
+    // handler reports `nudged: false` and records no `message.sent` event. An
+    // injected message service persists the `message.sent` event itself
+    // (MessageService.send appends one), so the handler reuses that event instead
+    // of appending a duplicate; the deliverNudge hook and the direct path both
+    // append the event here.
     let delivered = true;
+    let servicePersisted = false;
+    let resolvedMsgId = msgId;
+    let serviceEvent: EventEnvelope | null = null;
     try {
       if (typeof this.deps.deliverNudge === "function") {
         delivered =
@@ -584,6 +632,11 @@ export class FailureRecoveryHandler {
           refs: [],
         });
         delivered = sent !== false;
+        if (delivered) {
+          servicePersisted = true;
+          resolvedMsgId = extractMessageRecordId(sent) ?? msgId;
+          serviceEvent = this.findMessageSentEvent(input.runId, resolvedMsgId);
+        }
       }
     } catch {
       delivered = false;
@@ -599,13 +652,25 @@ export class FailureRecoveryHandler {
       };
     }
 
+    // The message service already appended the `message.sent` record; return that
+    // event rather than appending a second one for the same nudge.
+    if (servicePersisted) {
+      return {
+        runId: input.runId,
+        nudged: true,
+        silentDurationMs: input.silentDurationMs,
+        thresholdMs,
+        event: serviceEvent,
+      };
+    }
+
     const event = this.deps.eventStore.append({
       runId: input.runId,
       kind: "message.sent",
       actor: "FailureRecoveryHandler",
       skeletonId: input.skeletonId,
       data: this.redact({
-        msgId,
+        msgId: resolvedMsgId,
         from: "necromancer",
         to,
         intent: "nudge",

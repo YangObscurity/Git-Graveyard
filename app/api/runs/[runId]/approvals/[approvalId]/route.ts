@@ -357,7 +357,11 @@ export async function POST(
     return Response.json(
       {
         ok: false,
-        error: "The approval was resolved but its audit event could not be recorded",
+        // The audit failure must not overstate the outcome: only claim the
+        // approval was resolved when a resolver actually accepted it.
+        error: resolved
+          ? "The approval was resolved but its audit event could not be recorded"
+          : "The approval was not resolved and its audit event could not be recorded",
         code: "APPROVAL_AUDIT_FAILED",
         runId,
         approvalId,

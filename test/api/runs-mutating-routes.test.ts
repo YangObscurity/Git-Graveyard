@@ -807,6 +807,64 @@ describe("mutating run API routes", () => {
       assert.equal(data.approvalId, "appr-audit");
       assert.equal(data.decision, "approve_once");
       assert.equal(data.resolved, true);
+      assert.equal(
+        data.error,
+        "The approval was resolved but its audit event could not be recorded"
+      );
+    });
+
+    it("reports 500 without claiming resolution when an unresolved approval's audit event cannot be recorded", async () => {
+      const { runStore, eventStore } = makeStores();
+      const runId = "run-appr-audit-fail-unresolved";
+      makeRun(runStore, runId);
+
+      // Ownership is proven by this run's own approval.requested event.
+      eventStore.append({
+        runId,
+        kind: "approval.requested",
+        actor: "warden",
+        data: { approvalId: "appr-audit-unresolved" },
+      });
+
+      // No resolver accepts the approval, so it must not be treated as resolved.
+      (globalThis as Record<string, unknown>).__runOrchestrator = {
+        resolveApproval: async () => false,
+      };
+
+      // The audit event cannot be persisted afterwards.
+      (eventStore as unknown as { append: (...args: never[]) => unknown }).append =
+        () => {
+          throw new Error("approval audit store unavailable");
+        };
+
+      const res = await resolveApproval(
+        jsonRequest(
+          `http://test/api/runs/${runId}/approvals/appr-audit-unresolved`,
+          { decision: "approve_once" }
+        ),
+        {
+          params: Promise.resolve({
+            runId,
+            approvalId: "appr-audit-unresolved",
+          }),
+        }
+      );
+      assert.equal(res.status, 500);
+      const data = await readJson(res);
+      assert.equal(data.ok, false);
+      assert.equal(data.code, "APPROVAL_AUDIT_FAILED");
+      assert.equal(data.runId, runId);
+      assert.equal(data.approvalId, "appr-audit-unresolved");
+      assert.equal(data.decision, "approve_once");
+      assert.equal(data.resolved, false);
+      assert.equal(
+        data.error,
+        "The approval was not resolved and its audit event could not be recorded"
+      );
+      assert.ok(
+        !/was resolved but/i.test(data.error),
+        "an unresolved approval must never be reported as resolved"
+      );
     });
   });
 

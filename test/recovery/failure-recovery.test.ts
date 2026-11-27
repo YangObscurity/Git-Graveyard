@@ -22,6 +22,10 @@ import {
 } from "../../lib/recovery/boot-reconciliation";
 import { Redactor } from "../../lib/security/redactor";
 import {
+  MessageService,
+  type MessageRecord,
+} from "../../lib/messaging/message-service";
+import {
   CLAUDE_HAIKU_5_5_MODEL_ID,
   CLAUDE_OPUS_5_5_MODEL_ID,
 } from "../../lib/supervisor/model-allowlist";
@@ -1898,6 +1902,46 @@ test("failure-recovery: silence nudge populates structured fields and fails clos
   });
   assert.equal(delivered.nudged, true);
   assert.ok(delivered.event);
+});
+
+test("failure-recovery: a successful message service delivery emits exactly one message.sent event", () => {
+  const eventStore = new EventStore(":memory:");
+  const messageService = new MessageService({
+    eventStore,
+    roleBySkeletonId: { "skeleton-nudge-ok": "bonesetter" },
+  });
+
+  const sentRecords: MessageRecord[] = [];
+  const handler = new FailureRecoveryHandler({
+    eventStore,
+    messageService: {
+      send: (message) => {
+        const record = messageService.send({ ...message, refs: [...message.refs] });
+        sentRecords.push(record);
+        return record;
+      },
+    },
+  });
+
+  const result = handler.handleSilenceNudge({
+    runId: "run-nudge-service-ok",
+    skeletonId: "skeleton-nudge-ok",
+    silentDurationMs: 9000,
+    thresholdMs: 5000,
+  });
+
+  assert.equal(result.nudged, true);
+  assert.equal(sentRecords.length, 1);
+  const record = sentRecords[0];
+  assert.ok(result.event);
+  // The handler returns the event the service persisted rather than a duplicate.
+  assert.equal(result.event!.data.msgId, record.id);
+
+  const sent = eventStore.getEvents("run-nudge-service-ok", { kind: "message.sent" });
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].data.msgId, record.id);
+  assert.equal(sent[0].seq, result.event!.seq);
+  assert.equal(sent[0].actor, "necromancer");
 });
 
 test("failure-recovery: handleKiroCreditExhaustion preserves an already done run", () => {
