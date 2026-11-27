@@ -153,7 +153,11 @@ export interface RaiseAskInput {
 
 export interface RequestApprovalInput {
   runId: string;
-  commandText: string;
+  /**
+   * Displayed command. When omitted it is derived canonically from `argv`; when
+   * supplied alongside `argv` the two must describe the same canonical command.
+   */
+  commandText?: string;
   cwd: string;
   riskClass: string;
   skeletonId: string;
@@ -253,18 +257,41 @@ export class AskManager {
    * requesting Skeleton and expiry (Requirements 28.1, 28.8, 28.10).
    */
   requestApproval(input: RequestApprovalInput): ApprovalCard {
-    if (!input.runId || !input.commandText || !input.cwd || !input.skeletonId) {
+    // The displayed command and the argv used for grant tracking must describe
+    // the same canonical command. A non-empty `argv` is canonical; when
+    // `commandText` is omitted it is derived canonically from that `argv`.
+    const suppliedArgv =
+      Array.isArray(input.argv) && input.argv.length > 0 ? [...input.argv] : undefined;
+    const canonicalCommandText = input.commandText || suppliedArgv?.join(" ");
+    if (!input.runId || !canonicalCommandText || !input.cwd || !input.skeletonId) {
       throw new AskManagerError(
-        "requestApproval requires runId, commandText, cwd and skeletonId",
+        "requestApproval requires runId, commandText (or argv), cwd and skeletonId",
         "INVALID_INPUT"
       );
+    }
+    // When both are supplied they must tokenize to the same canonical command;
+    // otherwise a caller could display one command while registering a grant
+    // for a different one.
+    if (input.commandText && suppliedArgv) {
+      const tokenized = tokenizeSimpleCommand(input.commandText).map((w) =>
+        removeQuotes(w)
+      );
+      const matches =
+        tokenized.length === suppliedArgv.length &&
+        tokenized.every((t, i) => t === suppliedArgv[i]);
+      if (!matches) {
+        throw new AskManagerError(
+          "requestApproval argv and commandText must match the same canonical command",
+          "INVALID_INPUT"
+        );
+      }
     }
     this.askSeq += 1;
     const approvalId = input.approvalId ?? `${input.runId}:approval:${this.askSeq}`;
     const raisedAt = this.now();
     const expiresAt = input.expiresAt ?? raisedAt + this.approvalWaitMs;
     const options = ASK_OPTIONS.approve_command;
-    const commandText = redactText(input.commandText);
+    const commandText = redactText(canonicalCommandText);
     const cwd = redactText(input.cwd);
     const reason = redactText(input.reason ?? input.riskClass);
     const question = redactText(`Approve command '${commandText}' in ${cwd}?`);
@@ -272,12 +299,11 @@ export class AskManager {
     // Keep the unredacted, tokenized argv and raw cwd/command so grant
     // tracking can register inputs that a later consumeGrant call can match.
     const rawArgv =
-      Array.isArray(input.argv) && input.argv.length > 0
-        ? [...input.argv]
-        : tokenizeSimpleCommand(input.commandText).map((w) => removeQuotes(w));
+      suppliedArgv ??
+      tokenizeSimpleCommand(canonicalCommandText).map((w) => removeQuotes(w));
     this.rawApprovalGrantInputs.set(approvalId, {
       argv: rawArgv,
-      commandText: input.commandText,
+      commandText: canonicalCommandText,
       cwd: input.cwd,
     });
 
