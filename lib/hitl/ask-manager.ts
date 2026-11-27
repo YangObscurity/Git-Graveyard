@@ -10,6 +10,7 @@ import type { EventStore } from "../events/event-store";
 import { checkBudgetIncreaseHardBlocks } from "../policy/hard-blocks";
 import { redactText } from "../security/redactor";
 import type { ApprovalManager } from "../gateway/approval-manager";
+import { removeQuotes, tokenizeSimpleCommand } from "../gateway/command-policy";
 
 export type HitlEventSink = Pick<EventStore, "append">;
 
@@ -156,6 +157,11 @@ export interface RequestApprovalInput {
   cwd: string;
   riskClass: string;
   skeletonId: string;
+  /**
+   * Unredacted, already-tokenized argv for grant tracking. When omitted, the
+   * raw argv is derived from `commandText`.
+   */
+  argv?: readonly string[];
   reason?: string;
   taskId?: string;
   expiresAt?: number;
@@ -184,6 +190,14 @@ export class AskManager {
   private readonly asks = new Map<string, AskRecord>();
   private readonly decisions = new Map<string, NecromancerDecision>();
   private readonly activePlannerSessions = new Map<string, string>();
+  /**
+   * Raw (unredacted) approval inputs keyed by approvalId so grant tracking can
+   * register the exact argv/cwd/command that must later match a consumeGrant.
+   */
+  private readonly rawApprovalGrantInputs = new Map<
+    string,
+    { argv: string[]; commandText: string; cwd: string }
+  >();
   private askSeq = 0;
   private decisionSeq = 0;
 
@@ -254,6 +268,18 @@ export class AskManager {
     const cwd = redactText(input.cwd);
     const reason = redactText(input.reason ?? input.riskClass);
     const question = redactText(`Approve command '${commandText}' in ${cwd}?`);
+
+    // Keep the unredacted, tokenized argv and raw cwd/command so grant
+    // tracking can register inputs that a later consumeGrant call can match.
+    const rawArgv =
+      Array.isArray(input.argv) && input.argv.length > 0
+        ? [...input.argv]
+        : tokenizeSimpleCommand(input.commandText).map((w) => removeQuotes(w));
+    this.rawApprovalGrantInputs.set(approvalId, {
+      argv: rawArgv,
+      commandText: input.commandText,
+      cwd: input.cwd,
+    });
 
     const ask: AskRecord = {
       askId: approvalId,
@@ -360,6 +386,7 @@ export class AskManager {
     ask.answeredAt = answeredAt;
     ask.effect = effect;
     this.delegateApprovalGrant(ask, normalized);
+    this.rawApprovalGrantInputs.delete(ask.askId);
     return ask;
   }
 
@@ -371,13 +398,17 @@ export class AskManager {
     const manager = this.approvalManager;
     if (!manager || ask.kind !== "approve_command" || !ask.card) return;
     const skeletonId = ask.skeletonId ?? ask.card.skeletonId;
+    const raw = this.rawApprovalGrantInputs.get(ask.askId);
+    const argv = raw?.argv ?? [ask.card.commandText];
+    const commandText = raw?.commandText ?? ask.card.commandText;
+    const cwd = raw?.cwd ?? ask.card.cwd;
     try {
       if (decision === "Approve once") {
-        manager.grantOnce(skeletonId, [ask.card.commandText], ask.card.cwd, undefined, ask.runId);
+        manager.grantOnce(skeletonId, argv, cwd, undefined, ask.runId);
       } else if (decision === "Approve this pattern for the run") {
-        manager.addPatternApproval(ask.runId, ask.card.commandText, {
-          command: ask.card.commandText,
-          cwd: ask.card.cwd,
+        manager.addPatternApproval(ask.runId, commandText, {
+          command: commandText,
+          cwd,
           skeletonId,
           approvedBy: "user",
           description: decision,
@@ -625,6 +656,10 @@ export class AskManager {
     ask.expiredAt = at;
     ask.answer = ask.defaultAction;
     ask.effect = effect;
+
+    if (ask.kind === "approve_command") {
+      this.rawApprovalGrantInputs.delete(ask.askId);
+    }
 
     if (ask.kind === "exceed_budget") {
       this.decide({

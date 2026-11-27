@@ -396,5 +396,83 @@ describe("RunOrchestrator: explicit push confirmation (Requirement 29.5)", () =>
     assert.equal(results.length, 1, "push.result must not be double-emitted");
     assert.equal(results[0].data.reason, "recorded by git service");
   });
+
+  it("routes push events through the orchestrator emitEvent redaction path", async () => {
+    const repoCtx = createTestRepo("run-pc-redact");
+    tmpDirs.push(repoCtx.tmpDir);
+    const harness = createHarness(repoCtx);
+    seedRun(harness, repoCtx);
+    const secret = ["gh", "p_", "orchestrator", "secret", "token", "1234"].join("");
+
+    (harness.gitService as unknown as { pushToFork: unknown }).pushToFork = async (
+      runId: string,
+      options: Record<string, unknown>
+    ) => {
+      const emit = options.emitEvent as (e: Record<string, unknown>) => void;
+      assert.equal(typeof emit, "function");
+      emit({
+        runId,
+        kind: "push.requested",
+        actor: "necromancer",
+        data: {
+          branch: `graveyard/${runId}`,
+          targetRepoUrl: "https://github.com/fork-owner/example-repo",
+          note: `bearer ${secret}`,
+        },
+        ts: Date.now(),
+      });
+      emit({
+        runId,
+        kind: "push.result",
+        actor: "necromancer",
+        data: {
+          ok: true,
+          branch: `graveyard/${runId}`,
+          targetRepoUrl: "https://github.com/fork-owner/example-repo",
+          stdout: secret,
+        },
+        ts: Date.now(),
+      });
+      return {
+        ok: true,
+        runId,
+        branch: `graveyard/${runId}`,
+        targetRepoUrl: "https://github.com/fork-owner/example-repo",
+        commitSha: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+      };
+    };
+
+    const runners = buildRunners();
+    const orchestrator = new RunOrchestrator({
+      host: harness.host,
+      gitService: harness.gitService,
+      runsDir: repoCtx.runsDir,
+      ...runners,
+      pushConfirm: true,
+    } as never);
+    activeOrchestrators.push(orchestrator);
+    const handle = orchestrator.startRun(repoCtx.runId);
+    await handle.promise;
+
+    const requested = harness.eventStore.getEvents(repoCtx.runId, {
+      kind: "push.requested",
+    });
+    assert.equal(requested.length, 1);
+    assert.equal(requested[0].data.branch, `graveyard/${repoCtx.runId}`);
+    assert.equal(
+      JSON.stringify(requested).includes(secret),
+      false,
+      "host emitEvent must redact secrets before recording"
+    );
+
+    const results = harness.eventStore.getEvents(repoCtx.runId, { kind: "push.result" });
+    assert.equal(results.length, 1, "push.result must not be double-emitted");
+    assert.equal(results[0].data.ok, true);
+    assert.equal(
+      JSON.stringify(results).includes(secret),
+      false,
+      "host emitEvent must redact secrets before recording"
+    );
+  });
 });
 

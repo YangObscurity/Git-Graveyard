@@ -366,3 +366,72 @@ test("parseDiffPaths: deleted lines inside a hunk body are never read as file pa
   assert.equal(parseDiffPaths(intoProtected).includes(".kiro/steering/tech.md"), false);
 });
 
+test("checkCommandHardBlocks: attached and clustered -v host binds are blocked", () => {
+  for (const argv of [
+    ["docker", "run", "-v/:/host", "alpine"],
+    ["docker", "run", "-v=/:/host", "alpine"],
+    ["docker", "run", "-itv", "/:/host", "alpine"],
+    ["docker", "run", "-itv=/:/host", "alpine"],
+    ["docker", "run", "--volume=./local:/container", "alpine"],
+  ]) {
+    const result = checkCommandHardBlocks(argv);
+    assert.equal(result.blocked, true, `${argv.join(" ")} must be blocked`);
+    assert.equal(result.code, "HARD_BLOCK_HOST_MOUNT");
+  }
+
+  assert.equal(isHostBindVolumeMount(["-v/:/host"]), true);
+  assert.equal(isHostBindVolumeMount(["-v=/:/host"]), true);
+  assert.equal(isHostBindVolumeMount(["-itv", "/:/host"]), true);
+  assert.equal(isHostBindVolumeMount(["-itv=/:/host"]), true);
+  assert.equal(isHostBindVolumeMount(["--volume", "./local:/container"]), true);
+
+  // Benign bare -v paths stay allowed: no `<host>:<container>` pair.
+  assert.equal(checkCommandHardBlocks(["pytest", "-v", "/tests"]).blocked, false);
+  assert.equal(checkCommandHardBlocks(["grep", "-v", "/etc"]).blocked, false);
+  assert.equal(isHostBindVolumeMount(["pytest", "-v", "/tests"]), false);
+  assert.equal(isHostBindVolumeMount(["-itv", "/tests"]), false);
+});
+
+test("checkCommandHardBlocks: quoted sh -c payloads cannot bypass the hard blocks", () => {
+  const cases: Array<[string[], string]> = [
+    [["sh", "-c", '"rm" -rf "/"'], "HARD_BLOCK_DESTRUCTIVE_HOST_OP"],
+    [["sh", "-c", 'dd "of=/dev/sda"'], "HARD_BLOCK_DESTRUCTIVE_HOST_OP"],
+    [["sh", "-c", 'docker run "-v" "/:/host" alpine'], "HARD_BLOCK_HOST_MOUNT"],
+  ];
+  for (const [argv, code] of cases) {
+    const result = checkCommandHardBlocks(argv);
+    assert.equal(result.blocked, true, `${argv.join(" ")} must be blocked`);
+    assert.equal(result.code, code, `${argv.join(" ")} expected ${code}`);
+  }
+});
+
+test("parseDiffPaths: parses a two-file diff without diff --git headers", () => {
+  const diff = [
+    "--- a/src/app.ts",
+    "+++ b/src/app.ts",
+    "@@ -1,2 +1,2 @@",
+    " context line",
+    "-old line",
+    "+new line",
+    "--- a/.kiro/steering/tech.md",
+    "+++ b/.kiro/steering/tech.md",
+    "@@ -1 +1 @@",
+    "-old",
+    "+new",
+  ].join("\n");
+
+  const paths = parseDiffPaths(diff);
+  assert.ok(paths.includes("src/app.ts"), "first file path must be parsed");
+  assert.ok(
+    paths.includes(".kiro/steering/tech.md"),
+    "second file path must be parsed"
+  );
+
+  const result = validateCandidateDiff(diff);
+  assert.equal(result.blocked, true);
+  assert.equal(result.code, "HARD_BLOCK_PROTECTED_PATH");
+  assert.ok(
+    (result.details?.offenders as string[]).includes(".kiro/steering/tech.md")
+  );
+});
+

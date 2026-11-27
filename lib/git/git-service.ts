@@ -6,6 +6,7 @@ import * as path from "node:path";
 import { candidateSha256FromDiff } from "../merge/candidate-hash";
 import type { GateResultInput } from "../merge/types";
 import type { EventStore } from "../events/event-store";
+import { redactEvent } from "../security/redactor";
 import { isCheckPassing, validateWardenVerdict } from "../warden/warden-review";
 
 export const GIT_HOOKS_FLAG = "core.hooksPath=/dev/null";
@@ -474,6 +475,18 @@ export interface PushToForkOptions {
   pushConfirm?: boolean;
   /** Optional event sink for `push.requested` / `push.result`. */
   eventStore?: Pick<EventStore, "append">;
+  /**
+   * Optional redacting event emitter. When supplied it receives the fully
+   * redacted `push.requested` / `push.result` events and takes precedence over
+   * `eventStore`.
+   */
+  emitEvent?: (event: {
+    runId: string;
+    kind: string;
+    actor: string;
+    data: Record<string, unknown>;
+    ts: number;
+  }) => void;
 }
 
 export interface PushToForkResult {
@@ -3055,16 +3068,22 @@ export class GitService {
     activePushLocks.add(effectiveRunId);
 
     const emitPushEvent = (kind: string, data: Record<string, unknown>): void => {
-      const sink = options.eventStore;
-      if (!sink || typeof sink.append !== "function") return;
+      const event = {
+        runId: effectiveRunId,
+        kind,
+        actor: "necromancer",
+        data: { branch, targetRepoUrl: targetUrl, ...data },
+        ts: Date.now(),
+      };
+      const redacted = redactEvent(event);
       try {
-        sink.append({
-          runId: effectiveRunId,
-          kind,
-          actor: "necromancer",
-          data: { branch, targetRepoUrl: targetUrl, ...data },
-          ts: Date.now(),
-        });
+        if (typeof options.emitEvent === "function") {
+          options.emitEvent(redacted);
+          return;
+        }
+        const sink = options.eventStore;
+        if (!sink || typeof sink.append !== "function") return;
+        sink.append(redacted);
       } catch {
         // Event recording must never abort a push decision.
       }
@@ -3096,11 +3115,7 @@ esac
       const gitDir = options.gitDir ?? path.join(runRoot, "git");
       const hostGitDir = resolveHostGitDir(gitDir);
 
-      emitPushEvent("push.requested", {
-        runId: effectiveRunId,
-        branch,
-        targetRepoUrl: targetUrl,
-      });
+      emitPushEvent("push.requested", {});
 
       const shaRes = await this.#execGitInternal([
         "--git-dir",
@@ -3139,9 +3154,6 @@ esac
       );
 
       emitPushEvent("push.result", {
-        runId: effectiveRunId,
-        branch,
-        targetRepoUrl: targetUrl,
         ok: true,
         commitSha,
         stdout: redactCredentials(pushRes.stdout ?? "", token),
@@ -3161,9 +3173,6 @@ esac
       const cleanMessage = redactCredentials(err.message ?? "", token);
       const cleanStderr = redactCredentials(err.stderr ?? "", token);
       emitPushEvent("push.result", {
-        runId: effectiveRunId,
-        branch,
-        targetRepoUrl: targetUrl,
         ok: false,
         reason: cleanMessage,
       });
