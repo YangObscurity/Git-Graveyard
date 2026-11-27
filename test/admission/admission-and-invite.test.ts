@@ -81,7 +81,7 @@ describe("InviteCodeService (Task 22.1)", () => {
     const result = service.revokeCode(created.code, { adminSession: true });
     assert.equal(result.ok, true);
     assert.equal(result.codeHash, created.record.codeHash);
-    assert.equal(service.getCode(created.record.codeHash)?.revoked, true);
+    assert.equal(service.getCode(created.record.codeHash, { adminSession: true })?.revoked, true);
 
     const verified = service.verifyCode(created.code, "2.2.2.2");
     assert.equal(verified.ok, false);
@@ -101,16 +101,34 @@ describe("InviteCodeService (Task 22.1)", () => {
     assert.ok(!Object.prototype.hasOwnProperty.call(created.record, "salt"));
     assert.ok(!JSON.stringify(created.record).includes(created.code));
 
-    const list = service.listCodes();
+    // listCodes and getCode are Admin-only and never echo the plaintext.
+    assert.throws(() => service.listCodes(), InviteCodeAuthorizationError);
+    assert.throws(
+      () => service.getCode(created.record.codeHash),
+      InviteCodeAuthorizationError
+    );
+
+    const list = service.listCodes({ adminSession: true });
     assert.equal(list.length, 1);
     for (const record of list) {
       assert.ok(!Object.prototype.hasOwnProperty.call(record, "salt"));
       assert.ok(!JSON.stringify(record).includes(created.code));
     }
 
-    const byHash = service.getCode(created.record.codeHash);
+    const byHash = service.getCode(created.record.codeHash, { adminSession: true });
     assert.ok(byHash);
     assert.ok(!Object.prototype.hasOwnProperty.call(byHash, "salt"));
+    assert.ok(!JSON.stringify(byHash).includes(created.code));
+
+    // A disclosed raw hash cannot be consumed without a verified Admin context.
+    assert.throws(
+      () => service.consumeRun(created.record.codeHash),
+      InviteCodeAuthorizationError
+    );
+    assert.equal(
+      service.consumeRun(created.record.codeHash, { adminSession: true }),
+      true
+    );
   });
 
   it("defaults the push flag off and only enables it explicitly", () => {
@@ -289,6 +307,42 @@ describe("FifoQueue (Task 22.2)", () => {
     assert.equal(queue.cancel("cancel-me")?.runId, "cancel-me");
     assert.equal(runStore.getRun("cancel-me")?.outcome, "cancelled");
   });
+
+  it("finalizes evicted idle runs as done/cancelled with terminal events", () => {
+    let now = 0;
+    const { runStore, eventStore } = makeHarness();
+    const queue = new FifoQueue({
+      eventStore,
+      runStore,
+      queueIdleLimitMs: 1000,
+      now: () => now,
+    });
+
+    runStore.createRun({
+      runId: "expired",
+      url: "https://example.test/a/b",
+      sha: "e".repeat(40),
+      phase: "queued",
+      queuePosition: 1,
+    });
+    queue.enqueue({ runId: "expired" });
+    now = 5000;
+
+    const evicted = queue.evictIdle();
+    assert.deepEqual(evicted.map((entry) => entry.runId), ["expired"]);
+
+    const run = runStore.getRun("expired");
+    assert.equal(run?.phase, "done");
+    assert.equal(run?.outcome, "cancelled");
+    assert.equal(run?.queuePosition, null);
+    assert.equal(run?.endedAt, 5000);
+    assert.equal(runStore.getLivingRuns().some((r) => r.runId === "expired"), false);
+
+    assert.ok(eventStore.getEvents("expired", { kind: "run.phase" }).length >= 1);
+    const doneEvents = eventStore.getEvents("expired", { kind: "run.done" });
+    assert.ok(doneEvents.length >= 1);
+    assert.equal(doneEvents[0].data.outcome, "cancelled");
+  });
 });
 
 
@@ -411,6 +465,61 @@ describe("AdmissionController (Task 22.2)", () => {
     assert.ok(alerts.length >= 1);
     assert.equal(alerts[0].data.ownerAlert, true);
   });
+
+  it("atomically reserves live-run slots so concurrent callers cannot exceed the ceiling", () => {
+    const { runStore, eventStore } = makeHarness();
+    // concurrentLiveRuns is capped at the hard ceiling (5); the stub offers 99 to prove clamping.
+    const settings = {
+      getSetting: (key: string) => (key === "concurrentLiveRuns" ? 99 : undefined),
+      validateRequiredSettings: () => ({ ok: true, missing: [] }),
+    } as unknown as SettingsStore;
+    const controller = new AdmissionController({ settingsStore: settings, runStore, eventStore });
+    const cloud = { backendKind: "docker-cloud" };
+
+    assert.equal(controller.effectiveConcurrentLiveRuns("docker-cloud"), 5);
+
+    for (let i = 0; i < 5; i += 1) {
+      const decision = controller.checkAdmission({ ...cloud, runId: `live-${i}` });
+      assert.equal(decision.admitted, true, `run ${i} should be admitted`);
+    }
+    assert.equal(controller.getReservedCount(), 5);
+
+    // The 6th distinct run queues: live + reserved (5) >= ceiling (5).
+    const overflow = controller.checkAdmission({ ...cloud, runId: "live-5" });
+    assert.equal(overflow.admitted, false);
+    assert.equal(overflow.code, "QUEUE");
+    assert.equal(controller.getReservedCount(), 5);
+
+    // Re-admitting an already-reserved run is idempotent and never double-counts.
+    const reAdmit = controller.checkAdmission({ ...cloud, runId: "live-0" });
+    assert.equal(reAdmit.admitted, true);
+    assert.equal(controller.getReservedCount(), 5);
+
+    // Releasing a slot frees exactly one admission.
+    assert.equal(controller.releaseSlot("live-2"), true);
+    assert.equal(controller.releaseSlot("live-2"), false);
+    assert.equal(controller.getReservedCount(), 4);
+    assert.equal(controller.admitRun("live-5", cloud).admitted, true);
+    assert.equal(controller.getReservedCount(), 5);
+  });
+
+  it("never floors a fractional concurrency setting down to zero", () => {
+    const { runStore, eventStore } = makeHarness();
+    const settings = {
+      getSetting: (key: string) =>
+        key === "parallelSoulStitchers" || key === "concurrentLiveRuns" ? 0.5 : undefined,
+      validateRequiredSettings: () => ({ ok: true, missing: [] }),
+    } as unknown as SettingsStore;
+    const controller = new AdmissionController({ settingsStore: settings, runStore, eventStore });
+
+    assert.equal(controller.maxParallelSoulStitchers(), 1);
+    assert.equal(controller.effectiveConcurrentLiveRuns("docker-cloud"), 1);
+    assert.equal(controller.effectiveConcurrentLiveRuns("instabox-docker"), 1);
+    assert.equal(
+      controller.checkAdmission({ backendKind: "instabox-docker", runId: "frac-1" }).admitted,
+      true
+    );
+  });
 });
 
 describe("BudgetGovernor (Task 22.3)", () => {
@@ -442,6 +551,58 @@ describe("BudgetGovernor (Task 22.3)", () => {
     }
     governor.evaluate();
     assert.equal(eventStore.getEvents("warn-run", { kind: "budget.warning" }).length, 2);
+  });
+
+  it("clamps every initial cap down to the code and global ceilings", () => {
+    const { eventStore } = makeHarness();
+    const governor = new BudgetGovernor({
+      runId: "clamp-run",
+      eventStore,
+      caps: {
+        toolCallsPerRun: 1000,
+        promptsPerSkeleton: 1000,
+        runWallClockMs: 1_000_000,
+        contextPressurePercent: 500,
+      },
+      codeCeiling: {
+        toolCallsPerRun: 10,
+        promptsPerSkeleton: 8,
+        runWallClockMs: 100_000,
+        // contextPressurePercent intentionally has no code ceiling
+      },
+      globalCeiling: {
+        toolCallsPerRun: 5,
+        runWallClockMs: 50_000,
+        contextPressurePercent: 90,
+      },
+    });
+
+    // min(codeCeiling, globalCeiling): toolCallsPerRun -> min(10, 5) = 5.
+    assert.equal(governor.getCap("toolCallsPerRun"), 5);
+    // codeCeiling only: promptsPerSkeleton -> 8.
+    assert.equal(governor.getCap("promptsPerSkeleton"), 8);
+    // globalCeiling only: runWallClockMs -> min(1_000_000, 50_000) = 50_000.
+    assert.equal(governor.getCap("runWallClockMs"), 50_000);
+    // globalCeiling only: contextPressurePercent -> min(500, 90) = 90.
+    assert.equal(governor.getCap("contextPressurePercent"), 90);
+    assert.deepEqual(governor.getCaps(), {
+      toolCallsPerRun: 5,
+      promptsPerSkeleton: 8,
+      runWallClockMs: 50_000,
+      contextPressurePercent: 90,
+    });
+  });
+
+  it("leaves an initial cap below both ceilings untouched", () => {
+    const { eventStore } = makeHarness();
+    const governor = new BudgetGovernor({
+      runId: "under-ceiling-run",
+      eventStore,
+      caps: { toolCallsPerRun: 3 },
+      codeCeiling: { toolCallsPerRun: 100 },
+      globalCeiling: { toolCallsPerRun: 50 },
+    });
+    assert.equal(governor.getCap("toolCallsPerRun"), 3);
   });
 });
 

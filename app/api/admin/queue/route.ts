@@ -42,7 +42,8 @@ function buildQueue(request: Request) {
 }
 
 export async function GET(request: Request): Promise<Response> {
-  const auth = requireAdminAuth(request);
+  const settingsStore = resolveSettingsStore(request);
+  const auth = requireAdminAuth(request, process.env, { settingsStore });
   if (!auth.ok) {
     return auth.response;
   }
@@ -52,7 +53,8 @@ export async function GET(request: Request): Promise<Response> {
 }
 
 export async function POST(request: Request): Promise<Response> {
-  const auth = requireAdminAuth(request);
+  const settingsStore = resolveSettingsStore(request);
+  const auth = requireAdminAuth(request, process.env, { settingsStore });
   if (!auth.ok) {
     return auth.response;
   }

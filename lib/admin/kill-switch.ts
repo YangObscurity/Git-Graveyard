@@ -102,6 +102,27 @@ export class KillSwitchService {
     };
   }
 
+  /**
+   * Restores the enforcement flags from persisted state on a cold start. Called after constructing
+   * a fresh service so `isPausedNewRuns()` / `isStoppingGracefully()` match the persisted
+   * `SettingsStore` values even when the in-memory flags would otherwise begin `false`.
+   */
+  rehydrateState(state: {
+    pausedNewRuns?: boolean;
+    stoppingGracefully?: boolean;
+    lastLevel?: KillSwitchLevel | null;
+  }): void {
+    if (typeof state.pausedNewRuns === "boolean") {
+      this.pausedNewRuns = state.pausedNewRuns;
+    }
+    if (typeof state.stoppingGracefully === "boolean") {
+      this.stoppingGracefully = state.stoppingGracefully;
+    }
+    if (state.lastLevel !== undefined && state.lastLevel !== null) {
+      this.lastLevel = state.lastLevel;
+    }
+  }
+
   /** Computes the exact set of runs a level affects BEFORE it acts (Requirement 39.10). */
   preview(level: KillSwitchLevel): KillSwitchPreview {
     const living = this.runStore.getLivingRuns();

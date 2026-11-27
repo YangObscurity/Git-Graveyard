@@ -1,4 +1,4 @@
-import { resolveRunStore } from "@/lib/runtime/store-context";
+import { resolveRunStore, resolveSettingsStore } from "@/lib/runtime/store-context";
 import { requireAdminAuth } from "@/lib/admin/admin-session";
 import {
   InviteCodeAuthorizationError,
@@ -28,19 +28,21 @@ async function readBody(request: Request): Promise<InviteCodeBody> {
 }
 
 export async function GET(request: Request): Promise<Response> {
-  const auth = requireAdminAuth(request);
+  const settingsStore = resolveSettingsStore(request);
+  const auth = requireAdminAuth(request, process.env, { settingsStore });
   if (!auth.ok) {
     return auth.response;
   }
   const service = new InviteCodeService({ runStore: resolveRunStore(request) });
   return Response.json({
     ok: true,
-    inviteCodes: service.listCodes(),
+    inviteCodes: service.listCodes({ actor: auth.actor.id, adminSession: true }),
   });
 }
 
 export async function POST(request: Request): Promise<Response> {
-  const auth = requireAdminAuth(request);
+  const settingsStore = resolveSettingsStore(request);
+  const auth = requireAdminAuth(request, process.env, { settingsStore });
   if (!auth.ok) {
     return auth.response;
   }
@@ -96,7 +98,8 @@ export async function POST(request: Request): Promise<Response> {
 }
 
 export async function DELETE(request: Request): Promise<Response> {
-  const auth = requireAdminAuth(request);
+  const settingsStore = resolveSettingsStore(request);
+  const auth = requireAdminAuth(request, process.env, { settingsStore });
   if (!auth.ok) {
     return auth.response;
   }

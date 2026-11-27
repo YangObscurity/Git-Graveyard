@@ -19,6 +19,7 @@ interface PromotionAuditRecord {
   signedAt: number;
   status: string;
   signature: string;
+  items: unknown;
 }
 
 async function readBody(request: Request): Promise<PromotionAuditBody> {
@@ -30,12 +31,35 @@ async function readBody(request: Request): Promise<PromotionAuditBody> {
   }
 }
 
+/** Recursively sorts object keys so the signed payload is stable regardless of key insertion order. */
+function canonicalizeValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(canonicalizeValue);
+  }
+  if (value && typeof value === "object") {
+    const source = value as Record<string, unknown>;
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(source).sort()) {
+      out[key] = canonicalizeValue(source[key]);
+    }
+    return out;
+  }
+  return value;
+}
+
+/**
+ * Canonical signed payload. `items` is part of the HMAC-covered content, so altering the stored
+ * `items` (audit checkbox set) invalidates `verified`.
+ */
 function canonicalize(record: Omit<PromotionAuditRecord, "signature">): string {
-  return JSON.stringify({
-    actor: record.actor,
-    signedAt: record.signedAt,
-    status: record.status,
-  });
+  return JSON.stringify(
+    canonicalizeValue({
+      actor: record.actor,
+      signedAt: record.signedAt,
+      status: record.status,
+      items: record.items ?? null,
+    })
+  );
 }
 
 function sign(secret: string, canonical: string): string {
@@ -60,11 +84,13 @@ function asRecord(value: unknown): PromotionAuditRecord | null {
     signedAt: record.signedAt,
     status: record.status,
     signature: record.signature,
+    items: record.items ?? null,
   };
 }
 
 export async function GET(request: Request): Promise<Response> {
-  const auth = requireAdminAuth(request);
+  const settingsStore = resolveSettingsStore(request);
+  const auth = requireAdminAuth(request, process.env, { settingsStore });
   if (!auth.ok) {
     return auth.response;
   }
@@ -87,7 +113,8 @@ export async function GET(request: Request): Promise<Response> {
 }
 
 export async function POST(request: Request): Promise<Response> {
-  const auth = requireAdminAuth(request);
+  const settingsStore = resolveSettingsStore(request);
+  const auth = requireAdminAuth(request, process.env, { settingsStore });
   if (!auth.ok) {
     return auth.response;
   }
@@ -102,20 +129,21 @@ export async function POST(request: Request): Promise<Response> {
     : "signed";
   const actor = auth.actor.id;
   const signedAt = Date.now();
-  const canonical = canonicalize({ actor, signedAt, status });
+  const items = body.items ?? null;
+  const canonical = canonicalize({ actor, signedAt, status, items });
   const signature = sign(secret, canonical);
 
   const store = resolveSettingsStore(request);
   store.setSetting(
     PROMOTION_AUDIT_SETTING_KEY,
-    { actor, signedAt, status, signature, items: body.items ?? null },
+    { actor, signedAt, status, signature, items },
     { actor, reason: "pre-promotion Security_Access_Audit sign-off" }
   );
 
   return Response.json(
     {
       ok: true,
-      record: { actor, signedAt, status, signature },
+      record: { actor, signedAt, status, signature, items },
       verified: true,
     },
     { status: 201 }

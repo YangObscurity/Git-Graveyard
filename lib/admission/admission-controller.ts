@@ -35,6 +35,8 @@ export interface AdmissionDecision {
   queueReason?: string;
   concurrentLiveRuns?: number;
   maxParallelSoulStitchers?: number;
+  /** Number of live-run slots currently claimed through `reserveSlot` but not yet live. */
+  reservedLiveRuns?: number;
 }
 
 export interface KillSwitchStatusSource {
@@ -61,6 +63,11 @@ export interface AdmissionControllerOptions {
 export interface AdmissionCheckInput {
   repoSizeKb?: number | null;
   backendKind?: string;
+  /**
+   * When supplied, the controller atomically claims a live-run slot for this run id so concurrent
+   * callers cannot overshoot `concurrentLiveRuns` / `HARD_CONCURRENT_LIVE_RUNS_CEILING`.
+   */
+  runId?: string | null;
 }
 
 export interface AdmissionControllerState {
@@ -83,6 +90,20 @@ function readNumberSetting(store: SettingsStore | undefined, key: string): numbe
   }
 }
 
+/** Normalizes a run id to a non-empty trimmed key, or `null` when absent/blank. */
+function normalizeRunId(runId?: string | null): string | null {
+  if (typeof runId !== "string") {
+    return null;
+  }
+  const trimmed = runId.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+/** A fractional concurrency setting (`0 < configured < 1`) must never floor down to zero. */
+function effectiveConfiguredCount(configured: number | null): number {
+  return configured !== null && configured > 0 ? Math.max(1, Math.floor(configured)) : 1;
+}
+
 
 export class AdmissionController {
   private readonly settingsStore?: SettingsStore;
@@ -98,6 +119,13 @@ export class AdmissionController {
   private backoffUntil = 0;
   private capacityLimited = false;
   private capacityLimitSource: string | null = null;
+
+  /**
+   * Run ids that have been admitted but are not yet reflected by {@link countLiveRuns} (the run row
+   * may not exist yet). Claiming these synchronously keeps concurrent callers from overshooting the
+   * effective live-run limit. De-duplicated by normalized run id.
+   */
+  private readonly reservedRunIds = new Set<string>();
 
   constructor(options: AdmissionControllerOptions = {}) {
     this.settingsStore = options.settingsStore;
@@ -222,7 +250,7 @@ export class AdmissionController {
       return 1;
     }
     const configured = readNumberSetting(this.settingsStore, "parallelSoulStitchers");
-    return configured !== null && configured > 0 ? Math.floor(configured) : 1;
+    return effectiveConfiguredCount(configured);
   }
 
   getState(now?: number): AdmissionControllerState {
@@ -281,7 +309,6 @@ export class AdmissionController {
     const backendKind = input.backendKind ?? this.backendKind();
     const capacity = this.readBackendCapacity();
     const limit = this.effectiveConcurrentLiveRuns(backendKind);
-    const live = this.countLiveRuns();
 
     // Requirement 41.11: a cloud backend reporting no free slot retains the run queued.
     const cloudish = backendKind !== "instabox-docker";
@@ -292,17 +319,37 @@ export class AdmissionController {
         reason: "ExecutionBackend reports no available capacity",
         queueReason: "capacity",
         concurrentLiveRuns: limit,
+        reservedLiveRuns: this.reservedRunIds.size,
         maxParallelSoulStitchers: this.maxParallelSoulStitchers(),
       };
     }
 
-    if (live >= limit) {
+    const live = this.countLiveRuns();
+    const claimed = live + this.reservedRunIds.size;
+    const requestedRunId = normalizeRunId(input.runId);
+
+    if (requestedRunId) {
+      // Synchronously claim a slot so concurrent callers cannot overshoot the effective limit.
+      // An already-reserved run is admitted idempotently without double-counting.
+      if (!this.reservedRunIds.has(requestedRunId) && !this.reserveSlot(requestedRunId, limit)) {
+        return {
+          admitted: false,
+          code: "QUEUE",
+          reason: `Concurrency limit reached (${claimed}/${limit})`,
+          queueReason: "capacity",
+          concurrentLiveRuns: limit,
+          reservedLiveRuns: this.reservedRunIds.size,
+          maxParallelSoulStitchers: this.maxParallelSoulStitchers(),
+        };
+      }
+    } else if (claimed >= limit) {
       return {
         admitted: false,
         code: "QUEUE",
-        reason: `Concurrency limit reached (${live}/${limit})`,
+        reason: `Concurrency limit reached (${claimed}/${limit})`,
         queueReason: "capacity",
         concurrentLiveRuns: limit,
+        reservedLiveRuns: this.reservedRunIds.size,
         maxParallelSoulStitchers: this.maxParallelSoulStitchers(),
       };
     }
@@ -310,6 +357,7 @@ export class AdmissionController {
     return {
       admitted: true,
       concurrentLiveRuns: limit,
+      reservedLiveRuns: this.reservedRunIds.size,
       maxParallelSoulStitchers: this.maxParallelSoulStitchers(),
     };
   }
@@ -318,11 +366,58 @@ export class AdmissionController {
   effectiveConcurrentLiveRuns(backendKind?: string): number {
     const kind = backendKind ?? this.backendKind();
     const configured = readNumberSetting(this.settingsStore, "concurrentLiveRuns");
-    const base = configured !== null && configured > 0 ? Math.floor(configured) : 1;
+    const base = effectiveConfiguredCount(configured);
     if (kind === "instabox-docker") {
       return Math.min(base, 1);
     }
     return Math.min(base, HARD_CONCURRENT_LIVE_RUNS_CEILING);
+  }
+
+  /**
+   * Synchronously claims a live-run slot for `runId`. Idempotent: re-claiming an already reserved id
+   * returns `true` without double-counting. Returns `false` when `live + reserved >= effectiveLimit`
+   * (respecting {@link HARD_CONCURRENT_LIVE_RUNS_CEILING}). `limit` lets a caller reuse the exact
+   * limit it already resolved for a specific backend kind.
+   */
+  reserveSlot(runId: string, limit?: number): boolean {
+    const id = normalizeRunId(runId);
+    if (!id) {
+      return false;
+    }
+    if (this.reservedRunIds.has(id)) {
+      return true;
+    }
+    const effective =
+      typeof limit === "number" ? limit : this.effectiveConcurrentLiveRuns();
+    if (this.countLiveRuns() + this.reservedRunIds.size >= effective) {
+      return false;
+    }
+    this.reservedRunIds.add(id);
+    return true;
+  }
+
+  /** Releases a previously reserved slot. Returns `true` when a reservation was removed. */
+  releaseSlot(runId: string): boolean {
+    const id = normalizeRunId(runId);
+    if (!id) {
+      return false;
+    }
+    return this.reservedRunIds.delete(id);
+  }
+
+  /** Number of live-run slots currently claimed but not yet visible through {@link countLiveRuns}. */
+  getReservedCount(): number {
+    return this.reservedRunIds.size;
+  }
+
+  /** Snapshot of the reserved run ids (mostly for diagnostics/tests). */
+  getReservedRunIds(): string[] {
+    return [...this.reservedRunIds];
+  }
+
+  /** Convenience wrapper that admits `runId`, claiming its slot, via {@link checkAdmission}. */
+  admitRun(runId: string, input: AdmissionCheckInput = {}): AdmissionDecision {
+    return this.checkAdmission({ ...input, runId });
   }
 
   countLiveRuns(): number {

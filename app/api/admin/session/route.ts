@@ -1,3 +1,4 @@
+import { resolveSettingsStore } from "@/lib/runtime/store-context";
 import {
   ADMIN_SESSION_COOKIE,
   bearerTokenFromAuthorization,
@@ -48,7 +49,8 @@ function providedCredential(request: Request, body: SessionBody): string | null 
 }
 
 export async function GET(request: Request): Promise<Response> {
-  const auth = requireAdminAuth(request);
+  const settingsStore = resolveSettingsStore(request);
+  const auth = requireAdminAuth(request, process.env, { settingsStore });
   if (auth.ok) {
     return Response.json({
       ok: true,
@@ -90,8 +92,9 @@ export async function POST(request: Request): Promise<Response> {
   }
 
   clearAdminLoginAttempts(ip);
-  const actor =
-    typeof body.actor === "string" && body.actor.trim().length > 0 ? body.actor.trim() : "owner";
+  // Requirement 39.11: the actor is derived from a server-trusted principal, never from the
+  // caller-supplied body, so audit attribution cannot be spoofed.
+  const actor = process.env.ADMIN_ACTOR_ID?.trim() || "owner";
   const issued = issueAdminSession({ actor, role: "owner", secret });
 
   return Response.json(
@@ -108,13 +111,22 @@ export async function POST(request: Request): Promise<Response> {
 }
 
 export async function DELETE(request: Request): Promise<Response> {
+  const settingsStore = resolveSettingsStore(request);
+  const auth = requireAdminAuth(request, process.env, { settingsStore });
+  if (!auth.ok) {
+    return auth.response;
+  }
   const cookieToken = parseCookie(request.headers.get("cookie"), ADMIN_SESSION_COOKIE);
   let revokedSessionId: string | null = null;
   const secret = getAdminSecret();
   if (cookieToken && secret) {
     const verified = verifyAdminSessionToken(cookieToken, secret);
     if (verified.ok && verified.payload) {
-      revokeAdminSession(verified.payload.sid);
+      // Persist the revocation so it holds across requests and instances.
+      revokeAdminSession(verified.payload.sid, {
+        settingsStore,
+        expiresAt: verified.payload.exp,
+      });
       revokedSessionId = verified.payload.sid;
     }
   }

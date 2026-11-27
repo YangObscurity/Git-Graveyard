@@ -124,6 +124,32 @@ function toCapMap(input?: BudgetCaps): Map<BudgetDimension, number> {
   return map;
 }
 
+/**
+ * Requirement 30.8: an initial cap may never exceed the invite-code ceiling or the global ceiling.
+ * Every configured dimension is lowered to `min(codeCeiling[dim], globalCeiling[dim])` when a
+ * ceiling is present, so a misconfigured `caps` grant cannot bypass either bound.
+ */
+function clampCapsToCeilings(
+  caps: Map<BudgetDimension, number>,
+  codeCeiling: Map<BudgetDimension, number>,
+  globalCeiling: Map<BudgetDimension, number>
+): Map<BudgetDimension, number> {
+  const clamped = new Map<BudgetDimension, number>();
+  for (const [dim, cap] of caps) {
+    let value = cap;
+    const code = codeCeiling.get(dim);
+    if (code !== undefined) {
+      value = Math.min(value, code);
+    }
+    const global = globalCeiling.get(dim);
+    if (global !== undefined) {
+      value = Math.min(value, global);
+    }
+    clamped.set(dim, value);
+  }
+  return clamped;
+}
+
 export class BudgetGovernor {
   readonly runId: string;
 
@@ -178,9 +204,13 @@ export class BudgetGovernor {
       Number.isFinite(options.contextCancelMarginPercent)
         ? options.contextCancelMarginPercent
         : 5;
-    this.caps = toCapMap(options.caps);
     this.codeCeiling = toCapMap(options.codeCeiling);
     this.globalCeiling = toCapMap(options.globalCeiling);
+    this.caps = clampCapsToCeilings(
+      toCapMap(options.caps),
+      this.codeCeiling,
+      this.globalCeiling
+    );
     this.runStartedAt = this.now();
     this.creditsDay =
       typeof options.initialCreditsToday === "number" && Number.isFinite(options.initialCreditsToday)

@@ -79,6 +79,13 @@ function buildService(request: Request): { service: KillSwitchService; settings:
         remove: (runId) => queue.remove(runId),
       },
     });
+    // Cold start: restore enforcement flags from the persisted SettingsStore so
+    // isPausedNewRuns()/isStoppingGracefully() match what was previously executed.
+    service.rehydrateState({
+      pausedNewRuns: readBooleanSetting(settings, KILL_SWITCH_PAUSE_KEY),
+      stoppingGracefully: readBooleanSetting(settings, KILL_SWITCH_STOP_KEY),
+      lastLevel: readLastLevel(settings),
+    });
     killSwitchRegistry.__killSwitchServices.set(key, service);
   }
   return { service, settings };
@@ -127,7 +134,8 @@ function persistState(settings: SettingsStore, actor: string, service: KillSwitc
 }
 
 export async function GET(request: Request): Promise<Response> {
-  const auth = requireAdminAuth(request);
+  const settingsStore = resolveSettingsStore(request);
+  const auth = requireAdminAuth(request, process.env, { settingsStore });
   if (!auth.ok) {
     return auth.response;
   }
@@ -137,7 +145,8 @@ export async function GET(request: Request): Promise<Response> {
 }
 
 export async function POST(request: Request): Promise<Response> {
-  const auth = requireAdminAuth(request);
+  const settingsStore = resolveSettingsStore(request);
+  const auth = requireAdminAuth(request, process.env, { settingsStore });
   if (!auth.ok) {
     return auth.response;
   }

@@ -136,13 +136,27 @@ export const DEFAULT_ATTEMPT_WINDOW_MS = 60_000;
 export const DEFAULT_CODE_BYTES = 24;
 /** Upper bound on distinct per-IP attempt buckets so spoofed keys cannot exhaust memory. */
 export const MAX_IP_TRACKING_BUCKETS = 10_000;
+/**
+ * Bounded, saturating fallback ceiling on total verification attempts per window for the whole
+ * instance. It guards the coarse limit even after per-IP buckets have been evicted under pressure.
+ */
+export const MAX_GLOBAL_FALLBACK_ATTEMPTS = 10_000;
+
+/** Per-IP sliding-window attempt bucket; `lastSeenMs` drives LRU eviction. */
+interface AttemptBucket {
+  timestamps: number[];
+  lastSeenMs: number;
+}
 export class InviteCodeService {
   private readonly runStore: RunStore;
   private readonly now: () => number;
   private readonly maxAttemptsPerIp: number;
   private readonly attemptWindowMs: number;
   private readonly codeBytes: number;
-  private readonly attemptsByIp = new Map<string, number[]>();
+  private readonly attemptsByIp = new Map<string, AttemptBucket>();
+  /** Saturating, bounded global attempt counter for the current window (fallback limit). */
+  private globalFallbackCount = 0;
+  private globalFallbackWindowStart = 0;
 
   constructor(options: InviteCodeServiceOptions) {
     if (!options || !options.runStore) {
@@ -202,14 +216,22 @@ export class InviteCodeService {
     return { code, record: sanitizeInviteCode(record) };
   }
 
-  /** Sanitized list — never exposes the plaintext code or the stored salt. */
-  listCodes(): SanitizedInviteCode[] {
+  /** Sanitized list — never exposes the plaintext code or the stored salt. Admin-only. */
+  listCodes(admin?: InviteCodeAdminContext | null): SanitizedInviteCode[] {
+    this.assertAdmin(admin);
     return this.runStore.listInviteCodes().map(sanitizeInviteCode);
   }
 
-  /** Sanitized single record by hash — never exposes the plaintext code or the stored salt. */
-  getCode(codeHash: string): SanitizedInviteCode | null {
-    const record = this.runStore.getInviteCodeByHash(codeHash);
+  /**
+   * Sanitized single record by hash (or plaintext) — never exposes the plaintext code or the stored
+   * salt. Admin-only: a disclosed raw hash must not be readable unauthenticated.
+   */
+  getCode(
+    codeOrHash: string,
+    admin?: InviteCodeAdminContext | null
+  ): SanitizedInviteCode | null {
+    this.assertAdmin(admin);
+    const record = this.resolveRecord(codeOrHash);
     return record ? sanitizeInviteCode(record) : null;
   }
 
@@ -222,19 +244,38 @@ export class InviteCodeService {
       return { ok: false };
     }
     const trimmed = codeOrHash.trim();
-    const resolved = this.resolveRecord(codeOrHash);
+    const resolved = this.resolveRecord(trimmed);
     const ok = this.runStore.revokeInviteCode(resolved ? resolved.codeHash : trimmed);
     const codeHash = resolved?.codeHash ?? undefined;
     return codeHash ? { ok, codeHash } : { ok };
   }
 
-  /** Consumes one allowed run from an Invite_Code (Requirement 31.7). */
-  consumeRun(codeOrHash: string): boolean {
-    const resolved = this.resolveRecord(codeOrHash);
-    if (!resolved) {
+  /**
+   * Consumes one allowed run from an Invite_Code (Requirement 31.7). A verified plaintext code is
+   * sufficient; a bare hash (which may have been disclosed elsewhere) additionally requires a
+   * verified Admin context so it cannot be replayed unauthenticated.
+   */
+  consumeRun(codeOrHash: string, admin?: InviteCodeAdminContext | null): boolean {
+    if (typeof codeOrHash !== "string" || codeOrHash.trim().length === 0) {
       return false;
     }
-    return this.runStore.consumeInviteCodeRun(resolved.codeHash);
+    const trimmed = codeOrHash.trim();
+    // A verified plaintext resolves through the salt-compare lookup; a non-valid status here means
+    // the caller presented a plaintext that maps to a known-but-unusable code (never a raw hash).
+    const details = this.runStore.lookupInviteCodeDetails(trimmed);
+    if (details.valid) {
+      return this.runStore.consumeInviteCodeRun(details.codeHash ?? "");
+    }
+    if (details.codeHash) {
+      return false;
+    }
+    // No plaintext match: treat the value as a raw hash, which requires a verified Admin context.
+    this.assertAdmin(admin);
+    const direct = this.runStore.getInviteCodeByHash(trimmed);
+    if (!direct) {
+      return false;
+    }
+    return this.runStore.consumeInviteCodeRun(direct.codeHash);
   }
   /**
    * Verifies a plaintext code for a client IP, enforcing a per-IP sliding-window rate limit.
@@ -281,6 +322,8 @@ export class InviteCodeService {
   /** Clears the per-IP sliding window (used by tests and by the Admin "unlock" action). */
   resetRateLimits(): void {
     this.attemptsByIp.clear();
+    this.globalFallbackCount = 0;
+    this.globalFallbackWindowStart = 0;
   }
 
   private recordAndCheckRateLimit(
@@ -288,11 +331,29 @@ export class InviteCodeService {
     now: number
   ): { limited: boolean; retryAfterMs: number } {
     const cutoff = now - this.attemptWindowMs;
-    const existing = this.attemptsByIp.get(ip) ?? [];
-    const pruned = existing.filter((ts) => ts > cutoff);
+    const existing = this.attemptsByIp.get(ip);
+    const pruned = (existing?.timestamps ?? []).filter((ts) => ts > cutoff);
     pruned.push(now);
-    this.attemptsByIp.set(ip, pruned);
+    this.attemptsByIp.set(ip, { timestamps: pruned, lastSeenMs: now });
     this.pruneAttemptBuckets(cutoff);
+
+    // Saturating, bounded global fallback: when the per-IP map is saturated every bucket was
+    // evicted at least once, so per-IP tracking is unreliable; a single bounded counter still caps
+    // total attempts for the window without growing memory.
+    if (now - this.globalFallbackWindowStart >= this.attemptWindowMs) {
+      this.globalFallbackWindowStart = now;
+      this.globalFallbackCount = 0;
+    }
+    this.globalFallbackCount = Math.min(
+      this.globalFallbackCount + 1,
+      MAX_GLOBAL_FALLBACK_ATTEMPTS
+    );
+    if (
+      this.attemptsByIp.size >= MAX_IP_TRACKING_BUCKETS &&
+      this.globalFallbackCount >= MAX_GLOBAL_FALLBACK_ATTEMPTS
+    ) {
+      return { limited: true, retryAfterMs: this.attemptWindowMs };
+    }
 
     if (pruned.length > this.maxAttemptsPerIp) {
       const oldest = pruned[0];
@@ -303,41 +364,46 @@ export class InviteCodeService {
   }
 
   /**
-   * Drops every attempt bucket whose timestamps have all aged out and caps the map at
-   * {@link MAX_IP_TRACKING_BUCKETS} keys (evicting the oldest-inserted buckets) so a flood of
-   * distinct client keys can never grow the per-instance tracking map without bound.
+   * Drops every attempt bucket whose timestamps have all aged out, then caps the map at
+   * {@link MAX_IP_TRACKING_BUCKETS} keys. Eviction is least-recently-seen (`lastSeenMs`) LRU rather
+   * than oldest-inserted, so a flood of distinct client keys can never grow the per-instance
+   * tracking map without bound while active buckets survive longest.
    */
   private pruneAttemptBuckets(cutoff: number): void {
-    for (const [key, timestamps] of this.attemptsByIp) {
-      const live = timestamps.filter((ts) => ts > cutoff);
+    for (const [key, bucket] of this.attemptsByIp) {
+      const live = bucket.timestamps.filter((ts) => ts > cutoff);
       if (live.length === 0) {
         this.attemptsByIp.delete(key);
-      } else if (live.length !== timestamps.length) {
-        this.attemptsByIp.set(key, live);
+      } else if (live.length !== bucket.timestamps.length) {
+        bucket.timestamps = live;
       }
     }
     if (this.attemptsByIp.size <= MAX_IP_TRACKING_BUCKETS) {
       return;
     }
     const overflow = this.attemptsByIp.size - MAX_IP_TRACKING_BUCKETS;
-    const evicted: string[] = [];
-    for (const key of this.attemptsByIp.keys()) {
-      if (evicted.length >= overflow) {
-        break;
-      }
-      evicted.push(key);
-    }
-    for (const key of evicted) {
-      this.attemptsByIp.delete(key);
+    const byLastSeen = [...this.attemptsByIp.entries()].sort(
+      (a, b) => a[1].lastSeenMs - b[1].lastSeenMs
+    );
+    for (let i = 0; i < overflow && i < byLastSeen.length; i += 1) {
+      this.attemptsByIp.delete(byLastSeen[i][0]);
     }
   }
 
+  /** Resolves a trimmed plaintext-or-hash value to its stored record, or `null`. */
   private resolveRecord(codeOrHash: string): InviteCodeRecord | null {
-    const direct = this.runStore.getInviteCodeByHash(codeOrHash);
+    if (typeof codeOrHash !== "string") {
+      return null;
+    }
+    const trimmed = codeOrHash.trim();
+    if (trimmed.length === 0) {
+      return null;
+    }
+    const direct = this.runStore.getInviteCodeByHash(trimmed);
     if (direct) {
       return direct;
     }
-    const details = this.runStore.lookupInviteCodeDetails(codeOrHash);
+    const details = this.runStore.lookupInviteCodeDetails(trimmed);
     if (details.codeHash) {
       return this.runStore.getInviteCodeByHash(details.codeHash);
     }

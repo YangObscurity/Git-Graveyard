@@ -8,11 +8,13 @@ import { RunStore } from "@/lib/runs/run-store";
 import { EventStore } from "@/lib/events/event-store";
 import { SettingsStore } from "@/lib/admin/settings-store";
 import {
+  ADMIN_REVOKED_SESSIONS_SETTING_KEY,
   DIRECT_CLIENT_IP_KEY,
   clientIpFromRequest,
   resetAdminSessionState,
 } from "@/lib/admin/admin-session";
 import { resetFifoQueueRegistry, resolveFifoQueue } from "@/lib/admission/fifo-queue";
+import { KillSwitchService, type KillSwitchLevel } from "@/lib/admin/kill-switch";
 
 import {
   GET as sessionGet,
@@ -148,6 +150,30 @@ describe("Admin session and /api/admin/* authentication (Task 22.5)", () => {
     assert.equal(wrong.status, 401);
   });
 
+  it("refuses every guarded mutating route without a credential (401)", async () => {
+    const postJson = (url: string, method: string): Request =>
+      new Request(url, {
+        method,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+
+    const checks: Array<Promise<Response>> = [
+      invitePost(attach(postJson("http://test/api/admin/invite-codes", "POST"))),
+      settingsPatch(attach(postJson("http://test/api/admin/settings", "PATCH"))),
+      queuePost(attach(postJson("http://test/api/admin/queue", "POST"))),
+      killPost(attach(postJson("http://test/api/admin/kill-switch", "POST"))),
+      promoPost(attach(postJson("http://test/api/admin/promotion-audit", "POST"))),
+      sessionDelete(
+        attach(new Request("http://test/api/admin/session", { method: "DELETE" }))
+      ),
+    ];
+
+    for (const response of await Promise.all(checks)) {
+      assert.equal(response.status, 401);
+    }
+  });
+
   it("accepts a timing-safe x-admin-token and issues an HMAC session cookie", async () => {
     const listRes = await inviteGet(
       attach(new Request("http://test/api/admin/invite-codes", { headers: adminHeaders() }))
@@ -196,6 +222,78 @@ describe("Admin session and /api/admin/* authentication (Task 22.5)", () => {
     assert.equal(status.status, 200);
     const statusBody = (await status.json()) as { authenticated: boolean };
     assert.equal(statusBody.authenticated, false);
+  });
+
+  it("persists admin session revocation through the SettingsStore across a cold start", async () => {
+    const signIn = await sessionPost(
+      new Request("http://test/api/admin/session", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: ADMIN_SECRET }),
+      })
+    );
+    assert.equal(signIn.status, 200);
+    const cookie = cookieFrom(signIn);
+
+    const signOut = await sessionDelete(
+      attach(
+        new Request("http://test/api/admin/session", { method: "DELETE", headers: { cookie } })
+      )
+    );
+    assert.equal(signOut.status, 200);
+    const { revokedSessionId } = (await signOut.json()) as { revokedSessionId: string | null };
+    assert.ok(revokedSessionId);
+
+    // The revocation was written to the shared SettingsStore.
+    const persisted = stores.settingsStore.getSetting<{
+      sessions?: Array<{ sessionId: string }>;
+    }>(ADMIN_REVOKED_SESSIONS_SETTING_KEY);
+    assert.ok(
+      persisted?.sessions?.some((session) => session.sessionId === revokedSessionId)
+    );
+
+    // A fresh instance (in-memory revocations cleared) still rejects the cookie.
+    resetAdminSessionState();
+    const afterRestart = await inviteGet(
+      attach(new Request("http://test/api/admin/invite-codes", { headers: { cookie } }))
+    );
+    assert.equal(afterRestart.status, 403);
+  });
+
+  it("derives the session actor from a server-trusted principal, ignoring body.actor", async () => {
+    const spoof = await sessionPost(
+      new Request("http://test/api/admin/session", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: ADMIN_SECRET, actor: "attacker" }),
+      })
+    );
+    assert.equal(spoof.status, 200);
+    const spoofBody = (await spoof.json()) as { actor: { id: string } };
+    assert.equal(spoofBody.actor.id, "owner");
+
+    const cookie = cookieFrom(spoof);
+    const status = await sessionGet(
+      attach(new Request("http://test/api/admin/session", { headers: { cookie } }))
+    );
+    const statusBody = (await status.json()) as { actor: { id: string } | null };
+    assert.equal(statusBody.actor?.id, "owner");
+
+    // A configured server principal wins over both the caller body and the default.
+    process.env.ADMIN_ACTOR_ID = "principal-7";
+    try {
+      const bound = await sessionPost(
+        new Request("http://test/api/admin/session", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ token: ADMIN_SECRET, actor: "attacker" }),
+        })
+      );
+      const boundBody = (await bound.json()) as { actor: { id: string } };
+      assert.equal(boundBody.actor.id, "principal-7");
+    } finally {
+      delete process.env.ADMIN_ACTOR_ID;
+    }
   });
 });
 
@@ -279,10 +377,17 @@ describe("Admin invite codes, settings and queue routes (Task 22.5)", () => {
     );
     const body = (await getRes.json()) as {
       settings: Record<string, unknown>;
-      auditLog: Array<{ key: string; actor: string }>;
+      auditLog: Array<{ key: string; actor: string; reason: string | null }>;
     };
     assert.equal(body.settings.runWallClockMs, 12345);
-    assert.ok(body.auditLog.some((entry) => entry.key === "runWallClockMs"));
+    assert.equal(body.settings.toolCallsPerRun, 300);
+    // Both updated keys must each carry a mandatory audit entry with the actor and reason.
+    for (const key of ["runWallClockMs", "toolCallsPerRun"]) {
+      const entry = body.auditLog.find((item) => item.key === key);
+      assert.ok(entry, `expected an audit entry for ${key}`);
+      assert.equal(entry.actor, "owner");
+      assert.equal(entry.reason, "budget tune");
+    }
     assert.ok(body.auditLog.every((entry) => entry.actor.length > 0));
   });
 
@@ -396,6 +501,10 @@ describe("Admin run actions: review, redact, publish, hide (Task 22.5)", () => {
     );
     assert.equal(redact.status, 200);
     assert.ok(stores.eventStore.getEvents("run-b", { kind: "admin.redaction" }).length >= 1);
+    // Redaction marks the run reviewed and records the matching review audit entry.
+    const redacted = stores.runStore.getRun("run-b");
+    assert.equal((redacted?.metadata as Record<string, unknown>).reviewed, true);
+    assert.ok(stores.eventStore.getEvents("run-b", { kind: "admin.review" }).length >= 1);
 
     const hide = await runActionPost(
       attach(
@@ -478,12 +587,14 @@ describe("Kill switch (Task 22.5)", () => {
       url: "https://example.test/a/b",
       sha: "1".repeat(40),
       phase: "legion",
+      createdAt: 1,
     });
     stores.runStore.createRun({
       runId: "queued-1",
       url: "https://example.test/a/b",
       sha: "2".repeat(40),
       phase: "queued",
+      createdAt: 2,
     });
 
     const res = await killGet(
@@ -499,6 +610,7 @@ describe("Kill switch (Task 22.5)", () => {
     assert.equal(byLevel.get("stop_gracefully")?.affectedRunCount, 1);
     assert.deepEqual(byLevel.get("stop_gracefully")?.affectedRunIds, ["active-1"]);
     assert.equal(byLevel.get("hard_kill")?.affectedRunCount, 2);
+    assert.deepEqual(byLevel.get("hard_kill")?.affectedRunIds, ["active-1", "queued-1"]);
   });
 
   it("requires confirmation before acting, then hard-kills and records admin.kill events", async () => {
@@ -595,6 +707,56 @@ describe("Kill switch (Task 22.5)", () => {
     assert.equal(stores.settingsStore.getSetting("killSwitch.pauseNewRuns"), true);
     assert.equal(stores.settingsStore.getSetting("killSwitch.lastLevel"), "pause_new_runs");
   });
+
+  it("rehydrates enforcement flags from the SettingsStore on a cold start", () => {
+    stores.settingsStore.setSetting("killSwitch.pauseNewRuns", true, { actor: "owner" });
+    stores.settingsStore.setSetting("killSwitch.stopGracefully", true, { actor: "owner" });
+    stores.settingsStore.setSetting("killSwitch.lastLevel", "stop_gracefully", { actor: "owner" });
+
+    const service = new KillSwitchService({
+      runStore: stores.runStore,
+      eventStore: stores.eventStore,
+    });
+    // A freshly constructed service enforces nothing until it is rehydrated.
+    assert.equal(service.isPausedNewRuns(), false);
+    assert.equal(service.isStoppingGracefully(), false);
+
+    service.rehydrateState({
+      pausedNewRuns: stores.settingsStore.getSetting("killSwitch.pauseNewRuns") === true,
+      stoppingGracefully: stores.settingsStore.getSetting("killSwitch.stopGracefully") === true,
+      lastLevel:
+        (stores.settingsStore.getSetting("killSwitch.lastLevel") as KillSwitchLevel | undefined) ??
+        null,
+    });
+
+    assert.equal(service.isPausedNewRuns(), true);
+    assert.equal(service.isStoppingGracefully(), true);
+    assert.equal(service.getState().lastLevel, "stop_gracefully");
+  });
+
+  it("keeps pause enforcement after the shared service is discarded (cold start via GET)", async () => {
+    const pause = await killPost(
+      attach(
+        jsonRequest(
+          "http://test/api/admin/kill-switch",
+          { level: "pause_new_runs", confirmed: true },
+          { method: "POST", headers: adminHeaders() }
+        )
+      )
+    );
+    assert.equal(pause.status, 200);
+
+    // Simulate a new process: drop the cached service so buildService must rebuild it.
+    resetKillSwitchRegistry();
+
+    const get = await killGet(
+      attach(new Request("http://test/api/admin/kill-switch", { headers: adminHeaders() }))
+    );
+    assert.equal(get.status, 200);
+    const body = (await get.json()) as { state: { pausedNewRuns: boolean; lastLevel: string } };
+    assert.equal(body.state.pausedNewRuns, true);
+    assert.equal(body.state.lastLevel, "pause_new_runs");
+  });
 });
 
 describe("Promotion audit sign-off (Task 22.5)", () => {
@@ -651,6 +813,55 @@ describe("Promotion audit sign-off (Task 22.5)", () => {
     const body = (await res.json()) as { present: boolean; verified: boolean };
     assert.equal(body.present, true);
     assert.equal(body.verified, false);
+  });
+
+  it("invalidates verified when the stored promotion-audit items are modified", async () => {
+    const post = await promoPost(
+      attach(
+        jsonRequest(
+          "http://test/api/admin/promotion-audit",
+          { status: "passed", items: { checks: ["a", "b"], score: 7 } },
+          { method: "POST", headers: adminHeaders() }
+        )
+      )
+    );
+    assert.equal(post.status, 201);
+    const posted = (await post.json()) as { verified: boolean; record: { items: unknown } };
+    assert.equal(posted.verified, true);
+    assert.deepEqual(posted.record.items, { checks: ["a", "b"], score: 7 });
+
+    // The untampered record verifies and exposes its items.
+    const untampered = await promoGet(
+      attach(new Request("http://test/api/admin/promotion-audit", { headers: adminHeaders() }))
+    );
+    const untamperedBody = (await untampered.json()) as {
+      verified: boolean;
+      record: { items: unknown };
+    };
+    assert.equal(untamperedBody.verified, true);
+    assert.deepEqual(untamperedBody.record.items, { checks: ["a", "b"], score: 7 });
+
+    // Tamper the stored items; the HMAC (which now covers items) no longer matches.
+    const stored = stores.settingsStore.getSetting<Record<string, unknown>>("promotionAudit");
+    assert.ok(stored);
+    stores.settingsStore.setSetting(
+      "promotionAudit",
+      { ...stored, items: { checks: ["a", "b", "evil"], score: 7 } },
+      { actor: "attacker" }
+    );
+
+    const tampered = await promoGet(
+      attach(new Request("http://test/api/admin/promotion-audit", { headers: adminHeaders() }))
+    );
+    assert.equal(tampered.status, 200);
+    const tamperedBody = (await tampered.json()) as {
+      present: boolean;
+      verified: boolean;
+      record: { items: unknown };
+    };
+    assert.equal(tamperedBody.present, true);
+    assert.equal(tamperedBody.verified, false);
+    assert.deepEqual(tamperedBody.record.items, { checks: ["a", "b", "evil"], score: 7 });
   });
 });
 

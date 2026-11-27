@@ -35,7 +35,8 @@ function collectUpdates(body: SettingsBody): {
 }
 
 export async function GET(request: Request): Promise<Response> {
-  const auth = requireAdminAuth(request);
+  const settingsStore = resolveSettingsStore(request);
+  const auth = requireAdminAuth(request, process.env, { settingsStore });
   if (!auth.ok) {
     return auth.response;
   }
@@ -51,7 +52,8 @@ export async function GET(request: Request): Promise<Response> {
 }
 
 async function update(request: Request): Promise<Response> {
-  const auth = requireAdminAuth(request);
+  const settingsStore = resolveSettingsStore(request);
+  const auth = requireAdminAuth(request, process.env, { settingsStore });
   if (!auth.ok) {
     return auth.response;
   }

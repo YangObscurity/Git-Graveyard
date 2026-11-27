@@ -1,4 +1,4 @@
-import { resolveEventStore, resolveRunStore } from "@/lib/runtime/store-context";
+import { resolveEventStore, resolveRunStore, resolveSettingsStore } from "@/lib/runtime/store-context";
 import { requireAdminAuth } from "@/lib/admin/admin-session";
 import { redactEvent } from "@/lib/security/redactor";
 
@@ -32,7 +32,8 @@ function toMetadata(value: unknown): Record<string, unknown> {
 }
 
 export async function POST(request: Request, context: RouteContext): Promise<Response> {
-  const auth = requireAdminAuth(request);
+  const settingsStore = resolveSettingsStore(request);
+  const auth = requireAdminAuth(request, process.env, { settingsStore });
   if (!auth.ok) {
     return auth.response;
   }
@@ -89,12 +90,13 @@ export async function POST(request: Request, context: RouteContext): Promise<Res
     }
   };
   const commit = (
-    kind: string,
-    data: Record<string, unknown>,
+    events: Array<{ kind: string; data: Record<string, unknown> }>,
     success: () => Response
   ): Response => {
     try {
-      appendAdmin(kind, data);
+      for (const event of events) {
+        appendAdmin(event.kind, event.data);
+      }
     } catch {
       rollback();
       return Response.json({ ok: false, error: "audit_append_failed" }, { status: 500 });
@@ -112,7 +114,7 @@ export async function POST(request: Request, context: RouteContext): Promise<Res
           reviewedAt: Date.now(),
         },
       });
-      return commit("admin.review", { actor: auth.actor.id, reason }, () =>
+      return commit([{ kind: "admin.review", data: { actor: auth.actor.id, reason } }], () =>
         Response.json({ ok: true, action, run: updated })
       );
     }
@@ -127,8 +129,13 @@ export async function POST(request: Request, context: RouteContext): Promise<Res
           redactionFields: fields,
         },
       });
-      return commit("admin.redaction", { actor: auth.actor.id, reason, fields }, () =>
-        Response.json({ ok: true, action, run: updated })
+      // Redaction marks the run reviewed, so record the matching review audit entry too.
+      return commit(
+        [
+          { kind: "admin.review", data: { actor: auth.actor.id, reason } },
+          { kind: "admin.redaction", data: { actor: auth.actor.id, reason, fields } },
+        ],
+        () => Response.json({ ok: true, action, run: updated })
       );
     }
     case "publish": {
@@ -139,7 +146,7 @@ export async function POST(request: Request, context: RouteContext): Promise<Res
         );
       }
       const updated = runStore.updateRun(runId, { isPublished: true });
-      return commit("admin.publish", { actor: auth.actor.id, reason }, () =>
+      return commit([{ kind: "admin.publish", data: { actor: auth.actor.id, reason } }], () =>
         Response.json({ ok: true, action, run: updated })
       );
     }
@@ -155,7 +162,7 @@ export async function POST(request: Request, context: RouteContext): Promise<Res
           removedAt: Date.now(),
         },
       });
-      return commit("admin.hide", { actor: auth.actor.id, reason, marker }, () =>
+      return commit([{ kind: "admin.hide", data: { actor: auth.actor.id, reason, marker } }], () =>
         Response.json({ ok: true, action, run: updated, marker })
       );
     }

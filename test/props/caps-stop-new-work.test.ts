@@ -129,7 +129,18 @@ describe("Property 20: Caps stop new work (P20) (Requirement 30.7)", () => {
               assert.equal(execGate.allowed, true);
             }
           }
-          assert.ok(eventStore.countEvents("prop-run") >= 0);
+          const exceededDims = governor.getExceededDimensions();
+          const exceededEvents = eventStore.getEvents("prop-run", { kind: "budget.exceeded" });
+          if (exceededDims.length > 0) {
+            // Every exceeded dimension must have produced a corresponding budget.exceeded event.
+            assert.ok(exceededEvents.length >= 1);
+            const signalled = new Set(exceededEvents.map((event) => event.data.dimension));
+            for (const dim of exceededDims) {
+              assert.ok(signalled.has(dim), `missing budget.exceeded for ${dim}`);
+            }
+          } else {
+            assert.equal(exceededEvents.length, 0);
+          }
         } finally {
           db.close();
         }

@@ -265,6 +265,32 @@ export class FifoQueue {
       return [];
     }
     this.entries = kept;
+    // Expired queue items must not stay stuck as `phase: "queued"`: finalize the run row and emit
+    // the terminal events the rest of the system listens for.
+    for (const entry of expired) {
+      if (this.runStore) {
+        try {
+          this.runStore.updateRun(entry.runId, {
+            phase: "done",
+            outcome: "cancelled",
+            queuePosition: null,
+            endedAt: at,
+          });
+        } catch {
+          // A missing run record must not prevent eviction of its queue entry.
+        }
+      }
+      appendRedacted(this.eventStore, entry.runId, "run.phase", this.actor, {
+        phase: "done",
+        reason: "queue_idle_timeout",
+      });
+      appendRedacted(this.eventStore, entry.runId, "run.done", this.actor, {
+        phase: "done",
+        outcome: "cancelled",
+        endedAt: at,
+        reason: "queue_idle_timeout",
+      });
+    }
     this.reindexAndEmit(previous);
     return expired;
   }
