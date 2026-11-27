@@ -5,6 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { candidateSha256FromDiff } from "../merge/candidate-hash";
 import type { GateResultInput } from "../merge/types";
+import type { EventStore } from "../events/event-store";
 import { isCheckPassing, validateWardenVerdict } from "../warden/warden-review";
 
 export const GIT_HOOKS_FLAG = "core.hooksPath=/dev/null";
@@ -18,6 +19,19 @@ export const GIT_ISOLATION_FLAGS: readonly string[] = [
   "-c",
   GIT_PROTOCOL_ALLOW_FLAG,
 ];
+
+// The GitService holds the only GitHub write operation. A single in-process
+// exclusive write lock per run prevents two concurrent fork pushes for the same
+// run from interleaving (Requirement 29.1).
+const activePushLocks = new Set<string>();
+
+export function isPushLocked(runId: string): boolean {
+  return activePushLocks.has(runId);
+}
+
+export function activePushLockCount(): number {
+  return activePushLocks.size;
+}
 
 export class RepoSizeExceededError extends Error {
   readonly ok = false as const;
@@ -456,6 +470,10 @@ export interface PushToForkOptions {
   runPhase?: string;
   token?: string;
   branchName?: string;
+  /** Explicit push confirmation (Tier 1 push_confirm); `false` is a refusal. */
+  pushConfirm?: boolean;
+  /** Optional event sink for `push.requested` / `push.result`. */
+  eventStore?: Pick<EventStore, "append">;
 }
 
 export interface PushToForkResult {
@@ -2879,6 +2897,14 @@ export class GitService {
       );
     }
 
+    // An explicit push confirmation of `false` is a refusal (Requirement 29.5).
+    if (options.pushConfirm === false) {
+      throw new GitServiceError(
+        "pushToFork refused: explicit push confirmation was not given (Requirement 29.5)",
+        "PUSH_NOT_CONFIRMED"
+      );
+    }
+
     // Target owner must equal configured owner login, compared case-insensitively.
     const configuredOwner = (
       options.ownerLogin ??
@@ -3041,6 +3067,37 @@ esac
     const gitDir = options.gitDir ?? path.join(runRoot, "git");
     const hostGitDir = resolveHostGitDir(gitDir);
 
+    // Acquire the exclusive write lock before touching the remote.
+    if (activePushLocks.has(effectiveRunId)) {
+      throw new GitServiceError(
+        `pushToFork refused: exclusive fork push lock for run '${effectiveRunId}' is already held (Requirement 29.1)`,
+        "PUSH_LOCK_HELD"
+      );
+    }
+    activePushLocks.add(effectiveRunId);
+
+    const emitPushEvent = (kind: string, data: Record<string, unknown>): void => {
+      const sink = options.eventStore;
+      if (!sink || typeof sink.append !== "function") return;
+      try {
+        sink.append({
+          runId: effectiveRunId,
+          kind,
+          actor: "necromancer",
+          data: { branch, targetRepoUrl: targetUrl, ...data },
+          ts: Date.now(),
+        });
+      } catch {
+        // Event recording must never abort a push decision.
+      }
+    };
+
+    emitPushEvent("push.requested", {
+      runId: effectiveRunId,
+      branch,
+      targetRepoUrl: targetUrl,
+    });
+
     try {
       const shaRes = await this.#execGitInternal([
         "--git-dir",
@@ -3078,6 +3135,16 @@ esac
         true
       );
 
+      emitPushEvent("push.result", {
+        runId: effectiveRunId,
+        branch,
+        targetRepoUrl: targetUrl,
+        ok: true,
+        commitSha,
+        stdout: redactCredentials(pushRes.stdout ?? "", token),
+        stderr: redactCredentials(pushRes.stderr ?? "", token),
+      });
+
       return {
         ok: true,
         runId: effectiveRunId,
@@ -3090,6 +3157,13 @@ esac
     } catch (err: any) {
       const cleanMessage = redactCredentials(err.message ?? "", token);
       const cleanStderr = redactCredentials(err.stderr ?? "", token);
+      emitPushEvent("push.result", {
+        runId: effectiveRunId,
+        branch,
+        targetRepoUrl: targetUrl,
+        ok: false,
+        reason: cleanMessage,
+      });
       throw new GitServiceError(
         cleanMessage,
         err.code ?? "GIT_COMMAND_FAILED",
@@ -3097,6 +3171,7 @@ esac
         cleanStderr
       );
     } finally {
+      activePushLocks.delete(effectiveRunId);
       try {
         fs.rmSync(askpassDir, { recursive: true, force: true });
       } catch {
