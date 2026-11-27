@@ -583,3 +583,47 @@ test("AskManager: grant tracking preserves unredacted multi-token argv and raw c
   );
 });
 
+test("AskManager: requestApproval rejects argv that disagrees with commandText before any card or grant", () => {
+  const approvalManager = new ApprovalManager({ defaultWaitMs: 60_000 });
+  const store = new EventStore(":memory:");
+  const manager = new AskManager({ eventStore: store, approvalManager });
+
+  assert.throws(
+    () =>
+      manager.requestApproval({
+        runId: "run-canonical-mismatch",
+        commandText: "echo ok",
+        argv: ["rm", "-rf", "/"],
+        cwd: "/w",
+        riskClass: "safe",
+        skeletonId: "sk-canon",
+      }),
+    (err: unknown) => err instanceof AskManagerError && err.code === "INVALID_INPUT"
+  );
+
+  // The disagreement is refused before any approval card, ask or grant exists.
+  assert.equal(
+    store.getEvents("run-canonical-mismatch", { kind: "approval.requested" }).length,
+    0
+  );
+  assert.equal(manager.pendingAsks("run-canonical-mismatch").length, 0);
+  assert.equal(approvalManager.consumeGrant("sk-canon", ["rm", "-rf", "/"], "/w"), false);
+});
+
+test("AskManager: requestApproval derives commandText canonically from argv when omitted", () => {
+  const approvalManager = new ApprovalManager({ defaultWaitMs: 60_000 });
+  const store = new EventStore(":memory:");
+  const manager = new AskManager({ eventStore: store, approvalManager });
+
+  const card = manager.requestApproval({
+    runId: "run-canonical-derived",
+    argv: ["npm", "ci"],
+    cwd: "/w",
+    riskClass: "safe",
+    skeletonId: "sk-canon",
+  });
+  assert.equal(card.commandText, "npm ci");
+
+  manager.resolveApproval(card.approvalId, "Approve once");
+  assert.equal(approvalManager.consumeGrant("sk-canon", ["npm", "ci"], "/w"), true);
+});
