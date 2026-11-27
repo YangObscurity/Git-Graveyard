@@ -357,12 +357,10 @@ function readPersistedRevocations(
 }
 
 /**
- * Per-`SettingsStore` promise queue serializing the read-modify-write in
- * {@link persistRevokedSession}. Two overlapping in-process revocations that both read the stored
- * list, append their own id and write the result back could otherwise lose one of the two ids.
+ * Synchronously appends `sessionId` to the persisted revocation list. `SettingsStore` is backed by
+ * a `node:sqlite` `DatabaseSync`, which is strictly synchronous, so this read-modify-write runs to
+ * completion before returning and no promise chaining is needed to serialize concurrent revocations.
  */
-const revocationWriteQueue = new WeakMap<object, Promise<void>>();
-
 function persistRevokedSession(
   store: SettingsStore | undefined,
   sessionId: string,
@@ -374,36 +372,15 @@ function persistRevokedSession(
   }
   // Persistence errors are NOT swallowed: a revocation that cannot be written must surface so the
   // caller can report the failure instead of silently leaving a session un-revoked across requests.
-  const key = store as unknown as object;
-  const write = (): void => {
-    const kept = readPersistedRevocations(store, revokedAt).filter(
-      (entry) => entry.sessionId !== sessionId
-    );
-    kept.push({ sessionId, revokedAt, expiresAt });
-    store.setSetting(
-      ADMIN_REVOKED_SESSIONS_SETTING_KEY,
-      { sessions: kept },
-      { actor: "admin-session", reason: "admin session revocation" }
-    );
-  };
-
-  const pending = revocationWriteQueue.get(key);
-  if (!pending) {
-    // No write is in flight for this store: apply synchronously so the caller observes its own
-    // revocation immediately and a persistence error propagates to the caller (which fails closed).
-    write();
-    return;
-  }
-  // A write is already in flight for this store: chain behind it so the two read-modify-write
-  // operations cannot both read the same list and overwrite each other.
-  const next = pending.then(write, write);
-  revocationWriteQueue.set(key, next);
-  const clear = (): void => {
-    if (revocationWriteQueue.get(key) === next) {
-      revocationWriteQueue.delete(key);
-    }
-  };
-  next.then(clear, clear);
+  const kept = readPersistedRevocations(store, revokedAt).filter(
+    (entry) => entry.sessionId !== sessionId
+  );
+  kept.push({ sessionId, revokedAt, expiresAt });
+  store.setSetting(
+    ADMIN_REVOKED_SESSIONS_SETTING_KEY,
+    { sessions: kept },
+    { actor: "admin-session", reason: "admin session revocation" }
+  );
 }
 
 export function revokeAdminSession(

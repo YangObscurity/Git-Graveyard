@@ -61,7 +61,7 @@ function isQueued(run: RunRecord): boolean {
 }
 
 function isActive(run: RunRecord): boolean {
-  return run.phase !== "queued";
+  return run.phase !== "queued" && run.phase !== "done";
 }
 
 export class KillSwitchService {
@@ -287,6 +287,15 @@ export function markKillSwitchUnpersistedAuthority(key: object): void {
 /** True once a failed persistence write made the in-memory kill-switch state authoritative. */
 export function isKillSwitchUnpersistedAuthority(key: object): boolean {
   return killSwitchRegistry.__killSwitchUnpersistedAuthority?.has(key) === true;
+}
+
+/**
+ * Clears the unpersisted-authority mark for a store key after a later `persistState` write
+ * succeeds. Without this a single transient write failure would permanently keep the in-memory
+ * state authoritative and prevent future requests from rehydrating persisted `SettingsStore` state.
+ */
+export function clearKillSwitchUnpersistedAuthority(storeKey: object): void {
+  killSwitchRegistry.__killSwitchUnpersistedAuthority?.delete(storeKey);
 }
 
 /** Clears the shared kill-switch registry (used by tests between fixtures). */

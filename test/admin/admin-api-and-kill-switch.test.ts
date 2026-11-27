@@ -997,6 +997,99 @@ describe("Kill switch (Task 22.5)", () => {
     const body = (await get.json()) as { state: { pausedNewRuns: boolean } };
     assert.equal(body.state.pausedNewRuns, true);
   });
+
+  it("clears unpersisted authority after a later successful persist so rehydration resumes", async () => {
+    // First persist attempt fails: the in-memory pause becomes authoritative for this store.
+    const original = stores.settingsStore.setSettingsBatch.bind(stores.settingsStore);
+    (stores.settingsStore as unknown as { setSettingsBatch: unknown }).setSettingsBatch = () => {
+      throw new Error("settings store unavailable");
+    };
+    try {
+      const failed = await killPost(
+        attach(
+          jsonRequest(
+            "http://test/api/admin/kill-switch",
+            { level: "pause_new_runs", confirmed: true },
+            { method: "POST", headers: adminHeaders() }
+          )
+        )
+      );
+      assert.equal(failed.status, 500);
+      assert.equal(
+        (await failed.json() as { error?: string }).error,
+        "kill_switch_persist_failed"
+      );
+    } finally {
+      (stores.settingsStore as unknown as { setSettingsBatch: unknown }).setSettingsBatch = original;
+    }
+    // Nothing was persisted, so the store still has no pause value.
+    assert.equal(stores.settingsStore.getSetting("killSwitch.pauseNewRuns"), undefined);
+
+    // A later request whose persist SUCCEEDS must clear the unpersisted-authority mark.
+    const recovered = await killPost(
+      attach(
+        jsonRequest(
+          "http://test/api/admin/kill-switch",
+          { level: "pause_new_runs", confirmed: true },
+          { method: "POST", headers: adminHeaders() }
+        )
+      )
+    );
+    assert.equal(recovered.status, 200);
+    assert.equal(stores.settingsStore.getSetting("killSwitch.pauseNewRuns"), true);
+
+    // With the mark cleared, a later out-of-band SettingsStore change wins on GET...
+    stores.settingsStore.setSetting("killSwitch.pauseNewRuns", false, { actor: "owner" });
+    const get = await killGet(
+      attach(new Request("http://test/api/admin/kill-switch", { headers: adminHeaders() }))
+    );
+    assert.equal(get.status, 200);
+    const getBody = (await get.json()) as { state: { pausedNewRuns: boolean } };
+    assert.equal(getBody.state.pausedNewRuns, false);
+
+    // ...and on a subsequent POST, which rehydrates the persisted `false` before it acts. A level
+    // that does not itself set the pause flag exposes whether the stale in-memory `true` survived.
+    const post = await killPost(
+      attach(
+        jsonRequest(
+          "http://test/api/admin/kill-switch",
+          { level: "hard_kill", confirmed: true },
+          { method: "POST", headers: adminHeaders() }
+        )
+      )
+    );
+    assert.equal(post.status, 200);
+    const postBody = (await post.json()) as { state: { pausedNewRuns: boolean } };
+    assert.equal(postBody.state.pausedNewRuns, false);
+  });
+
+  it("excludes finished (done) runs from stop_gracefully preview and execute", () => {
+    const runs = [
+      { runId: "running-1", phase: "legion", outcome: null, createdAt: 1 },
+      { runId: "done-1", phase: "done", outcome: "resurrected", createdAt: 2 },
+      { runId: "queued-1", phase: "queued", outcome: null, createdAt: 3 },
+    ];
+    const fakeRunStore = {
+      getLivingRuns: () => runs,
+      getRun: (runId: string) => runs.find((run) => run.runId === runId) ?? null,
+      updateRun: () => undefined,
+    };
+    const service = new KillSwitchService({
+      runStore: fakeRunStore as unknown as RunStore,
+      eventStore: stores.eventStore,
+    });
+
+    const preview = service.preview("stop_gracefully");
+    assert.equal(preview.affectedRunCount, 1);
+    assert.deepEqual(preview.affectedRunIds, ["running-1"]);
+
+    const result = service.execute("stop_gracefully", { actor: "ops-1" });
+    assert.equal(result.affectedRunCount, 1);
+    assert.deepEqual(result.affectedRunIds, ["running-1"]);
+    // The finished run received no stop request.
+    assert.equal(stores.eventStore.getEvents("done-1", { kind: "system.worker_state" }).length, 0);
+    assert.ok(stores.eventStore.getEvents("running-1", { kind: "system.worker_state" }).length >= 1);
+  });
 });
 
 describe("Promotion audit sign-off (Task 22.5)", () => {

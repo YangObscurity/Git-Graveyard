@@ -8,6 +8,7 @@ import { resolveFifoQueue } from "@/lib/admission/fifo-queue";
 import {
   KILL_SWITCH_LEVELS,
   KillSwitchService,
+  clearKillSwitchUnpersistedAuthority,
   isKillSwitchUnpersistedAuthority,
   killSwitchServiceRegistry,
   markKillSwitchUnpersistedAuthority,
@@ -178,5 +179,9 @@ export async function POST(request: Request): Promise<Response> {
     markKillSwitchUnpersistedAuthority(storeKey);
     return Response.json({ ok: false, error: "kill_switch_persist_failed" }, { status: 500 });
   }
+  // The write succeeded, so the persisted SettingsStore now matches the in-memory state: drop any
+  // unpersisted-authority mark left by an earlier transient failure so future requests rehydrate
+  // from the store again.
+  clearKillSwitchUnpersistedAuthority(storeKey);
   return Response.json({ ok: true, result, state: mergedState(service, settings) });
 }
