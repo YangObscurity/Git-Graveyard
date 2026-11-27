@@ -1262,13 +1262,15 @@ export class TaskDispatcher {
    * Builds the production default `onAskAutoDeny` handler: it records the
    * auto-denial as an `ask.auto_denied` event through the Dispatcher's event
    * sink so the Gateway observes every auto-denied headless `ask`
-   * (Requirement 17.11).
+   * (Requirement 17.11). The handler AWAITS the sink so an async write failure
+   * propagates to the Headless Fallback channel (which then fails the turn
+   * closed) instead of floating as an unhandled rejection.
    */
   private buildDefaultAskAutoDeny(
     skeletonId: string
-  ): (ask: HeadlessAskRequest) => void {
-    return (ask: HeadlessAskRequest) => {
-      this.emitEvent({
+  ): (ask: HeadlessAskRequest) => Promise<void> {
+    return async (ask: HeadlessAskRequest) => {
+      await this.emitEvent({
         runId: this.runId,
         kind: "ask.auto_denied",
         actor: "SkeletonSupervisor",
