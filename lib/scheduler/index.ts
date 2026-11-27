@@ -3,5 +3,6 @@
 
 export * from "./types";
 export * from "./scheduler";
+export * from "./parallel-scheduler";
 export * from "./candidate-submission";
 export * from "./dispatcher";
