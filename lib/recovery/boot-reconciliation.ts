@@ -524,15 +524,22 @@ export class BootReconciliationService {
     let listValid = true;
     let boxes: SandboxBoxInfo[] = [];
     if (backend) {
-      const raw = await backend.list(filterLabels);
-      if (Array.isArray(raw)) {
-        boxes = raw.filter(
-          (b): b is SandboxBoxInfo => typeof b === "object" && b !== null
-        );
-      } else {
-        // A non-array (null/undefined/garbage) list result is not a trustworthy
-        // empty set: abort lost-box transitions so living runs are never falsely
-        // marked lost while the backend listing is unavailable.
+      try {
+        const raw = await backend.list(filterLabels);
+        if (Array.isArray(raw)) {
+          boxes = raw.filter(
+            (b): b is SandboxBoxInfo => typeof b === "object" && b !== null
+          );
+        } else {
+          // A non-array (null/undefined/garbage) list result is not a trustworthy
+          // empty set: abort lost-box transitions so living runs are never falsely
+          // marked lost while the backend listing is unavailable.
+          listValid = false;
+        }
+      } catch {
+        // A backend listing error must not abort reconciliation: pidfile reaping,
+        // clock pausing and orphan handling still finish, and living runs are
+        // never falsely marked lost while the listing is unavailable.
         listValid = false;
       }
     }
@@ -671,7 +678,7 @@ export class BootReconciliationService {
           resolvedId.trim().length > 0
         ) {
           recreated = true;
-          newSandboxId = resolvedId;
+          newSandboxId = resolvedId.trim();
         } else {
           // Empty or missing sandboxId is a failed recreation.
           recreationFailed = true;

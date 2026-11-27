@@ -1589,4 +1589,93 @@ test("failure-recovery: an injected post-rename containment failure reports isol
     forceRemoveTree(quarantineRoot);
   }
 });
+test("failure-recovery: a throwing backend.list never aborts reconcileOnBoot or marks living runs lost", async () => {
+  const runStore = new RunStore(":memory:");
+  const eventStore = new EventStore(":memory:");
+  runStore.createRun({
+    runId: "run-live-list",
+    url: "https://github.com/owner/repo",
+    sha: "abc",
+    phase: "legion",
+    sandboxId: "box-live-list",
+  });
+
+  let destroyCalls = 0;
+  const killed: number[] = [];
+  const result = await new BootReconciliationService().reconcileOnBoot({
+    runStore,
+    eventStore,
+    backend: {
+      list: () => {
+        throw new Error("backend list exploded");
+      },
+      destroy: () => {
+        destroyCalls++;
+      },
+    },
+    pidFiles: [{ pid: 501, command: "kiro-cli --acp", expectedOwner: "root" }],
+    processOps: {
+      isAlive: () => true,
+      readCommand: () => "kiro-cli --acp",
+      readOwner: () => "root",
+      kill: (pid) => {
+        killed.push(pid);
+      },
+    },
+  });
+
+  // Reconciliation still finished its other duties after the listing error: the
+  // pid was reaped, the clock was paused, and no box was destroyed from an
+  // untrustworthy listing.
+  assert.deepEqual(result.reapedPids, [501]);
+  assert.deepEqual(killed, [501]);
+  assert.equal(destroyCalls, 0);
+  assert.ok(result.pausedRuns.includes("run-live-list"));
+  // The living run is not falsely marked lost.
+  assert.ok(result.recovered.includes("run-live-list"));
+  assert.deepEqual(result.errored, []);
+  const run = runStore.getRun("run-live-list")!;
+  assert.equal(run.phase, "legion");
+  assert.equal(run.outcome, null);
+  assert.equal(
+    runStore.getRunSandboxes("run-live-list").some((s) => s.status === "lost"),
+    false
+  );
+});
+
+test("failure-recovery: a whitespace-padded recreated sandboxId is trimmed before rerunCommand", async () => {
+  const service = new BootReconciliationService();
+  let receivedSandboxId: string | null = null;
+  const result = await service.handleBoxFailure({
+    runId: "run-trim",
+    sandboxId: "box-1",
+    kind: "exit",
+    recreateBox: () => ({ sandboxId: "  box-2  " }),
+    rerunCommand: (params) => {
+      receivedSandboxId = params.sandboxId;
+      return { exitCode: 0 };
+    },
+  });
+
+  assert.equal(result.recreated, true);
+  assert.equal(result.newSandboxId, "box-2");
+  assert.equal(receivedSandboxId, "box-2");
+});
+
+test("failure-recovery: isWorktreeQuarantined detects an on-disk .QUARANTINED marker on a fresh instance", () => {
+  const eventStore = new EventStore(":memory:");
+  const fresh = new FailureRecoveryHandler({ eventStore });
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "gg-wt-marker-"));
+  fs.writeFileSync(path.join(tmp, ".QUARANTINED"), "{}");
+  try {
+    assert.equal(fresh.isWorktreeQuarantined(tmp), true);
+    // The marker match is memoized: the worktree stays quarantined even after the
+    // marker file is removed, matching isMergeBlocked across restarts.
+    fs.rmSync(path.join(tmp, ".QUARANTINED"));
+    assert.equal(fresh.isWorktreeQuarantined(tmp), true);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 

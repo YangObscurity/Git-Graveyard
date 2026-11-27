@@ -763,7 +763,16 @@ export class FailureRecoveryHandler {
   }
 
   isWorktreeQuarantined(worktreeDir: string): boolean {
-    return this.quarantinedWorktrees.has(worktreeDir);
+    if (this.quarantinedWorktrees.has(worktreeDir)) {
+      return true;
+    }
+    if (this.hasQuarantineMarker(worktreeDir)) {
+      // Memoize the marker match so later lookups stay quarantined even once the
+      // marker is gone, matching isMergeBlocked across supervisor restarts.
+      this.quarantinedWorktrees.add(worktreeDir);
+      return true;
+    }
+    return false;
   }
 
   private hasQuarantineMarker(worktreeDir: string): boolean {
