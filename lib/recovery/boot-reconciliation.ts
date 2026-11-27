@@ -2,6 +2,8 @@
 // Kiro credit exhaustion handling.
 // Requirements: 32.9, 41.7, 41.8, 43.13, 43.14, 43.15, 43.19.
 
+import * as path from "node:path";
+
 import type { EventEnvelope } from "../events/event-store";
 import { type EventStore } from "../events/event-store";
 import {
@@ -11,6 +13,11 @@ import {
   type RunRecord,
 } from "../runs/run-store";
 import { redactEventData, type Redactor, type RedactionOptions } from "../security/redactor";
+
+export const SANDBOX_OWNERSHIP_LABEL = "managedBy";
+export const DEFAULT_SANDBOX_MANAGED_BY = "git-graveyard";
+export const SANDBOX_WORKER_LABEL = "workerId";
+export const SANDBOX_TENANT_LABEL = "tenantId";
 
 export interface SandboxBoxInfo {
   readonly sandboxId?: string;
@@ -50,6 +57,9 @@ export interface BootReconciliationParams {
   readonly backend?: SandboxBackendLike;
   readonly pidFiles?: readonly PidFileRecord[];
   readonly processOps?: ProcessOps;
+  readonly managedBy?: string;
+  readonly workerId?: string;
+  readonly tenantId?: string;
 }
 
 export interface BootReconciliationResult {
@@ -59,6 +69,7 @@ export interface BootReconciliationResult {
   readonly reapedPids: number[];
   readonly skippedPids: number[];
   readonly destroyedBoxes: string[];
+  readonly unownedBoxes: string[];
   readonly workerRestarted: boolean;
   readonly pausedRuns: string[];
 }
@@ -157,6 +168,9 @@ export interface BootReconciliationDeps {
   readonly processOps?: ProcessOps;
   readonly redactor?: Redactor;
   readonly redactionOptions?: RedactionOptions;
+  readonly managedBy?: string;
+  readonly workerId?: string;
+  readonly tenantId?: string;
   readonly now?: () => number;
 }
 
@@ -172,22 +186,46 @@ function boxRunId(box: SandboxBoxInfo): string | null {
   return typeof id === "string" && id.length > 0 ? id : null;
 }
 
+/**
+ * Extracts the exact executable basename from a command line or single token.
+ * Handles both POSIX and Windows separators, strips surrounding quotes and a
+ * trailing `.exe`, and lowercases the result. Never performs substring matching.
+ */
+function executableBasename(token: string | null | undefined): string {
+  if (typeof token !== "string") {
+    return "";
+  }
+  const trimmed = token.trim();
+  if (trimmed.length === 0) {
+    return "";
+  }
+  let argv0: string;
+  if (trimmed.startsWith('"') || trimmed.startsWith("'")) {
+    const quote = trimmed[0];
+    const end = trimmed.indexOf(quote, 1);
+    argv0 = end === -1 ? trimmed.slice(1) : trimmed.slice(1, end);
+  } else {
+    argv0 = trimmed.split(/\s+/)[0] ?? "";
+  }
+  const unquoted = argv0.replace(/^["']+/, "").replace(/["']+$/, "");
+  if (unquoted.length === 0) {
+    return "";
+  }
+  const base = path.win32.basename(path.posix.basename(unquoted));
+  return base.replace(/\.exe$/i, "").trim().toLowerCase();
+}
+
+/**
+ * Strictly matches the command whose executable basename equals the expected
+ * executable name. Substrings such as `vim kiro-cli.md` never match `kiro-cli`.
+ */
 function commandMatches(actual: string, expected: string): boolean {
-  const a = actual.toLowerCase();
-  const e = expected.toLowerCase().trim();
-  if (e.length === 0) {
+  const expectedBase = executableBasename(expected);
+  if (expectedBase.length === 0) {
     return false;
   }
-  if (a === e || a.includes(e)) {
-    return true;
-  }
-  const base = e.split(/\s+/)[0];
-  return a
-    .split(/\s+/)
-    .some(
-      (token) =>
-        token === base || token.endsWith(`/${base}`) || token.endsWith(`\\${base}`)
-    );
+  const actualBase = executableBasename(actual);
+  return actualBase.length > 0 && actualBase === expectedBase;
 }
 
 function normalizeCommand(
@@ -265,27 +303,36 @@ export class BootReconciliationService {
       return false;
     }
     // Only kiro-cli processes are ever signalled: the recorded command field is
-    // informational, so the match target defaults to kiro-cli unless an explicit
-    // expectedCommand is supplied.
-    const expected = pf.expectedCommand ?? "kiro-cli";
-    if (!commandMatches(actual, expected)) {
+    // informational, so the match target defaults to the canonical executable
+    // names unless an explicit expectedCommand is supplied. Matching is strict on
+    // the executable basename so substrings such as `vim kiro-cli.md` never match.
+    const explicitExpected = pf.expectedCommand?.trim();
+    const expectedNames =
+      explicitExpected && explicitExpected.length > 0
+        ? [explicitExpected]
+        : ["kiro-cli", "kiro-cli-real"];
+    if (!expectedNames.some((name) => commandMatches(actual, name))) {
       return false;
     }
+    // Owner verification is mandatory and fails closed: reaping is skipped when no
+    // expected owner is known, when the process owner cannot be read, or when the
+    // observed owner differs from the expected one.
     const expectedOwner = pf.expectedOwner ?? pf.owner;
-    if (expectedOwner !== undefined) {
-      const readOwner = processOps.readOwner;
-      if (typeof readOwner !== "function") {
-        return false;
-      }
-      let owner: string | number | null | undefined;
-      try {
-        owner = readOwner(pid);
-      } catch {
-        owner = undefined;
-      }
-      if (owner === undefined || owner === null || String(owner) !== String(expectedOwner)) {
-        return false;
-      }
+    if (expectedOwner === undefined || expectedOwner === null) {
+      return false;
+    }
+    const readOwner = processOps.readOwner;
+    if (typeof readOwner !== "function") {
+      return false;
+    }
+    let owner: string | number | null | undefined;
+    try {
+      owner = readOwner(pid);
+    } catch {
+      owner = undefined;
+    }
+    if (owner === undefined || owner === null || String(owner) !== String(expectedOwner)) {
+      return false;
     }
     return true;
   }
@@ -344,9 +391,49 @@ export class BootReconciliationService {
       }
     }
 
+    const managedBy =
+      params.managedBy ?? this.deps.managedBy ?? DEFAULT_SANDBOX_MANAGED_BY;
+    const workerId = params.workerId ?? this.deps.workerId;
+    const tenantId = params.tenantId ?? this.deps.tenantId;
+
+    const filterLabels: Record<string, string> = {
+      [SANDBOX_OWNERSHIP_LABEL]: managedBy,
+    };
+    if (typeof workerId === "string" && workerId.length > 0) {
+      filterLabels[SANDBOX_WORKER_LABEL] = workerId;
+    }
+    if (typeof tenantId === "string" && tenantId.length > 0) {
+      filterLabels[SANDBOX_TENANT_LABEL] = tenantId;
+    }
+
+    // A candidate box is only ours when it explicitly carries every configured
+    // ownership label. Anything else is treated as unowned and never destroyed.
+    const ownsBox = (box: SandboxBoxInfo): boolean => {
+      const labels = box.labels;
+      if (!labels || typeof labels !== "object") {
+        return false;
+      }
+      if (labels[SANDBOX_OWNERSHIP_LABEL] !== managedBy) {
+        return false;
+      }
+      if (
+        filterLabels[SANDBOX_WORKER_LABEL] !== undefined &&
+        labels[SANDBOX_WORKER_LABEL] !== filterLabels[SANDBOX_WORKER_LABEL]
+      ) {
+        return false;
+      }
+      if (
+        filterLabels[SANDBOX_TENANT_LABEL] !== undefined &&
+        labels[SANDBOX_TENANT_LABEL] !== filterLabels[SANDBOX_TENANT_LABEL]
+      ) {
+        return false;
+      }
+      return true;
+    };
+
     let boxes: SandboxBoxInfo[] = [];
     if (backend) {
-      const raw = await backend.list();
+      const raw = await backend.list(filterLabels);
       boxes = (Array.isArray(raw) ? raw : []).filter(
         (b): b is SandboxBoxInfo => typeof b === "object" && b !== null
       );
@@ -360,6 +447,7 @@ export class BootReconciliationService {
     }
 
     const destroyedBoxes: string[] = [];
+    const unownedBoxes: string[] = [];
     if (backend) {
       for (const box of boxes) {
         const id = boxId(box);
@@ -370,14 +458,19 @@ export class BootReconciliationService {
         const belongs = living.some(
           (r) => r.sandboxId === id || (runId !== null && r.runId === runId)
         );
-        if (!belongs) {
-          try {
-            await backend.destroy(id);
-          } catch {
-            // ignore destroy failures; the box is still reported as orphaned
-          }
-          destroyedBoxes.push(id);
+        if (belongs) {
+          continue;
         }
+        if (!ownsBox(box)) {
+          unownedBoxes.push(id);
+          continue;
+        }
+        try {
+          await backend.destroy(id);
+        } catch {
+          // ignore destroy failures; the box is still reported as orphaned
+        }
+        destroyedBoxes.push(id);
       }
     }
 
@@ -422,6 +515,7 @@ export class BootReconciliationService {
       reapedPids,
       skippedPids,
       destroyedBoxes,
+      unownedBoxes,
       workerRestarted,
       pausedRuns,
     };

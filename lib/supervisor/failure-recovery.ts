@@ -1,6 +1,9 @@
 // Task 23.3: Supervisor failure recovery, crash handling, quarantine and nudges.
 // Requirements: 15.1-15.6, 16.16, 22.14, 22.15, 41.5, 41.6, 41.20, 41.23.
 
+import * as fs from "node:fs";
+import * as path from "node:path";
+
 import type { EventEnvelope } from "../events/event-store";
 import { type EventStore } from "../events/event-store";
 import type { RunStore } from "../runs/run-store";
@@ -64,6 +67,7 @@ export interface ProcessCrashResult {
   readonly sessionLoaded: boolean;
   readonly attempts: number;
   readonly recoveringEvent: EventEnvelope | null;
+  readonly failedEvent: EventEnvelope | null;
 }
 
 export interface FailureRecoverySettings {
@@ -122,6 +126,7 @@ export interface QuarantineWorktreeInput {
   readonly worktreeDir?: string;
   readonly reason: QuarantineReason;
   readonly detail?: string;
+  readonly quarantineRoot?: string;
 }
 
 export interface QuarantineWorktreeResult {
@@ -158,6 +163,13 @@ export interface FailureRecoveryDeps {
   readonly redactor?: Redactor;
   readonly redactionOptions?: RedactionOptions;
   readonly settings?: FailureRecoverySettings;
+  readonly quarantineRoot?: string;
+  readonly stopProcess?: (params: {
+    readonly runId: string;
+    readonly skeletonId?: string;
+    readonly worktreeDir?: string;
+    readonly reason: QuarantineReason;
+  }) => boolean | void;
   readonly now?: () => number;
 }
 
@@ -183,7 +195,16 @@ export class FailureRecoveryHandler {
   }
 
   private redact(data: Record<string, unknown>): Record<string, unknown> {
-    return redactEventData(data, this.deps.redactionOptions);
+    const byOptions = redactEventData(data, this.deps.redactionOptions);
+    const redactor = this.deps.redactor;
+    if (!redactor || typeof redactor.redactEventData !== "function") {
+      return byOptions;
+    }
+    try {
+      return redactor.redactEventData(byOptions);
+    } catch {
+      return byOptions;
+    }
   }
 
   /**
@@ -209,8 +230,8 @@ export class FailureRecoveryHandler {
       };
     }
 
-    let gatewayConnected = true;
-    if (input.checkGateway) {
+    let gatewayConnected = false;
+    if (typeof input.checkGateway === "function") {
       try {
         gatewayConnected = (await input.checkGateway()) === true;
       } catch {
@@ -275,6 +296,25 @@ export class FailureRecoveryHandler {
       recoveringEvent,
     };
 
+    const appendFailed = (): EventEnvelope =>
+      this.deps.eventStore.append({
+        runId: input.runId,
+        kind: "skeleton.state",
+        actor: "FailureRecoveryHandler",
+        skeletonId: input.skeletonId,
+        data: this.redact({
+          state: "failed",
+          skeletonId: input.skeletonId,
+          role: input.role ?? null,
+          reason: input.reason ?? "crash",
+          worktree: preservedWorktree,
+          logRef,
+          terminal: true,
+          attempts: 1,
+          refs: [],
+        }),
+      });
+
     if (crashCount >= 1) {
       return {
         ...base,
@@ -283,6 +323,7 @@ export class FailureRecoveryHandler {
         respawnMessage: "Restarted from its last commit",
         sessionLoaded: false,
         attempts: 1,
+        failedEvent: appendFailed(),
       };
     }
 
@@ -308,6 +349,7 @@ export class FailureRecoveryHandler {
         respawnMessage: "Resumed the same session",
         sessionLoaded: true,
         attempts: 1,
+        failedEvent: null,
       };
     }
 
@@ -318,6 +360,7 @@ export class FailureRecoveryHandler {
       respawnMessage: "Restarted from its last commit",
       sessionLoaded: false,
       attempts: 1,
+      failedEvent: appendFailed(),
     };
   }
 
@@ -423,6 +466,36 @@ export class FailureRecoveryHandler {
     this.quarantinedWorktrees.add(`${input.runId}:${input.skeletonId ?? ""}`);
     this.blockedMerges.add(input.runId);
 
+    let requestedSteps = 0;
+    let succeededSteps = 0;
+
+    const stopProcess = this.deps.stopProcess;
+    if (typeof stopProcess === "function") {
+      requestedSteps++;
+      try {
+        const outcome = stopProcess({
+          runId: input.runId,
+          skeletonId: input.skeletonId,
+          worktreeDir: input.worktreeDir,
+          reason: input.reason,
+        });
+        if (outcome !== false) {
+          succeededSteps++;
+        }
+      } catch {
+        // containment step failed; isolation stays false for this step
+      }
+    }
+
+    if (input.worktreeDir) {
+      requestedSteps++;
+      if (this.containWorktreeOnDisk(input.worktreeDir, input)) {
+        succeededSteps++;
+      }
+    }
+
+    const isolated = requestedSteps > 0 && succeededSteps === requestedSteps;
+
     const event = this.deps.eventStore.append({
       runId: input.runId,
       kind: SECURITY_CONTAINMENT_EVENT_KIND,
@@ -432,7 +505,7 @@ export class FailureRecoveryHandler {
         reason: input.reason,
         detail: input.detail ?? null,
         worktree: input.worktreeDir ?? null,
-        isolated: true,
+        isolated,
         mergeBlocked: true,
         refs: [],
       }),
@@ -441,12 +514,105 @@ export class FailureRecoveryHandler {
     return {
       runId: input.runId,
       quarantined: true,
-      isolated: true,
+      isolated,
       mergeBlocked: true,
       reason: input.reason,
       worktreeDir: input.worktreeDir ?? null,
       event,
     };
+  }
+
+  /**
+   * Performs real, best-effort on-disk containment for a quarantined worktree:
+   * writes a lock marker, restricts the worktree and its files to read-only, and
+   * moves it under the configured quarantine root when one is set. Returns false
+   * whenever a requested containment step cannot be completed.
+   */
+  private containWorktreeOnDisk(
+    worktreeDir: string,
+    input: QuarantineWorktreeInput
+  ): boolean {
+    try {
+      let stat: fs.Stats;
+      try {
+        stat = fs.statSync(worktreeDir);
+      } catch {
+        return false;
+      }
+      if (!stat.isDirectory()) {
+        return false;
+      }
+
+      fs.writeFileSync(
+        path.join(worktreeDir, ".QUARANTINED"),
+        JSON.stringify(
+          {
+            runId: input.runId,
+            skeletonId: input.skeletonId ?? null,
+            reason: input.reason,
+            quarantinedAt: this.now(),
+          },
+          null,
+          2
+        ),
+        { mode: 0o444 }
+      );
+
+      this.makeWorktreeReadOnly(worktreeDir);
+
+      const quarantineRoot = input.quarantineRoot ?? this.deps.quarantineRoot;
+      if (typeof quarantineRoot === "string" && quarantineRoot.trim().length > 0) {
+        fs.mkdirSync(quarantineRoot, { recursive: true });
+        const target = path.join(
+          quarantineRoot,
+          `${path.basename(worktreeDir)}-${this.now()}`
+        );
+        fs.renameSync(worktreeDir, target);
+        this.quarantinedWorktrees.add(target);
+      }
+
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Best-effort recursive read-only permissions: files become 0444 and directories
+   * become 0555 so the quarantined worktree can no longer be modified in place.
+   */
+  private makeWorktreeReadOnly(root: string): void {
+    const dirs: string[] = [];
+    const stack: string[] = [root];
+    while (stack.length > 0) {
+      const current = stack.pop() as string;
+      dirs.push(current);
+      let entries: fs.Dirent[] = [];
+      try {
+        entries = fs.readdirSync(current, { withFileTypes: true });
+      } catch {
+        entries = [];
+      }
+      for (const entry of entries) {
+        const full = path.join(current, entry.name);
+        if (entry.isDirectory()) {
+          stack.push(full);
+        } else {
+          try {
+            fs.chmodSync(full, 0o444);
+          } catch {
+            // best effort only
+          }
+        }
+      }
+    }
+    for (const dir of dirs) {
+      try {
+        fs.chmodSync(dir, 0o555);
+      } catch {
+        // best effort only
+      }
+    }
   }
 
   isWorktreeQuarantined(worktreeDir: string): boolean {

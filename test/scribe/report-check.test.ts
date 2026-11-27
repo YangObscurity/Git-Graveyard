@@ -19,6 +19,7 @@ import {
   isFinalCheckComplete,
 } from "../../lib/scribe/scribe-service";
 import { SCRIBE_NARRATIVE_FALLBACK_NOTICE } from "../../lib/lifecycle/report-step";
+import { Redactor } from "../../lib/security/redactor";
 
 function makeStores() {
   const runStore = new RunStore(":memory:");
@@ -327,3 +328,51 @@ test("report-check: ScribeService drops the reading when it fails twice", async 
   assert.equal(result.scribeReading, SCRIBE_NARRATIVE_FALLBACK_NOTICE);
   assert.equal(result.fallbackNotice, SCRIBE_NARRATIVE_FALLBACK_NOTICE);
 });
+
+test("report-check: install error rows redact secret tokens and keys", () => {
+  const ghToken = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  const skToken = "sk-abcdefghijklmnopqrstuvwxyz012345";
+
+  const result = assignRunOutcomeWithInstallComparison({
+    tasks: [{ id: "task-1", state: "merged" }],
+    finalCheck: { installPassed: true, buildPassed: true, testsPassed: true, hasTests: true },
+    baselineInstallError: `npm ERR! baseline install failed with ${ghToken}`,
+    newInstallError: {
+      command: "npm ci",
+      exitCode: 1,
+      error: `auth failed using ${skToken}`,
+      ref: "cmd:install",
+    },
+  });
+
+  assert.equal(result.installComparison.hasInstallErrors, true);
+  assert.ok(!String(result.installComparison.baseline?.error).includes(ghToken));
+  assert.ok(!String(result.installComparison.new?.error).includes(skToken));
+  assert.ok(String(result.installComparison.baseline?.error).includes("[REDACTED]"));
+  assert.ok(String(result.installComparison.new?.error).includes("[REDACTED]"));
+  // Non-secret fields keep passing through untouched.
+  assert.equal(result.installComparison.new?.ref, "cmd:install");
+  assert.equal(result.installComparison.new?.exitCode, 1);
+});
+
+test("report-check: a caller-supplied redactor is honored for install error text", () => {
+  const redactor = new Redactor({ autoRegisterEnvSecrets: false });
+  const customSecret = "custom-install-secret-value";
+  redactor.registerSecret(customSecret);
+
+  const result = assignRunOutcomeWithInstallComparison({
+    tasks: [{ id: "task-1", state: "merged" }],
+    finalCheck: { installPassed: true, buildPassed: true, testsPassed: true, hasTests: true },
+    newInstallError: {
+      command: "npm ci",
+      exitCode: 1,
+      stderr: `leaked ${customSecret} while installing`,
+    },
+    redactor,
+  });
+
+  assert.equal(result.installComparison.hasInstallErrors, true);
+  assert.ok(!String(result.installComparison.new?.error).includes(customSecret));
+  assert.ok(String(result.installComparison.new?.error).includes("[REDACTED]"));
+});
+

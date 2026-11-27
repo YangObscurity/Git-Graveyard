@@ -13,7 +13,7 @@ import {
   evaluateReportOutcome,
   type ReportOutcomeEvaluationInput,
 } from "../lifecycle/outcome-evaluator";
-import { redactEventData, type RedactionOptions } from "../security/redactor";
+import { redactEventData, redactText, type Redactor, type RedactionOptions } from "../security/redactor";
 
 export type { UnbackedClaimItem };
 
@@ -592,11 +592,36 @@ export interface RunOutcomeAssignment {
 export interface AssignOutcomeInput extends ReportOutcomeEvaluationInput {
   readonly baselineInstallError?: InstallErrorLike;
   readonly newInstallError?: InstallErrorLike;
+  readonly redactor?: Redactor;
+  readonly redactionOptions?: RedactionOptions;
+}
+
+/**
+ * Redacts install error text with the injected redactor (when supplied) on top of
+ * the built-in `redactText` engine so secret tokens and keys never reach the
+ * `InstallErrorRow` rows returned in the install comparison.
+ */
+function redactInstallText(
+  text: string,
+  redactor?: Redactor,
+  redactionOptions?: RedactionOptions
+): string {
+  const base = redactText(text, redactionOptions);
+  if (!redactor || typeof redactor.redactText !== "function") {
+    return base;
+  }
+  try {
+    return redactor.redactText(base);
+  } catch {
+    return base;
+  }
 }
 
 function toInstallRow(
   context: InstallErrorContext,
-  value: InstallErrorLike
+  value: InstallErrorLike,
+  redactor?: Redactor,
+  redactionOptions?: RedactionOptions
 ): InstallErrorRow | null {
   if (value === null || value === undefined) {
     return null;
@@ -609,7 +634,7 @@ function toInstallRow(
           context,
           command: null,
           exitCode: null,
-          error: trimmed,
+          error: redactInstallText(trimmed, redactor, redactionOptions),
           ref: null,
         };
   }
@@ -618,7 +643,7 @@ function toInstallRow(
     context,
     command: value.command ?? null,
     exitCode: typeof value.exitCode === "number" ? value.exitCode : null,
-    error: String(error),
+    error: redactInstallText(String(error), redactor, redactionOptions),
     ref: value.ref ?? null,
   };
   if (
@@ -634,10 +659,12 @@ function toInstallRow(
 
 function buildInstallComparison(
   baseline: InstallErrorLike,
-  newError: InstallErrorLike
+  newError: InstallErrorLike,
+  redactor?: Redactor,
+  redactionOptions?: RedactionOptions
 ): InstallComparison {
-  const baselineRow = toInstallRow("baseline", baseline);
-  const newRow = toInstallRow("new", newError);
+  const baselineRow = toInstallRow("baseline", baseline, redactor, redactionOptions);
+  const newRow = toInstallRow("new", newError, redactor, redactionOptions);
   const rows: InstallErrorRow[] = [];
   if (baselineRow) {
     rows.push(baselineRow);
@@ -663,7 +690,9 @@ export function assignRunOutcomeWithInstallComparison(
   const outcome = evaluateReportOutcome(input);
   const installComparison = buildInstallComparison(
     input.baselineInstallError,
-    input.newInstallError
+    input.newInstallError,
+    input.redactor,
+    input.redactionOptions
   );
   return { outcome, installComparison };
 }

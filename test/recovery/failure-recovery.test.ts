@@ -1,5 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 
 import { EventStore } from "../../lib/events/event-store";
 import { RunStore } from "../../lib/runs/run-store";
@@ -7,7 +10,14 @@ import {
   FailureRecoveryHandler,
   SECURITY_CONTAINMENT_EVENT_KIND,
 } from "../../lib/supervisor/failure-recovery";
-import { BootReconciliationService } from "../../lib/recovery/boot-reconciliation";
+import {
+  BootReconciliationService,
+  DEFAULT_SANDBOX_MANAGED_BY,
+  SANDBOX_OWNERSHIP_LABEL,
+  SANDBOX_TENANT_LABEL,
+  SANDBOX_WORKER_LABEL,
+} from "../../lib/recovery/boot-reconciliation";
+import { Redactor } from "../../lib/security/redactor";
 import {
   CLAUDE_HAIKU_5_5_MODEL_ID,
   CLAUDE_OPUS_5_5_MODEL_ID,
@@ -150,7 +160,7 @@ test("failure-recovery: quarantines a worktree and blocks its merge", () => {
   });
   assert.equal(q.quarantined, true);
   assert.equal(q.mergeBlocked, true);
-  assert.equal(q.isolated, true);
+  assert.equal(q.isolated, false);
   assert.equal(handler.isWorktreeQuarantined("/tmp/worktrees/sk-9"), true);
   assert.equal(handler.isMergeBlocked("run-sec"), true);
 
@@ -160,6 +170,7 @@ test("failure-recovery: quarantines a worktree and blocks its merge", () => {
   assert.equal(events.length, 1);
   assert.equal(events[0].data.reason, "secret_detected");
   assert.equal(events[0].data.mergeBlocked, true);
+  assert.equal(events[0].data.isolated, false);
 
   const q2 = handler.quarantineWorktree({
     runId: "run-sec-2",
@@ -253,16 +264,23 @@ test("failure-recovery: boot reconciliation reaps safe pids, destroys orphan box
     eventStore,
     backend: {
       list: () => [
-        { sandboxId: "box-a", runId: "run-a" },
-        { sandboxId: "box-orphan" },
+        {
+          sandboxId: "box-a",
+          runId: "run-a",
+          labels: { [SANDBOX_OWNERSHIP_LABEL]: DEFAULT_SANDBOX_MANAGED_BY },
+        },
+        {
+          sandboxId: "box-orphan",
+          labels: { [SANDBOX_OWNERSHIP_LABEL]: DEFAULT_SANDBOX_MANAGED_BY },
+        },
       ],
       destroy: (id) => {
         destroyed.push(id);
       },
     },
     pidFiles: [
-      { pid: 100, command: "kiro-cli --acp" },
-      { pid: 200, command: "node unrelated.js" },
+      { pid: 100, command: "kiro-cli --acp", expectedOwner: "root" },
+      { pid: 200, command: "node unrelated.js", expectedOwner: "root" },
       { pid: 300, command: "kiro-cli --acp", expectedOwner: "root" },
     ],
     processOps: {
@@ -279,6 +297,7 @@ test("failure-recovery: boot reconciliation reaps safe pids, destroys orphan box
   assert.deepEqual([...result.skippedPids].sort((a, b) => a - b), [200, 300]);
   assert.deepEqual(killed, [100]);
   assert.ok(result.destroyedBoxes.includes("box-orphan"));
+  assert.deepEqual(result.unownedBoxes, []);
   assert.ok(result.errored.includes("run-b"));
   assert.ok(result.recovered.includes("run-a"));
   assert.ok(result.recovered.includes("run-c"));
@@ -413,3 +432,264 @@ test("failure-recovery: transitions a run to budget_stopped on Kiro credit exhau
     1
   );
 });
+
+test("failure-recovery: skips unowned/cross-tenant boxes and never reaps substring or unverifiable pids", async () => {
+  const runStore = new RunStore(":memory:");
+  const eventStore = new EventStore(":memory:");
+
+  const listedFilters: Record<string, string>[] = [];
+  const destroyed: string[] = [];
+  const killed: number[] = [];
+
+  const service = new BootReconciliationService();
+  const result = await service.reconcileOnBoot({
+    runStore,
+    eventStore,
+    managedBy: DEFAULT_SANDBOX_MANAGED_BY,
+    workerId: "worker-1",
+    tenantId: "tenant-1",
+    backend: {
+      list: (labels) => {
+        listedFilters.push(labels ?? {});
+        return [
+          {
+            sandboxId: "box-ours",
+            labels: {
+              [SANDBOX_OWNERSHIP_LABEL]: DEFAULT_SANDBOX_MANAGED_BY,
+              [SANDBOX_WORKER_LABEL]: "worker-1",
+              [SANDBOX_TENANT_LABEL]: "tenant-1",
+            },
+          },
+          {
+            sandboxId: "box-cross-tenant",
+            labels: {
+              [SANDBOX_OWNERSHIP_LABEL]: DEFAULT_SANDBOX_MANAGED_BY,
+              [SANDBOX_WORKER_LABEL]: "worker-1",
+              [SANDBOX_TENANT_LABEL]: "tenant-2",
+            },
+          },
+          {
+            sandboxId: "box-foreign-owner",
+            labels: { [SANDBOX_OWNERSHIP_LABEL]: "someone-else" },
+          },
+          { sandboxId: "box-no-labels" },
+        ];
+      },
+      destroy: (id) => {
+        destroyed.push(id);
+      },
+    },
+    pidFiles: [
+      { pid: 11, command: "vim kiro-cli.md", expectedOwner: "root" },
+      { pid: 12, command: "kiro-cli --acp", expectedOwner: "root" },
+      { pid: 13, command: "kiro-cli --acp", expectedOwner: "root" },
+      { pid: 14, command: "kiro-cli --acp" },
+    ],
+    processOps: {
+      isAlive: () => true,
+      readCommand: (pid) =>
+        ({
+          11: "vim kiro-cli.md",
+          12: "kiro-cli --acp",
+          13: "kiro-cli --acp",
+          14: "kiro-cli --acp",
+        }[pid] ?? null),
+      readOwner: (pid) => {
+        if (pid === 12) {
+          return undefined;
+        }
+        if (pid === 13) {
+          return "user";
+        }
+        return "root";
+      },
+      kill: (pid) => {
+        killed.push(pid);
+      },
+    },
+  });
+
+  assert.equal(listedFilters.length, 1);
+  assert.deepEqual(listedFilters[0], {
+    [SANDBOX_OWNERSHIP_LABEL]: DEFAULT_SANDBOX_MANAGED_BY,
+    [SANDBOX_WORKER_LABEL]: "worker-1",
+    [SANDBOX_TENANT_LABEL]: "tenant-1",
+  });
+
+  assert.deepEqual(destroyed, ["box-ours"]);
+  assert.ok(result.destroyedBoxes.includes("box-ours"));
+  assert.ok(result.unownedBoxes.includes("box-cross-tenant"));
+  assert.ok(result.unownedBoxes.includes("box-foreign-owner"));
+  assert.ok(result.unownedBoxes.includes("box-no-labels"));
+  assert.ok(!result.destroyedBoxes.includes("box-cross-tenant"));
+  assert.ok(!result.destroyedBoxes.includes("box-foreign-owner"));
+
+  assert.deepEqual(result.reapedPids, []);
+  assert.deepEqual(killed, []);
+  assert.deepEqual([...result.skippedPids].sort((a, b) => a - b), [11, 12, 13, 14]);
+});
+
+
+test("failure-recovery: omitting checkGateway fails closed with gateway_missing", async () => {
+  const eventStore = new EventStore(":memory:");
+  const handler = new FailureRecoveryHandler({ eventStore });
+
+  const result = await handler.verifyPrePromptInvariants({
+    role: "scribe",
+    activeModel: CLAUDE_HAIKU_5_5_MODEL_ID,
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.canPrompt, false);
+  assert.equal(result.reason, "gateway_missing");
+  assert.equal(result.gatewayConnected, false);
+});
+
+test("failure-recovery: threads the injected custom Redactor through event data", () => {
+  const eventStore = new EventStore(":memory:");
+  const redactor = new Redactor({ autoRegisterEnvSecrets: false });
+  const secret = "topsecretvalue-abc123";
+  redactor.registerSecret(secret);
+
+  const handler = new FailureRecoveryHandler({ eventStore, redactor });
+  handler.handleBrokerWatchdogTimeout({
+    runId: "run-redact",
+    skeletonId: "sk-redact",
+    requestId: secret,
+    timeoutMs: 1000,
+    watchdogLimitMs: 1000,
+  });
+
+  const anomalies = eventStore.getEvents("run-redact", { kind: "permission.anomaly" });
+  assert.equal(anomalies.length, 1);
+  assert.equal(anomalies[0].data.requestId, "[REDACTED]");
+  assert.ok(!String(anomalies[0].data.requestId).includes(secret));
+});
+
+
+test("failure-recovery: quarantineWorktree writes real .QUARANTINED containment on a temp worktree", () => {
+  const eventStore = new EventStore(":memory:");
+  const handler = new FailureRecoveryHandler({ eventStore });
+
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "gg-quarantine-"));
+  const nested = path.join(tmp, "nested");
+  fs.mkdirSync(nested);
+  fs.writeFileSync(path.join(tmp, "file.txt"), "secret");
+  fs.writeFileSync(path.join(nested, "deep.txt"), "deep");
+
+  try {
+    const result = handler.quarantineWorktree({
+      runId: "run-real",
+      skeletonId: "sk-real",
+      worktreeDir: tmp,
+      reason: "secret_detected",
+    });
+
+    assert.equal(result.isolated, true);
+    assert.equal(result.mergeBlocked, true);
+
+    const markerPath = path.join(tmp, ".QUARANTINED");
+    assert.equal(fs.existsSync(markerPath), true);
+    const marker = JSON.parse(fs.readFileSync(markerPath, "utf-8")) as Record<string, unknown>;
+    assert.equal(marker.runId, "run-real");
+    assert.equal(marker.reason, "secret_detected");
+
+    assert.equal(fs.statSync(path.join(tmp, "file.txt")).mode & 0o222, 0);
+    assert.equal(fs.statSync(path.join(nested, "deep.txt")).mode & 0o222, 0);
+    assert.equal(fs.statSync(tmp).mode & 0o222, 0);
+
+    const events = eventStore.getEvents("run-real", {
+      kind: SECURITY_CONTAINMENT_EVENT_KIND,
+    });
+    assert.equal(events.length, 1);
+    assert.equal(events[0].data.isolated, true);
+  } finally {
+    const restore = (target: string, mode: number) => {
+      try {
+        fs.chmodSync(target, mode);
+      } catch {
+        // ignore
+      }
+    };
+    restore(nested, 0o755);
+    restore(tmp, 0o755);
+    restore(path.join(tmp, "file.txt"), 0o644);
+    restore(path.join(nested, "deep.txt"), 0o644);
+    restore(path.join(tmp, ".QUARANTINED"), 0o644);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("failure-recovery: quarantineWorktree invokes the stopProcess hook for containment", () => {
+  const eventStore = new EventStore(":memory:");
+  const stopped: string[] = [];
+  const handler = new FailureRecoveryHandler({
+    eventStore,
+    stopProcess: (params) => {
+      stopped.push(params.runId);
+      return true;
+    },
+  });
+
+  const result = handler.quarantineWorktree({
+    runId: "run-stop",
+    reason: "secret_detected",
+  });
+
+  assert.deepEqual(stopped, ["run-stop"]);
+  assert.equal(result.isolated, true);
+  assert.equal(result.mergeBlocked, true);
+});
+
+
+test("failure-recovery: handleProcessCrash records a terminal failed skeleton.state on every failure branch", async () => {
+  const eventStore = new EventStore(":memory:");
+  const handler = new FailureRecoveryHandler({ eventStore });
+
+  const recovered = await handler.handleProcessCrash({
+    runId: "run-ok",
+    skeletonId: "sk-ok",
+    loadSession: () => true,
+  });
+  assert.equal(recovered.status, "recovering");
+  assert.equal(recovered.failedEvent, null);
+  assert.equal(eventStore.getEvents("run-ok", { kind: "skeleton.state" }).length, 1);
+
+  const exhausted = await handler.handleProcessCrash({
+    runId: "run-exhausted",
+    skeletonId: "sk-ex",
+    crashCount: 1,
+  });
+  assert.equal(exhausted.status, "failed");
+  assert.ok(exhausted.failedEvent);
+  const exhaustedStates = eventStore.getEvents("run-exhausted", {
+    kind: "skeleton.state",
+  });
+  assert.equal(exhaustedStates.length, 2);
+  assert.equal(exhaustedStates[0].data.state, "recovering");
+  assert.equal(exhaustedStates[1].data.state, "failed");
+  assert.equal(exhaustedStates[1].data.terminal, true);
+
+  const loadFailure = await handler.handleProcessCrash({
+    runId: "run-loadfail",
+    skeletonId: "sk-lf",
+    loadSession: () => false,
+  });
+  assert.equal(loadFailure.status, "failed");
+  const loadStates = eventStore.getEvents("run-loadfail", { kind: "skeleton.state" });
+  assert.equal(loadStates.length, 2);
+  assert.equal(loadStates[1].data.state, "failed");
+
+  const throwing = await handler.handleProcessCrash({
+    runId: "run-throws",
+    skeletonId: "sk-th",
+    loadSession: () => {
+      throw new Error("load exploded");
+    },
+  });
+  assert.equal(throwing.status, "failed");
+  const throwStates = eventStore.getEvents("run-throws", { kind: "skeleton.state" });
+  assert.equal(throwStates.length, 2);
+  assert.equal(throwStates[1].data.state, "failed");
+});
+
