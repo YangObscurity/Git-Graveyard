@@ -7,6 +7,7 @@
 // the module fails closed with `503`.
 
 import * as crypto from "node:crypto";
+import type { SettingsStore } from "./settings-store";
 
 export const ADMIN_SESSION_COOKIE = "gg_admin_session";
 export const DEFAULT_ADMIN_SESSION_TTL_MS = 12 * 60 * 60 * 1000;
@@ -223,31 +224,202 @@ export function bearerTokenFromAuthorization(authorization: string | null): stri
 
 
 // ---------------------------------------------------------------------------------------------
-// Revoked sessions and failed-login rate limiting (process-wide, resettable for tests)
+// Revoked sessions, failed-login throttling and client identity (process-wide, resettable)
 // ---------------------------------------------------------------------------------------------
 
+/** Key under which revoked admin session ids are persisted for cross-request visibility. */
+export const ADMIN_REVOKED_SESSIONS_SETTING_KEY = "admin.revokedSessions";
+/** A non-spoofable client key used when no trusted proxy is configured. */
+export const DIRECT_CLIENT_IP_KEY = "direct";
+/** Process-wide ceiling on failed admin logins within the window, independent of the client key. */
+export const DEFAULT_ADMIN_GLOBAL_LOGIN_MAX_ATTEMPTS = 50;
+/** Sliding window for the process-wide failed-login throttle. */
+export const DEFAULT_ADMIN_GLOBAL_LOGIN_WINDOW_MS = 60_000;
+/** Upper bound on distinct per-client login buckets so spoofed keys cannot exhaust memory. */
+export const MAX_TRACKED_ADMIN_LOGIN_KEYS = 10_000;
+
+interface RevokedSessionEntry {
+  revokedAt: number;
+  /** Absolute expiry (ms) after which the revocation no longer needs to be remembered. */
+  expiresAt: number | null;
+}
+
+interface PersistedRevocation {
+  sessionId: string;
+  revokedAt: number;
+  expiresAt: number | null;
+}
+
 interface AdminSessionState {
-  revokedSessions?: Set<string>;
+  revokedSessions?: Map<string, RevokedSessionEntry>;
   loginAttempts?: Map<string, number[]>;
+  globalLoginAttempts?: number[];
+}
+
+export interface RevokeAdminSessionOptions {
+  now?: number;
+  expiresAt?: number | null;
+  settingsStore?: SettingsStore;
+}
+
+export interface AdminSessionLookupOptions {
+  now?: number;
+  settingsStore?: SettingsStore;
 }
 
 function state(): AdminSessionState {
   return globalThis as unknown as AdminSessionState;
 }
 
-export function revokeAdminSession(sessionId: string): void {
+function normalizeLoginKey(ip: string): string {
+  return ip && ip.trim().length > 0 ? ip.trim() : "unknown";
+}
+
+function resolveEntryExpiry(entry: PersistedRevocation): number {
+  return entry.expiresAt ?? entry.revokedAt + DEFAULT_ADMIN_SESSION_TTL_MS;
+}
+
+function pruneRevokedSessions(now: number): void {
+  const map = state().revokedSessions;
+  if (!map || map.size === 0) {
+    return;
+  }
+  for (const [sessionId, entry] of map) {
+    const expiresAt = entry.expiresAt ?? entry.revokedAt + DEFAULT_ADMIN_SESSION_TTL_MS;
+    if (now >= expiresAt) {
+      map.delete(sessionId);
+    }
+  }
+}
+
+function readPersistedRevocations(
+  store: SettingsStore | undefined,
+  now: number
+): PersistedRevocation[] {
+  if (!store) {
+    return [];
+  }
+  let raw: unknown;
+  try {
+    raw = store.getSetting<unknown>(ADMIN_REVOKED_SESSIONS_SETTING_KEY);
+  } catch {
+    return [];
+  }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return [];
+  }
+  const sessions = (raw as Record<string, unknown>).sessions;
+  if (!Array.isArray(sessions)) {
+    return [];
+  }
+  const out: PersistedRevocation[] = [];
+  for (const item of sessions) {
+    if (!item || typeof item !== "object") {
+      continue;
+    }
+    const record = item as Record<string, unknown>;
+    const sessionId = record.sessionId;
+    if (typeof sessionId !== "string" || sessionId.length === 0) {
+      continue;
+    }
+    const revokedAt = typeof record.revokedAt === "number" ? record.revokedAt : now;
+    const expiresAt = typeof record.expiresAt === "number" ? record.expiresAt : null;
+    const entry: PersistedRevocation = { sessionId, revokedAt, expiresAt };
+    if (now < resolveEntryExpiry(entry)) {
+      out.push(entry);
+    }
+  }
+  return out;
+}
+
+function persistRevokedSession(
+  store: SettingsStore | undefined,
+  sessionId: string,
+  revokedAt: number,
+  expiresAt: number | null
+): void {
+  if (!store) {
+    return;
+  }
+  try {
+    const kept = readPersistedRevocations(store, revokedAt).filter(
+      (entry) => entry.sessionId !== sessionId
+    );
+    kept.push({ sessionId, revokedAt, expiresAt });
+    store.setSetting(
+      ADMIN_REVOKED_SESSIONS_SETTING_KEY,
+      { sessions: kept },
+      { actor: "admin-session", reason: "admin session revocation" }
+    );
+  } catch {
+    // Cross-request persistence is best effort; the in-memory revocation still holds.
+  }
+}
+
+export function revokeAdminSession(
+  sessionId: string,
+  options: RevokeAdminSessionOptions = {}
+): void {
   if (typeof sessionId !== "string" || sessionId.length === 0) {
     return;
   }
+  const now = typeof options.now === "number" ? options.now : Date.now();
   const s = state();
   if (!s.revokedSessions) {
-    s.revokedSessions = new Set<string>();
+    s.revokedSessions = new Map<string, RevokedSessionEntry>();
   }
-  s.revokedSessions.add(sessionId);
+  const expiresAt = typeof options.expiresAt === "number" ? options.expiresAt : null;
+  s.revokedSessions.set(sessionId, { revokedAt: now, expiresAt });
+  pruneRevokedSessions(now);
+  persistRevokedSession(options.settingsStore, sessionId, now, expiresAt);
 }
 
-export function isAdminSessionRevoked(sessionId: string): boolean {
-  return Boolean(state().revokedSessions?.has(sessionId));
+export function isAdminSessionRevoked(
+  sessionId: string,
+  options: AdminSessionLookupOptions = {}
+): boolean {
+  if (typeof sessionId !== "string" || sessionId.length === 0) {
+    return false;
+  }
+  const now = typeof options.now === "number" ? options.now : Date.now();
+  pruneRevokedSessions(now);
+  if (state().revokedSessions?.has(sessionId)) {
+    return true;
+  }
+  return readPersistedRevocations(options.settingsStore, now).some(
+    (entry) => entry.sessionId === sessionId
+  );
+}
+
+function pruneLoginAttempts(cutoff: number): void {
+  const s = state();
+  const map = s.loginAttempts;
+  if (map) {
+    for (const [key, timestamps] of map) {
+      const live = timestamps.filter((ts) => ts > cutoff);
+      if (live.length === 0) {
+        map.delete(key);
+      } else if (live.length !== timestamps.length) {
+        map.set(key, live);
+      }
+    }
+    if (map.size > MAX_TRACKED_ADMIN_LOGIN_KEYS) {
+      const overflow = map.size - MAX_TRACKED_ADMIN_LOGIN_KEYS;
+      const evicted: string[] = [];
+      for (const key of map.keys()) {
+        if (evicted.length >= overflow) {
+          break;
+        }
+        evicted.push(key);
+      }
+      for (const key of evicted) {
+        map.delete(key);
+      }
+    }
+  }
+  if (s.globalLoginAttempts) {
+    s.globalLoginAttempts = s.globalLoginAttempts.filter((ts) => ts > cutoff);
+  }
 }
 
 export function recordFailedAdminLogin(
@@ -259,21 +431,38 @@ export function recordFailedAdminLogin(
   if (!s.loginAttempts) {
     s.loginAttempts = new Map<string, number[]>();
   }
-  const key = ip && ip.trim().length > 0 ? ip.trim() : "unknown";
+  const key = normalizeLoginKey(ip);
   const cutoff = now - windowMs;
   const existing = (s.loginAttempts.get(key) ?? []).filter((ts) => ts > cutoff);
   existing.push(now);
   s.loginAttempts.set(key, existing);
+
+  if (!s.globalLoginAttempts) {
+    s.globalLoginAttempts = [];
+  }
+  const globalCutoff = now - Math.max(windowMs, DEFAULT_ADMIN_GLOBAL_LOGIN_WINDOW_MS);
+  const global = s.globalLoginAttempts.filter((ts) => ts > globalCutoff);
+  global.push(now);
+  s.globalLoginAttempts = global;
+
+  pruneLoginAttempts(now - Math.max(windowMs, DEFAULT_ADMIN_GLOBAL_LOGIN_WINDOW_MS));
 }
 
 export function isAdminLoginRateLimited(
   ip: string,
   now: number = Date.now(),
   windowMs: number = DEFAULT_ADMIN_LOGIN_WINDOW_MS,
-  maxAttempts: number = DEFAULT_ADMIN_LOGIN_MAX_ATTEMPTS
+  maxAttempts: number = DEFAULT_ADMIN_LOGIN_MAX_ATTEMPTS,
+  globalMaxAttempts: number = DEFAULT_ADMIN_GLOBAL_LOGIN_MAX_ATTEMPTS
 ): boolean {
   const s = state();
-  const key = ip && ip.trim().length > 0 ? ip.trim() : "unknown";
+  const globalCutoff = now - Math.max(windowMs, DEFAULT_ADMIN_GLOBAL_LOGIN_WINDOW_MS);
+  const globalRecent = (s.globalLoginAttempts ?? []).filter((ts) => ts > globalCutoff);
+  if (globalRecent.length >= globalMaxAttempts) {
+    return true;
+  }
+
+  const key = normalizeLoginKey(ip);
   const list = s.loginAttempts?.get(key);
   if (!list) {
     return false;
@@ -284,26 +473,50 @@ export function isAdminLoginRateLimited(
 
 export function clearAdminLoginAttempts(ip: string): void {
   const s = state();
-  const key = ip && ip.trim().length > 0 ? ip.trim() : "unknown";
+  const key = normalizeLoginKey(ip);
   s.loginAttempts?.delete(key);
 }
 
 export function resetAdminSessionState(): void {
   const s = state();
-  s.revokedSessions = new Set<string>();
+  s.revokedSessions = new Map<string, RevokedSessionEntry>();
   s.loginAttempts = new Map<string, number[]>();
+  s.globalLoginAttempts = [];
 }
 
-export function clientIpFromRequest(request: Request): string {
-  const forwarded = request.headers.get("x-forwarded-for");
-  if (forwarded && forwarded.trim().length > 0) {
-    return forwarded.split(",")[0].trim();
+export interface ClientIpOptions {
+  /** Explicitly trust `X-Forwarded-For` / `X-Real-IP`; defaults to the `TRUST_PROXY` env flag. */
+  trustProxy?: boolean;
+  env?: NodeJS.ProcessEnv;
+}
+
+function isProxyTrustEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const value = env.TRUST_PROXY;
+  return value === "1" || value === "true";
+}
+
+/**
+ * Derives the client key for rate limiting. Forwarded headers are attacker-controlled, so they are
+ * only honored when an operator has explicitly opted in via `TRUST_PROXY=1|true` (or the
+ * `{ trustProxy: true }` option). Otherwise a constant, non-spoofable `direct` key is returned so a
+ * caller cannot mint fresh buckets by rotating headers.
+ */
+export function clientIpFromRequest(request: Request, options: ClientIpOptions = {}): string {
+  const trustProxy = options.trustProxy ?? isProxyTrustEnabled(options.env);
+  if (trustProxy) {
+    const forwarded = request.headers.get("x-forwarded-for");
+    if (forwarded && forwarded.trim().length > 0) {
+      const first = forwarded.split(",")[0].trim();
+      if (first.length > 0) {
+        return first;
+      }
+    }
+    const realIp = request.headers.get("x-real-ip");
+    if (realIp && realIp.trim().length > 0) {
+      return realIp.trim();
+    }
   }
-  const realIp = request.headers.get("x-real-ip");
-  if (realIp && realIp.trim().length > 0) {
-    return realIp.trim();
-  }
-  return "unknown";
+  return DIRECT_CLIENT_IP_KEY;
 }
 
 function denied(status: number, error: string): { ok: false; response: Response } {
@@ -311,6 +524,11 @@ function denied(status: number, error: string): { ok: false; response: Response 
     ok: false,
     response: Response.json({ ok: false, error }, { status }),
   };
+}
+
+export interface RequireAdminAuthOptions {
+  /** Optional SettingsStore used to observe cross-request session revocations. */
+  settingsStore?: SettingsStore;
 }
 
 /**
@@ -321,7 +539,8 @@ function denied(status: number, error: string): { ok: false; response: Response 
  */
 export function requireAdminAuth(
   request: Request,
-  env: NodeJS.ProcessEnv = process.env
+  env: NodeJS.ProcessEnv = process.env,
+  options: RequireAdminAuthOptions = {}
 ): AdminAuthResult {
   const secret = getAdminSecret(env);
   if (!secret) {
@@ -342,7 +561,9 @@ export function requireAdminAuth(
   if (cookieToken) {
     const verified = verifyAdminSessionToken(cookieToken, secret);
     if (verified.ok && verified.payload) {
-      if (isAdminSessionRevoked(verified.payload.sid)) {
+      if (
+        isAdminSessionRevoked(verified.payload.sid, { settingsStore: options.settingsStore })
+      ) {
         return denied(403, "admin_session_revoked");
       }
       return {

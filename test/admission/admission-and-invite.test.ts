@@ -16,6 +16,7 @@ import {
 } from "../../lib/admission/invite-code";
 import { FifoQueue } from "../../lib/admission/fifo-queue";
 import { AdmissionController } from "../../lib/admission/admission-controller";
+import { BudgetGovernor } from "../../lib/governor/budget-governor";
 
 function makeHarness() {
   const db = new DatabaseSync(":memory:");
@@ -46,6 +47,45 @@ describe("InviteCodeService (Task 22.1)", () => {
     const created = service.createCode({ allowedRunCount: 1 }, { adminSession: true });
     assert.equal(typeof created.code, "string");
     assert.ok(created.code.length > 10);
+  });
+
+  it("rejects a bare actor string but accepts a verified session object", () => {
+    const { runStore } = makeHarness();
+    const service = new InviteCodeService({ runStore });
+
+    assert.throws(
+      () => service.createCode({ allowedRunCount: 1 }, { actor: "owner" }),
+      InviteCodeAuthorizationError
+    );
+    assert.throws(
+      () => service.revokeCode("anything", { actor: "owner" }),
+      InviteCodeAuthorizationError
+    );
+    assert.throws(
+      () => service.createCode({ allowedRunCount: 1 }, { adminSession: { verified: false } }),
+      InviteCodeAuthorizationError
+    );
+
+    const created = service.createCode(
+      { allowedRunCount: 1 },
+      { adminSession: { verified: true } }
+    );
+    assert.ok(created.code.startsWith("gg_"));
+  });
+
+  it("revokes a plaintext code through its resolved hash", () => {
+    const { runStore } = makeHarness();
+    const service = new InviteCodeService({ runStore });
+    const created = service.createCode({ allowedRunCount: 1 }, { adminSession: true });
+
+    const result = service.revokeCode(created.code, { adminSession: true });
+    assert.equal(result.ok, true);
+    assert.equal(result.codeHash, created.record.codeHash);
+    assert.equal(service.getCode(created.record.codeHash)?.revoked, true);
+
+    const verified = service.verifyCode(created.code, "2.2.2.2");
+    assert.equal(verified.ok, false);
+    assert.equal(verified.ok === false ? verified.reason : "", "revoked");
   });
 
   it("returns the plaintext code exactly once and never leaks it or the salt afterwards", () => {
@@ -191,6 +231,23 @@ describe("FifoQueue (Task 22.2)", () => {
     assert.ok(eventStore.getEvents("r2", { kind: "run.queue_position" }).length >= 2);
   });
 
+  it("emits zero spurious run.queue_position events for unchanged entries on enqueue", () => {
+    const { eventStore } = makeHarness();
+    const queue = new FifoQueue({ eventStore });
+
+    queue.enqueue({ runId: "first" });
+    const before = eventStore.getEvents("first", { kind: "run.queue_position" }).length;
+
+    queue.enqueue({ runId: "second" });
+    queue.enqueue({ runId: "third" });
+
+    const after = eventStore.getEvents("first", { kind: "run.queue_position" }).length;
+    assert.equal(after, before);
+    assert.equal(queue.getPosition("first"), 1);
+    assert.equal(queue.getPosition("second"), 2);
+    assert.equal(queue.getPosition("third"), 3);
+  });
+
   it("evicts idle entries and supports move/remove/cancel", () => {
     let now = 0;
     const { runStore, eventStore } = makeHarness();
@@ -307,6 +364,31 @@ describe("AdmissionController (Task 22.2)", () => {
     assert.equal(after.admitted, true);
   });
 
+  it("applies a positive default backoff when the retry hint is missing or non-positive", () => {
+    let now = 0;
+    const { runStore } = makeHarness();
+    const settings = new SettingsStore(":memory:");
+    satisfyRequiredSettings(settings);
+    const controller = new AdmissionController({
+      settingsStore: settings,
+      runStore,
+      now: () => now,
+    });
+
+    controller.triggerRateLimitBackoff(0);
+    assert.equal(controller.isBackingOff(), true);
+    assert.ok(controller.backoffRetryAfterMs() > 0);
+
+    controller.clearBackoff();
+    controller.triggerRateLimitBackoff(Number.NaN);
+    assert.equal(controller.isBackingOff(), true);
+    assert.ok(controller.backoffRetryAfterMs() >= 30_000);
+    assert.equal(controller.checkAdmission().code, "RATE_LIMITED");
+
+    now = 30_001;
+    assert.equal(controller.checkAdmission().admitted, true);
+  });
+
   it("halts on ACP auth failure without retries, preserving the queue and alerting the Owner", () => {
     const { runStore, eventStore } = makeHarness();
     const settings = new SettingsStore(":memory:");
@@ -328,6 +410,38 @@ describe("AdmissionController (Task 22.2)", () => {
     const alerts = eventStore.getEvents("system", { kind: "system.worker_state" });
     assert.ok(alerts.length >= 1);
     assert.equal(alerts[0].data.ownerAlert, true);
+  });
+});
+
+describe("BudgetGovernor (Task 22.3)", () => {
+  it("re-arms the warning after a cap increase drops usage below the threshold", () => {
+    const { eventStore } = makeHarness();
+    const governor = new BudgetGovernor({
+      runId: "warn-run",
+      eventStore,
+      caps: { toolCallsPerRun: 10 },
+      warningPercent: 80,
+    });
+
+    governor.beginTurn("s1");
+    for (let i = 0; i < 8; i += 1) {
+      governor.recordToolCall("s1");
+    }
+    governor.evaluate();
+    assert.equal(eventStore.getEvents("warn-run", { kind: "budget.warning" }).length, 1);
+    assert.deepEqual(governor.getWarnings(), ["toolCallsPerRun"]);
+
+    // Raising the cap moves usage (8) strictly below the new 80% threshold (16) and re-arms it.
+    const grant = governor.grantCapIncrease("toolCallsPerRun", 20, { actor: "owner" });
+    assert.equal(grant.ok, true);
+    assert.deepEqual(governor.getWarnings(), []);
+
+    // Crossing the new threshold emits a fresh budget.warning.
+    for (let i = 0; i < 8; i += 1) {
+      governor.recordToolCall("s1");
+    }
+    governor.evaluate();
+    assert.equal(eventStore.getEvents("warn-run", { kind: "budget.warning" }).length, 2);
   });
 });
 

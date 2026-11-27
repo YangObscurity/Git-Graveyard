@@ -9,7 +9,9 @@ import {
   KILL_SWITCH_LEVELS,
   KillSwitchService,
   type KillSwitchLevel,
+  type KillSwitchState,
 } from "@/lib/admin/kill-switch";
+import type { SettingsStore } from "@/lib/admin/settings-store";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -38,24 +40,90 @@ function numberSetting(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
-function buildService(request: Request): KillSwitchService {
+/** SettingsStore keys that persist kill-switch state across requests. */
+const KILL_SWITCH_PAUSE_KEY = "killSwitch.pauseNewRuns";
+const KILL_SWITCH_STOP_KEY = "killSwitch.stopGracefully";
+const KILL_SWITCH_LAST_LEVEL_KEY = "killSwitch.lastLevel";
+
+const killSwitchRegistry = globalThis as unknown as {
+  __killSwitchServices?: WeakMap<object, KillSwitchService>;
+};
+
+/**
+ * Returns the shared {@link KillSwitchService} bound to a particular `RunStore`, so successive Admin
+ * calls observe the same pause/stop state while distinct stores (tests, other processes) stay
+ * isolated. A shared instance is required because the service mutates in-memory state on `execute`.
+ */
+function buildService(request: Request): { service: KillSwitchService; settings: SettingsStore } {
   const runStore = resolveRunStore(request);
   const eventStore = resolveEventStore(request, undefined, runStore);
   const settings = resolveSettingsStore(request);
-  const queue = resolveFifoQueue({
-    eventStore,
-    runStore,
-    queueDepth: numberSetting(settings.getSetting("queueDepth")),
-    queueIdleLimitMs: numberSetting(settings.getSetting("queueIdleLimitMs")),
-  });
-  return new KillSwitchService({
-    runStore,
-    eventStore,
-    queue: {
-      cancel: (runId) => queue.cancel(runId),
-      remove: (runId) => queue.remove(runId),
-    },
-  });
+
+  if (!killSwitchRegistry.__killSwitchServices) {
+    killSwitchRegistry.__killSwitchServices = new WeakMap<object, KillSwitchService>();
+  }
+  const key = runStore as unknown as object;
+  let service = killSwitchRegistry.__killSwitchServices.get(key);
+  if (!service) {
+    const queue = resolveFifoQueue({
+      eventStore,
+      runStore,
+      queueDepth: numberSetting(settings.getSetting("queueDepth")),
+      queueIdleLimitMs: numberSetting(settings.getSetting("queueIdleLimitMs")),
+    });
+    service = new KillSwitchService({
+      runStore,
+      eventStore,
+      queue: {
+        cancel: (runId) => queue.cancel(runId),
+        remove: (runId) => queue.remove(runId),
+      },
+    });
+    killSwitchRegistry.__killSwitchServices.set(key, service);
+  }
+  return { service, settings };
+}
+
+/** Clears the shared kill-switch registry (used by tests between fixtures). */
+export function resetKillSwitchRegistry(): void {
+  killSwitchRegistry.__killSwitchServices = new WeakMap<object, KillSwitchService>();
+}
+
+function readBooleanSetting(settings: SettingsStore, key: string): boolean {
+  return settings.getSetting(key) === true;
+}
+
+function readLastLevel(settings: SettingsStore): KillSwitchLevel | null {
+  const value = settings.getSetting(KILL_SWITCH_LAST_LEVEL_KEY);
+  return isLevel(value) ? value : null;
+}
+
+/** Merges the live service state with any persisted state so a fresh process still observes it. */
+function mergedState(service: KillSwitchService, settings: SettingsStore): KillSwitchState {
+  const base = service.getState();
+  return {
+    pausedNewRuns: base.pausedNewRuns || readBooleanSetting(settings, KILL_SWITCH_PAUSE_KEY),
+    stoppingGracefully:
+      base.stoppingGracefully || readBooleanSetting(settings, KILL_SWITCH_STOP_KEY),
+    lastLevel: base.lastLevel ?? readLastLevel(settings),
+    lastExecutedAt: base.lastExecutedAt,
+  };
+}
+
+function persistState(settings: SettingsStore, actor: string, service: KillSwitchService): void {
+  const state = service.getState();
+  try {
+    settings.setSettingsBatch(
+      {
+        [KILL_SWITCH_PAUSE_KEY]: state.pausedNewRuns,
+        [KILL_SWITCH_STOP_KEY]: state.stoppingGracefully,
+        [KILL_SWITCH_LAST_LEVEL_KEY]: state.lastLevel,
+      },
+      { actor, reason: "kill switch state" }
+    );
+  } catch {
+    // Persistence is best effort; the shared in-memory service still holds the state.
+  }
 }
 
 export async function GET(request: Request): Promise<Response> {
@@ -63,9 +131,9 @@ export async function GET(request: Request): Promise<Response> {
   if (!auth.ok) {
     return auth.response;
   }
-  const service = buildService(request);
+  const { service, settings } = buildService(request);
   const previews = KILL_SWITCH_LEVELS.map((level) => service.preview(level));
-  return Response.json({ ok: true, previews, state: service.getState() });
+  return Response.json({ ok: true, previews, state: mergedState(service, settings) });
 }
 
 export async function POST(request: Request): Promise<Response> {
@@ -78,7 +146,7 @@ export async function POST(request: Request): Promise<Response> {
     return Response.json({ ok: false, error: "invalid_level" }, { status: 400 });
   }
 
-  const service = buildService(request);
+  const { service, settings } = buildService(request);
   const preview = service.preview(body.level);
 
   const confirmed = body.confirmed === true || body.confirm === true;
@@ -94,5 +162,6 @@ export async function POST(request: Request): Promise<Response> {
     actor: auth.actor.id,
     reason: typeof body.reason === "string" ? body.reason : undefined,
   });
-  return Response.json({ ok: true, result, state: service.getState() });
+  persistState(settings, auth.actor.id, service);
+  return Response.json({ ok: true, result, state: mergedState(service, settings) });
 }

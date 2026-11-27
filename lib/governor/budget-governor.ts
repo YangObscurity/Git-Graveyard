@@ -540,6 +540,11 @@ export class BudgetGovernor {
     if (value !== null && value < newCap) {
       this.exceededDimensions.delete(dimension);
     }
+    // Re-arm the warning when the raised cap moves the usage ratio strictly below the warning
+    // threshold, so crossing the new threshold later emits a fresh `budget.warning` (Requirement 30.5).
+    if (value !== null && value < (newCap * this.warningPercent) / 100) {
+      this.warningsEmitted.delete(dimension);
+    }
     if (this.exceededDimensions.size === 0) {
       this.pendingAsk = null;
     }

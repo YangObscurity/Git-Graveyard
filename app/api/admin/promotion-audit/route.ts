@@ -74,10 +74,14 @@ export async function GET(request: Request): Promise<Response> {
   let verified = false;
   if (record && secret) {
     const expected = sign(secret, canonicalize(record));
-    verified = expected.length === record.signature.length && crypto.timingSafeEqual(
-      Buffer.from(expected, "utf8"),
-      Buffer.from(record.signature, "utf8")
-    );
+    const expectedBuf = Buffer.from(expected, "utf8");
+    const actualBuf = Buffer.from(record.signature, "utf8");
+    try {
+      verified =
+        expectedBuf.length === actualBuf.length && crypto.timingSafeEqual(expectedBuf, actualBuf);
+    } catch {
+      verified = false;
+    }
   }
   return Response.json({ ok: true, record, verified, present: record !== null });
 }

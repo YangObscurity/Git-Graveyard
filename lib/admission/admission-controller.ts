@@ -14,6 +14,8 @@ import { redactEvent } from "../security/redactor";
 export const SYSTEM_RUN_ID = "system";
 /** Requirement 30.3: the global live-run ceiling (prod at most 5 under the default sandbox quota). */
 export const HARD_CONCURRENT_LIVE_RUNS_CEILING = 5;
+/** Positive fallback backoff applied whenever a rate-limit retry hint is missing or non-positive. */
+export const DEFAULT_RATE_LIMIT_BACKOFF_MS = 30_000;
 
 export type AdmissionRejectionCode =
   | "REQUIRED_SETTINGS_MISSING"
@@ -174,8 +176,8 @@ export class AdmissionController {
     const delay =
       typeof retryAfterMs === "number" && Number.isFinite(retryAfterMs) && retryAfterMs > 0
         ? Math.floor(retryAfterMs)
-        : 0;
-    this.backoffUntil = delay > 0 ? at + delay : at;
+        : DEFAULT_RATE_LIMIT_BACKOFF_MS;
+    this.backoffUntil = at + delay;
   }
 
   clearBackoff(): void {

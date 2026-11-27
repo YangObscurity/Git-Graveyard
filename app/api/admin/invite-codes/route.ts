@@ -45,6 +45,18 @@ export async function POST(request: Request): Promise<Response> {
     return auth.response;
   }
   const body = await readBody(request);
+  const rawAllowedRunCount = body.allowedRunCount;
+  if (rawAllowedRunCount !== undefined) {
+    if (
+      typeof rawAllowedRunCount !== "number" ||
+      !Number.isFinite(rawAllowedRunCount) ||
+      !Number.isInteger(rawAllowedRunCount) ||
+      rawAllowedRunCount < 1
+    ) {
+      return Response.json({ ok: false, error: "invalid_allowed_run_count" }, { status: 400 });
+    }
+  }
+
   const runStore = resolveRunStore(request);
   const service = new InviteCodeService({ runStore });
 
@@ -56,7 +68,7 @@ export async function POST(request: Request): Promise<Response> {
             ? body.expiresAt
             : null,
         allowedRunCount:
-          typeof body.allowedRunCount === "number" ? body.allowedRunCount : undefined,
+          typeof rawAllowedRunCount === "number" ? rawAllowedRunCount : undefined,
         caps:
           body.caps && typeof body.caps === "object"
             ? (body.caps as Record<string, unknown>)

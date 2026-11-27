@@ -34,7 +34,7 @@ export class InviteCodeAuthorizationError extends Error {
   }
 }
 
-/** True only for a verified Admin session or an authenticated actor context. */
+/** True only for a verified Admin session; a bare actor string is never sufficient on its own. */
 export function isVerifiedAdminContext(ctx?: InviteCodeAdminContext | null): boolean {
   if (!ctx || typeof ctx !== "object") {
     return false;
@@ -43,17 +43,7 @@ export function isVerifiedAdminContext(ctx?: InviteCodeAdminContext | null): boo
     return true;
   }
   const session = ctx.adminSession;
-  if (session && typeof session === "object" && session.verified === true) {
-    return true;
-  }
-  if (
-    typeof ctx.actor === "string" &&
-    ctx.actor.trim().length > 0 &&
-    ctx.adminSession !== false
-  ) {
-    return true;
-  }
-  return false;
+  return typeof session === "object" && session !== null && session.verified === true;
 }
 
 /** Public, non-sensitive view of a stored Invite_Code (no plaintext code, no raw salt). */
@@ -144,6 +134,8 @@ export interface InviteCodeServiceOptions {
 export const DEFAULT_MAX_ATTEMPTS_PER_IP = 5;
 export const DEFAULT_ATTEMPT_WINDOW_MS = 60_000;
 export const DEFAULT_CODE_BYTES = 24;
+/** Upper bound on distinct per-IP attempt buckets so spoofed keys cannot exhaust memory. */
+export const MAX_IP_TRACKING_BUCKETS = 10_000;
 export class InviteCodeService {
   private readonly runStore: RunStore;
   private readonly now: () => number;
@@ -229,8 +221,9 @@ export class InviteCodeService {
     if (typeof codeOrHash !== "string" || codeOrHash.trim().length === 0) {
       return { ok: false };
     }
+    const trimmed = codeOrHash.trim();
     const resolved = this.resolveRecord(codeOrHash);
-    const ok = this.runStore.revokeInviteCode(codeOrHash.trim());
+    const ok = this.runStore.revokeInviteCode(resolved ? resolved.codeHash : trimmed);
     const codeHash = resolved?.codeHash ?? undefined;
     return codeHash ? { ok, codeHash } : { ok };
   }
@@ -299,6 +292,7 @@ export class InviteCodeService {
     const pruned = existing.filter((ts) => ts > cutoff);
     pruned.push(now);
     this.attemptsByIp.set(ip, pruned);
+    this.pruneAttemptBuckets(cutoff);
 
     if (pruned.length > this.maxAttemptsPerIp) {
       const oldest = pruned[0];
@@ -306,6 +300,36 @@ export class InviteCodeService {
       return { limited: true, retryAfterMs };
     }
     return { limited: false, retryAfterMs: 0 };
+  }
+
+  /**
+   * Drops every attempt bucket whose timestamps have all aged out and caps the map at
+   * {@link MAX_IP_TRACKING_BUCKETS} keys (evicting the oldest-inserted buckets) so a flood of
+   * distinct client keys can never grow the per-instance tracking map without bound.
+   */
+  private pruneAttemptBuckets(cutoff: number): void {
+    for (const [key, timestamps] of this.attemptsByIp) {
+      const live = timestamps.filter((ts) => ts > cutoff);
+      if (live.length === 0) {
+        this.attemptsByIp.delete(key);
+      } else if (live.length !== timestamps.length) {
+        this.attemptsByIp.set(key, live);
+      }
+    }
+    if (this.attemptsByIp.size <= MAX_IP_TRACKING_BUCKETS) {
+      return;
+    }
+    const overflow = this.attemptsByIp.size - MAX_IP_TRACKING_BUCKETS;
+    const evicted: string[] = [];
+    for (const key of this.attemptsByIp.keys()) {
+      if (evicted.length >= overflow) {
+        break;
+      }
+      evicted.push(key);
+    }
+    for (const key of evicted) {
+      this.attemptsByIp.delete(key);
+    }
   }
 
   private resolveRecord(codeOrHash: string): InviteCodeRecord | null {

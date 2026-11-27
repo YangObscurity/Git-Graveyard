@@ -7,7 +7,11 @@ import { DatabaseSync } from "node:sqlite";
 import { RunStore } from "@/lib/runs/run-store";
 import { EventStore } from "@/lib/events/event-store";
 import { SettingsStore } from "@/lib/admin/settings-store";
-import { resetAdminSessionState } from "@/lib/admin/admin-session";
+import {
+  DIRECT_CLIENT_IP_KEY,
+  clientIpFromRequest,
+  resetAdminSessionState,
+} from "@/lib/admin/admin-session";
 import { resetFifoQueueRegistry, resolveFifoQueue } from "@/lib/admission/fifo-queue";
 
 import {
@@ -19,7 +23,11 @@ import { GET as inviteGet, POST as invitePost } from "@/app/api/admin/invite-cod
 import { GET as settingsGet, PATCH as settingsPatch } from "@/app/api/admin/settings/route";
 import { GET as queueGet, POST as queuePost } from "@/app/api/admin/queue/route";
 import { POST as runActionPost } from "@/app/api/admin/runs/[runId]/route";
-import { GET as killGet, POST as killPost } from "@/app/api/admin/kill-switch/route";
+import {
+  GET as killGet,
+  POST as killPost,
+  resetKillSwitchRegistry,
+} from "@/app/api/admin/kill-switch/route";
 import { GET as promoGet, POST as promoPost } from "@/app/api/admin/promotion-audit/route";
 
 const ADMIN_SECRET = "test-admin-secret-value";
@@ -83,6 +91,7 @@ beforeEach(() => {
   delete process.env.ADMIN_KEY;
   resetAdminSessionState();
   resetFifoQueueRegistry();
+  resetKillSwitchRegistry();
   stores = makeStores();
 });
 
@@ -90,6 +99,7 @@ afterEach(() => {
   process.env = savedEnv;
   resetAdminSessionState();
   resetFifoQueueRegistry();
+  resetKillSwitchRegistry();
   try {
     stores.db.close();
   } catch {
@@ -214,6 +224,42 @@ describe("Admin invite codes, settings and queue routes (Task 22.5)", () => {
     assert.equal(list.inviteCodes.length, 1);
     assert.ok(!Object.prototype.hasOwnProperty.call(list.inviteCodes[0], "salt"));
     assert.ok(!JSON.stringify(list).includes(created.code));
+  });
+
+  it("rejects non-finite, non-integer and non-positive allowedRunCount with 400", async () => {
+    const postRaw = async (rawBody: string): Promise<Response> =>
+      invitePost(
+        attach(
+          new Request("http://test/api/admin/invite-codes", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", ...adminHeaders() },
+            body: rawBody,
+          })
+        )
+      );
+
+    // 1e999 overflows JSON.parse to Infinity; the rest cover zero, negative, fractional and string.
+    for (const raw of [
+      '{"allowedRunCount":1e999}',
+      '{"allowedRunCount":0}',
+      '{"allowedRunCount":-2}',
+      '{"allowedRunCount":2.5}',
+      '{"allowedRunCount":"3"}',
+    ]) {
+      const res = await postRaw(raw);
+      assert.equal(res.status, 400, `expected 400 for body ${raw}`);
+    }
+
+    const ok = await invitePost(
+      attach(
+        jsonRequest(
+          "http://test/api/admin/invite-codes",
+          { allowedRunCount: 3 },
+          { method: "POST", headers: adminHeaders() }
+        )
+      )
+    );
+    assert.equal(ok.status, 201);
   });
 
   it("records a mandatory audit entry on every budget setting update", async () => {
@@ -384,6 +430,44 @@ describe("Admin run actions: review, redact, publish, hide (Task 22.5)", () => {
     );
     assert.equal(res.status, 404);
   });
+
+  it("rolls back the run mutation and returns 500 when the audit event cannot be appended", async () => {
+    stores.runStore.createRun({
+      runId: "rollback-run",
+      url: "https://example.test/a/b",
+      sha: "c".repeat(40),
+      phase: "done",
+      outcome: "resurrected",
+      metadata: { reviewed: true },
+    });
+    assert.equal(stores.runStore.getRun("rollback-run")?.isPublished, false);
+
+    const originalAppend = stores.eventStore.append.bind(stores.eventStore);
+    (stores.eventStore as unknown as { append: unknown }).append = () => {
+      throw new Error("audit store unavailable");
+    };
+    try {
+      const res = await runActionPost(
+        attach(
+          jsonRequest(
+            "http://test/api/admin/runs/rollback-run",
+            { action: "publish" },
+            { method: "POST", headers: adminHeaders() }
+          )
+        ),
+        { params: { runId: "rollback-run" } }
+      );
+      assert.equal(res.status, 500);
+    } finally {
+      (stores.eventStore as unknown as { append: unknown }).append = originalAppend;
+    }
+
+    // The mutation was rolled back so the run row and the audit log never diverge.
+    const run = stores.runStore.getRun("rollback-run");
+    assert.equal(run?.isPublished, false);
+    assert.equal(run?.isRemoved, false);
+    assert.equal(stores.eventStore.getEvents("rollback-run", { kind: "admin.publish" }).length, 0);
+  });
 });
 
 
@@ -465,6 +549,11 @@ describe("Kill switch (Task 22.5)", () => {
   });
 
   it("pauses new runs while preserving the queue", async () => {
+    const queue = resolveFifoQueue({ eventStore: stores.eventStore, runStore: stores.runStore });
+    queue.enqueue({ runId: "queued-keep" });
+    const initial = queue.snapshot();
+    assert.equal(initial.depth, 1);
+
     const res = await killPost(
       attach(
         jsonRequest(
@@ -477,6 +566,34 @@ describe("Kill switch (Task 22.5)", () => {
     assert.equal(res.status, 200);
     const body = (await res.json()) as { state: { pausedNewRuns: boolean } };
     assert.equal(body.state.pausedNewRuns, true);
+
+    const preserved = queue.snapshot();
+    assert.equal(preserved.depth, initial.depth);
+    assert.deepEqual(preserved.entries.map((entry) => entry.runId), ["queued-keep"]);
+    assert.equal(queue.getPosition("queued-keep"), 1);
+  });
+
+  it("persists pause_new_runs across POST -> GET and the SettingsStore", async () => {
+    const pause = await killPost(
+      attach(
+        jsonRequest(
+          "http://test/api/admin/kill-switch",
+          { level: "pause_new_runs", confirmed: true },
+          { method: "POST", headers: adminHeaders() }
+        )
+      )
+    );
+    assert.equal(pause.status, 200);
+
+    const get = await killGet(
+      attach(new Request("http://test/api/admin/kill-switch", { headers: adminHeaders() }))
+    );
+    assert.equal(get.status, 200);
+    const body = (await get.json()) as { state: { pausedNewRuns: boolean; lastLevel: string } };
+    assert.equal(body.state.pausedNewRuns, true);
+    assert.equal(body.state.lastLevel, "pause_new_runs");
+    assert.equal(stores.settingsStore.getSetting("killSwitch.pauseNewRuns"), true);
+    assert.equal(stores.settingsStore.getSetting("killSwitch.lastLevel"), "pause_new_runs");
   });
 });
 
@@ -513,6 +630,53 @@ describe("Promotion audit sign-off (Task 22.5)", () => {
     assert.equal(body.present, true);
     assert.equal(body.verified, true);
     assert.equal(body.record.signature, posted.record.signature);
+  });
+
+  it("returns verified:false without throwing for a non-ASCII signature", async () => {
+    stores.settingsStore.setSetting(
+      "promotionAudit",
+      {
+        actor: "owner",
+        signedAt: Date.now(),
+        status: "passed",
+        signature: "→".repeat(64),
+      },
+      { actor: "owner" }
+    );
+
+    const res = await promoGet(
+      attach(new Request("http://test/api/admin/promotion-audit", { headers: adminHeaders() }))
+    );
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as { present: boolean; verified: boolean };
+    assert.equal(body.present, true);
+    assert.equal(body.verified, false);
+  });
+});
+
+describe("Admin client identity (Task 22.5)", () => {
+  it("ignores X-Forwarded-For / X-Real-IP unless the proxy is explicitly trusted", () => {
+    const previous = process.env.TRUST_PROXY;
+    delete process.env.TRUST_PROXY;
+    try {
+      const spoofed = new Request("http://test/api/admin/session", {
+        headers: { "x-forwarded-for": "203.0.113.7, 10.0.0.1", "x-real-ip": "203.0.113.8" },
+      });
+
+      assert.equal(DIRECT_CLIENT_IP_KEY, "direct");
+      assert.equal(clientIpFromRequest(spoofed), "direct");
+      assert.equal(clientIpFromRequest(spoofed, { trustProxy: true }), "203.0.113.7");
+
+      const env = { ...process.env, TRUST_PROXY: "true" };
+      assert.equal(clientIpFromRequest(spoofed, { env }), "203.0.113.7");
+      assert.equal(clientIpFromRequest(spoofed, { trustProxy: false }), "direct");
+    } finally {
+      if (previous === undefined) {
+        delete process.env.TRUST_PROXY;
+      } else {
+        process.env.TRUST_PROXY = previous;
+      }
+    }
   });
 });
 

@@ -70,6 +70,38 @@ export async function POST(request: Request, context: RouteContext): Promise<Res
     );
   };
 
+  // Snapshot the mutable run fields so an audit-append failure can be rolled back; the run row and
+  // the audit log must never diverge (a persisted change with no matching admin.* event).
+  const priorState = {
+    isPublished: run.isPublished,
+    isRemoved: run.isRemoved,
+    metadata: run.metadata,
+  };
+  const rollback = (): void => {
+    try {
+      runStore.updateRun(runId, {
+        isPublished: priorState.isPublished,
+        isRemoved: priorState.isRemoved,
+        metadata: priorState.metadata,
+      });
+    } catch {
+      // Best effort: the response already reports the failure.
+    }
+  };
+  const commit = (
+    kind: string,
+    data: Record<string, unknown>,
+    success: () => Response
+  ): Response => {
+    try {
+      appendAdmin(kind, data);
+    } catch {
+      rollback();
+      return Response.json({ ok: false, error: "audit_append_failed" }, { status: 500 });
+    }
+    return success();
+  };
+
   switch (action) {
     case "review": {
       const updated = runStore.updateRun(runId, {
@@ -80,8 +112,9 @@ export async function POST(request: Request, context: RouteContext): Promise<Res
           reviewedAt: Date.now(),
         },
       });
-      appendAdmin("admin.review", { actor: auth.actor.id, reason });
-      return Response.json({ ok: true, action, run: updated });
+      return commit("admin.review", { actor: auth.actor.id, reason }, () =>
+        Response.json({ ok: true, action, run: updated })
+      );
     }
     case "redact": {
       const fields = Array.isArray(body.fields) ? body.fields.map((f) => String(f)) : [];
@@ -94,8 +127,9 @@ export async function POST(request: Request, context: RouteContext): Promise<Res
           redactionFields: fields,
         },
       });
-      appendAdmin("admin.redaction", { actor: auth.actor.id, reason, fields });
-      return Response.json({ ok: true, action, run: updated });
+      return commit("admin.redaction", { actor: auth.actor.id, reason, fields }, () =>
+        Response.json({ ok: true, action, run: updated })
+      );
     }
     case "publish": {
       if (!alreadyReviewed) {
@@ -105,8 +139,9 @@ export async function POST(request: Request, context: RouteContext): Promise<Res
         );
       }
       const updated = runStore.updateRun(runId, { isPublished: true });
-      appendAdmin("admin.publish", { actor: auth.actor.id, reason });
-      return Response.json({ ok: true, action, run: updated });
+      return commit("admin.publish", { actor: auth.actor.id, reason }, () =>
+        Response.json({ ok: true, action, run: updated })
+      );
     }
     case "hide": {
       const marker = "Removed by the owner";
@@ -120,8 +155,9 @@ export async function POST(request: Request, context: RouteContext): Promise<Res
           removedAt: Date.now(),
         },
       });
-      appendAdmin("admin.hide", { actor: auth.actor.id, reason, marker });
-      return Response.json({ ok: true, action, run: updated, marker });
+      return commit("admin.hide", { actor: auth.actor.id, reason, marker }, () =>
+        Response.json({ ok: true, action, run: updated, marker })
+      );
     }
     default:
       return Response.json({ ok: false, error: "unknown_action" }, { status: 400 });

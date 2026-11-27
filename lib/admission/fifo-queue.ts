@@ -144,6 +144,8 @@ export class FifoQueue {
       position: this.entries.length + 1,
       queuedAt: typeof input.queuedAt === "number" ? input.queuedAt : this.now(),
     };
+    // Capture the pre-enqueue positions so runs that keep their position emit no event.
+    const previous = this.positionMap();
     this.entries.push(entry);
 
     appendRedacted(this.eventStore, runId, "run.queued", this.actor, {
@@ -153,7 +155,7 @@ export class FifoQueue {
       reason: entry.reason,
     });
 
-    this.reindexAndEmit(new Map());
+    this.reindexAndEmit(previous);
     return { ok: true, entry: { ...entry } };
   }
 
