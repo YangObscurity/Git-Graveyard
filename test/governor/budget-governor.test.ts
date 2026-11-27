@@ -26,6 +26,7 @@ import {
   type ExhumeRunnerContext,
   type PlanRunnerContext,
   type FinalCheckContext,
+  type RunExecutionHandle,
 } from "../../lib/orchestrator/run-orchestrator";
 import type { WorkerContext, WardenReviewContext } from "../../lib/scheduler/dispatcher";
 
@@ -302,5 +303,224 @@ describe("BudgetGovernor: RunOrchestrator + TaskDispatcher prompt budget", () =>
     assert.equal(handle.getPhase(), "done");
     assert.equal(runStore.getRun(runId)?.outcome, "budget_stopped");
   });
+  it("updates only toolCallsPerRun in place on Pact approval, preserving Exhume/Plan usage and the run wall clock", async () => {
+    const runId = "run-governor-cap-update";
+    const repoCtx = createTestRepo(runId);
+    tmpDirs.push(repoCtx.tmpDir);
+
+    const eventStore = new EventStore(path.join(repoCtx.tmpDir, "events.db"));
+    const runStore = new RunStore(path.join(repoCtx.tmpDir, "runs.db"));
+    const host = new RuntimeHost({
+      skipReconcile: true,
+      eventStore,
+      runStore,
+      logStore: new LogStore({ dir: path.join(repoCtx.tmpDir, "logs") }),
+      closeStoresOnShutdown: true,
+    });
+    activeHosts.push(host);
+    const gitService = new GitService({ runsDir: repoCtx.runsDir });
+
+    const INITIAL_TOOL_CALLS_CAP = 4;
+    const APPROVED_TOOL_CALLS_CAP = 8;
+    const WALL_CLOCK_CAP_MS = 1200;
+    const PLAN_ELAPSED_MS = 500;
+    const PACT_HOLD_MS = 250;
+    const LEGION_ELAPSED_MS = 900;
+    const PLAN_TOOL_CALLS = 2;
+
+    runStore.createRun({
+      runId,
+      url: "https://github.com/git-graveyard/example-repo",
+      sha: repoCtx.baseSha,
+      phase: "queued",
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      caps: { toolCallsPerRun: INITIAL_TOOL_CALLS_CAP, runWallClockMs: WALL_CLOCK_CAP_MS },
+    });
+
+    const pactMarkdown = `
+- [ ] T1. Feature Fix
+  - role: bonesetter
+  - depends:
+  - files: feature.txt
+  - accept: node test.js
+  - hard: no
+  - rules: M1
+`;
+
+    const waitFor = (predicate: () => boolean, timeoutMs = 8000): Promise<void> => {
+      const started = Date.now();
+      return new Promise<void>((resolve, reject) => {
+        const tick = () => {
+          let ok = false;
+          try {
+            ok = predicate();
+          } catch {
+            ok = false;
+          }
+          if (ok) {
+            resolve();
+            return;
+          }
+          if (Date.now() - started > timeoutMs) {
+            reject(new Error("waitFor timed out"));
+            return;
+          }
+          setTimeout(tick, 10);
+        };
+        tick();
+      });
+    };
+
+    let orchestratorHandle: RunExecutionHandle | undefined;
+    let capturedGovernor: BudgetGovernor | undefined;
+    let wallBeforeApproval = 0;
+
+    const exhumeRunner = async (ctx: ExhumeRunnerContext) => ({
+      healthy: false,
+      deathCertificate: createDeathCertificate({
+        runId: ctx.runId,
+        baseSha: ctx.baseSha,
+        install: { step: "install", status: "passed", command: "npm install" },
+        build: { step: "build", status: "passed", command: "npm run build" },
+        test: { step: "test", status: "failed", command: "npm test", exitCode: 1 },
+        failures: [{ step: "test", class: "syntax_error", message: "boom" }],
+      }),
+      rows: [],
+      manifestInspection: {} as any,
+      wallClockTimeoutHit: false,
+    });
+
+    const planRunner = async (ctx: PlanRunnerContext) => {
+      const governor = orchestratorHandle?.budgetGovernor;
+      assert.ok(governor, "the per-run governor must exist during Plan");
+      capturedGovernor = governor;
+      // Exhume / Plan already spent tool calls and wall-clock time before the Pact is approved.
+      for (let i = 0; i < PLAN_TOOL_CALLS; i += 1) {
+        governor!.recordToolCall("plan-skeleton");
+      }
+      await new Promise((resolve) => setTimeout(resolve, PLAN_ELAPSED_MS));
+      wallBeforeApproval = governor!.runWallClockMs();
+      const parsed = parsePact(pactMarkdown);
+      return {
+        ok: true as const,
+        draftId: `pact-${ctx.runId}-v1`,
+        sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        markdown: pactMarkdown,
+        tasks: parsed.tasks,
+        version: 1,
+        coverage: {
+          ok: true,
+          covered: true,
+          coveredFailures: [],
+          uncoveredFailures: [],
+          missingFailures: [],
+        },
+      };
+    };
+
+    const workerRunner = async (ctx: WorkerContext) => {
+      fs.writeFileSync(path.join(ctx.worktreeDir, "feature.txt"), "resurrected\n", "utf8");
+      // Legion spends enough wall-clock time that cumulative Exhume/Plan + Legion crosses the cap.
+      await new Promise((resolve) => setTimeout(resolve, LEGION_ELAPSED_MS));
+      return { ok: true, taskId: ctx.taskId, worktreeDir: ctx.worktreeDir };
+    };
+
+    const wardenRunner = async (ctx: WardenReviewContext) =>
+      buildVerdictRecord(ctx.candidateSha, {
+        diff: ctx.diff,
+        candidateSha256: ctx.candidateSha256,
+        tree: ctx.candidateTree,
+        install: { ok: true, ref: "cmd:install" },
+        build: { ok: true, ref: "cmd:build" },
+        accept: { ok: true, ref: "cmd:accept", exitCode: 0 },
+        tests: { ok: true, ref: "cmd:tests" },
+        noTestWeakening: true,
+      });
+
+    const finalCheckRunner = async (_ctx: FinalCheckContext) => ({
+      ok: true,
+      passed: true,
+      installPassed: true,
+      buildPassed: true,
+      testsPassed: true,
+      hasTests: true,
+    });
+
+    const orchestrator = new RunOrchestrator({
+      host,
+      gitService,
+      runsDir: repoCtx.runsDir,
+      autoApprovePact: false,
+      exhumeRunner,
+      planRunner,
+      workerRunner,
+      wardenRunner,
+      finalCheckRunner,
+    });
+    activeOrchestrators.push(orchestrator);
+
+    const handle = orchestrator.startRun(runId);
+    orchestratorHandle = handle;
+
+    // Wait for Plan to finish and hold the Pact review open so the Pact wait is measurable.
+    await waitFor(() => handle.getPhase() === "pact_review");
+    await new Promise((resolve) => setTimeout(resolve, PACT_HOLD_MS));
+
+    const governorBeforeApproval = capturedGovernor;
+    assert.ok(governorBeforeApproval, "Plan captured the running governor");
+    assert.ok(wallBeforeApproval >= PLAN_ELAPSED_MS, "Plan spent real wall-clock time");
+
+    // The Pact approval changes ONLY toolCallsPerRun.
+    await orchestrator.approvePact(runId, {
+      approvedTaskIds: ["T1"],
+      approvedBy: "tester",
+      caps: { toolCallsPerRun: APPROVED_TOOL_CALLS_CAP },
+    });
+
+    const finalResult = await handle.promise;
+
+    // The exact same governor instance survived the grant.
+    assert.ok(handle.budgetGovernor, "the run keeps a governor");
+    assert.equal(handle.budgetGovernor, governorBeforeApproval);
+    // Metering survived the grant: the Exhume/Plan tool calls are still counted.
+    assert.equal(handle.budgetGovernor!.totalToolCallsSoFar(), PLAN_TOOL_CALLS);
+    // Only toolCallsPerRun changed; the run wall-clock cap is unchanged.
+    assert.equal(
+      handle.budgetGovernor!.getCap("toolCallsPerRun"),
+      APPROVED_TOOL_CALLS_CAP
+    );
+    assert.equal(handle.budgetGovernor!.getCap("runWallClockMs"), WALL_CLOCK_CAP_MS);
+    // The Pact wait was tracked (and is therefore excluded from the run wall clock).
+    assert.ok(
+      handle.budgetGovernor!.pactWaitMs() >= 200,
+      "the Pact review wait is excluded from the run wall clock"
+    );
+    // The unchanged wall-clock cap is still enforced from cumulative Exhume/Plan + Legion time, so
+    // the run stops rather than letting a rebuilt governor's fresh clock forgive that time.
+    assert.equal(
+      handle.budgetGovernor!.getExceededDimensions().includes("runWallClockMs"),
+      true
+    );
+    assert.equal(handle.scheduler?.isBudgetExceeded, true);
+    assert.equal(finalResult.outcome, "budget_stopped");
+    // The run wall clock was not reset: it still reflects the Plan time spent before approval.
+    assert.ok(
+      handle.budgetGovernor!.runWallClockMs() >= PLAN_ELAPSED_MS,
+      "the run wall clock must not be reset by the Pact approval"
+    );
+
+    // A `cap_update` event recorded the toolCallsPerRun change (not the grant's `cap_increase`).
+    const updates = eventStore.getEvents(runId, { kind: "budget.update" });
+    assert.ok(
+      updates.some(
+        (event) =>
+          (event.data as { change?: string; dimension?: string }).change === "cap_update" &&
+          (event.data as { dimension?: string }).dimension === "toolCallsPerRun"
+      ),
+      "a cap_update budget.update event records the toolCallsPerRun change"
+    );
+  });
+
 });
 

@@ -969,7 +969,7 @@ export class RunOrchestrator extends EventEmitter {
     // a `sandbox_exec` for this run is refused once any capped dimension is crossed, and passed to
     // the TaskDispatcher so it gates worker/Warden prompts.
     const initialCaps = extractBudgetCaps(run?.caps ?? null);
-    let budgetGovernor = new BudgetGovernor({
+    const budgetGovernor = new BudgetGovernor({
       runId,
       eventStore: this.host.eventStore,
       runStore: this.host.runStore,
@@ -1393,27 +1393,21 @@ export class RunOrchestrator extends EventEmitter {
         });
       }
 
-      // A Pact approval may raise the caps. Rebuild the governor with the merged caps only when the
-      // approved caps actually change what is enforced, so an unchanged grant keeps the running
-      // governor's metering and clock semantics intact.
+      // A Pact approval may raise (or lower) the caps. Update the running governor's caps in place so
+      // its accumulated metering (`totalToolCalls`, prompt counts) and its run wall clock (including
+      // the Pact-wait exclusion) survive the grant. Rebuilding the governor here would reset that
+      // usage to zero and silently forgive the tool calls / wall-clock time Exhume and Plan already
+      // spent, letting Legion exceed a cap the run had already crossed.
       const approvalCaps: BudgetCaps = {
         ...extractBudgetCaps(approvalInput.caps as Record<string, unknown> | undefined),
         ...extractBudgetCaps(approvalInput.budget as Record<string, unknown> | undefined),
       };
       const mergedCaps: BudgetCaps = { ...initialCaps, ...approvalCaps };
       if (!budgetCapsEqual(initialCaps, mergedCaps)) {
-        budgetGovernor = new BudgetGovernor({
-          runId,
-          eventStore: this.host.eventStore,
-          runStore: this.host.runStore,
-          caps: mergedCaps,
+        budgetGovernor.updateCaps(mergedCaps, {
+          actor: approvalInput.approvedBy ?? "pact-approval",
+          reason: "Pact approval updated run budget caps",
         });
-        handle.budgetGovernor = budgetGovernor;
-        try {
-          (this.host.gateway as any)?.registerRunBudgetGovernor?.(runId, budgetGovernor);
-        } catch {
-          // A gateway that cannot re-register the governor must not abort the run.
-        }
       }
 
       const approvedTaskIds =

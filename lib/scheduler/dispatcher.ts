@@ -1564,15 +1564,31 @@ export class TaskDispatcher {
         return;
       }
 
+      // A cancellation or a graceful stop must fail closed at every review boundary. A graceful stop
+      // that lands while the task is `in_review` awaiting the reviewer must never let an approving
+      // verdict reach the merge: the candidate is kept on disk and the task settles out of
+      // `"in_review"` instead. The phase keeps the two pre-existing cancellation messages intact.
+      const assertWardenReviewable = (phase: "before" | "during"): void => {
+        if (
+          abortController.signal.aborted ||
+          this.isStoppedState ||
+          this.isGracefulStopState
+        ) {
+          throw new Error(
+            this.isGracefulStopState
+              ? "Task stopped gracefully during Warden review"
+              : `Task cancelled ${phase} Warden review`
+          );
+        }
+      };
+
       const wrappedWardenReviewer = async (
         run: any,
         candidate: any,
         acceptanceCommand: string
       ): Promise<WardenVerdictRecord> => {
-        // A cancellation must fail closed before the reviewer runs.
-        if (abortController.signal.aborted || this.isStoppedState) {
-          throw new Error("Task cancelled before Warden review");
-        }
+        // A cancellation or a graceful stop must fail closed before the reviewer runs.
+        assertWardenReviewable("before");
         const wardenSkeletonId = `warden-${cleanTaskId}-${Date.now()}`;
         // The run's budget gates the Warden prompt exactly like a worker prompt: refuse to start a
         // review once any capped dimension is crossed.
@@ -1610,10 +1626,8 @@ export class TaskDispatcher {
               signal: abortController.signal,
             };
             const rawResult = await this.options.wardenRunner(wardenCtx);
-            // A cancellation that landed during review must never proceed to merge.
-            if (abortController.signal.aborted || this.isStoppedState) {
-              throw new Error("Task cancelled during Warden review");
-            }
+            // A cancellation or graceful stop that landed during review must never proceed to merge.
+            assertWardenReviewable("during");
             return this.normalizeVerdictRecord(rawResult, candidate);
           }
 
@@ -1623,9 +1637,8 @@ export class TaskDispatcher {
               reviewFocus ? { ...candidate, reviewFocus } : candidate,
               acceptanceCommand
             );
-            if (abortController.signal.aborted || this.isStoppedState) {
-              throw new Error("Task cancelled during Warden review");
-            }
+            // A cancellation or graceful stop that landed during review must never proceed to merge.
+            assertWardenReviewable("during");
             return this.normalizeVerdictRecord(rawResult, candidate);
           }
 
@@ -1636,9 +1649,8 @@ export class TaskDispatcher {
             worktreeRes.worktreeDir,
             reviewFocus
           );
-          if (abortController.signal.aborted || this.isStoppedState) {
-            throw new Error("Task cancelled during Warden review");
-          }
+          // A cancellation or graceful stop that landed during review must never proceed to merge.
+          assertWardenReviewable("during");
           return rawResult;
         } finally {
           this.finishPromptBudgetMetering(wardenSkeletonId);

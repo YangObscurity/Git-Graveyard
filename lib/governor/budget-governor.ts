@@ -684,6 +684,73 @@ export class BudgetGovernor {
   }
 
   /**
+   * Updates the enforced caps in place, preserving every accumulated usage counter and the run wall
+   * clock (including its Pact-wait exclusion). A Pact approval that only changes what is enforced
+   * must never reset `totalToolCalls`, `promptCounts`, `runStartedAt`, `pactPauseTotalMs` or the
+   * exceeded latches the run already accrued during Exhume / Plan.
+   *
+   * A dimension whose usage has moved strictly below the new bound has its exceeded / warning latch
+   * cleared (so a later crossing re-emits), while a lowered cap already crossed by cumulative usage is
+   * re-evaluated so it latches and emits `budget.exceeded` immediately. Unlike {@link grantCapIncrease}
+   * this accepts a raise or a lower and records `change: "cap_update"`.
+   */
+  updateCaps(
+    caps: BudgetCaps,
+    input?: { actor?: string; reason?: string; now?: number }
+  ): BudgetSnapshot {
+    const at = typeof input?.now === "number" ? input.now : this.now();
+    // A terminal run (credits exhausted / budget stopped) has already recorded its final events:
+    // updating caps must not resurrect it, so report the current state without mutating the caps.
+    if (this.isTerminal()) {
+      return this.snapshot(at);
+    }
+
+    const clampedCaps = clampCapsToCeilings(
+      toCapMap(caps),
+      this.codeCeiling,
+      this.globalCeiling
+    );
+
+    for (const dim of BUDGET_DIMENSIONS) {
+      const clampedCap = clampedCaps.get(dim);
+      if (clampedCap === undefined) {
+        continue;
+      }
+      const previousCap = this.caps.get(dim);
+      this.caps.set(dim, clampedCap);
+      const value = this.usageFor(dim, at);
+      if (value !== null) {
+        // Usage is now strictly under the cap: the dimension is no longer crossed. Re-arm the context
+        // escalation so a future crossing of the cancel boundary emits a fresh `cancel_turn`.
+        if (value < clampedCap) {
+          this.exceededDimensions.delete(dim);
+          if (dim === "contextPressurePercent") {
+            this.contextEscalated = false;
+          }
+        }
+        // Re-arm the warning when the bound moves usage strictly below the warning threshold.
+        if (value < (clampedCap * this.warningPercent) / 100) {
+          this.warningsEmitted.delete(dim);
+        }
+      }
+      if (previousCap !== clampedCap) {
+        this.emit("budget.update", {
+          dimension: dim,
+          previousCap: previousCap ?? null,
+          newCap: clampedCap,
+          actor: input?.actor ?? "orchestrator",
+          reason: input?.reason,
+          change: "cap_update",
+        });
+      }
+    }
+
+    this.pendingAsk = this.exceededDimensions.size > 0 ? "exceed_budget" : null;
+    // Re-evaluate so a lowered cap already crossed by cumulative usage latches and emits now.
+    return this.evaluate(at);
+  }
+
+  /**
    * Best-effort telemetry append. Returns `true` when there is no event store or the append
    * succeeded, and `false` when the append threw. The failure is swallowed so dispatch never breaks,
    * but callers that latch state on the event (the context escalation) can retry when it returns
