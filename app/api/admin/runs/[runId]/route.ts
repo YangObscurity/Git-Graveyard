@@ -31,6 +31,34 @@ function toMetadata(value: unknown): Record<string, unknown> {
     : {};
 }
 
+/**
+ * Validates the caller-supplied redaction field list. Every entry must be a non-empty string field
+ * name (never a coerced arbitrary JSON value); anything else is rejected so an object/array/number
+ * cannot be silently flattened into `"[object Object]"` and recorded as an audit redaction target.
+ */
+function parseRedactionFields(
+  value: unknown
+): { ok: true; fields: string[] } | { ok: false } {
+  if (value === undefined || value === null) {
+    return { ok: true, fields: [] };
+  }
+  if (!Array.isArray(value)) {
+    return { ok: false };
+  }
+  const fields: string[] = [];
+  for (const entry of value) {
+    if (typeof entry !== "string") {
+      return { ok: false };
+    }
+    const name = entry.trim();
+    if (name.length === 0) {
+      return { ok: false };
+    }
+    fields.push(name);
+  }
+  return { ok: true, fields };
+}
+
 export async function POST(request: Request, context: RouteContext): Promise<Response> {
   const settingsStore = resolveSettingsStore(request);
   const auth = requireAdminAuth(request, process.env, { settingsStore });
@@ -123,7 +151,11 @@ export async function POST(request: Request, context: RouteContext): Promise<Res
       );
     }
     case "redact": {
-      const fields = Array.isArray(body.fields) ? body.fields.map((f) => String(f)) : [];
+      const parsedFields = parseRedactionFields(body.fields);
+      if (!parsedFields.ok) {
+        return Response.json({ ok: false, error: "invalid_redaction_fields" }, { status: 400 });
+      }
+      const fields = parsedFields.fields;
       const updated = runStore.updateRun(runId, {
         metadata: {
           ...metadata,

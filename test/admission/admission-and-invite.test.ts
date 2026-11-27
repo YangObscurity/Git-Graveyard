@@ -13,6 +13,7 @@ import {
 import {
   InviteCodeAuthorizationError,
   InviteCodeService,
+  MAX_IP_TRACKING_BUCKETS,
 } from "../../lib/admission/invite-code";
 import { FifoQueue } from "../../lib/admission/fifo-queue";
 import { AdmissionController } from "../../lib/admission/admission-controller";
@@ -470,6 +471,7 @@ describe("AdmissionController (Task 22.2)", () => {
       runStore,
       eventStore,
       backend: { kind: "docker-cloud", capacity: () => 0 },
+      env: {},
     });
     const decision = controller.checkAdmission();
     assert.equal(decision.admitted, false);
@@ -590,6 +592,7 @@ describe("AdmissionController (Task 22.2)", () => {
       runStore,
       eventStore,
       backend: { kind: "docker-cloud" },
+      env: {},
     });
 
     assert.equal(controller.effectiveConcurrentLiveRuns(), 5);
@@ -627,6 +630,7 @@ describe("AdmissionController (Task 22.2)", () => {
       runStore,
       eventStore,
       backend: { kind: "docker-cloud" },
+      env: {},
     });
     assert.equal(controller.effectiveConcurrentLiveRuns(), 5);
 
@@ -698,6 +702,7 @@ describe("AdmissionController (Task 22.2)", () => {
       runStore,
       eventStore,
       backend: { kind: "docker-cloud" },
+      env: {},
     });
     assert.equal(controller.effectiveConcurrentLiveRuns(), 5);
 
@@ -823,6 +828,164 @@ describe("BudgetGovernor (Task 22.3)", () => {
       globalCeiling: { toolCallsPerRun: 50 },
     });
     assert.equal(governor.getCap("toolCallsPerRun"), 3);
+  });
+});
+
+
+describe("AdmissionController reserveSlot bounds (Task 22.2)", () => {
+  it("floors a fractional reserveSlot limit and honours the backendKind ceiling", () => {
+    const { runStore, eventStore } = makeHarness();
+    const settings = {
+      getSetting: (key: string) => (key === "concurrentLiveRuns" ? 99 : undefined),
+      validateRequiredSettings: () => ({ ok: true, missing: [] }),
+    } as unknown as SettingsStore;
+    const controller = new AdmissionController({
+      settingsStore: settings,
+      runStore,
+      eventStore,
+      backend: { kind: "docker-cloud" },
+      env: {},
+    });
+
+    // 1.5 must floor to 1, so only a single slot may be claimed regardless of how many ask.
+    assert.equal(controller.reserveSlot("frac-a", 1.5), true);
+    assert.equal(controller.reserveSlot("frac-b", 1.5), false);
+    assert.equal(controller.getReservedCount(), 1);
+    assert.equal(controller.releaseSlot("frac-a"), true);
+
+    // The same over-large limit against the instabox ceiling (1) can never reserve more than one.
+    assert.equal(controller.reserveSlot("ib-a", 5, "instabox-docker"), true);
+    assert.equal(controller.reserveSlot("ib-b", 5, "instabox-docker"), false);
+    assert.equal(controller.getReservedCount(), 1);
+    controller.releaseSlot("ib-a");
+
+    // checkAdmission threads the backend kind through, so instabox admits a single run.
+    assert.equal(
+      controller.checkAdmission({ backendKind: "instabox-docker", runId: "z1" }).admitted,
+      true
+    );
+    assert.equal(
+      controller.checkAdmission({ backendKind: "instabox-docker", runId: "z2" }).admitted,
+      false
+    );
+  });
+});
+
+
+describe("FifoQueue cap normalization and caps isolation (Task 22.2)", () => {
+  it("normalizes a fractional QUEUE_DEPTH_CAP up to at least one", () => {
+    const { eventStore } = makeHarness();
+    const previous = process.env.QUEUE_DEPTH_CAP;
+    process.env.QUEUE_DEPTH_CAP = "0.5";
+    try {
+      const queue = new FifoQueue({ eventStore });
+      assert.equal(queue.cap, 1);
+      assert.equal(queue.enqueue({ runId: "cap-1" }).ok, true);
+      const full = queue.enqueue({ runId: "cap-2" });
+      assert.equal(full.ok, false);
+      assert.equal(full.ok === false ? full.code : "", "QUEUE_FULL");
+    } finally {
+      if (previous === undefined) {
+        delete process.env.QUEUE_DEPTH_CAP;
+      } else {
+        process.env.QUEUE_DEPTH_CAP = previous;
+      }
+    }
+  });
+
+  it("deep-clones caps so caller and snapshot mutation cannot affect queued caps", () => {
+    const { eventStore } = makeHarness();
+    const queue = new FifoQueue({ eventStore });
+    const caps: Record<string, unknown> = { maxMinutes: 30, nested: { tool: 5 } };
+    queue.enqueue({ runId: "caps-run", caps });
+
+    // Mutating the caller's object after enqueue must not change the queued caps.
+    caps.maxMinutes = 999;
+    (caps.nested as Record<string, unknown>).tool = 999;
+    assert.deepEqual(queue.list()[0].caps, { maxMinutes: 30, nested: { tool: 5 } });
+
+    // Mutating a returned snapshot must not change the queued caps either.
+    const snapshot = queue.snapshot();
+    const snapshotCaps = snapshot.entries[0].caps as Record<string, unknown>;
+    snapshotCaps.maxMinutes = 777;
+    (snapshotCaps.nested as Record<string, unknown>).tool = 777;
+    assert.deepEqual(queue.list()[0].caps, { maxMinutes: 30, nested: { tool: 5 } });
+    assert.deepEqual(queue.snapshot().entries[0].caps, { maxMinutes: 30, nested: { tool: 5 } });
+  });
+});
+
+
+describe("InviteCodeService hash consumption and pruning (Task 22.1)", () => {
+  it("refuses to consume an expired invite code by its hash", () => {
+    const { runStore } = makeHarness();
+    const service = new InviteCodeService({ runStore });
+
+    const expired = service.createCode(
+      { allowedRunCount: 1, expiresAt: Date.now() - 1_000 },
+      { adminSession: true }
+    );
+    // The plaintext path rejects the expiry ...
+    assert.equal(service.consumeRun(expired.code), false);
+    // ... and the hash path must match it rather than silently consuming the expired code.
+    assert.equal(service.consumeRun(expired.record.codeHash, { adminSession: true }), false);
+
+    // A live code is still consumable through its hash.
+    const live = service.createCode({ allowedRunCount: 1 }, { adminSession: true });
+    assert.equal(service.consumeRun(live.record.codeHash, { adminSession: true }), true);
+  });
+
+  it("throttles the full bucket sweep while an insertion keeps a new key", () => {
+    const { runStore } = makeHarness();
+    let now = 10_000;
+    const service = new InviteCodeService({
+      runStore,
+      now: () => now,
+      maxAttemptsPerIp: 1,
+      attemptWindowMs: 60_000,
+      pruneIntervalMs: 1_000,
+    });
+
+    service.verifyCode("gg_wrong", "1.1.1.1");
+    const afterFirst = service.pruneSweepCount();
+    assert.ok(afterFirst >= 1);
+
+    // A burst of rate-limited rejections inside the throttle interval never re-sweeps.
+    for (let i = 0; i < 25; i += 1) {
+      const result = service.verifyCode("gg_wrong", "1.1.1.1");
+      assert.equal(result.ok === false ? result.reason : "", "rate_limited");
+    }
+    assert.equal(service.pruneSweepCount(), afterFirst);
+
+    // New-key insertions inside the interval also do not force a sweep.
+    for (let i = 0; i < 25; i += 1) {
+      service.verifyCode("gg_wrong", `2.2.2.${i}`);
+    }
+    assert.equal(service.pruneSweepCount(), afterFirst);
+    assert.equal(service.trackedBucketCount(), 26);
+
+    // Once the interval elapses the next call performs exactly one sweep.
+    now += 1_000;
+    service.verifyCode("gg_wrong", "3.3.3.0");
+    assert.equal(service.pruneSweepCount(), afterFirst + 1);
+  });
+
+  it("keeps the tracked-bucket map bounded when new keys are inserted under a throttled sweep", () => {
+    const { runStore } = makeHarness();
+    let now = 0;
+    const service = new InviteCodeService({
+      runStore,
+      now: () => now,
+      maxAttemptsPerIp: 5,
+      attemptWindowMs: 60_000,
+      pruneIntervalMs: 60_000,
+    });
+
+    const extra = 25;
+    for (let i = 0; i < MAX_IP_TRACKING_BUCKETS + extra; i += 1) {
+      now += 1;
+      service.verifyCode("gg_wrong", `10.0.${Math.floor(i / 256)}.${i % 256}`);
+    }
+    assert.ok(service.trackedBucketCount() <= MAX_IP_TRACKING_BUCKETS);
   });
 });
 

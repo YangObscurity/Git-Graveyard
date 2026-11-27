@@ -84,7 +84,18 @@ export interface ProcessCrashInput {
   }) => boolean | Promise<boolean>;
 }
 
-export type RespawnMessage = "Resumed the same session" | "Restarted from its last commit";
+/**
+ * Descriptive failure message emitted whenever a crashed Skeleton could not be
+ * respawned: `loadSession` returned false, threw, or the crash budget was already
+ * exhausted. The worktree and log are always preserved for a fresh attempt.
+ */
+export const RESPAWN_FAILED_MESSAGE =
+  "Respawn failed: the session could not be resumed; kept the worktree and log";
+
+export type RespawnMessage =
+  | "Resumed the same session"
+  | "Restarted from its last commit"
+  | typeof RESPAWN_FAILED_MESSAGE;
 
 export interface ProcessCrashResult {
   readonly runId: string;
@@ -149,6 +160,35 @@ export interface SilenceNudgeResult {
   readonly event: EventEnvelope | null;
 }
 
+/**
+ * Structured silence-nudge message. The field names mirror a `message.sent`
+ * event so a handler-issued nudge is indistinguishable from a MessageService
+ * nudge at the event layer.
+ */
+export interface SilenceNudgeMessage {
+  readonly runId: string;
+  readonly msgId: string;
+  readonly from: "necromancer";
+  readonly to: string;
+  readonly skeletonId?: string;
+  readonly intent: "nudge";
+  readonly text: string;
+  readonly nudge: true;
+  readonly refs: readonly string[];
+}
+
+export interface SilenceNudgeMessageService {
+  send(message: {
+    runId: string;
+    from: "necromancer";
+    to: string;
+    skeletonId?: string;
+    intent: "nudge";
+    text: string;
+    refs: readonly string[];
+  }): unknown;
+}
+
 export type QuarantineReason = "secret_detected" | "symlink_escape";
 
 export interface QuarantineWorktreeInput {
@@ -207,6 +247,18 @@ export interface FailureRecoveryDeps {
    * post-rename containment failure path deterministically.
    */
   readonly readOnlyPass?: (root: string) => void;
+  /**
+   * Optional silence-nudge delivery hook. When supplied the hook is responsible
+   * for delivering the nudge; a throw or an explicit `false` reports
+   * `nudged: false` and records no `message.sent` event.
+   */
+  readonly deliverNudge?: (message: SilenceNudgeMessage) => boolean | void;
+  /**
+   * Optional silence-nudge delivery service (e.g. the MessageService). When
+   * supplied it replaces the direct `message.sent` append; a throw or an explicit
+   * `false` reports `nudged: false`.
+   */
+  readonly messageService?: SilenceNudgeMessageService;
   readonly now?: () => number;
 }
 
@@ -337,7 +389,7 @@ export class FailureRecoveryHandler {
         skeletonId: input.skeletonId,
         status: "failed",
         respawned: false,
-        respawnMessage: "Restarted from its last commit",
+        respawnMessage: RESPAWN_FAILED_MESSAGE,
         preservedWorktree,
         logRef,
         promptResent: false,
@@ -403,7 +455,7 @@ export class FailureRecoveryHandler {
       ...base,
       status: "failed",
       respawned: false,
-      respawnMessage: "Restarted from its last commit",
+      respawnMessage: RESPAWN_FAILED_MESSAGE,
       sessionLoaded: false,
       attempts: 1,
       failedEvent: appendFailed(),
@@ -447,9 +499,10 @@ export class FailureRecoveryHandler {
       if (state !== "pending" && state !== "ready") {
         continue;
       }
-      // Resolve dependencies defensively: an empty `blockedBy: []` must never hide
-      // unmet `deps`, so a non-empty blockedBy wins and otherwise deps are used.
-      const deps = task.blockedBy?.length ? task.blockedBy : task.deps ?? [];
+      // Resolve dependencies defensively: a non-empty `blockedBy` must never hide
+      // unmet `deps`, so both lists are combined and every unmet dependency blocks
+      // the task.
+      const deps = [...(task.blockedBy ?? []), ...(task.deps ?? [])];
       const isBlocked =
         task.blocked === true || deps.some((dep) => !completed.has(dep));
       if (isBlocked) {
@@ -470,8 +523,9 @@ export class FailureRecoveryHandler {
   }
 
   /**
-   * Emits a silence nudge when the silent duration reaches the configured
-   * threshold.
+   * Emits a structured silence nudge when the silent duration reaches the
+   * configured threshold. An optional delivery hook/service can actually deliver
+   * the nudge; a failed delivery reports `nudged: false` and records no event.
    */
   handleSilenceNudge(input: SilenceNudgeInput): SilenceNudgeResult {
     const thresholdMs =
@@ -480,26 +534,93 @@ export class FailureRecoveryHandler {
       DEFAULT_SILENCE_THRESHOLD_MS;
     const nudged = input.silentDurationMs >= thresholdMs;
 
-    let event: EventEnvelope | null = null;
-    if (nudged) {
-      event = this.deps.eventStore.append({
+    if (!nudged) {
+      return {
         runId: input.runId,
-        kind: "message.sent",
-        actor: "FailureRecoveryHandler",
-        skeletonId: input.skeletonId,
-        data: this.redact({
-          nudge: true,
-          kind: "silence_nudge",
-          silentDurationMs: input.silentDurationMs,
-          thresholdMs,
-          refs: [],
-        }),
-      });
+        nudged: false,
+        silentDurationMs: input.silentDurationMs,
+        thresholdMs,
+        event: null,
+      };
     }
+
+    const to = input.skeletonId ?? input.runId;
+    const msgId = `${input.runId}:msg:nudge:${this.now()}`;
+    const text = `Silent for ${Math.floor(
+      input.silentDurationMs / 1000
+    )}s; report status.`;
+
+    // Optional delivery: an explicit hook is preferred over an injected message
+    // service. A throw or an explicit `false` means delivery failed, so the
+    // handler reports `nudged: false` and records no `message.sent` event. When
+    // neither hook is injected the nudge is emitted directly, preserving the
+    // existing event-append behavior.
+    let delivered = true;
+    try {
+      if (typeof this.deps.deliverNudge === "function") {
+        delivered =
+          this.deps.deliverNudge({
+            runId: input.runId,
+            msgId,
+            from: "necromancer",
+            to,
+            skeletonId: input.skeletonId,
+            intent: "nudge",
+            text,
+            nudge: true,
+            refs: [],
+          }) !== false;
+      } else if (
+        this.deps.messageService &&
+        typeof this.deps.messageService.send === "function"
+      ) {
+        const sent = this.deps.messageService.send({
+          runId: input.runId,
+          from: "necromancer",
+          to,
+          skeletonId: input.skeletonId,
+          intent: "nudge",
+          text,
+          refs: [],
+        });
+        delivered = sent !== false;
+      }
+    } catch {
+      delivered = false;
+    }
+
+    if (!delivered) {
+      return {
+        runId: input.runId,
+        nudged: false,
+        silentDurationMs: input.silentDurationMs,
+        thresholdMs,
+        event: null,
+      };
+    }
+
+    const event = this.deps.eventStore.append({
+      runId: input.runId,
+      kind: "message.sent",
+      actor: "FailureRecoveryHandler",
+      skeletonId: input.skeletonId,
+      data: this.redact({
+        msgId,
+        from: "necromancer",
+        to,
+        intent: "nudge",
+        text,
+        nudge: true,
+        kind: "silence_nudge",
+        silentDurationMs: input.silentDurationMs,
+        thresholdMs,
+        refs: [],
+      }),
+    });
 
     return {
       runId: input.runId,
-      nudged,
+      nudged: true,
       silentDurationMs: input.silentDurationMs,
       thresholdMs,
       event,
@@ -720,10 +841,11 @@ export class FailureRecoveryHandler {
   }
 
   /**
-   * Recursive read-only permissions: files become 0444 and directories become
-   * 0555 so the quarantined worktree can no longer be modified in place. Symlinks
-   * are skipped entirely so their targets are never followed or chmodded, and any
-   * chmod failure propagates to the caller.
+   * Recursive least-privilege containment: only the write bits are stripped from
+   * each entry's existing mode (`mode & ~0o222`) so a `0600` file becomes `0400`
+   * and a `0700` directory becomes `0500` without ever granting group/other read
+   * access. Symlinks are skipped entirely so their targets are never followed or
+   * chmodded, and any chmod failure propagates to the caller.
    */
   private makeWorktreeReadOnly(root: string): void {
     const dirs: string[] = [];
@@ -752,13 +874,19 @@ export class FailureRecoveryHandler {
           continue;
         }
         if (st.isFile() && st.nlink === 1) {
-          fs.chmodSync(full, 0o444);
+          fs.chmodSync(full, st.mode & ~0o222);
         }
         // Anything else (device, socket, fifo, or multi-hardlink file) is skipped.
       }
     }
     for (const dir of dirs) {
-      fs.chmodSync(dir, 0o555);
+      let st: fs.Stats;
+      try {
+        st = fs.lstatSync(dir);
+      } catch {
+        continue;
+      }
+      fs.chmodSync(dir, st.mode & ~0o222);
     }
   }
 

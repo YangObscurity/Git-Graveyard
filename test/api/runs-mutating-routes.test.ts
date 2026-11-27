@@ -363,6 +363,35 @@ describe("mutating run API routes", () => {
         0
       );
     });
+
+    it("maps an unexpected persistence failure to a generic 500 without leaking details", async () => {
+      const { runStore } = makeStores();
+      const runId = "run-msg-persist-fail";
+      makeRun(runStore, runId);
+
+      const req = jsonRequest(`http://test/api/runs/${runId}/messages`, {
+        to: "exhumer",
+        intent: "instruct",
+        text: "hello",
+      });
+      // A non-MessageError thrown by the service is a storage failure, not a
+      // refusal: it must surface as a generic 500 with no internal detail.
+      (req as unknown as Record<string, unknown>).messageService = {
+        send: () => {
+          throw new Error("sqlite disk I/O error at /var/data/events.db");
+        },
+      };
+
+      const res = await postMessage(req, runParams(runId));
+      assert.equal(res.status, 500);
+      const data = await readJson(res);
+      assert.equal(data.ok, false);
+      const serialized = JSON.stringify(data);
+      assert.ok(
+        !serialized.includes("disk I/O error") && !serialized.includes("/var/data"),
+        "must not leak internal exception details"
+      );
+    });
   });
 
 
@@ -427,6 +456,21 @@ describe("mutating run API routes", () => {
         runParams(runId)
       );
       assert.equal(ok.status, 200);
+    });
+
+    it("marks an authorized 200 response with Cache-Control: no-store", async () => {
+      const { runStore } = makeStores();
+      const runId = "run-msg-get-cache";
+      makeRun(runStore, runId, { inviteCodeHash: OWNER_INVITE_HASH });
+
+      const res = await getMessages(
+        new Request(`http://test/api/runs/${runId}/messages`, {
+          headers: { "x-invite-code": OWNER_INVITE },
+        }),
+        runParams(runId)
+      );
+      assert.equal(res.status, 200);
+      assert.equal(res.headers.get("cache-control"), "no-store");
     });
   });
 
@@ -724,6 +768,45 @@ describe("mutating run API routes", () => {
         eventStore.getEvents(runId, { kind: "approval.resolved" }).length,
         0
       );
+    });
+
+    it("reports 500 when the approval resolves but its audit event cannot be recorded", async () => {
+      const { runStore, eventStore } = makeStores();
+      const runId = "run-appr-audit-fail";
+      makeRun(runStore, runId);
+
+      // Ownership is proven by this run's own approval.requested event.
+      eventStore.append({
+        runId,
+        kind: "approval.requested",
+        actor: "warden",
+        data: { approvalId: "appr-audit" },
+      });
+
+      (globalThis as Record<string, unknown>).__runOrchestrator = {
+        resolveApproval: async () => ({ ok: true }),
+      };
+
+      // The approval resolves, but persisting its audit event fails afterwards.
+      (eventStore as unknown as { append: (...args: never[]) => unknown }).append =
+        () => {
+          throw new Error("approval audit store unavailable");
+        };
+
+      const res = await resolveApproval(
+        jsonRequest(`http://test/api/runs/${runId}/approvals/appr-audit`, {
+          decision: "approve_once",
+        }),
+        { params: Promise.resolve({ runId, approvalId: "appr-audit" }) }
+      );
+      assert.equal(res.status, 500);
+      const data = await readJson(res);
+      assert.equal(data.ok, false);
+      assert.equal(data.code, "APPROVAL_AUDIT_FAILED");
+      assert.equal(data.runId, runId);
+      assert.equal(data.approvalId, "appr-audit");
+      assert.equal(data.decision, "approve_once");
+      assert.equal(data.resolved, true);
     });
   });
 
@@ -1868,7 +1951,7 @@ describe("mutating run API routes", () => {
       assert.equal(pushed, false);
     });
 
-    it("refuses a caller-supplied sourceRepoUrl that mismatches the run source (authoritative)", async () => {
+    it("refuses a caller-supplied sourceRepoUrl that mismatches the run source (403)", async () => {
       const { runStore } = makeStores();
       const runId = "run-push-source-override";
       makeRun(runStore, runId, {
@@ -1893,18 +1976,15 @@ describe("mutating run API routes", () => {
       };
 
       const res = await pushFork(req, runParams(runId));
-      if (res.status === 200) {
-        // If the override is tolerated at all, run.url must remain authoritative.
-        assert.equal(calls.length, 1);
-        assert.equal(calls[0].sourceRepoUrl, SOURCE);
-        assert.notEqual(calls[0].sourceRepoUrl, "https://github.com/attacker-user/other-repo");
-      } else {
-        assert.ok(
-          res.status === 400 || res.status === 403,
-          `expected 200 (using run.url) or 400/403, got ${res.status}`
-        );
-        assert.equal(calls.length, 0);
-      }
+      assert.equal(res.status, 403);
+      const data = await readJson(res);
+      assert.equal(data.ok, false);
+      assert.equal(data.code, "SOURCE_REPO_MISMATCH");
+      assert.equal(
+        calls.length,
+        0,
+        "a mismatching source repository must never reach GitService"
+      );
     });
 
     it("accepts a matching sourceRepoUrl but still pushes using run.url", async () => {
@@ -2181,6 +2261,126 @@ describe("mutating run API routes", () => {
         eventStore.getEvents(runId, { kind: "ask.answered" }).length,
         1
       );
+    });
+
+    it("reports 500 with pushed:true when the push succeeds but its audit event cannot be recorded", async () => {
+      const { runStore, eventStore } = makeStores();
+      const runId = "run-push-audit-fail";
+      makeRun(runStore, runId, {
+        phase: "done",
+        pushFlag: true,
+        pushTargetFork: FORK,
+      });
+
+      const askId = await raisePushConfirmAsk(runId);
+
+      // The fork push still succeeds; only recording the confirmation audit
+      // event fails, so the response must make the already-performed push clear.
+      (eventStore as unknown as { append: (...args: never[]) => unknown }).append =
+        () => {
+          throw new Error("audit store unavailable");
+        };
+
+      const req = jsonRequest(`http://test/api/runs/${runId}/push-fork`, {
+        confirmed: true,
+        askId,
+      });
+      (req as unknown as Record<string, unknown>).gitService = {
+        pushToFork: async () => ({
+          commitSha: "audit-fail-sha",
+          branch: `graveyard/${runId}`,
+        }),
+      };
+
+      const res = await pushFork(req, runParams(runId));
+      assert.equal(res.status, 500);
+      const data = await readJson(res);
+      assert.equal(data.ok, false);
+      assert.equal(data.code, "PUSH_AUDIT_FAILED");
+      assert.equal(data.pushed, true, "the caller must know the push already happened");
+      assert.equal(data.sourceUntouched, true);
+      assert.equal(data.commitSha, "audit-fail-sha");
+      assert.equal(data.branch, `graveyard/${runId}`);
+    });
+
+    it("rejects an empty or whitespace-only askId with 400 in both preview and confirm", async () => {
+      const { runStore } = makeStores();
+      const runId = "run-push-blank-ask";
+      makeRun(runStore, runId, {
+        phase: "done",
+        pushFlag: true,
+        pushTargetFork: FORK,
+      });
+
+      const blankPreview = await pushFork(
+        jsonRequest(`http://test/api/runs/${runId}/push-fork`, {
+          confirmed: false,
+          askId: "",
+        }),
+        runParams(runId)
+      );
+      assert.equal(blankPreview.status, 400);
+
+      const whitespacePreview = await pushFork(
+        jsonRequest(`http://test/api/runs/${runId}/push-fork`, {
+          confirmed: false,
+          askId: "   ",
+        }),
+        runParams(runId)
+      );
+      assert.equal(whitespacePreview.status, 400);
+
+      // A pending confirmation exists, so the confirm path would otherwise push;
+      // a blank askId must still be refused before the fork is touched.
+      await raisePushConfirmAsk(runId);
+
+      let pushed = false;
+      const makeConfirm = (askId: string): Request => {
+        const req = jsonRequest(`http://test/api/runs/${runId}/push-fork`, {
+          confirmed: true,
+          askId,
+        });
+        (req as unknown as Record<string, unknown>).gitService = {
+          pushToFork: async () => {
+            pushed = true;
+            return {};
+          },
+        };
+        return req;
+      };
+
+      const blankConfirm = await pushFork(makeConfirm(""), runParams(runId));
+      assert.equal(blankConfirm.status, 400);
+
+      const whitespaceConfirm = await pushFork(makeConfirm("   "), runParams(runId));
+      assert.equal(whitespaceConfirm.status, 400);
+      assert.equal(pushed, false, "a blank askId must never trigger a push");
+    });
+
+    it("generates a distinct confirmation askId for two previews in the same millisecond", async () => {
+      const { runStore } = makeStores();
+      const runId = "run-push-ask-unique";
+      makeRun(runStore, runId, {
+        phase: "done",
+        pushFlag: true,
+        pushTargetFork: FORK,
+      });
+
+      const originalNow = Date.now;
+      (Date as unknown as { now: () => number }).now = () => 1_700_000_000_000;
+      try {
+        const first = await raisePushConfirmAsk(runId);
+        const second = await raisePushConfirmAsk(runId);
+        assert.equal(typeof first, "string");
+        assert.equal(typeof second, "string");
+        assert.notEqual(
+          first,
+          second,
+          "same-millisecond previews must not produce a colliding askId"
+        );
+      } finally {
+        (Date as unknown as { now: () => number }).now = originalNow;
+      }
     });
   });
 

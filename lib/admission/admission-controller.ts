@@ -58,7 +58,8 @@ export interface AdmissionControllerOptions {
   killSwitch?: KillSwitchStatusSource | null;
   backend?: BackendCapacitySource | null;
   now?: () => number;
-  env?: NodeJS.ProcessEnv;
+  /** Environment read for `EXECUTION_BACKEND`; a plain string map so tests can pass `{}`. */
+  env?: Record<string, string | undefined>;
 }
 
 export interface AdmissionCheckInput {
@@ -113,7 +114,7 @@ export class AdmissionController {
   private readonly killSwitch?: KillSwitchStatusSource | null;
   private readonly backend?: BackendCapacitySource | null;
   private readonly now: () => number;
-  private readonly env: NodeJS.ProcessEnv;
+  private readonly env: Record<string, string | undefined>;
 
   private authHalted = false;
   private authFailureReason: string | null = null;
@@ -347,7 +348,7 @@ export class AdmissionController {
     if (requestedRunId) {
       // Synchronously claim a slot so concurrent callers cannot overshoot the effective limit.
       // An already-reserved run is admitted idempotently without double-counting.
-      if (!this.reservedRunIds.has(requestedRunId) && !this.reserveSlot(requestedRunId, limit)) {
+      if (!this.reservedRunIds.has(requestedRunId) && !this.reserveSlot(requestedRunId, limit, backendKind)) {
         return {
           admitted: false,
           code: "QUEUE",
@@ -393,10 +394,11 @@ export class AdmissionController {
    * Synchronously claims a live-run slot for `runId`. Idempotent: re-claiming an already reserved id
    * returns `true` without double-counting. Returns `false` when `live + reserved >= effectiveLimit`
    * (respecting {@link HARD_CONCURRENT_LIVE_RUNS_CEILING}). `limit` lets a caller reuse the exact
-   * limit it already resolved for a specific backend kind, but it is always clamped to the effective
-   * live-run ceiling so a caller can never bypass {@link HARD_CONCURRENT_LIVE_RUNS_CEILING}.
+   * limit it already resolved for a specific backend kind; it is floored first (so a fractional
+   * `1.5` can never reserve two slots) and then always clamped to the effective live-run ceiling for
+   * `backendKind`, so a caller can never bypass {@link HARD_CONCURRENT_LIVE_RUNS_CEILING}.
    */
-  reserveSlot(runId: string, limit?: number): boolean {
+  reserveSlot(runId: string, limit?: number, backendKind?: string): boolean {
     const id = normalizeRunId(runId);
     if (!id) {
       return false;
@@ -404,10 +406,11 @@ export class AdmissionController {
     if (this.reservedRunIds.has(id)) {
       return true;
     }
+    const ceiling = this.effectiveConcurrentLiveRuns(backendKind);
     const effective =
       typeof limit === "number" && Number.isFinite(limit)
-        ? Math.min(limit, this.effectiveConcurrentLiveRuns())
-        : this.effectiveConcurrentLiveRuns();
+        ? Math.min(Math.floor(limit), ceiling)
+        : ceiling;
     if (this.countLiveRuns() + this.reservedRunIds.size >= effective) {
       return false;
     }

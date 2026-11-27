@@ -1,3 +1,4 @@
+import * as crypto from "node:crypto";
 import { z } from "zod";
 import {
   authorizeMutatingRunRequest,
@@ -381,6 +382,21 @@ export async function POST(
   }
 
   const body = parsed.data;
+
+  // An empty or whitespace-only askId is not the same as an omitted one: left
+  // as-is it would raise or confirm an ask under a blank identifier, so it is
+  // refused before either the preview or the confirm branch runs.
+  if (body.askId !== undefined && body.askId.trim().length === 0) {
+    return Response.json(
+      {
+        ok: false,
+        error: "askId must not be empty or whitespace",
+        code: "INVALID_ASK_ID",
+      },
+      { status: 400 }
+    );
+  }
+
   const runStore = resolveRunStore(request);
   const eventStore = resolveEventStore(request, undefined, runStore);
 
@@ -458,9 +474,11 @@ export async function POST(
       );
     }
 
+    // The random suffix keeps two confirmations raised in the same
+    // millisecond distinct, so auto-generated ask ids never collide.
     const askId =
       body.askId ??
-      `push_confirm:${runId}:${Date.now().toString(36)}`;
+      `push_confirm:${runId}:${Date.now().toString(36)}:${crypto.randomUUID()}`;
 
     // A caller-supplied askId must not retarget an existing confirmation: it may
     // only be used when nothing in this run's log has raised or answered it.
@@ -618,21 +636,40 @@ export async function POST(
     })) as { commitSha?: string; branch?: string } | null;
 
     // Consume the confirmation only after the push actually succeeded: a
-    // transient git/network error must not burn a still-valid pending ask.
-    eventStore.append(
-      redactEvent({
-        runId,
-        kind: "ask.answered",
-        actor: "user",
-        data: {
-          askId: pendingAsk.askId,
-          kind: "push_confirm",
-          answer: "Push",
+    // transient git/network error must not burn a still-valid pending ask. The
+    // audit append is a separate step so a storage failure can be reported
+    // distinctly from a failed push, without inviting a duplicate retry.
+    try {
+      eventStore.append(
+        redactEvent({
+          runId,
+          kind: "ask.answered",
+          actor: "user",
+          data: {
+            askId: pendingAsk.askId,
+            kind: "push_confirm",
+            answer: "Push",
+            targetFork,
+            branch: pushedBranch,
+          },
+        }) as never
+      );
+    } catch {
+      return Response.json(
+        {
+          ok: false,
+          error: "The push succeeded but its confirmation could not be recorded",
+          code: "PUSH_AUDIT_FAILED",
+          runId,
           targetFork,
-          branch: pushedBranch,
+          branch: result?.branch ?? pushedBranch,
+          commitSha: result?.commitSha ?? null,
+          sourceUntouched: true,
+          pushed: true,
         },
-      }) as never
-    );
+        { status: 500 }
+      );
+    }
 
     return Response.json(
       {

@@ -677,3 +677,124 @@ test("report-check: install error ref is redacted while plain refs pass through"
   assert.ok(!String(withRedactor.installComparison.new?.ref).includes(custom));
 });
 
+test("report-check: inline backtick citations resolve without the trailing backtick", () => {
+  assert.deepEqual(extractMarkers("See `cmd:build` here"), ["cmd:build"]);
+  assert.deepEqual(extractMarkers("See (`ev:2`)."), ["ev:2"]);
+  assert.deepEqual(extractMarkers("See `file:src/app.ts`."), ["file:src/app.ts"]);
+
+  const index = buildEvidenceIndex({
+    commandResults: [{ id: "build" }],
+    files: ["src/app.ts"],
+    events: [
+      { runId: "r", seq: 2, ts: 0, kind: "command.result", actor: "a", data: { refs: [] } },
+    ],
+  });
+
+  const reading = checkReading(
+    "Build passed (`cmd:build`) and 2 events (`ev:2`).",
+    index
+  );
+  assert.equal(reading.passed, true);
+  assert.ok(reading.resolvedMarkers.includes("cmd:build"));
+  assert.ok(reading.resolvedMarkers.includes("ev:2"));
+
+  // Plain citations and sentence punctuation handling are preserved.
+  assert.deepEqual(extractMarkers("See cmd:build."), ["cmd:build"]);
+  assert.equal(checkReading("See file:src/app.ts.", index).passed, true);
+});
+
+test("report-check: runReportCheckWithRetry fails closed when redactor.redactText throws", async () => {
+  const { eventStore } = makeStores();
+  const index = buildEvidenceIndex({ commandResults: [{ id: "build" }] });
+  const throwing = {
+    redactText: () => {
+      throw new Error("redact exploded");
+    },
+  } as unknown as Redactor;
+
+  const result = await runReportCheckWithRetry({
+    reading: "Build passed with top-secret-value (cmd:build).",
+    index,
+    retry: () => null,
+    eventStore,
+    runId: "run-redact-fail",
+    redactor: throwing,
+  });
+
+  // A throwing redactor never leaks the original draft: the reading fails closed
+  // to the mask before any verification.
+  assert.equal(result.reading, "[REDACTED]");
+  assert.ok(!result.reading.includes("cmd:build"));
+  assert.ok(!result.reading.includes("top-secret-value"));
+
+  const events = eventStore.getEvents("run-redact-fail", { kind: "report.checked" });
+  assert.equal(events.length, 1);
+  assert.ok(!JSON.stringify(events[0].data).includes("top-secret-value"));
+});
+
+test("report-check: install error text fails closed when the redactor throws", () => {
+  const throwing = {
+    redactText: () => {
+      throw new Error("redact exploded");
+    },
+  } as unknown as Redactor;
+
+  const result = assignRunOutcomeWithInstallComparison({
+    tasks: [{ id: "task-1", state: "merged" }],
+    finalCheck: { installPassed: false },
+    newInstallError: {
+      command: "npm ci",
+      exitCode: 1,
+      error: "install failed",
+      ref: "cmd:install",
+    },
+    redactor: throwing,
+  });
+
+  // Every string field falls back to the mask instead of unredacted text.
+  assert.equal(result.installComparison.new?.error, "[REDACTED]");
+  assert.equal(result.installComparison.new?.command, "[REDACTED]");
+  assert.equal(result.installComparison.new?.ref, "[REDACTED]");
+  assert.equal(result.installComparison.new?.exitCode, 1);
+});
+
+test("report-check: ScribeService returns a redacted scribeReading with citations intact", async () => {
+  const { runStore, eventStore } = makeStores();
+  runStore.createRun({
+    runId: "run-svc-leak",
+    url: "https://github.com/owner/repo",
+    sha: "abcdef0123456789abcdef0123456789abcdef01",
+    phase: "report",
+  });
+  eventStore.append({
+    runId: "run-svc-leak",
+    kind: "final_check.result",
+    actor: "test",
+    data: { installPassed: true, buildPassed: true, testsPassed: true, hasTests: true, refs: [] },
+  });
+
+  const redactor = new Redactor({ autoRegisterEnvSecrets: false });
+  const secret = "scribe-leak-secret-abc-123456";
+  redactor.registerSecret(secret);
+
+  const service = new ScribeService({
+    runStore,
+    eventStore,
+    redactor,
+    scribeRunner: () => `Build passed with ${secret} (cmd:build).`,
+  });
+  const result = await service.run({
+    runId: "run-svc-leak",
+    commands: [{ id: "build" }],
+  });
+
+  assert.equal(result.narrativeDropped, false);
+  assert.equal(result.reportCheck.passed, true);
+  assert.ok(!result.scribeReading.includes(secret));
+  assert.ok(result.scribeReading.includes("[REDACTED]"));
+  assert.ok(result.scribeReading.includes("cmd:build"));
+
+  const events = eventStore.getEvents("run-svc-leak", { kind: "report.checked" });
+  assert.ok(!JSON.stringify(events.map((e) => e.data)).includes(secret));
+});
+

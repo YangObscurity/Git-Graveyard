@@ -9,7 +9,9 @@ import { RunStore } from "../../lib/runs/run-store";
 import {
   FailureRecoveryHandler,
   SECURITY_CONTAINMENT_EVENT_KIND,
+  RESPAWN_FAILED_MESSAGE,
   redactAllStringLeaves,
+  type SilenceNudgeMessage,
 } from "../../lib/supervisor/failure-recovery";
 import {
   BootReconciliationService,
@@ -106,7 +108,8 @@ test("failure-recovery: crash/broken pipe respawns once via session/load without
   assert.equal(repeatedCalls, 0);
   assert.equal(repeated.status, "failed");
   assert.equal(repeated.respawned, false);
-  assert.equal(repeated.respawnMessage, "Restarted from its last commit");
+  assert.equal(repeated.respawnMessage, RESPAWN_FAILED_MESSAGE);
+  assert.notEqual(repeated.respawnMessage, "Restarted from its last commit");
 
   let failCalls = 0;
   const loadFail = await handler.handleProcessCrash({
@@ -152,34 +155,41 @@ test("failure-recovery: quarantines a worktree and blocks its merge", () => {
   const eventStore = new EventStore(":memory:");
   const handler = new FailureRecoveryHandler({ eventStore });
 
-  const q = handler.quarantineWorktree({
-    runId: "run-sec",
-    skeletonId: "sk-9",
-    worktreeDir: "/tmp/worktrees/sk-9",
-    reason: "secret_detected",
-    detail: "redacted secret found in diff",
-  });
-  assert.equal(q.quarantined, true);
-  assert.equal(q.mergeBlocked, true);
-  assert.equal(q.isolated, false);
-  assert.equal(handler.isWorktreeQuarantined("/tmp/worktrees/sk-9"), true);
-  assert.equal(handler.isMergeBlocked("run-sec"), true);
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), "gg-quarantine-paths-"));
+  const sk9 = path.join(parent, "sk-9");
+  const sk10 = path.join(parent, "sk-10");
+  try {
+    const q = handler.quarantineWorktree({
+      runId: "run-sec",
+      skeletonId: "sk-9",
+      worktreeDir: sk9,
+      reason: "secret_detected",
+      detail: "redacted secret found in diff",
+    });
+    assert.equal(q.quarantined, true);
+    assert.equal(q.mergeBlocked, true);
+    assert.equal(q.isolated, false);
+    assert.equal(handler.isWorktreeQuarantined(sk9), true);
+    assert.equal(handler.isMergeBlocked("run-sec"), true);
 
-  const events = eventStore.getEvents("run-sec", {
-    kind: SECURITY_CONTAINMENT_EVENT_KIND,
-  });
-  assert.equal(events.length, 1);
-  assert.equal(events[0].data.reason, "secret_detected");
-  assert.equal(events[0].data.mergeBlocked, true);
-  assert.equal(events[0].data.isolated, false);
+    const events = eventStore.getEvents("run-sec", {
+      kind: SECURITY_CONTAINMENT_EVENT_KIND,
+    });
+    assert.equal(events.length, 1);
+    assert.equal(events[0].data.reason, "secret_detected");
+    assert.equal(events[0].data.mergeBlocked, true);
+    assert.equal(events[0].data.isolated, false);
 
-  const q2 = handler.quarantineWorktree({
-    runId: "run-sec-2",
-    worktreeDir: "/tmp/worktrees/sk-10",
-    reason: "symlink_escape",
-  });
-  assert.equal(q2.reason, "symlink_escape");
-  assert.equal(handler.isMergeBlocked("run-sec-2"), true);
+    const q2 = handler.quarantineWorktree({
+      runId: "run-sec-2",
+      worktreeDir: sk10,
+      reason: "symlink_escape",
+    });
+    assert.equal(q2.reason, "symlink_escape");
+    assert.equal(handler.isMergeBlocked("run-sec-2"), true);
+  } finally {
+    fs.rmSync(parent, { recursive: true, force: true });
+  }
 });
 
 test("failure-recovery: logs a permission.anomaly when the broker watchdog times out", () => {
@@ -1068,8 +1078,11 @@ test("failure-recovery: BootReconciliationService honors an injected redactor an
   await service2.reconcileOnBoot({ runStore: runStore2, eventStore: eventStore2 });
   const clock = eventStore2.getEvents("run-br-fail", { kind: "run.clock" });
   assert.equal(clock.length, 1);
-  assert.equal(clock[0].data.action, "[REDACTED]");
+  // The hardcoded pause control field is preserved while the untrusted string
+  // leaves are redacted to the mask.
+  assert.equal(clock[0].data.action, "pause");
   assert.equal(clock[0].data.reason, "[REDACTED]");
+  assert.equal(clock[0].data.phase, "[REDACTED]");
 });
 
 test("failure-recovery: a non-array backend.list aborts lost-box transitions", async () => {
@@ -1676,6 +1689,247 @@ test("failure-recovery: isWorktreeQuarantined detects an on-disk .QUARANTINED ma
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
+});
+
+test("failure-recovery: quarantine strips only the write bits from existing modes", () => {
+  const eventStore = new EventStore(":memory:");
+  const handler = new FailureRecoveryHandler({ eventStore });
+
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "gg-mode-"));
+  const nested = path.join(tmp, "nested");
+  const file = path.join(tmp, "private.txt");
+  fs.mkdirSync(nested);
+  fs.writeFileSync(file, "private");
+  fs.chmodSync(file, 0o600);
+  fs.chmodSync(nested, 0o700);
+  fs.chmodSync(tmp, 0o700);
+
+  try {
+    const result = handler.quarantineWorktree({
+      runId: "run-mode",
+      skeletonId: "sk-mode",
+      worktreeDir: tmp,
+      reason: "secret_detected",
+    });
+    assert.equal(result.isolated, true);
+
+    // 0600 file -> 0400 and 0700 dirs -> 0500: group/other read are never granted.
+    assert.equal(fs.statSync(file).mode & 0o777, 0o400);
+    assert.equal(fs.statSync(nested).mode & 0o777, 0o500);
+    assert.equal(fs.statSync(tmp).mode & 0o777, 0o500);
+    for (const target of [file, nested, tmp]) {
+      assert.equal(fs.statSync(target).mode & 0o044, 0);
+    }
+  } finally {
+    forceRemoveTree(tmp);
+  }
+});
+
+test("failure-recovery: non-respawned crashes report a descriptive failure message", async () => {
+  const eventStore = new EventStore(":memory:");
+  const handler = new FailureRecoveryHandler({ eventStore });
+
+  const loadFalse = await handler.handleProcessCrash({
+    runId: "run-msg-false",
+    skeletonId: "sk-msg-false",
+    loadSession: () => false,
+  });
+  assert.equal(loadFalse.respawned, false);
+  assert.equal(loadFalse.respawnMessage, RESPAWN_FAILED_MESSAGE);
+  assert.notEqual(loadFalse.respawnMessage, "Restarted from its last commit");
+
+  const loadThrow = await handler.handleProcessCrash({
+    runId: "run-msg-throw",
+    skeletonId: "sk-msg-throw",
+    loadSession: () => {
+      throw new Error("load exploded");
+    },
+  });
+  assert.equal(loadThrow.respawned, false);
+  assert.equal(loadThrow.respawnMessage, RESPAWN_FAILED_MESSAGE);
+
+  const exhausted = await handler.handleProcessCrash({
+    runId: "run-msg-exhausted",
+    skeletonId: "sk-msg-exhausted",
+    crashCount: 1,
+  });
+  assert.equal(exhausted.respawned, false);
+  assert.equal(exhausted.respawnMessage, RESPAWN_FAILED_MESSAGE);
+
+  // Only a successful respawn reports the resumed-session message.
+  const resumed = await handler.handleProcessCrash({
+    runId: "run-msg-resumed",
+    skeletonId: "sk-msg-resumed",
+    loadSession: () => true,
+  });
+  assert.equal(resumed.respawned, true);
+  assert.equal(resumed.respawnMessage, "Resumed the same session");
+});
+
+test("failure-recovery: handleMaxWardenRejections combines blockedBy and deps", () => {
+  const eventStore = new EventStore(":memory:");
+  const handler = new FailureRecoveryHandler({ eventStore });
+
+  const result = handler.handleMaxWardenRejections({
+    runId: "run-both-deps",
+    taskId: "task-skip",
+    rejectionRounds: 3,
+    maxRounds: 3,
+    pactTasks: [
+      { id: "task-merged", state: "merged" },
+      { id: "task-failed", state: "failed" },
+      // blockedBy is satisfied but deps is unmet -> the task stays blocked.
+      {
+        id: "task-both",
+        state: "pending",
+        blockedBy: ["task-merged"],
+        deps: ["task-failed"],
+      },
+      // Both lists are satisfied -> the task can be dispatched.
+      {
+        id: "task-ok",
+        state: "pending",
+        blockedBy: ["task-merged"],
+        deps: ["task-merged"],
+      },
+    ],
+  });
+
+  assert.ok(!result.dispatched.includes("task-both"));
+  assert.ok(result.remaining.includes("task-both"));
+  assert.ok(result.dispatched.includes("task-ok"));
+});
+
+test("failure-recovery: silence nudge populates structured fields and fails closed on delivery", () => {
+  const eventStore = new EventStore(":memory:");
+  const handler = new FailureRecoveryHandler({ eventStore });
+
+  const nudged = handler.handleSilenceNudge({
+    runId: "run-nudge-fields",
+    skeletonId: "skeleton-nudge",
+    silentDurationMs: 9000,
+    thresholdMs: 5000,
+  });
+  assert.equal(nudged.nudged, true);
+  const sent = eventStore.getEvents("run-nudge-fields", { kind: "message.sent" });
+  assert.equal(sent.length, 1);
+  const data = sent[0].data as Record<string, unknown>;
+  assert.equal(typeof data.msgId, "string");
+  assert.ok(String(data.msgId).length > 0);
+  assert.equal(data.from, "necromancer");
+  assert.equal(data.to, "skeleton-nudge");
+  assert.equal(data.intent, "nudge");
+  assert.equal(data.nudge, true);
+  assert.equal(typeof data.text, "string");
+  assert.ok(String(data.text).length > 0);
+  assert.deepEqual(data.refs, []);
+
+  // A delivery hook that fails reports nudged:false and records no event.
+  const seen: SilenceNudgeMessage[] = [];
+  const failing = new FailureRecoveryHandler({
+    eventStore,
+    deliverNudge: (message) => {
+      seen.push(message);
+      return false;
+    },
+  });
+  const failed = failing.handleSilenceNudge({
+    runId: "run-nudge-fail",
+    skeletonId: "skeleton-fail",
+    silentDurationMs: 9000,
+    thresholdMs: 5000,
+  });
+  assert.equal(failed.nudged, false);
+  assert.equal(failed.event, null);
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].from, "necromancer");
+  assert.equal(seen[0].to, "skeleton-fail");
+  assert.equal(seen[0].intent, "nudge");
+  assert.equal(seen[0].nudge, true);
+  assert.equal(
+    eventStore.getEvents("run-nudge-fail", { kind: "message.sent" }).length,
+    0
+  );
+
+  // A throwing delivery hook fails closed the same way.
+  const throwing = new FailureRecoveryHandler({
+    eventStore,
+    deliverNudge: () => {
+      throw new Error("delivery exploded");
+    },
+  });
+  const threw = throwing.handleSilenceNudge({
+    runId: "run-nudge-throw",
+    skeletonId: "skeleton-throw",
+    silentDurationMs: 9000,
+    thresholdMs: 5000,
+  });
+  assert.equal(threw.nudged, false);
+  assert.equal(threw.event, null);
+
+  // A throwing message service fails closed too.
+  const serviceFails = new FailureRecoveryHandler({
+    eventStore,
+    messageService: {
+      send: () => {
+        throw new Error("service exploded");
+      },
+    },
+  });
+  const serviceFailed = serviceFails.handleSilenceNudge({
+    runId: "run-nudge-service",
+    skeletonId: "skeleton-service",
+    silentDurationMs: 9000,
+    thresholdMs: 5000,
+  });
+  assert.equal(serviceFailed.nudged, false);
+  assert.equal(serviceFailed.event, null);
+
+  // A successful delivery still emits the structured event.
+  const delivering = new FailureRecoveryHandler({
+    eventStore,
+    deliverNudge: () => true,
+  });
+  const delivered = delivering.handleSilenceNudge({
+    runId: "run-nudge-ok",
+    skeletonId: "skeleton-ok",
+    silentDurationMs: 9000,
+    thresholdMs: 5000,
+  });
+  assert.equal(delivered.nudged, true);
+  assert.ok(delivered.event);
+});
+
+test("failure-recovery: handleKiroCreditExhaustion preserves an already done run", () => {
+  const runStore = new RunStore(":memory:");
+  const eventStore = new EventStore(":memory:");
+  runStore.createRun({
+    runId: "run-terminal",
+    url: "https://github.com/owner/repo",
+    sha: "abc",
+    phase: "done",
+    outcome: "resurrected",
+    endedAt: 1_234_567,
+  });
+  const before = runStore.getRun("run-terminal")!;
+
+  const service = new BootReconciliationService({ runStore, eventStore });
+  const result = service.handleKiroCreditExhaustion({ runId: "run-terminal" });
+
+  assert.equal(result.phase, "done");
+  assert.equal(result.outcome, "resurrected");
+  assert.equal(result.event, null);
+  assert.equal(
+    eventStore.getEvents("run-terminal", { kind: "budget.exceeded" }).length,
+    0
+  );
+
+  // The existing phase, outcome and endedAt are preserved untouched.
+  const after = runStore.getRun("run-terminal")!;
+  assert.equal(after.phase, "done");
+  assert.equal(after.outcome, "resurrected");
+  assert.equal(after.endedAt, before.endedAt);
+  assert.equal(after.updatedAt, before.updatedAt);
 });
 
 

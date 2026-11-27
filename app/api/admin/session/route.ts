@@ -51,23 +51,43 @@ function providedCredential(request: Request, body: SessionBody): string | null 
 export async function GET(request: Request): Promise<Response> {
   const settingsStore = resolveSettingsStore(request);
   const auth = requireAdminAuth(request, process.env, { settingsStore });
+  // Session state is per-caller and must never be cached by an intermediary.
+  const noStore = { "Cache-Control": "no-store" } as const;
   if (auth.ok) {
-    return Response.json({
-      ok: true,
-      authenticated: true,
-      configured: true,
-      actor: auth.actor,
-      method: auth.method,
-    });
-  }
-  // Fail closed when the admin secret is unconfigured; otherwise report an unauthenticated status.
-  if (auth.response.status === 503) {
     return Response.json(
-      { ok: false, authenticated: false, configured: false, error: "admin_auth_unconfigured" },
-      { status: 503 }
+      {
+        ok: true,
+        authenticated: true,
+        configured: true,
+        actor: auth.actor,
+        method: auth.method,
+      },
+      { headers: noStore }
     );
   }
-  return Response.json({ ok: true, authenticated: false, configured: true, actor: null });
+  // A configured admin secret whose revocation store could not be read is a transient authorization
+  // outage, not an unconfigured deployment: keep `configured: true` so the caller can retry.
+  if (auth.response.status === 503) {
+    if (getAdminSecret()) {
+      return Response.json(
+        {
+          ok: false,
+          authenticated: false,
+          configured: true,
+          error: "admin_authorization_unavailable",
+        },
+        { status: 503, headers: noStore }
+      );
+    }
+    return Response.json(
+      { ok: false, authenticated: false, configured: false, error: "admin_auth_unconfigured" },
+      { status: 503, headers: noStore }
+    );
+  }
+  return Response.json(
+    { ok: true, authenticated: false, configured: true, actor: null },
+    { headers: noStore }
+  );
 }
 
 export async function POST(request: Request): Promise<Response> {

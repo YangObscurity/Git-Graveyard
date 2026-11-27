@@ -192,6 +192,13 @@ export class BudgetGovernor {
    * (Property P20, Requirement 30.7).
    */
   private readonly exceededDimensions = new Map<BudgetDimension, number>();
+  /**
+   * Tracks whether the context-pressure dimension has already escalated to `cancel_turn`. It is
+   * separate from {@link exceededDimensions} so that once the context cap is crossed
+   * (`steer_wrap_up`) the later crossing of the cancel boundary can still emit `cancel_turn` instead
+   * of being suppressed by the latched exceedance.
+   */
+  private contextEscalated = false;
   private pendingAsk: "exceed_budget" | null = null;
   private runOutcome: string | null = null;
   private creditExhaustionHandled = false;
@@ -466,6 +473,10 @@ export class BudgetGovernor {
         continue;
       }
       if (value >= cap) {
+        if (dim === "contextPressurePercent") {
+          this.escalateContextPressure(dim, value, cap);
+          continue;
+        }
         if (!this.exceededDimensions.has(dim)) {
           this.exceededDimensions.set(dim, value);
           this.pendingAsk = "exceed_budget";
@@ -475,10 +486,6 @@ export class BudgetGovernor {
             cap,
             ask: "exceed_budget",
           };
-          if (dim === "contextPressurePercent") {
-            data.action =
-              value >= cap + this.contextCancelMarginPercent ? "cancel_turn" : "steer_wrap_up";
-          }
           this.emit("budget.exceeded", data);
           if (dim === "creditsPerRun" || dim === "creditsPerDay") {
             // `handleCreditExhaustion` emits the terminal `run.done`; stop the loop immediately so
@@ -534,6 +541,41 @@ export class BudgetGovernor {
   /** True once the run is terminal because credits were exhausted. */
   private isTerminal(): boolean {
     return this.creditExhaustionHandled || this.runOutcome === "budget_stopped";
+  }
+
+  /**
+   * Handles the context-pressure dimension separately from the generic latch: the first crossing
+   * emits `steer_wrap_up` (or `cancel_turn` if it already breached the cancel boundary), and a later
+   * crossing of `cap + contextCancelMarginPercent` still promotes to `cancel_turn` even though the
+   * dimension is already latched as exceeded.
+   */
+  private escalateContextPressure(dim: BudgetDimension, value: number, cap: number): void {
+    const action =
+      value >= cap + this.contextCancelMarginPercent ? "cancel_turn" : "steer_wrap_up";
+    if (!this.exceededDimensions.has(dim)) {
+      this.exceededDimensions.set(dim, value);
+      this.pendingAsk = "exceed_budget";
+      this.contextEscalated = action === "cancel_turn";
+      this.emit("budget.exceeded", {
+        dimension: dim,
+        usage: value,
+        cap,
+        ask: "exceed_budget",
+        action,
+      });
+      return;
+    }
+    if (action === "cancel_turn" && !this.contextEscalated) {
+      this.contextEscalated = true;
+      this.exceededDimensions.set(dim, value);
+      this.emit("budget.exceeded", {
+        dimension: dim,
+        usage: value,
+        cap,
+        ask: "exceed_budget",
+        action: "cancel_turn",
+      });
+    }
   }
 
   /**
@@ -615,6 +657,10 @@ export class BudgetGovernor {
     const value = this.usageFor(dimension, input.now);
     if (value !== null && value < newCap) {
       this.exceededDimensions.delete(dimension);
+      if (dimension === "contextPressurePercent") {
+        // Re-arm the escalation so a future crossing of the cancel boundary emits `cancel_turn`.
+        this.contextEscalated = false;
+      }
     }
     // Re-arm the warning when the raised cap moves the usage ratio strictly below the warning
     // threshold, so crossing the new threshold later emits a fresh `budget.warning` (Requirement 30.5).
