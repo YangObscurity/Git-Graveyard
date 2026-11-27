@@ -1,3 +1,4 @@
+import * as crypto from "node:crypto";
 import { z } from "zod";
 import { extractCallerCredentials, matchesRunInviteCode } from "@/lib/pact/pact-mutation";
 import {
@@ -14,6 +15,27 @@ export const runtime = "nodejs";
 interface RouteContext {
   params: Promise<{ runId: string }> | { runId: string };
 }
+
+/**
+ * Constant-time string comparison over SHA-256 digests: equal-length digests
+ * keep `timingSafeEqual` well-defined and leak no information about length or
+ * prefix of either token.
+ */
+function timingSafeTokenEqual(
+  provided: string | null | undefined,
+  expected: string | null | undefined
+): boolean {
+  if (typeof provided !== "string" || typeof expected !== "string") {
+    return false;
+  }
+  if (provided.length === 0 || expected.length === 0) {
+    return false;
+  }
+  const providedDigest = crypto.createHash("sha256").update(provided).digest();
+  const expectedDigest = crypto.createHash("sha256").update(expected).digest();
+  return crypto.timingSafeEqual(providedDigest, expectedDigest);
+}
+
 
 const controlBodySchema = z.object({
   action: z.enum(["pause", "resume", "stop", "kill"]),
@@ -89,14 +111,12 @@ export async function POST(
     bearer;
   const expectedAdminToken = process.env.ADMIN_TOKEN ?? process.env.ADMIN_KEY;
   const isVerifiedAdmin = Boolean(
-    expectedAdminToken &&
-      providedAdminToken &&
-      providedAdminToken === expectedAdminToken
+    expectedAdminToken && timingSafeTokenEqual(providedAdminToken, expectedAdminToken)
   );
 
   // Admin token check for kill action
   if (body.action === "kill" && process.env.ADMIN_TOKEN) {
-    if (!providedAdminToken || providedAdminToken !== process.env.ADMIN_TOKEN) {
+    if (!timingSafeTokenEqual(providedAdminToken, process.env.ADMIN_TOKEN)) {
       return Response.json(
         { ok: false, error: "Admin token required for kill action" },
         { status: 403 }

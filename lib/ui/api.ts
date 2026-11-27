@@ -298,3 +298,121 @@ export function postSkeletonAction(
     code ? { "x-invite-code": code } : undefined
   );
 }
+
+// --- R4-10 mutating routes ---------------------------------------------------
+
+/** POST /api/runs/[runId]/messages — send a user message to a mailbox. */
+export function postMessage(
+  runId: string,
+  body: {
+    to: string;
+    intent: string;
+    text?: string;
+    delivery?: "after_command" | "interrupt_now";
+    recipientRole?: string;
+    refs?: string[];
+    skeletonId?: string;
+  },
+  failure = "Failed to send the message",
+  inviteCode?: string
+) {
+  const code = inviteCode?.trim() || recallInviteCode(runId);
+  return postJson(
+    `/api/runs/${enc(runId)}/messages`,
+    { ...body },
+    failure,
+    code ? { "x-invite-code": code } : undefined
+  );
+}
+
+/** POST /api/runs/[runId]/approvals/[approvalId] — resolve one approval. */
+export function postApprovalById(
+  runId: string,
+  approvalId: string,
+  decision: ApprovalDecision,
+  options?: {
+    scope?: string;
+    pattern?: string;
+    reason?: string;
+    inviteCode?: string;
+  }
+) {
+  const code = options?.inviteCode?.trim() || recallInviteCode(runId);
+  const body: Record<string, unknown> = { decision };
+  if (options?.scope !== undefined) body.scope = options.scope;
+  if (options?.pattern !== undefined) body.pattern = options.pattern;
+  if (options?.reason !== undefined) body.reason = options.reason;
+  return postJson(
+    `/api/runs/${enc(runId)}/approvals/${enc(approvalId)}`,
+    body,
+    "Failed to submit approval decision",
+    code ? { "x-invite-code": code } : undefined
+  );
+}
+
+/** POST /api/runs/[runId]/asks/[askId] — answer one question. */
+export function postAskAnswerById(
+  runId: string,
+  askId: string,
+  answer: unknown,
+  inviteCode?: string
+) {
+  const code = inviteCode?.trim() || recallInviteCode(runId);
+  return postJson(
+    `/api/runs/${enc(runId)}/asks/${enc(askId)}`,
+    { answer },
+    "Failed to send the answer",
+    code ? { "x-invite-code": code } : undefined
+  );
+}
+
+export type SkeletonActionV2 =
+  | "interrupt"
+  | "re-raise"
+  | "lay-to-rest"
+  | "send-instruction"
+  | "add-review-focus";
+
+/** POST /api/runs/[runId]/skeletons/[skeletonId]/actions — R4-10 actions. */
+export function postSkeletonActionV2(
+  runId: string,
+  skeletonId: string,
+  body: {
+    action: SkeletonActionV2;
+    choice?: "keep_commits" | "discard_work";
+    instruction?: string;
+    focus?: string;
+    delivery?: string;
+    reason?: string;
+  },
+  failure = "Failed to control the Skeleton",
+  inviteCode?: string
+) {
+  const code = inviteCode?.trim() || recallInviteCode(runId);
+  return postJson(
+    `/api/runs/${enc(runId)}/skeletons/${enc(skeletonId)}/actions`,
+    { ...body },
+    failure,
+    code ? { "x-invite-code": code } : undefined
+  );
+}
+
+/** POST /api/runs/[runId]/push-fork — two-step fork push. */
+export function postPushFork(
+  runId: string,
+  body: {
+    confirmed?: boolean;
+    targetFork?: string;
+    sourceRepoUrl?: string;
+    askId?: string;
+  },
+  inviteCode?: string
+) {
+  const code = inviteCode?.trim() || recallInviteCode(runId);
+  return postJson(
+    `/api/runs/${enc(runId)}/push-fork`,
+    { ...body },
+    "Failed to push to the fork",
+    code ? { "x-invite-code": code } : undefined
+  );
+}
