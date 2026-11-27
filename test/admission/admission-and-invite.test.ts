@@ -938,6 +938,43 @@ describe("FifoQueue cap normalization and caps isolation (Task 22.2)", () => {
     assert.deepEqual(queue.list()[0].caps, { nested: { tool: 5 } });
     assert.deepEqual(queue.snapshot().entries[0].caps, { nested: { tool: 5 } });
   });
+
+  it("preserves an own __proto__ caps key through the fallback clone without aliasing", () => {
+    const { eventStore } = makeHarness();
+    const queue = new FifoQueue({ eventStore });
+    // `JSON.parse` yields an own, enumerable data property named "__proto__"; adding a function
+    // property forces `structuredClone` to throw so the recursive fallback clone runs.
+    const caps = JSON.parse('{"__proto__":{"tool":5}}') as Record<string, unknown>;
+    caps.extra = () => {};
+
+    const result = queue.enqueue({ runId: "proto-run", caps });
+    assert.equal(result.ok, true);
+
+    // The own "__proto__" subtree must survive as an own data property, never become the prototype.
+    const queued = queue.list()[0].caps as Record<string, unknown>;
+    assert.equal(Object.prototype.hasOwnProperty.call(queued, "__proto__"), true);
+    assert.deepEqual(Object.getOwnPropertyDescriptor(queued, "__proto__")?.value, { tool: 5 });
+    assert.equal(Object.getPrototypeOf(queued), Object.prototype);
+    assert.equal("extra" in queued, false);
+
+    // Mutating the caller's own "__proto__" subtree must not change the queued clone.
+    (caps.__proto__ as Record<string, unknown>).tool = 999;
+    assert.deepEqual(
+      Object.getOwnPropertyDescriptor(queue.list()[0].caps, "__proto__")?.value,
+      { tool: 5 }
+    );
+
+    // Mutating a returned snapshot's own "__proto__" subtree must not change the queued clone.
+    const snapshotCaps = queue.snapshot().entries[0].caps as Record<string, unknown>;
+    (snapshotCaps.__proto__ as Record<string, unknown>).tool = 777;
+    assert.deepEqual(
+      Object.getOwnPropertyDescriptor(queue.list()[0].caps, "__proto__")?.value,
+      { tool: 5 }
+    );
+    const freshCaps = queue.snapshot().entries[0].caps as Record<string, unknown>;
+    assert.equal(Object.prototype.hasOwnProperty.call(freshCaps, "__proto__"), true);
+    assert.deepEqual(Object.getOwnPropertyDescriptor(freshCaps, "__proto__")?.value, { tool: 5 });
+  });
 });
 
 

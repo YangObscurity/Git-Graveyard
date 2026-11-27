@@ -126,7 +126,15 @@ function deepCloneCapsValue(value: unknown, seen: WeakMap<object, unknown>): unk
     for (const [key, item] of Object.entries(value)) {
       const cloned = deepCloneCapsValue(item, seen);
       if (cloned !== DROP_UNCLONEABLE) {
-        out[key] = cloned;
+        // Define each key as an own data property. A plain `out[key] = cloned` would invoke the
+        // inherited `Object.prototype.__proto__` setter for an own `"__proto__"` key parsed from
+        // JSON, silently dropping it (and rewiring the clone's prototype) instead of preserving it.
+        Object.defineProperty(out, key, {
+          value: cloned,
+          enumerable: true,
+          writable: true,
+          configurable: true,
+        });
       }
     }
     return out;

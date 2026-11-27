@@ -635,7 +635,18 @@ export class FailureRecoveryHandler {
         if (delivered) {
           servicePersisted = true;
           resolvedMsgId = extractMessageRecordId(sent) ?? msgId;
-          serviceEvent = this.findMessageSentEvent(input.runId, resolvedMsgId);
+          // The send already succeeded, so a failure while looking up the
+          // persisted `message.sent` record must not be mistaken for a delivery
+          // failure. Isolate the lookup: a post-send eventStore failure leaves
+          // `serviceEvent` null while the nudge stays `nudged: true`.
+          try {
+            serviceEvent = this.findMessageSentEvent(
+              input.runId,
+              resolvedMsgId
+            );
+          } catch {
+            serviceEvent = null;
+          }
         }
       }
     } catch {

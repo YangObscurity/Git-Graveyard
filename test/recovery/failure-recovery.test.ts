@@ -1944,6 +1944,43 @@ test("failure-recovery: a successful message service delivery emits exactly one 
   assert.equal(sent[0].actor, "necromancer");
 });
 
+test("failure-recovery: a silence nudge stays delivered when the post-send event lookup throws", () => {
+  // The message service send() succeeds (servicePersisted path), but the
+  // follow-up lookup of the persisted message.sent event throws. A post-send
+  // store failure must not be reported as a delivery failure: the nudge still
+  // reports nudged:true with a null event.
+  const throwingStore = {
+    getEvents: () => {
+      throw new Error("event store unavailable after send");
+    },
+  } as unknown as EventStore;
+
+  const sentRecords: unknown[] = [];
+  const handler = new FailureRecoveryHandler({
+    eventStore: throwingStore,
+    messageService: {
+      send: (message) => {
+        const record = { id: "msg-post-send-lookup", ...message };
+        sentRecords.push(record);
+        return record;
+      },
+    },
+  });
+
+  const result = handler.handleSilenceNudge({
+    runId: "run-nudge-post-send-lookup",
+    skeletonId: "skeleton-nudge-lookup",
+    silentDurationMs: 9000,
+    thresholdMs: 5000,
+  });
+
+  // send() was invoked once and succeeded, so the nudge is reported as delivered
+  // even though the post-send event lookup failed.
+  assert.equal(sentRecords.length, 1);
+  assert.equal(result.nudged, true);
+  assert.equal(result.event, null);
+});
+
 test("failure-recovery: handleKiroCreditExhaustion preserves an already done run", () => {
   const runStore = new RunStore(":memory:");
   const eventStore = new EventStore(":memory:");
