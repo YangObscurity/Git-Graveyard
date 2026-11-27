@@ -450,28 +450,28 @@ export async function bakeFixtureArtifacts(
       yearsDead: result.reportJson.verdict.yearsDead,
     })
   );
+  const revertedSteps = bundle.patchSteps.filter((step) => step.reverted);
   events.push(
     JSON.stringify({
       seq: events.length,
       kind: "gate.result",
       gate: "syntax",
-      ok: true,
+      ok: bundle.patchSteps.every((step) => !step.reverted),
       files: bundle.patchSteps.map((step) => step.file),
-      reasons: [],
+      reasons: revertedSteps.map((step) => step.revertReason ?? "all_edits_rejected"),
     })
   );
 
-  const revertedSteps = bundle.patchSteps.filter((step) => step.reverted).length;
   const verifyResult = {
     owner: result.owner,
     repo: result.repo,
     sha: meta.sha,
     gate: "syntax",
-    ok: revertedSteps === 0,
+    ok: revertedSteps.length === 0,
     engineVersion: resolveEngineVersion(),
     signals: result.reportJson.signals.length,
     patchSteps: bundle.patchSteps.length,
-    revertedSteps,
+    revertedSteps: revertedSteps.length,
     unknowns: result.reportJson.unknowns.length + python.unknowns.length,
     pythonLabels: python.labels,
   };
