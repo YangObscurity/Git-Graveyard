@@ -815,7 +815,9 @@ export function planFromTree(
   file: string
 ): PythonPlan {
   const hasFuture = hasFuturePrint(tree);
-  const unicodeBound = collectBoundNames(tree).has("unicode");
+  const boundNames = collectBoundNames(tree);
+  const unicodeBound = boundNames.has("unicode");
+  const strBound = boundNames.has("str");
   const toUtf16 = makeIndexMapper(tree, source);
   const edits: PythonPlannedEdit[] = [];
   const unknowns: UnknownRecord[] = [];
@@ -913,6 +915,19 @@ export function planFromTree(
           unknowns.push({
             ruleId: "M1",
             reason: "unicode_rebound",
+            file,
+            line: lineOf(node),
+          });
+          return;
+        }
+        // `unicode(...) -> str(...)` is only safe when `str` still resolves to
+        // the built-in. If the file rebinds `str` (e.g. `def f(str):` or
+        // `str = ...`), the rewritten call would reach the shadowing binding
+        // instead, so keep it unrewritten and flag it for manual review.
+        if (strBound) {
+          unknowns.push({
+            ruleId: "M1",
+            reason: "str_rebound",
             file,
             line: lineOf(node),
           });
