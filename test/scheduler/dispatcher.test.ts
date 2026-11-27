@@ -894,4 +894,51 @@ describe("TaskDispatcher: T34 Wave 2A Execution & Merge Pipeline", () => {
 
     await supervisor.finish();
   });
+
+  it("buildDefaultAskAutoDeny awaits emitEvent and rejects cleanly when the sink rejects", async () => {
+    const runId = "run-ask-deny-reject";
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "gg-ask-deny-"));
+    tmpDirs.push(tmpDir);
+
+    const gitService = new GitService({ runsDir: tmpDir });
+    const pactMarkdown = `
+- [ ] T1. Ask Deny Task
+  - role: bonesetter
+  - depends:
+  - files: a.txt
+  - accept: npm test
+  - hard: no
+  - rules: M1
+`;
+    const scheduler = new Scheduler({ pact: pactMarkdown, runId });
+    const sinkError = new Error("emit sink boom");
+    const dispatcher = new TaskDispatcher({
+      runId,
+      scheduler,
+      gitService,
+      // The event sink rejects: the default onAskAutoDeny must surface that
+      // rejection instead of resolving or floating it as an unhandled rejection.
+      emitEvent: () => Promise.reject(sinkError),
+    });
+
+    const onAskAutoDeny = (dispatcher as any).buildDefaultAskAutoDeny(
+      "skel-ask-deny"
+    );
+    assert.equal(typeof onAskAutoDeny, "function");
+
+    await assert.rejects(
+      async () => {
+        await onAskAutoDeny({
+          askId: "ask-1",
+          toolCallId: null,
+          text: "Proceed?",
+          raw: { type: "ask_request", askId: "ask-1", text: "Proceed?" },
+        });
+      },
+      (err: any) => {
+        assert.equal(err, sinkError);
+        return true;
+      }
+    );
+  });
 });

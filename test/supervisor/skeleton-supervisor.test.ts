@@ -1349,8 +1349,10 @@ test("Requirement 17.3: steer() mid-headless-turn never runs two concurrent head
   let live = 0;
   let maxConcurrentSpawns = 0;
   const children: MockChildProcess[] = [];
+  const capturedCommands: Array<{ command: string; args: readonly string[] }> = [];
 
-  const spawnFn: SpawnFunction = () => {
+  const spawnFn: SpawnFunction = (command, args) => {
+    capturedCommands.push({ command, args });
     live += 1;
     maxConcurrentSpawns = Math.max(maxConcurrentSpawns, live);
     const child = new MockChildProcess();
@@ -1362,7 +1364,9 @@ test("Requirement 17.3: steer() mid-headless-turn never runs two concurrent head
       child.killed = true;
       child.signalCode = "SIGTERM";
       child.exitCode = null;
-      child.emit("close", null);
+      // Emit "close" ASYNCHRONOUSLY so the cancelled turn settles on a later
+      // tick rather than synchronously inside kill().
+      setImmediate(() => child.emit("close", null));
       return true;
     };
     setImmediate(() => {
@@ -1415,6 +1419,28 @@ test("Requirement 17.3: steer() mid-headless-turn never runs two concurrent head
   }
   assert.equal(live, 1, "the first headless turn must have exactly one live process");
 
+  // Wait until the FIRST process has reported its session id ("cli-steer-0") and
+  // the channel parsed it, so the steered resume can target that exact session.
+  const streamLog = path.join(
+    supervisor.getPaths().sessionsDir,
+    "headless-stream.jsonl"
+  );
+  const sessionDeadline = Date.now() + 2000;
+  while (Date.now() < sessionDeadline) {
+    if (
+      fs.existsSync(streamLog) &&
+      fs.readFileSync(streamLog, "utf-8").includes("cli-steer-0")
+    ) {
+      break;
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.ok(
+    fs.existsSync(streamLog) &&
+      fs.readFileSync(streamLog, "utf-8").includes("cli-steer-0"),
+    "process #1 must report cli-steer-0 before steer()"
+  );
+
   // steer while the first headless turn is still in flight. It must resolve
   // without throwing and must NOT mark the Skeleton failed.
   const steerPromise = supervisor.steer("correction");
@@ -1437,6 +1463,11 @@ test("Requirement 17.3: steer() mid-headless-turn never runs two concurrent head
     "a mid-turn steer() must not fail the Skeleton"
   );
   assert.ok(children.length >= 2, "steer() must spawn a resume process");
+  // The resume process must target the exact session id process #1 reported.
+  const resumeArgs = capturedCommands[1].args;
+  const resumeIndex = resumeArgs.indexOf("--resume-id");
+  assert.ok(resumeIndex >= 0, "the steer resume must pass --resume-id");
+  assert.equal(resumeArgs[resumeIndex + 1], "cli-steer-0");
 
   // The Skeleton stays usable: a follow-up prompt must still succeed.
   const followUp: any = await supervisor.prompt("follow-up");
@@ -1444,6 +1475,106 @@ test("Requirement 17.3: steer() mid-headless-turn never runs two concurrent head
   assert.equal(live, 0);
 
   await supervisor.finish();
+  fs.rmSync(tmpBase, { recursive: true, force: true });
+});
+
+test("Requirement 17.3, 17.8: finish() while a steered headless turn settles keeps the Skeleton terminated and never respawns", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "gg-headless-finish-steer-"));
+  let spawnCount = 0;
+  const children: MockChildProcess[] = [];
+
+  const spawnFn: SpawnFunction = () => {
+    spawnCount += 1;
+    const child = new MockChildProcess();
+    const index = children.length;
+    children.push(child);
+    child.kill = () => {
+      child.killed = true;
+      child.signalCode = "SIGTERM";
+      child.exitCode = null;
+      // Settle asynchronously so finish() lands while the steered turn settles.
+      setImmediate(() => child.emit("close", null));
+      return true;
+    };
+    setImmediate(() => {
+      child.stdout.write(
+        JSON.stringify({
+          type: "session",
+          sessionId: `cli-finish-steer-${index}`,
+          model: CLAUDE_SONNET_5_5_MODEL_ID,
+        }) + "\n"
+      );
+      // Never closes on its own: only kill() settles it.
+    });
+    return child;
+  };
+
+  const supervisor = createSkeletonSupervisor({
+    runId: "run-headless-finish-steer",
+    skeletonId: "skel-headless-finish-steer",
+    role: "bonesetter",
+    cwd: path.join(tmpBase, "wt"),
+    baseDir: tmpBase,
+    quarantineDir: path.join(tmpBase, "quarantine"),
+    probeResults: {
+      P1: { id: "P1", passed: false },
+      P14: { id: "P14", passed: true },
+    },
+    onAskAutoDeny: () => {},
+    cancelGracePeriodMs: 1,
+    cancelPromptTimeoutMs: 100,
+    brokerOptions: getRequiredBrokerSettings(),
+    spawnFn,
+  });
+
+  await supervisor.raise();
+
+  const firstTurn = supervisor.prompt("first turn");
+  const spawnDeadline = Date.now() + 2000;
+  while (children.length < 1 && Date.now() < spawnDeadline) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(spawnCount, 1);
+
+  // Wait until process #1 has reported its session id.
+  const streamLog = path.join(
+    supervisor.getPaths().sessionsDir,
+    "headless-stream.jsonl"
+  );
+  const sessionDeadline = Date.now() + 2000;
+  while (Date.now() < sessionDeadline) {
+    if (
+      fs.existsSync(streamLog) &&
+      fs.readFileSync(streamLog, "utf-8").includes("cli-finish-steer-0")
+    ) {
+      break;
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+
+  // Start a steer, then finish() while the steered turn is still settling.
+  const steerPromise = supervisor.steer("correction");
+  const finishPromise = supervisor.finish();
+
+  // steer() must abort instead of spawning a replacement resume turn.
+  await assert.rejects(
+    () => steerPromise,
+    (err: any) => err instanceof SkeletonSupervisorError
+  );
+  await finishPromise;
+  await firstTurn;
+
+  assert.equal(supervisor.getState(), "terminated");
+  assert.equal(
+    spawnCount,
+    1,
+    "finish() must prevent a replacement resume process"
+  );
+
+  // A subsequent prompt() must neither spawn nor resurrect the Skeleton.
+  await assert.rejects(() => supervisor.prompt("again"));
+  assert.equal(spawnCount, 1);
+
   fs.rmSync(tmpBase, { recursive: true, force: true });
 });
 
@@ -1563,6 +1694,8 @@ test("Requirement 17.12: prompt().sessionId is redacted while steer() resumes wi
   const promptResult: any = await supervisor.prompt("do work");
   assert.equal(promptResult.status, "complete");
   // Requirement 17.12: the PUBLIC session id never leaks the credential.
+  assert.equal(typeof promptResult.sessionId, "string");
+  assert.ok(promptResult.sessionId.length > 0);
   assert.ok(
     !String(promptResult.sessionId).includes(kiroKey),
     "prompt().sessionId must not leak the API key"
