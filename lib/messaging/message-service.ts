@@ -226,9 +226,118 @@ export function validateMessageIntent(
   }
 }
 
+// Tier 3 hard-block scanning for user instructions. Free-text instructions are
+// prose, so the whole sentence must never be fed to the argv checker: doing so
+// flags benign wording ("the CI image has no sudo", "run pytest -v /tests").
+// Instead each shell clause is inspected for real command forms and dangerous
+// Tier 3 targets only.
+//
+// Clauses are separated on newlines, command chaining and subshell/backtick
+// openers so `sudo` is only a command when it actually starts a command.
+const SHELL_CLAUSE_SEPARATOR = /\r?\n|;|&&|\|\||\||\(|\)|`/;
+
+// Privilege-escalation binaries are a Tier 3 hit only at a command/subshell
+// start; a bare mention in prose ("no sudo") is not an instruction to run them.
+const PRIVILEGE_COMMAND_HEADS: ReadonlySet<string> = new Set([
+  "sudo",
+  "sudoedit",
+  "doas",
+  "su",
+  "pkexec",
+  "setcap",
+  "setuid",
+  "chsh",
+]);
+
+// Destructive host binaries are a Tier 3 hit only at a command/subshell start.
+const DESTRUCTIVE_COMMAND_HEADS: ReadonlySet<string> = new Set([
+  "mkfs",
+  "mkfs.ext4",
+  "mkfs.xfs",
+  "fdisk",
+  "parted",
+  "mkswap",
+  "shutdown",
+  "reboot",
+  "halt",
+  "poweroff",
+]);
+
+// Container runtime sockets are never reachable, wherever they appear.
+const CONTAINER_SOCKET_MARKERS: readonly string[] = [
+  "docker.sock",
+  "podman.sock",
+  "containerd.sock",
+  "crio.sock",
+];
+
+// Prose instructions that try to lift the budget ceiling in words.
+const BUDGET_BYPASS_PHRASES: readonly RegExp[] = [
+  /ignore\s+(?:the\s+)?(?:budget|spend\s+limit|cap|ceiling)\b/i,
+  /bypass\s+(?:the\s+)?(?:budget|spend\s+limit|cap|ceiling|limit)\b/i,
+  /(?:raise|increase|lift|remove)\s+(?:the\s+)?(?:budget|cap|ceiling)\s+(?:beyond|past|above|over|without)\b/i,
+  /(?:exceed|surpass)\s+(?:the\s+)?(?:budget|cap|ceiling)\s+ceiling\b/i,
+  /(?:no|without\s+any)\s+(?:budget|cap|ceiling)\s+limit\b/i,
+  /budget\s+ceiling\s+(?:does\s*n[o'’]?t|doesnt|does\s+not|is\s+not)\s+apply\b/i,
+];
+
+function shellBasename(token: string): string {
+  const trimmed = token.trim().replace(/^["']+|["']+$/g, "");
+  const slash = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
+  return (slash >= 0 ? trimmed.slice(slash + 1) : trimmed).toLowerCase();
+}
+
+function clauseTokens(clause: string): string[] {
+  return clause.split(/\s+/).filter(Boolean);
+}
+
+/**
+ * True only for explicit docker/podman host-bind syntax
+ * (`-v <host_path>:<container_path>` or `--volume=<host>:<container>`). A bare
+ * path such as pytest's `-v /tests` has no `<host>:<container>` pair and must
+ * not be treated as a host mount.
+ */
+function isHostBindVolumeMount(tokens: string[]): boolean {
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    const eq = token.indexOf("=");
+    const flag = eq >= 0 ? token.slice(0, eq) : token;
+    if (flag !== "-v" && flag !== "--volume") continue;
+    const value = (eq >= 0 ? token.slice(eq + 1) : tokens[i + 1] ?? "").trim();
+    const colon = value.indexOf(":");
+    if (colon <= 0) continue;
+    const host = value.slice(0, colon);
+    if (host.startsWith("/") || host.startsWith(".") || host.startsWith("~")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Destructive root operations (`rm -rf /`, `dd of=/dev/sda`) are a Tier 3 hit
+ * wherever they appear in a clause, so "run sudo rm -rf /" is still refused.
+ * The argv checker is only handed the slice that begins at the `rm`/`dd`
+ * binary, so its other checks cannot false-positive on surrounding prose.
+ */
+function clauseHasDestructiveHostOp(tokens: string[]): boolean {
+  for (let i = 0; i < tokens.length; i++) {
+    const base = shellBasename(tokens[i]);
+    if (base !== "rm" && base !== "dd") continue;
+    const result = checkCommandHardBlocks(tokens.slice(i));
+    if (result.blocked && result.code === "HARD_BLOCK_DESTRUCTIVE_HOST_OP") {
+      return true;
+    }
+  }
+  return false;
+}
+
+
 /**
  * Rejects a user instruction that would violate a Tier 3 hard block
- * (Requirement 27.13). Only user/builder instructions are scanned.
+ * (Requirement 27.13). Only user/builder instructions are scanned, and only
+ * real shell/command forms or dangerous Tier 3 targets are matched so ordinary
+ * prose is never rejected.
  */
 export function assertMessageNotHardBlocked(
   from: MessageSender,
@@ -237,14 +346,57 @@ export function assertMessageNotHardBlocked(
 ): void {
   if (from !== "user") return;
   if (intent === "nudge" || !text) return;
-  const tokens = text.trim().split(/\s+/).filter(Boolean);
-  if (tokens.length === 0) return;
-  const result = checkCommandHardBlocks(tokens);
-  if (result.blocked) {
-    throw new MessageError(
-      `Message instruction violates a Tier 3 hard block: ${result.reason}`,
-      "HARD_BLOCK"
-    );
+
+  for (const phrase of BUDGET_BYPASS_PHRASES) {
+    if (phrase.test(text)) {
+      throw new MessageError(
+        "Message instruction violates a Tier 3 hard block: instruction attempts to bypass the budget ceiling",
+        "HARD_BLOCK"
+      );
+    }
+  }
+
+  for (const clause of text.split(SHELL_CLAUSE_SEPARATOR)) {
+    const trimmedClause = clause.trim();
+    if (!trimmedClause) continue;
+
+    for (const marker of CONTAINER_SOCKET_MARKERS) {
+      if (trimmedClause.includes(marker)) {
+        throw new MessageError(
+          `Message instruction violates a Tier 3 hard block: instruction references container runtime socket '${marker}'`,
+          "HARD_BLOCK"
+        );
+      }
+    }
+
+    const tokens = clauseTokens(trimmedClause);
+    if (tokens.length === 0) continue;
+
+    const head = shellBasename(tokens[0]);
+    if (PRIVILEGE_COMMAND_HEADS.has(head)) {
+      throw new MessageError(
+        `Message instruction violates a Tier 3 hard block: instruction invokes '${head}' at the start of a command`,
+        "HARD_BLOCK"
+      );
+    }
+    if (DESTRUCTIVE_COMMAND_HEADS.has(head)) {
+      throw new MessageError(
+        `Message instruction violates a Tier 3 hard block: instruction invokes destructive host operation '${head}'`,
+        "HARD_BLOCK"
+      );
+    }
+    if (isHostBindVolumeMount(tokens)) {
+      throw new MessageError(
+        "Message instruction violates a Tier 3 hard block: instruction bind-mounts a host path",
+        "HARD_BLOCK"
+      );
+    }
+    if (clauseHasDestructiveHostOp(tokens)) {
+      throw new MessageError(
+        "Message instruction violates a Tier 3 hard block: instruction performs a destructive host operation",
+        "HARD_BLOCK"
+      );
+    }
   }
 }
 

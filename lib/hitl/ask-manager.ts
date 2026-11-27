@@ -353,23 +353,38 @@ export class AskManager {
   private effectFor(kind: AskKind, action: string): string {
     switch (kind) {
       case "approve_command":
-        return action === "Deny and lay to rest" ? "denied_lay_to_rest" : "denied";
+        switch (action) {
+          case "Approve once":
+            return "approved";
+          case "Approve this pattern for the run":
+            return "approved";
+          case "Deny and lay to rest":
+            return "denied_lay_to_rest";
+          default:
+            return "denied";
+        }
       case "exceed_budget":
-        return action === "Stop now"
-          ? "budget_stopped"
-          : "finish_current_tasks_then_budget_stopped";
+        if (action === "Raise the cap") return "cap_raised";
+        if (action === "Stop now") return "budget_stopped";
+        return "finish_current_tasks_then_budget_stopped";
       case "plan_change":
+        if (action === "Add it") return "added";
+        if (action === "Stop") return "stop";
         return "skipped_unaddressed";
       case "stuck_after_rejections":
+        if (action === "Re-plan the task") return "re_plan";
+        if (action === "Stop the run") return "stop";
         return "skipped";
       case "conflict_choice":
+        if (action === "Prefer A") return "prefer_a";
+        if (action === "Prefer B") return "prefer_b";
         return "re_plan";
       case "ambiguity":
         return "evidence_backed_candidate";
       case "nothing_to_do":
-        return "stop";
+        return action === "Plan anyway" ? "plan_anyway" : "stop";
       case "push_confirm":
-        return "no_push";
+        return action === "Push" ? "push" : "no_push";
       default:
         return "noop";
     }
@@ -581,10 +596,16 @@ export class AskManager {
     }
     const normalized = input.answer.trim();
     if (normalized === "Raise the cap") {
+      if (input.requestedCap === undefined) {
+        throw new AskManagerError(
+          "Raise the cap requires an explicit requestedCap",
+          "HARD_BLOCK_BUDGET_CEILING"
+        );
+      }
       const block = checkBudgetIncreaseHardBlocks({
         dimension: "cap",
         currentCap: input.currentCap,
-        requestedCap: input.requestedCap ?? input.currentCap,
+        requestedCap: input.requestedCap,
         codeCeiling: input.codeCeiling,
         globalCeiling: input.globalCeiling,
       });

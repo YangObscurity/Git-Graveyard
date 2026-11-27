@@ -2897,8 +2897,9 @@ export class GitService {
       );
     }
 
-    // An explicit push confirmation of `false` is a refusal (Requirement 29.5).
-    if (options.pushConfirm === false) {
+    // pushConfirm must be exactly true. A missing value is a refusal: the
+    // confirmation is fail-closed, so `undefined` never authorizes a push.
+    if (options.pushConfirm !== true) {
       throw new GitServiceError(
         "pushToFork refused: explicit push confirmation was not given (Requirement 29.5)",
         "PUSH_NOT_CONFIRMED"

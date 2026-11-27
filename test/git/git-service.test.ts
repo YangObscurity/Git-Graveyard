@@ -914,6 +914,7 @@ test("pushToFork: target owner must equal configured owner login case-insensitiv
   await assert.rejects(
     async () => {
       await serviceNoOwner.pushToFork("run-owner-1", {
+        pushConfirm: true,
         targetRepoUrl: "https://github.com/fork-owner/fork-repo",
         runPhase: "done",
         invitePushFlag: true,
@@ -936,6 +937,7 @@ test("pushToFork: target owner must equal configured owner login case-insensitiv
   await assert.rejects(
     async () => {
       await serviceOwnerMismatch.pushToFork("run-owner-2", {
+        pushConfirm: true,
         targetRepoUrl: "https://github.com/fork-owner/fork-repo",
         runPhase: "done",
         invitePushFlag: true,
@@ -959,6 +961,7 @@ test("pushToFork: target owner must equal configured owner login case-insensitiv
   await assert.rejects(
     async () => {
       await serviceCaseMatch.pushToFork("run-owner-3", {
+        pushConfirm: true,
         targetRepoUrl: "https://github.com/fork-owner/fork-repo",
         runPhase: "done",
         invitePushFlag: true,
@@ -986,6 +989,7 @@ test("pushToFork: fork checker validation and default deny", async () => {
   await assert.rejects(
     async () => {
       await service.pushToFork("run-fork-1", {
+        pushConfirm: true,
         targetRepoUrl: "https://github.com/fork-owner/fork-repo",
         runPhase: "done",
         invitePushFlag: true,
@@ -1003,6 +1007,7 @@ test("pushToFork: fork checker validation and default deny", async () => {
   await assert.rejects(
     async () => {
       await service.pushToFork("run-fork-2", {
+        pushConfirm: true,
         targetRepoUrl: "https://github.com/fork-owner/fork-repo",
         runPhase: "done",
         invitePushFlag: true,
@@ -1021,6 +1026,7 @@ test("pushToFork: fork checker validation and default deny", async () => {
   await assert.rejects(
     async () => {
       await service.pushToFork("run-fork-3", {
+        pushConfirm: true,
         targetRepoUrl: "https://github.com/fork-owner/fork-repo",
         runPhase: "done",
         invitePushFlag: true,
@@ -1039,6 +1045,7 @@ test("pushToFork: fork checker validation and default deny", async () => {
   await assert.rejects(
     async () => {
       await service.pushToFork("run-fork-4", {
+        pushConfirm: true,
         targetRepoUrl: "https://github.com/fork-owner/fork-repo",
         runPhase: "done",
         invitePushFlag: true,
@@ -1057,6 +1064,7 @@ test("pushToFork: fork checker validation and default deny", async () => {
   await assert.rejects(
     async () => {
       await service.pushToFork("run-fork-5", {
+        pushConfirm: true,
         targetRepoUrl: "https://github.com/fork-owner/fork-repo",
         runPhase: "done",
         invitePushFlag: true,
@@ -1083,6 +1091,7 @@ test("pushToFork: write token validation (refusal on missing token)", async () =
   await assert.rejects(
     async () => {
       await service.pushToFork("run-token-1", {
+        pushConfirm: true,
         targetRepoUrl: "https://github.com/fork-owner/fork-repo",
         runPhase: "done",
         invitePushFlag: true,
@@ -1152,6 +1161,7 @@ SCRIPT_DIR="$(cd "$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
     });
 
     const res = await service.pushToFork("run-askpass-01", {
+      pushConfirm: true,
       targetRepoUrl: "https://github.com/fork-owner/fork-repo",
       runPhase: "done",
       invitePushFlag: true,
@@ -1234,6 +1244,7 @@ SCRIPT_DIR="$(cd "$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
     await assert.rejects(
       async () => {
         await service.pushToFork("run-err-redact-01", {
+          pushConfirm: true,
           targetRepoUrl: "https://github.com/fork-owner/fork-repo",
           runPhase: "done",
           invitePushFlag: true,
@@ -1291,6 +1302,7 @@ SCRIPT_DIR="$(cd "$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
     });
 
     const res = await service.pushToFork(ctx.runId, {
+      pushConfirm: true,
       targetRepoUrl: "https://github.com/target-owner/source-repo",
       runPhase: "done",
       invitePushFlag: true,
@@ -1388,6 +1400,7 @@ SCRIPT_DIR="$(cd "$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
 
     // Network command: pushToFork
     await service.pushToFork("run-proto-01", {
+      pushConfirm: true,
       targetRepoUrl: "https://github.com/target-owner/source-repo",
       runPhase: "done",
       invitePushFlag: true,
@@ -1548,6 +1561,7 @@ test("rule 4: pushToFork - strict https://github.com/<owner>/<repo> target URL a
     await assert.rejects(
       async () => {
         await noWriteTokenService.pushToFork("run-r4-5", {
+          pushConfirm: true,
           targetRepoUrl: "https://github.com/owner-login/fork-repo",
           runPhase: "done",
           invitePushFlag: true,
@@ -1759,6 +1773,60 @@ test("pushToFork: refuses an explicit negative push confirmation", async () => {
     }
   );
 });
+test("pushToFork: omitted or undefined push confirmation is refused fail-closed", async () => {
+  const service = new GitService({
+    ownerLogin: "fork-owner",
+    sourceRepoUrl: "https://github.com/source-owner/source-repo",
+  });
+
+  let checkerCalls = 0;
+  const forkChecker = async () => {
+    checkerCalls += 1;
+    return "source-owner/source-repo";
+  };
+
+  // Omitted pushConfirm (undefined) is refused.
+  await assert.rejects(
+    async () => {
+      await service.pushToFork("run-confirm-omit", {
+        targetRepoUrl: "https://github.com/fork-owner/fork-repo",
+        runPhase: "done",
+        invitePushFlag: true,
+        forkChecker,
+        token: "test-token",
+      });
+    },
+    (err: unknown) => {
+      assert.ok(err instanceof GitServiceError);
+      assert.equal(err.code, "PUSH_NOT_CONFIRMED");
+      return true;
+    }
+  );
+
+  // An explicit undefined pushConfirm is refused too.
+  await assert.rejects(
+    async () => {
+      await service.pushToFork("run-confirm-undefined", {
+        targetRepoUrl: "https://github.com/fork-owner/fork-repo",
+        runPhase: "done",
+        invitePushFlag: true,
+        pushConfirm: undefined,
+        forkChecker,
+        token: "test-token",
+      });
+    },
+    (err: unknown) => {
+      assert.ok(err instanceof GitServiceError);
+      assert.equal(err.code, "PUSH_NOT_CONFIRMED");
+      return true;
+    }
+  );
+
+  // Fail-closed: the refusal happens before any fork verification or remote work.
+  assert.equal(checkerCalls, 0);
+});
+
+
 
 test("pushToFork: emits push.requested and push.result without leaking the token", async () => {
   const secretToken = ["gh", "p_", "event", "secret", "token", "9876"].join("");
@@ -1788,6 +1856,7 @@ SCRIPT_DIR="$(cd "$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
     });
 
     const res = await service.pushToFork("run-push-events", {
+      pushConfirm: true,
       targetRepoUrl: "https://github.com/fork-owner/fork-repo",
       runPhase: "done",
       invitePushFlag: true,
@@ -1839,6 +1908,7 @@ SCRIPT_DIR="$(cd "$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
       targetRepoUrl: "https://github.com/fork-owner/fork-repo",
       runPhase: "done" as const,
       invitePushFlag: true,
+      pushConfirm: true,
       forkChecker: async () => "source-owner/source-repo",
       token: "test-token",
     };

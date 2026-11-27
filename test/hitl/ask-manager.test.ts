@@ -180,7 +180,7 @@ test("AskManager: only design-defined options are accepted", () => {
 
   const answered = manager.answerAsk(ask.askId, "Prefer B");
   assert.equal(answered.status, "answered");
-  assert.equal(answered.effect, "re_plan");
+  assert.equal(answered.effect, "prefer_b");
   assert.equal(store.getEvents("run-hitl-5", { kind: "ask.answered" }).length, 1);
 });
 
@@ -233,4 +233,83 @@ test("AskManager: design options and defaults are stable", () => {
   assert.equal(ASK_DEFAULTS.push_confirm, "Do not push");
   assert.equal(ASK_DEFAULTS.nothing_to_do, "Stop");
 });
+
+test("AskManager: the chosen action determines the recorded effect", () => {
+  const { manager } = createManager();
+
+  const pushAsk = manager.raiseAsk({
+    runId: "run-hitl-7",
+    kind: "push_confirm",
+    question: "push the branch?",
+  });
+  assert.equal(manager.answerAsk(pushAsk.askId, "Push").effect, "push");
+
+  const noPushAsk = manager.raiseAsk({
+    runId: "run-hitl-7",
+    kind: "push_confirm",
+    question: "push the branch?",
+  });
+  assert.equal(manager.answerAsk(noPushAsk.askId, "Do not push").effect, "no_push");
+
+  const planAsk = manager.raiseAsk({
+    runId: "run-hitl-7",
+    kind: "plan_change",
+    question: "add the task?",
+  });
+  assert.equal(manager.answerAsk(planAsk.askId, "Add it").effect, "added");
+
+  const preferAAsk = manager.raiseAsk({
+    runId: "run-hitl-7",
+    kind: "conflict_choice",
+    question: "prefer A or B?",
+  });
+  assert.equal(manager.answerAsk(preferAAsk.askId, "Prefer A").effect, "prefer_a");
+
+  const preferBAsk = manager.raiseAsk({
+    runId: "run-hitl-7",
+    kind: "conflict_choice",
+    question: "prefer A or B?",
+  });
+  assert.equal(manager.answerAsk(preferBAsk.askId, "Prefer B").effect, "prefer_b");
+
+  const budgetAsk = manager.raiseAsk({
+    runId: "run-hitl-7",
+    kind: "exceed_budget",
+    question: "raise the cap?",
+  });
+  const raised = manager.resolveBudgetAsk({
+    askId: budgetAsk.askId,
+    answer: "Raise the cap",
+    currentCap: 10,
+    requestedCap: 40,
+    codeCeiling: 100,
+    globalCeiling: 200,
+  });
+  assert.equal(raised.effect, "cap_raised");
+});
+
+test("AskManager: Raise the cap without an explicit requestedCap is refused", () => {
+  const { manager } = createManager();
+  const ask = manager.raiseAsk({
+    runId: "run-hitl-8",
+    kind: "exceed_budget",
+    question: "raise the cap?",
+  });
+
+  assert.throws(
+    () =>
+      manager.resolveBudgetAsk({
+        askId: ask.askId,
+        answer: "Raise the cap",
+        currentCap: 10,
+        codeCeiling: 100,
+        globalCeiling: 200,
+      }),
+    (err: unknown) =>
+      err instanceof AskManagerError &&
+      err.code === "HARD_BLOCK_BUDGET_CEILING" &&
+      err.message.includes("requestedCap")
+  );
+});
+
 

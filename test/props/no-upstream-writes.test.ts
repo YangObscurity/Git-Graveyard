@@ -179,6 +179,7 @@ describe("Property 15: No upstream writes (pushToFork)", () => {
               ...common,
               runPhase: "done",
               invitePushFlag: true,
+              pushConfirm: true,
               branchName: "main",
             }),
             (err: unknown) =>

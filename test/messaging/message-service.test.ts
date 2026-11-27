@@ -228,6 +228,37 @@ test("MessageService: rejects a user instruction that violates a hard block", ()
     (err: unknown) => err instanceof MessageError && err.code === "HARD_BLOCK"
   );
 });
+test("MessageService: hard-block scanning ignores benign prose but blocks real Tier 3 forms", () => {
+  const { service } = createService();
+
+  const send = (text: string) =>
+    service.send({
+      runId: "run-msg-8",
+      from: "user",
+      to: "necromancer",
+      intent: "instruct",
+      text,
+    });
+
+  // Ordinary prose that merely mentions sudo or a -v flag must be allowed.
+  assert.doesNotThrow(() => send("the CI image has no sudo"));
+  assert.doesNotThrow(() => send("run pytest -v /tests"));
+
+  const blocked = (text: string) =>
+    assert.throws(
+      () => send(text),
+      (err: unknown) => err instanceof MessageError && err.code === "HARD_BLOCK"
+    );
+
+  // Real command forms and dangerous Tier 3 targets stay blocked.
+  blocked("sudo rm -rf /");
+  blocked("docker run -v /var/run/docker.sock:/var/run/docker.sock alpine");
+  blocked("mount /var/run/docker.sock");
+  // The pre-existing destructive form must remain refused.
+  blocked("run sudo rm -rf /");
+});
+
+
 
 test("MessageService: emits a silence nudge past the silent limit", () => {
   let clock = 1_000_000;
