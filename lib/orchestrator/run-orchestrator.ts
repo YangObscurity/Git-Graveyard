@@ -75,7 +75,7 @@ import {
   CLAUDE_OPUS_5_5_MODEL_ID,
   getAssignedModelForRole,
 } from "../agents/model-allowlist";
-import { redactEvent } from "../security/redactor";
+import { redactEvent, redactText } from "../security/redactor";
 import { neutralizeUntrustedContent } from "../security/untrusted-content";
 import {
   buildDockerInternalNetwork,
@@ -229,6 +229,20 @@ export interface RunOrchestratorOptions {
   forkChecker?: ForkChecker;
   githubToken?: string;
   ownerLogin?: string;
+  /**
+   * Explicit run-level push confirmation (Requirement 29.5). A run is only
+   * pushed to its fork when this is exactly `true`.
+   */
+  pushConfirm?: boolean;
+  /**
+   * Optional callback invoked at push time to obtain explicit confirmation.
+   * Only a resolved `true` authorizes the push.
+   */
+  requestPushConfirmation?: (info: {
+    runId: string;
+    targetFork: string;
+    branch: string;
+  }) => Promise<boolean> | boolean;
   pollIntervalMs?: number;
   closeHostOnShutdown?: boolean;
   boxImage?: string;
@@ -1219,25 +1233,69 @@ export class RunOrchestrator extends EventEmitter {
       }
       handle.manifest = manifest;
 
-      // Push to fork if requested and valid
+      // Push to fork if requested and valid (Requirement 29.5).
       const currentRun = this.host.runStore.getRun(runId);
       if (currentRun?.pushFlag && currentRun?.pushTargetFork) {
-        if (currentRun.pushTargetFork !== currentRun.url) {
-          try {
-            await this.gitService.pushToFork(runId, {
-              targetRepoUrl: currentRun.pushTargetFork,
-              sourceRepoUrl: currentRun.url,
-              branchName: currentRun.pushBranch ?? `graveyard/${runId}`,
-              gitDir,
-              runDir,
-              ownerLogin: this.options.ownerLogin,
-              forkChecker: this.options.forkChecker,
-              token: this.options.githubToken,
-              runPhase: "done",
-              invitePushFlag: currentRun.pushFlag,
+        const targetFork = currentRun.pushTargetFork;
+        const branch = currentRun.pushBranch ?? `graveyard/${runId}`;
+        if (targetFork !== currentRun.url) {
+          let confirmed = false;
+          if (this.options.pushConfirm === true) {
+            confirmed = true;
+          } else if (
+            (currentRun.metadata as Record<string, unknown> | undefined)
+              ?.pushConfirm === true
+          ) {
+            confirmed = true;
+          } else if (this.hasPushConfirmAnswer(runId)) {
+            confirmed = true;
+          } else if (this.options.requestPushConfirmation) {
+            try {
+              confirmed =
+                (await this.options.requestPushConfirmation({
+                  runId,
+                  targetFork,
+                  branch,
+                })) === true;
+            } catch {
+              confirmed = false;
+            }
+          }
+
+          if (confirmed) {
+            try {
+              await this.gitService.pushToFork(runId, {
+                targetRepoUrl: targetFork,
+                sourceRepoUrl: currentRun.url,
+                branchName: branch,
+                gitDir,
+                runDir,
+                ownerLogin: this.options.ownerLogin,
+                forkChecker: this.options.forkChecker,
+                token: this.options.githubToken,
+                runPhase: "done",
+                invitePushFlag: currentRun.pushFlag,
+                pushConfirm: true,
+                eventStore: this.host.eventStore,
+              });
+            } catch (err) {
+              // Surface a redacted push.result unless pushToFork already
+              // recorded one via its own eventStore sink.
+              if (!this.hasPushResultEvent(runId)) {
+                this.emitPushResult(runId, branch, targetFork, {
+                  ok: false,
+                  reason: redactText(
+                    err instanceof Error ? err.message : String(err)
+                  ),
+                });
+              }
+            }
+          } else {
+            this.emitPushResult(runId, branch, targetFork, {
+              ok: false,
+              skipped: true,
+              reason: "Explicit push confirmation not granted (Requirement 29.5)",
             });
-          } catch {
-            // push errors do not fail the orchestrator run
           }
         }
       }
@@ -1273,6 +1331,51 @@ export class RunOrchestrator extends EventEmitter {
       await this.teardownRunResources(runId);
     }
   }
+  /** True when an `ask.answered` event recorded a `push_confirm` -> "Push". */
+  private hasPushConfirmAnswer(runId: string): boolean {
+    const store = this.host.eventStore;
+    if (!store || typeof store.getEvents !== "function") return false;
+    try {
+      return store.getEvents(runId, { kind: "ask.answered" }).some((evt) => {
+        const data = evt.data as Record<string, unknown>;
+        return data?.kind === "push_confirm" && data?.answer === "Push";
+      });
+    } catch {
+      return false;
+    }
+  }
+
+  /** True when a `push.result` event was already recorded for this run. */
+  private hasPushResultEvent(runId: string): boolean {
+    const store = this.host.eventStore;
+    if (!store || typeof store.getEvents !== "function") return false;
+    try {
+      return store.getEvents(runId, { kind: "push.result" }).length > 0;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Emits a redacted `push.result`; reporting must never fail the run. */
+  private emitPushResult(
+    runId: string,
+    branch: string,
+    targetFork: string,
+    data: Record<string, unknown>
+  ): void {
+    try {
+      this.emitEvent({
+        runId,
+        kind: "push.result",
+        actor: "necromancer",
+        data: { branch, targetRepoUrl: targetFork, ...data },
+      });
+    } catch {
+      // Push result reporting must not fail the run.
+    }
+  }
+
+
 
   private async executeEarlyExit(
     runId: string,

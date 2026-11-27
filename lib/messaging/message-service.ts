@@ -7,7 +7,14 @@
 // cancels the running turn at once ("Interrupt now").
 
 import type { EventStore } from "../events/event-store";
-import { checkCommandHardBlocks } from "../policy/hard-blocks";
+import {
+  CONTAINER_SOCKET_MARKERS,
+  DESTRUCTIVE_HOST_BINARIES,
+  PRIVILEGE_COMMAND_HEADS,
+  checkCommandHardBlocks,
+  isHostBindVolumeMount,
+} from "../policy/hard-blocks";
+import { redactText } from "../security/redactor";
 
 /** Structural sink so tests can pass a minimal EventStore double. */
 export type MessageEventSink = Pick<EventStore, "append">;
@@ -236,41 +243,6 @@ export function validateMessageIntent(
 // openers so `sudo` is only a command when it actually starts a command.
 const SHELL_CLAUSE_SEPARATOR = /\r?\n|;|&&|\|\||\||\(|\)|`/;
 
-// Privilege-escalation binaries are a Tier 3 hit only at a command/subshell
-// start; a bare mention in prose ("no sudo") is not an instruction to run them.
-const PRIVILEGE_COMMAND_HEADS: ReadonlySet<string> = new Set([
-  "sudo",
-  "sudoedit",
-  "doas",
-  "su",
-  "pkexec",
-  "setcap",
-  "setuid",
-  "chsh",
-]);
-
-// Destructive host binaries are a Tier 3 hit only at a command/subshell start.
-const DESTRUCTIVE_COMMAND_HEADS: ReadonlySet<string> = new Set([
-  "mkfs",
-  "mkfs.ext4",
-  "mkfs.xfs",
-  "fdisk",
-  "parted",
-  "mkswap",
-  "shutdown",
-  "reboot",
-  "halt",
-  "poweroff",
-]);
-
-// Container runtime sockets are never reachable, wherever they appear.
-const CONTAINER_SOCKET_MARKERS: readonly string[] = [
-  "docker.sock",
-  "podman.sock",
-  "containerd.sock",
-  "crio.sock",
-];
-
 // Prose instructions that try to lift the budget ceiling in words.
 const BUDGET_BYPASS_PHRASES: readonly RegExp[] = [
   /ignore\s+(?:the\s+)?(?:budget|spend\s+limit|cap|ceiling)\b/i,
@@ -289,29 +261,6 @@ function shellBasename(token: string): string {
 
 function clauseTokens(clause: string): string[] {
   return clause.split(/\s+/).filter(Boolean);
-}
-
-/**
- * True only for explicit docker/podman host-bind syntax
- * (`-v <host_path>:<container_path>` or `--volume=<host>:<container>`). A bare
- * path such as pytest's `-v /tests` has no `<host>:<container>` pair and must
- * not be treated as a host mount.
- */
-function isHostBindVolumeMount(tokens: string[]): boolean {
-  for (let i = 0; i < tokens.length; i++) {
-    const token = tokens[i];
-    const eq = token.indexOf("=");
-    const flag = eq >= 0 ? token.slice(0, eq) : token;
-    if (flag !== "-v" && flag !== "--volume") continue;
-    const value = (eq >= 0 ? token.slice(eq + 1) : tokens[i + 1] ?? "").trim();
-    const colon = value.indexOf(":");
-    if (colon <= 0) continue;
-    const host = value.slice(0, colon);
-    if (host.startsWith("/") || host.startsWith(".") || host.startsWith("~")) {
-      return true;
-    }
-  }
-  return false;
 }
 
 /**
@@ -379,7 +328,7 @@ export function assertMessageNotHardBlocked(
         "HARD_BLOCK"
       );
     }
-    if (DESTRUCTIVE_COMMAND_HEADS.has(head)) {
+    if (DESTRUCTIVE_HOST_BINARIES.has(head)) {
       throw new MessageError(
         `Message instruction violates a Tier 3 hard block: instruction invokes destructive host operation '${head}'`,
         "HARD_BLOCK"
@@ -428,18 +377,32 @@ export class MessageService {
   }
 
   private resolveRole(input: SendMessageInput): MailboxOwnerRole {
-    if (input.recipientRole) return input.recipientRole;
     const to = input.to;
-    if (to === "necromancer") return "necromancer";
-    if ((MAILBOX_ROLES as readonly string[]).includes(to)) {
-      return to as MailboxOwnerRole;
+    let actual: MailboxOwnerRole | undefined;
+    if (to === "necromancer") {
+      actual = "necromancer";
+    } else if ((MAILBOX_ROLES as readonly string[]).includes(to)) {
+      actual = to as MailboxOwnerRole;
+    } else if (input.skeletonId && this.roleBySkeletonId[input.skeletonId]) {
+      actual = this.roleBySkeletonId[input.skeletonId];
+    } else if (this.roleBySkeletonId[to]) {
+      actual = this.roleBySkeletonId[to];
     }
-    if (input.skeletonId && this.roleBySkeletonId[input.skeletonId]) {
-      return this.roleBySkeletonId[input.skeletonId];
+
+    if (actual) {
+      if (input.recipientRole && input.recipientRole !== actual) {
+        throw new MessageError(
+          `Recipient role '${input.recipientRole}' conflicts with the actual recipient '${to}' role '${actual}'`,
+          "ROLE_MISMATCH"
+        );
+      }
+      return actual;
     }
-    if (this.roleBySkeletonId[to]) {
-      return this.roleBySkeletonId[to];
+
+    if (input.recipientRole) {
+      return input.recipientRole;
     }
+
     throw new MessageError(
       `Cannot resolve a mailbox role for recipient '${to}'`,
       "UNKNOWN_RECIPIENT"
@@ -460,12 +423,21 @@ export class MessageService {
     }
     const recipientRole = this.resolveRole(input);
     const text = input.text ?? "";
+    const delivery: DeliveryMode = input.delivery ?? "after_command";
+    if (
+      delivery === "interrupt_now" &&
+      (recipientRole === "warden" || recipientRole === "scribe")
+    ) {
+      throw new MessageError(
+        `Delivery mode 'interrupt_now' cannot target a ${recipientRole} (Requirement 27.9-27.11)`,
+        "FORBIDDEN_TARGET"
+      );
+    }
     validateMessageIntent(recipientRole, input.intent, text, input.from);
     assertMessageNotHardBlocked(input.from, input.intent, text);
 
     this.seq += 1;
     const id = input.id ?? `${input.runId}:msg:${this.seq}`;
-    const delivery: DeliveryMode = input.delivery ?? "after_command";
     const record: MessageRecord = {
       id,
       runId: input.runId,
@@ -486,21 +458,29 @@ export class MessageService {
       record.cc = "necromancer";
     }
 
+    // Event before commit: append the event first so a failed write leaves no
+    // message or mailbox state behind.
+    this.emit(record.runId, "message.sent", record.from, record);
+
     this.messages.set(id, record);
     this.appendToMailbox(record.to, record);
     if (record.cc === "necromancer") {
       this.appendToMailbox("necromancer", record);
     }
 
-    this.emit(record.runId, "message.sent", record.from, record);
-    this.noteActivity(record.to, record.createdAt);
+    // Receiving a message never resets a Skeleton's silence clock; only the
+    // Skeleton's own activity does (Requirement 27.7).
+    if (input.from === "skeleton") {
+      this.noteActivity(record.skeletonId ?? record.to, record.createdAt);
+    }
     return record;
   }
 
   private appendToMailbox(owner: string, record: MessageRecord): void {
-    const box = this.mailboxes.get(owner) ?? [];
+    const key = `${record.runId}\u0000${owner}`;
+    const box = this.mailboxes.get(key) ?? [];
     box.push(record);
-    this.mailboxes.set(owner, box);
+    this.mailboxes.set(key, box);
   }
 
   private emit(
@@ -519,6 +499,7 @@ export class MessageService {
         from: record.from,
         to: record.to,
         intent: record.intent,
+        text: redactText(record.text),
         state: record.state,
         delivery: record.delivery,
         cc: record.cc,
@@ -543,22 +524,31 @@ export class MessageService {
   /** Marks a message Delivered and emits `message.delivered` (Requirement 27.5). */
   deliver(id: string, strategy?: DeliveryStrategy): MessageRecord {
     const record = this.getMessage(id);
-    if (record.state === "sent") {
-      record.state = "delivered";
-      record.deliveredAt = this.now();
-      let resolved: DeliveryStrategy;
-      if (strategy) {
-        resolved = strategy;
-      } else if (record.delivery === "interrupt_now") {
-        resolved = "interrupt";
-      } else {
-        resolved = record.deliveryStrategy === "post_command_prompt" ? "post_command_prompt" : "steer";
-      }
-      record.deliveryStrategy = resolved;
-      this.emit(record.runId, "message.delivered", "necromancer", record, {
-        strategy: resolved,
-      });
+    if (record.state !== "sent") {
+      return record;
     }
+    let resolved: DeliveryStrategy;
+    if (strategy) {
+      resolved = strategy;
+    } else if (record.delivery === "interrupt_now") {
+      resolved = "interrupt";
+    } else {
+      resolved = record.deliveryStrategy === "post_command_prompt" ? "post_command_prompt" : "steer";
+    }
+    const deliveredAt = this.now();
+    const updated: MessageRecord = {
+      ...record,
+      state: "delivered",
+      deliveredAt,
+      deliveryStrategy: resolved,
+    };
+    // Event before commit.
+    this.emit(record.runId, "message.delivered", "necromancer", updated, {
+      strategy: resolved,
+    });
+    record.state = "delivered";
+    record.deliveredAt = deliveredAt;
+    record.deliveryStrategy = resolved;
     return record;
   }
 
@@ -568,19 +558,36 @@ export class MessageService {
     if (record.state === "sent") {
       this.deliver(id);
     }
-    if (record.state === "delivered") {
-      record.state = "acknowledged";
-      record.acknowledgedAt = this.now();
-      this.emit(record.runId, "message.acked", "skeleton", record, {
-        strategy: record.deliveryStrategy,
-      });
+    if (record.state !== "delivered") {
+      return record;
     }
+    const acknowledgedAt = this.now();
+    const updated: MessageRecord = {
+      ...record,
+      state: "acknowledged",
+      acknowledgedAt,
+    };
+    // Event before commit.
+    this.emit(record.runId, "message.acked", "skeleton", updated, {
+      strategy: record.deliveryStrategy,
+    });
+    record.state = "acknowledged";
+    record.acknowledgedAt = acknowledgedAt;
     return record;
   }
 
-  /** All messages for a mailbox owner, in insertion order. */
-  getMailbox(owner: string): MessageRecord[] {
-    return [...(this.mailboxes.get(owner) ?? [])];
+  /**
+   * All messages for a mailbox owner, in insertion order. When `runId` is given
+   * only that run's mailbox is returned; otherwise mailboxes are aggregated
+   * across runs in insertion order.
+   */
+  getMailbox(owner: string, runId?: string): MessageRecord[] {
+    if (runId !== undefined) {
+      return [...(this.mailboxes.get(`${runId}\u0000${owner}`) ?? [])];
+    }
+    return [...this.messages.values()].filter(
+      (m) => m.to === owner || m.cc === owner
+    );
   }
 
   /** All messages for a run, in insertion order. */
@@ -596,6 +603,16 @@ export class MessageService {
   }
 
   /**
+   * Registers a Skeleton and its baseline activity timestamp before any tool
+   * call or log line has been recorded, so silence can be measured from run
+   * start rather than defaulting to "now".
+   */
+  registerSkeleton(skeletonId: string, startedAt?: number): void {
+    this.lastActivityAt.set(skeletonId, startedAt ?? this.now());
+    this.nudgedSinceActivity.set(skeletonId, false);
+  }
+
+  /**
    * When a Skeleton has made no tool call and written no log line for the
    * silent limit, sends a nudge (Requirement 27.7). Idempotent until activity
    * is recorded again.
@@ -603,10 +620,11 @@ export class MessageService {
   checkSilence(
     runId: string,
     skeletonId: string,
-    options?: { now?: number; recipientRole?: MailboxOwnerRole }
+    options?: { now?: number; recipientRole?: MailboxOwnerRole; startedAt?: number }
   ): SilenceCheckResult {
     const now = options?.now ?? this.now();
-    const last = this.lastActivityAt.get(skeletonId) ?? now;
+    const last =
+      this.lastActivityAt.get(skeletonId) ?? options?.startedAt ?? now;
     const silentMs = Math.max(0, now - last);
     const silent = silentMs >= this.silentSkeletonMs;
     if (!silent) {

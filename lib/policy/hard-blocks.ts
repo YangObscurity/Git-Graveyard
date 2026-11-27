@@ -8,6 +8,14 @@
 // diffs before any of them can take effect. Hard blocks can never be lifted by
 // a prompt, an invite code, a Necromancer decision or a UI action.
 
+import {
+  isEnvironmentDump,
+  removeQuotes,
+  splitShellListAndPipelines,
+  tokenizeSimpleCommand,
+  unwrapWrappers,
+} from "../gateway/command-policy";
+
 /**
  * Stable structured denial codes. Callers persist these; never rename.
  */
@@ -46,7 +54,7 @@ export const CONTAINER_SOCKET_MARKERS: readonly string[] = [
   "crio.sock",
 ];
 
-const SUDO_BINARIES: ReadonlySet<string> = new Set([
+export const SUDO_BINARIES: ReadonlySet<string> = new Set([
   "sudo",
   "sudoedit",
   "doas",
@@ -54,13 +62,22 @@ const SUDO_BINARIES: ReadonlySet<string> = new Set([
   "pkexec",
 ]);
 
-const PRIVILEGE_ESCALATION_BINARIES: ReadonlySet<string> = new Set([
+export const PRIVILEGE_ESCALATION_BINARIES: ReadonlySet<string> = new Set([
   "setcap",
   "setuid",
   "chsh",
 ]);
 
-const DESTRUCTIVE_HOST_BINARIES: ReadonlySet<string> = new Set([
+/**
+ * Union of sudo and raw privilege-escalation binaries. These are a Tier 3 hit
+ * only when they occupy a command head position, never as a filename argument.
+ */
+export const PRIVILEGE_COMMAND_HEADS: ReadonlySet<string> = new Set([
+  ...SUDO_BINARIES,
+  ...PRIVILEGE_ESCALATION_BINARIES,
+]);
+
+export const DESTRUCTIVE_HOST_BINARIES: ReadonlySet<string> = new Set([
   "mkfs",
   "mkfs.ext4",
   "mkfs.xfs",
@@ -86,6 +103,29 @@ function basename(token: string): string {
   const trimmed = token.trim();
   const slash = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
   return (slash >= 0 ? trimmed.slice(slash + 1) : trimmed).toLowerCase();
+}
+
+/**
+ * True only for explicit docker/podman host-bind syntax
+ * (`-v <host_path>:<container_path>` or `--volume=<host>:<container>`). A bare
+ * path such as pytest's `-v /tests` has no `<host>:<container>` pair and must
+ * not be treated as a host mount.
+ */
+export function isHostBindVolumeMount(tokens: readonly string[]): boolean {
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    const eq = token.indexOf("=");
+    const flag = eq >= 0 ? token.slice(0, eq) : token;
+    if (flag !== "-v" && flag !== "--volume") continue;
+    const value = (eq >= 0 ? token.slice(eq + 1) : tokens[i + 1] ?? "").trim();
+    const colon = value.indexOf(":");
+    if (colon <= 0) continue;
+    const host = value.slice(0, colon);
+    if (host.startsWith("/") || host.startsWith(".") || host.startsWith("~")) {
+      return true;
+    }
+  }
+  return false;
 }
 
 
@@ -136,15 +176,125 @@ function isDestructiveDd(argv: readonly string[]): boolean {
   if (argv.length === 0 || basename(argv[0]) !== "dd") {
     return false;
   }
-  // The shell operator cannot be seen in argv, so a write to a raw device path
-  // is the closest enforceable signal.
-  return argv.slice(1).some((arg) => {
-    const token = arg.trim();
-    const eq = token.indexOf("=");
-    const value = eq >= 0 ? token.slice(eq + 1) : token;
-    return /^of=\/dev\/(sd|nvme|hd|vd|mmcblk)/.test(token) ||
-      /^\/dev\/(sd|nvme|hd|vd|mmcblk)/.test(value);
+  // Only the OUTPUT operand (`of=/dev/...`) writes to a raw device. `if=`
+  // operands read from a device and must never be mistaken for a write.
+  return argv.slice(1).some((arg) =>
+    /^of=\/dev\/(?:sd|nvme|hd|vd|mmcblk)/i.test(arg.trim())
+  );
+}
+
+const SHELL_BINARIES: readonly string[] = ["sh", "bash", "zsh", "dash", "ksh"];
+
+function isShellHead(head: string): boolean {
+  return SHELL_BINARIES.includes(head);
+}
+
+/** Extracts the code string passed to a shell via `-c` (including `-lc`). */
+function shellCodeFromWords(words: readonly string[]): string | undefined {
+  const cIdx = words.findIndex((a) => {
+    const token = removeQuotes(a);
+    return token === "-c" || /^-[a-zA-Z]*c$/.test(token);
   });
+  if (cIdx === -1) return undefined;
+  const token = removeQuotes(words[cIdx]);
+  if (token === "-c") {
+    return cIdx + 1 < words.length ? words[cIdx + 1] : undefined;
+  }
+  if (token.startsWith("-c")) {
+    return words[cIdx].slice(2);
+  }
+  return cIdx + 1 < words.length ? words[cIdx + 1] : undefined;
+}
+
+/** Extracts the inline program passed to a code-running interpreter. */
+function interpreterCodeFromWords(
+  head: string,
+  words: readonly string[]
+): string | undefined {
+  const tokens = words.map((w) => removeQuotes(w));
+  const valueAfter = (pred: (token: string) => boolean): string | undefined => {
+    for (let i = 1; i < tokens.length; i++) {
+      if (pred(tokens[i])) {
+        return i + 1 < words.length ? words[i + 1] : undefined;
+      }
+    }
+    return undefined;
+  };
+  if (/^(?:python|python3|python\d+(?:\.\d+)?)$/.test(head)) {
+    return valueAfter((t) => t === "-c" || /^-[a-zA-Z]*c$/.test(t));
+  }
+  if (/^(?:node|nodejs)$/.test(head)) {
+    return valueAfter(
+      (t) =>
+        t === "-e" ||
+        t === "--eval" ||
+        t === "-p" ||
+        t === "--print" ||
+        /^-[a-zA-Z]*(?:e|p)$/.test(t)
+    );
+  }
+  if (/^ruby\d*(?:\.\d+)?$/.test(head)) {
+    return valueAfter(
+      (t) => t === "-e" || t === "--eval" || /^-[a-zA-Z]*e$/.test(t)
+    );
+  }
+  if (/^(?:perl|perl\d+(?:\.\d+)?)$/.test(head)) {
+    return valueAfter(
+      (t) => t === "-e" || t === "-E" || /^-[a-zA-Z]*[eE]$/.test(t)
+    );
+  }
+  return undefined;
+}
+
+/**
+ * Splits an interpreter program into candidate command fragments (statement,
+ * call and string-literal boundaries) and returns each fragment tokenized so
+ * `os.system('sudo id')` yields a `sudo id` command.
+ */
+function codeFragmentTokenLists(code: string): string[][] {
+  const lists: string[][] = [];
+  for (const part of code.split(/[()\[\]{};,\n\r`]+/)) {
+    const unquoted = removeQuotes(part).trim();
+    if (!unquoted) continue;
+    const tokens = unquoted.split(/\s+/).filter(Boolean);
+    if (tokens.length > 0) lists.push(tokens);
+  }
+  return lists;
+}
+
+/**
+ * Collects every simple command reachable from an argv by unwrapping wrapper
+ * chains, shell `-c` code and interpreter program strings. Each returned entry
+ * is one simple command whose first token is its head.
+ */
+function collectSubcommands(argv: readonly string[], depth = 0): string[][] {
+  if (depth > 20 || argv.length === 0) return [];
+  const unwrapped = unwrapWrappers(argv);
+  const words = unwrapped.words;
+  if (words.length === 0) return [];
+  const head = basename(removeQuotes(words[0]));
+
+  if (isShellHead(head)) {
+    const code = shellCodeFromWords(words);
+    if (!code) return [];
+    const out: string[][] = [];
+    for (const piece of splitShellListAndPipelines(code)) {
+      const tokens = tokenizeSimpleCommand(piece);
+      if (tokens.length > 0) out.push(...collectSubcommands(tokens, depth + 1));
+    }
+    return out;
+  }
+
+  const code = interpreterCodeFromWords(head, words);
+  if (code !== undefined) {
+    const out: string[][] = [];
+    for (const tokens of codeFragmentTokenLists(code)) {
+      out.push(...collectSubcommands(tokens, depth + 1));
+    }
+    return out;
+  }
+
+  return [words];
 }
 
 /**
@@ -171,33 +321,36 @@ export function checkCommandHardBlocks(
   }
 
   const argvCopy = [...argv];
-  const joined = argvCopy.join(" ");
-  const firstBin = basename(argvCopy[0]);
+  const subcommands = collectSubcommands(argvCopy);
+  const headOf = (tokens: readonly string[]): string =>
+    basename(removeQuotes(tokens[0] ?? ""));
 
-  // 1. Sudo and raw privilege escalation (Requirement 29.12).
-  for (const token of argvCopy) {
-    if (SUDO_BINARIES.has(basename(token))) {
+  // 1. Sudo and raw privilege escalation, at a command head position only.
+  for (const tokens of subcommands) {
+    const head = headOf(tokens);
+    if (SUDO_BINARIES.has(head)) {
       return {
         blocked: true,
         code: "HARD_BLOCK_SUDO",
-        reason: `Blocked: command attempts sudo or privilege escalation via '${basename(token)}' (Requirement 29.12)`,
-        matched: token,
+        reason: `Blocked: command attempts sudo or privilege escalation via '${head}' (Requirement 29.12)`,
+        matched: head,
       };
     }
   }
-  for (const token of argvCopy) {
-    if (PRIVILEGE_ESCALATION_BINARIES.has(basename(token))) {
+  for (const tokens of subcommands) {
+    const head = headOf(tokens);
+    if (PRIVILEGE_ESCALATION_BINARIES.has(head)) {
       return {
         blocked: true,
         code: "HARD_BLOCK_PRIVILEGE_ESCALATION",
-        reason: `Blocked: command attempts raw privilege escalation via '${basename(token)}' (Requirement 29.12)`,
-        matched: token,
+        reason: `Blocked: command attempts raw privilege escalation via '${head}' (Requirement 29.12)`,
+        matched: head,
       };
     }
   }
 
   // 2. Container / runtime sockets (Requirement 29.12).
-  for (const token of argvCopy) {
+  for (const token of [...argvCopy, ...subcommands.flat()]) {
     for (const marker of CONTAINER_SOCKET_MARKERS) {
       if (token.includes(marker)) {
         return {
@@ -211,77 +364,79 @@ export function checkCommandHardBlocks(
   }
 
   // 3. Host mounts, host namespaces and container escape flags (Requirement 29.12).
-  for (let i = 0; i < argvCopy.length; i++) {
-    const token = argvCopy[i];
-    const eq = token.indexOf("=");
-    const flagName = eq >= 0 ? token.slice(0, eq) : token;
-    if (flagName === "--privileged") {
+  for (const tokens of [argvCopy, ...subcommands]) {
+    for (let i = 0; i < tokens.length; i++) {
+      const token = tokens[i];
+      const eq = token.indexOf("=");
+      const flagName = eq >= 0 ? token.slice(0, eq) : token;
+      if (flagName === "--privileged") {
+        return {
+          blocked: true,
+          code: "HARD_BLOCK_HOST_MOUNT",
+          reason: `Blocked: argv requests a host mount or host namespace via '${flagName}' (Requirement 29.12)`,
+          matched: token,
+        };
+      }
+      if (HOST_NAMESPACE_FLAGS.includes(flagName)) {
+        const value = (eq >= 0 ? token.slice(eq + 1) : tokens[i + 1] ?? "").trim();
+        if (value === "host") {
+          return {
+            blocked: true,
+            code: "HARD_BLOCK_HOST_MOUNT",
+            reason: `Blocked: argv requests a host namespace via '${flagName}=host' (Requirement 29.12)`,
+            matched: token,
+          };
+        }
+      }
+      if (flagName.startsWith("--mount")) {
+        const value = eq >= 0 ? token.slice(eq + 1) : tokens[i + 1] ?? "";
+        if (/(?:^|,)source=\/(?:$|,)/.test(value) || /type=bind/.test(value)) {
+          return {
+            blocked: true,
+            code: "HARD_BLOCK_HOST_MOUNT",
+            reason: "Blocked: argv bind-mounts a host path (Requirement 29.12)",
+            matched: token,
+          };
+        }
+      }
+    }
+    if (isHostBindVolumeMount(tokens)) {
       return {
         blocked: true,
         code: "HARD_BLOCK_HOST_MOUNT",
-        reason: `Blocked: argv requests a host mount or host namespace via '${flagName}' (Requirement 29.12)`,
-        matched: token,
+        reason: "Blocked: argv bind-mounts a host path (Requirement 29.12)",
+        matched: tokens.join(" "),
       };
-    }
-    if (HOST_NAMESPACE_FLAGS.includes(flagName)) {
-      const value = (eq >= 0 ? token.slice(eq + 1) : argvCopy[i + 1] ?? "").trim();
-      if (value === "host") {
-        return {
-          blocked: true,
-          code: "HARD_BLOCK_HOST_MOUNT",
-          reason: `Blocked: argv requests a host namespace via '${flagName}=host' (Requirement 29.12)`,
-          matched: token,
-        };
-      }
-    }
-    if (flagName.startsWith("--mount")) {
-      const value = eq >= 0 ? token.slice(eq + 1) : argvCopy[i + 1] ?? "";
-      if (/(?:^|,)source=\/(?:$|,)/.test(value) || /type=bind/.test(value)) {
-        return {
-          blocked: true,
-          code: "HARD_BLOCK_HOST_MOUNT",
-          reason: "Blocked: argv bind-mounts a host path (Requirement 29.12)",
-          matched: token,
-        };
-      }
-    }
-    if (flagName === "-v" || flagName === "--volume") {
-      const value = (eq >= 0 ? token.slice(eq + 1) : argvCopy[i + 1] ?? "").trim();
-      if (value.startsWith("/")) {
-        return {
-          blocked: true,
-          code: "HARD_BLOCK_HOST_MOUNT",
-          reason: "Blocked: argv bind-mounts a host path (Requirement 29.12)",
-          matched: token,
-        };
-      }
     }
   }
 
-  // 4. Destructive host operations (Requirement 29.12).
-  if (DESTRUCTIVE_HOST_BINARIES.has(firstBin)) {
-    return {
-      blocked: true,
-      code: "HARD_BLOCK_DESTRUCTIVE_HOST_OP",
-      reason: `Blocked: destructive host operation '${firstBin}' (Requirement 29.12)`,
-      matched: argvCopy[0],
-    };
-  }
-  if (isDestructiveRm(argvCopy)) {
-    return {
-      blocked: true,
-      code: "HARD_BLOCK_DESTRUCTIVE_HOST_OP",
-      reason: "Blocked: recursive forced removal against a host path (Requirement 29.12)",
-      matched: joined,
-    };
-  }
-  if (isDestructiveDd(argvCopy)) {
-    return {
-      blocked: true,
-      code: "HARD_BLOCK_DESTRUCTIVE_HOST_OP",
-      reason: "Blocked: raw device write is a destructive host operation (Requirement 29.12)",
-      matched: joined,
-    };
+  // 4. Destructive host operations, at a command head position only (Requirement 29.12).
+  for (const tokens of subcommands) {
+    const head = headOf(tokens);
+    if (DESTRUCTIVE_HOST_BINARIES.has(head)) {
+      return {
+        blocked: true,
+        code: "HARD_BLOCK_DESTRUCTIVE_HOST_OP",
+        reason: `Blocked: destructive host operation '${head}' (Requirement 29.12)`,
+        matched: tokens[0],
+      };
+    }
+    if (isDestructiveRm(tokens)) {
+      return {
+        blocked: true,
+        code: "HARD_BLOCK_DESTRUCTIVE_HOST_OP",
+        reason: "Blocked: recursive forced removal against a host path (Requirement 29.12)",
+        matched: tokens.join(" "),
+      };
+    }
+    if (isDestructiveDd(tokens)) {
+      return {
+        blocked: true,
+        code: "HARD_BLOCK_DESTRUCTIVE_HOST_OP",
+        reason: "Blocked: raw device write is a destructive host operation (Requirement 29.12)",
+        matched: tokens.join(" "),
+      };
+    }
   }
 
   return hardBlockAllowed();
@@ -392,14 +547,24 @@ const DIFF_RENAME = /^(?:rename|copy) (?:from|to) (?:")?(.+?)(?:")?$/;
 export function parseDiffPaths(diff: string): string[] {
   if (typeof diff !== "string" || !diff) return [];
   const paths = new Set<string>();
+  // Unified diffs are read in two states: file headers (before any hunk) and
+  // hunk bodies (after `@@ ... @@`). Deleted lines inside a hunk body that begin
+  // with `-- ` (i.e. `--- ...`) are patch content, never file paths.
+  let inHunkBody = false;
   for (const line of diff.split("\n")) {
     const trimmed = line.replace(/\r$/, "");
+    if (trimmed.startsWith("@@")) {
+      inHunkBody = true;
+      continue;
+    }
     let match = DIFF_GIT_HEADER.exec(trimmed);
     if (match) {
+      inHunkBody = false;
       paths.add(match[1]);
       paths.add(match[2]);
       continue;
     }
+    if (inHunkBody) continue;
     match = DIFF_OLD_PATH.exec(trimmed);
     if (match) {
       paths.add(match[1]);
