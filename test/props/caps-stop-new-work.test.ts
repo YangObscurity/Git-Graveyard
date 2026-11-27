@@ -89,6 +89,10 @@ describe("Property 20: Caps stop new work (P20) (Requirement 30.7)", () => {
         });
 
         try {
+          // Latched exceedance tracked independently of the governor's own state: once any
+          // `budget.exceeded` is observed it must remain in effect for the rest of the run because
+          // this property test never issues a `grantCapIncrease` to clear it.
+          const latched = new Set<BudgetDimension>();
           for (const action of actions) {
             switch (action.kind) {
               case "prompt":
@@ -121,21 +125,26 @@ describe("Property 20: Caps stop new work (P20) (Requirement 30.7)", () => {
             governor.evaluate();
             const promptGate = governor.canDispatchPrompt("s1");
             const execGate = governor.canDispatchSandboxExec();
-            if (governor.getExceededDimensions().length > 0) {
+            // Fold in any newly signalled dimension; the latch is monotonic across beginTurn().
+            for (const dim of governor.getExceededDimensions()) {
+              latched.add(dim);
+            }
+            if (latched.size > 0) {
+              // After any budget.exceeded, zero dispatches pass in this run.
               assert.equal(promptGate.allowed, false);
               assert.equal(execGate.allowed, false);
             } else {
+              // Nothing has exceeded yet, so new work is still permitted.
               assert.equal(promptGate.allowed, true);
               assert.equal(execGate.allowed, true);
             }
           }
-          const exceededDims = governor.getExceededDimensions();
           const exceededEvents = eventStore.getEvents("prop-run", { kind: "budget.exceeded" });
-          if (exceededDims.length > 0) {
-            // Every exceeded dimension must have produced a corresponding budget.exceeded event.
+          if (latched.size > 0) {
+            // Every latched dimension must have produced a corresponding budget.exceeded event.
             assert.ok(exceededEvents.length >= 1);
             const signalled = new Set(exceededEvents.map((event) => event.data.dimension));
-            for (const dim of exceededDims) {
+            for (const dim of latched) {
               assert.ok(signalled.has(dim), `missing budget.exceeded for ${dim}`);
             }
           } else {
@@ -269,3 +278,117 @@ describe("Property 20: Pact wait never advances the run wall clock (Requirement 
   });
 });
 
+describe("Property 20: Latched exceedance survives beginTurn and usage drops (Requirement 30.7)", () => {
+  it("keeps a run blocked after budget.exceeded even when the instantaneous usage falls", () => {
+    const db = new DatabaseSync(":memory:");
+    const eventStore = new EventStore(db);
+    const governor = new BudgetGovernor({
+      runId: "latch-run",
+      eventStore,
+      caps: { contextPressurePercent: 40 },
+      codeCeiling: { contextPressurePercent: 100 },
+      now: () => 0,
+    });
+    try {
+      governor.recordContextPressure(60);
+      governor.evaluate();
+      assert.ok(governor.getExceededDimensions().includes("contextPressurePercent"));
+      assert.equal(governor.canDispatchPrompt("s1").allowed, false);
+      assert.equal(governor.canDispatchSandboxExec().allowed, false);
+
+      // The measured pressure drops well below the cap; the latch must keep the run blocked.
+      governor.recordContextPressure(5);
+      governor.evaluate();
+      assert.equal(governor.canDispatchPrompt("s1").allowed, false);
+      assert.equal(governor.canDispatchSandboxExec().allowed, false);
+
+      // An over-ceiling grant does not clear the latch.
+      const over = governor.grantCapIncrease("contextPressurePercent", 200, { actor: "owner" });
+      assert.equal(over.ok, false);
+      assert.equal(governor.canDispatchSandboxExec().allowed, false);
+
+      // A within-ceiling grant above current usage clears it and re-opens dispatch.
+      const grant = governor.grantCapIncrease("contextPressurePercent", 50, { actor: "owner" });
+      assert.equal(grant.ok, true);
+      assert.equal(governor.getExceededDimensions().length, 0);
+      assert.equal(governor.canDispatchPrompt("s1").allowed, true);
+      assert.equal(governor.canDispatchSandboxExec().allowed, true);
+      assert.ok(eventStore.getEvents("latch-run", { kind: "budget.update" }).length >= 1);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("latches a per-turn exceedance across beginTurn() until a within-ceiling grant", () => {
+    let clock = 0;
+    const db = new DatabaseSync(":memory:");
+    const eventStore = new EventStore(db);
+    const governor = new BudgetGovernor({
+      runId: "turn-latch-run",
+      eventStore,
+      caps: { toolCallsPerTurn: 2 },
+      codeCeiling: { toolCallsPerTurn: 10 },
+      now: () => clock,
+    });
+    try {
+      governor.beginTurn("s1");
+      governor.recordToolCall("s1");
+      governor.recordToolCall("s1");
+      governor.evaluate();
+      assert.ok(governor.getExceededDimensions().includes("toolCallsPerTurn"));
+      assert.equal(governor.canDispatchPrompt("s1").allowed, false);
+
+      // A fresh turn starts with zero tool calls, but the run stays latched.
+      governor.beginTurn("s1");
+      clock += 1000;
+      governor.evaluate();
+      assert.equal(governor.canDispatchPrompt("s1").allowed, false);
+      assert.equal(governor.canDispatchSandboxExec().allowed, false);
+
+      // Only a within-ceiling grant above usage clears the latch.
+      const over = governor.grantCapIncrease("toolCallsPerTurn", 11, { actor: "owner" });
+      assert.equal(over.ok, false);
+      assert.equal(governor.canDispatchSandboxExec().allowed, false);
+
+      const grant = governor.grantCapIncrease("toolCallsPerTurn", 5, { actor: "owner" });
+      assert.equal(grant.ok, true);
+      assert.equal(governor.getExceededDimensions().length, 0);
+      assert.equal(governor.canDispatchPrompt("s1").allowed, true);
+      assert.equal(governor.canDispatchSandboxExec().allowed, true);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+describe("Property 20: Credit exhaustion finalizes the run (Requirements 30.19, 41.16)", () => {
+  it("emits run.phase and run.done with outcome budget_stopped on credit exhaustion", () => {
+    const db = new DatabaseSync(":memory:");
+    const eventStore = new EventStore(db);
+    const governor = new BudgetGovernor({
+      runId: "credit-run",
+      eventStore,
+      caps: { creditsPerRun: 1 },
+      codeCeiling: { creditsPerRun: 100 },
+      now: () => 1234,
+    });
+    try {
+      governor.recordCredits(5);
+      governor.evaluate();
+
+      const phaseEvents = eventStore.getEvents("credit-run", { kind: "run.phase" });
+      assert.ok(phaseEvents.length >= 1);
+      assert.equal(phaseEvents[0].data.to, "done");
+
+      const doneEvents = eventStore.getEvents("credit-run", { kind: "run.done" });
+      assert.ok(doneEvents.length >= 1);
+      assert.equal(doneEvents[0].data.outcome, "budget_stopped");
+      assert.equal(doneEvents[0].data.endedAt, 1234);
+
+      assert.ok(eventStore.getEvents("credit-run", { kind: "system.worker_state" }).length >= 1);
+      assert.equal(governor.getRunOutcome(), "budget_stopped");
+    } finally {
+      db.close();
+    }
+  });
+});

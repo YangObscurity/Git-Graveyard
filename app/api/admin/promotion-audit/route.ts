@@ -38,8 +38,13 @@ function canonicalizeValue(value: unknown): unknown {
   }
   if (value && typeof value === "object") {
     const source = value as Record<string, unknown>;
-    const out: Record<string, unknown> = {};
+    // A null-prototype accumulator so assigning a `__proto__` key can never reach `Object.prototype`.
+    const out = Object.create(null) as Record<string, unknown>;
     for (const key of Object.keys(source).sort()) {
+      // Skip prototype-pollution keys entirely: they are never legitimate signed payload members.
+      if (key === "__proto__" || key === "constructor" || key === "prototype") {
+        continue;
+      }
       out[key] = canonicalizeValue(source[key]);
     }
     return out;

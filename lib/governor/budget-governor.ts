@@ -182,6 +182,12 @@ export class BudgetGovernor {
   private creditsReported = false;
 
   private readonly warningsEmitted = new Set<BudgetDimension>();
+  /**
+   * Latched exceedance set. Once a capped dimension crosses 100 percent it stays here until an
+   * explicit `grantCapIncrease` raises usage below the new cap, so `canDispatchPrompt` /
+   * `canDispatchSandboxExec` keep blocking new work across `beginTurn()` and any later usage drop
+   * (Property P20, Requirement 30.7).
+   */
   private readonly exceededDimensions = new Map<BudgetDimension, number>();
   private pendingAsk: "exceed_budget" | null = null;
   private runOutcome: string | null = null;
@@ -528,6 +534,15 @@ export class BudgetGovernor {
         // The outcome is still surfaced through getRunOutcome even if no record exists.
       }
     }
+    // The run is terminal once credits are exhausted, so record the phase transition and the
+    // terminal `run.done` alongside the worker-state alert (Requirements 30.19, 41.16).
+    this.emit("run.phase", { to: "done", reason: "credits_exhausted" });
+    this.emit("run.done", {
+      phase: "done",
+      outcome: "budget_stopped",
+      endedAt: at,
+      reason: "credits_exhausted",
+    });
     this.emit("system.worker_state", {
       state: "credits_exhausted",
       ownerAlert: true,

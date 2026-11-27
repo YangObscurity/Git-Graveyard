@@ -23,6 +23,7 @@ export type AdmissionRejectionCode =
   | "PAUSED"
   | "AUTH_FAILED"
   | "RATE_LIMITED"
+  | "SETTINGS_UNAVAILABLE"
   | "QUEUE";
 
 export interface AdmissionDecision {
@@ -145,7 +146,22 @@ export class AdmissionController {
   }
 
   checkRepoSize(repoSizeKb?: number | null): AdmissionDecision {
-    const capKb = readNumberSetting(this.settingsStore, "repoSizeCapKb");
+    let capKb: number | null = null;
+    if (this.settingsStore) {
+      let raw: unknown;
+      try {
+        raw = this.settingsStore.getSetting("repoSizeCapKb");
+      } catch {
+        // An unset cap is legitimate (admit), but a read error is not: treating it as "unset" would
+        // let a repository of unbounded size through, so deny instead (fail closed).
+        return {
+          admitted: false,
+          code: "SETTINGS_UNAVAILABLE",
+          reason: "Could not read the repoSizeCapKb setting",
+        };
+      }
+      capKb = typeof raw === "number" && Number.isFinite(raw) ? raw : null;
+    }
     if (
       capKb !== null &&
       typeof repoSizeKb === "number" &&
@@ -377,7 +393,8 @@ export class AdmissionController {
    * Synchronously claims a live-run slot for `runId`. Idempotent: re-claiming an already reserved id
    * returns `true` without double-counting. Returns `false` when `live + reserved >= effectiveLimit`
    * (respecting {@link HARD_CONCURRENT_LIVE_RUNS_CEILING}). `limit` lets a caller reuse the exact
-   * limit it already resolved for a specific backend kind.
+   * limit it already resolved for a specific backend kind, but it is always clamped to the effective
+   * live-run ceiling so a caller can never bypass {@link HARD_CONCURRENT_LIVE_RUNS_CEILING}.
    */
   reserveSlot(runId: string, limit?: number): boolean {
     const id = normalizeRunId(runId);
@@ -388,7 +405,9 @@ export class AdmissionController {
       return true;
     }
     const effective =
-      typeof limit === "number" ? limit : this.effectiveConcurrentLiveRuns();
+      typeof limit === "number"
+        ? Math.min(limit, this.effectiveConcurrentLiveRuns())
+        : this.effectiveConcurrentLiveRuns();
     if (this.countLiveRuns() + this.reservedRunIds.size >= effective) {
       return false;
     }

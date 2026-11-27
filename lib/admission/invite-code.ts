@@ -15,9 +15,10 @@ import {
 } from "../runs/run-store";
 
 /**
- * Verified Admin session context. The Admin routes build this from `requireAdminAuth`; tests may
- * pass an explicit `adminSession` flag. An authenticated actor (a non-empty owner/admin actor) also
- * satisfies the requirement because only a verified caller can supply one.
+ * Verified Admin session context. The Admin routes build this from `requireAdminAuth` as
+ * `{ actor, adminSession: true }`; tests may pass an explicit `adminSession: { verified: true }`
+ * or `isAdmin: true`. A bare `actor` string is NEVER sufficient on its own — `isVerifiedAdminContext`
+ * requires an explicit verification signal so an unauthenticated caller cannot manage invite codes.
  */
 export interface InviteCodeAdminContext {
   actor?: string;
@@ -326,6 +327,17 @@ export class InviteCodeService {
     this.globalFallbackWindowStart = 0;
   }
 
+  /**
+   * Number of retained attempt timestamps for a client key inside the active window. Exposed so the
+   * per-IP bucket growth can be asserted bounded (it never exceeds `maxAttemptsPerIp`).
+   */
+  attemptWindowSizeForIp(clientIp?: string): number {
+    const ip =
+      typeof clientIp === "string" && clientIp.trim().length > 0 ? clientIp.trim() : "unknown";
+    const cutoff = this.now() - this.attemptWindowMs;
+    return (this.attemptsByIp.get(ip)?.timestamps ?? []).filter((ts) => ts > cutoff).length;
+  }
+
   private recordAndCheckRateLimit(
     ip: string,
     now: number
@@ -333,6 +345,18 @@ export class InviteCodeService {
     const cutoff = now - this.attemptWindowMs;
     const existing = this.attemptsByIp.get(ip);
     const pruned = (existing?.timestamps ?? []).filter((ts) => ts > cutoff);
+
+    // Per-IP limit is enforced BEFORE a new timestamp is pushed. Once the bucket already holds
+    // `maxAttemptsPerIp` live timestamps the request is rate-limited without recording another
+    // timestamp, so the per-IP array can never grow past `maxAttemptsPerIp` under a flood.
+    if (pruned.length >= this.maxAttemptsPerIp) {
+      this.attemptsByIp.set(ip, { timestamps: pruned, lastSeenMs: now });
+      this.pruneAttemptBuckets(cutoff);
+      const oldest = pruned[0];
+      const retryAfterMs = Math.max(1, this.attemptWindowMs - (now - oldest));
+      return { limited: true, retryAfterMs };
+    }
+
     pruned.push(now);
     this.attemptsByIp.set(ip, { timestamps: pruned, lastSeenMs: now });
     this.pruneAttemptBuckets(cutoff);
@@ -355,11 +379,6 @@ export class InviteCodeService {
       return { limited: true, retryAfterMs: this.attemptWindowMs };
     }
 
-    if (pruned.length > this.maxAttemptsPerIp) {
-      const oldest = pruned[0];
-      const retryAfterMs = Math.max(1, this.attemptWindowMs - (now - oldest));
-      return { limited: true, retryAfterMs };
-    }
     return { limited: false, retryAfterMs: 0 };
   }
 

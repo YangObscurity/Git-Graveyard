@@ -39,14 +39,21 @@ export interface AdminSessionVerification {
   reason?: "malformed" | "bad_signature" | "expired";
 }
 
-/** Reads the server-only admin secret; returns null when unconfigured (fail closed). */
+/**
+ * Reads the server-only admin secret; returns null when unconfigured (fail closed). Each candidate
+ * is trimmed, so a blank `ADMIN_SECRET=""` falls through to `ADMIN_TOKEN` and then `ADMIN_KEY`.
+ */
 export function getAdminSecret(env: NodeJS.ProcessEnv = process.env): string | null {
-  const raw = env.ADMIN_SECRET ?? env.ADMIN_TOKEN ?? env.ADMIN_KEY;
-  if (typeof raw !== "string") {
-    return null;
+  for (const key of ["ADMIN_SECRET", "ADMIN_TOKEN", "ADMIN_KEY"] as const) {
+    const raw = env[key];
+    if (typeof raw === "string") {
+      const trimmed = raw.trim();
+      if (trimmed.length > 0) {
+        return trimmed;
+      }
+    }
   }
-  const trimmed = raw.trim();
-  return trimmed.length > 0 ? trimmed : null;
+  return null;
 }
 
 /** Constant-time comparison of two strings by way of their SHA-256 digests. */
@@ -299,12 +306,9 @@ function readPersistedRevocations(
   if (!store) {
     return [];
   }
-  let raw: unknown;
-  try {
-    raw = store.getSetting<unknown>(ADMIN_REVOKED_SESSIONS_SETTING_KEY);
-  } catch {
-    return [];
-  }
+  // A read error must propagate so the caller can fail closed: it must never be mistaken for "no
+  // persisted revocations" (which would let a revoked cookie through).
+  const raw = store.getSetting<unknown>(ADMIN_REVOKED_SESSIONS_SETTING_KEY);
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     return [];
   }
@@ -341,19 +345,17 @@ function persistRevokedSession(
   if (!store) {
     return;
   }
-  try {
-    const kept = readPersistedRevocations(store, revokedAt).filter(
-      (entry) => entry.sessionId !== sessionId
-    );
-    kept.push({ sessionId, revokedAt, expiresAt });
-    store.setSetting(
-      ADMIN_REVOKED_SESSIONS_SETTING_KEY,
-      { sessions: kept },
-      { actor: "admin-session", reason: "admin session revocation" }
-    );
-  } catch {
-    // Cross-request persistence is best effort; the in-memory revocation still holds.
-  }
+  // Persistence errors are NOT swallowed: a revocation that cannot be written must surface so the
+  // caller can report the failure instead of silently leaving a session un-revoked across requests.
+  const kept = readPersistedRevocations(store, revokedAt).filter(
+    (entry) => entry.sessionId !== sessionId
+  );
+  kept.push({ sessionId, revokedAt, expiresAt });
+  store.setSetting(
+    ADMIN_REVOKED_SESSIONS_SETTING_KEY,
+    { sessions: kept },
+    { actor: "admin-session", reason: "admin session revocation" }
+  );
 }
 
 export function revokeAdminSession(
@@ -386,6 +388,8 @@ export function isAdminSessionRevoked(
   if (state().revokedSessions?.has(sessionId)) {
     return true;
   }
+  // Throws when the persisted revocation list cannot be read; callers on the request path must
+  // treat that as a fail-closed deny.
   return readPersistedRevocations(options.settingsStore, now).some(
     (entry) => entry.sessionId === sessionId
   );
@@ -463,6 +467,13 @@ export function isAdminLoginRateLimited(
   }
 
   const key = normalizeLoginKey(ip);
+  // When no trusted proxy / peer IP is configured every client shares the constant `direct` key, so
+  // a low per-key limit would lock out unrelated valid logins after only a handful of failures. The
+  // process-wide global limit checked above is the meaningful bound for that shared key; per-client
+  // windowing applies only to genuine, non-spoofable client keys.
+  if (key === DIRECT_CLIENT_IP_KEY) {
+    return false;
+  }
   const list = s.loginAttempts?.get(key);
   if (!list) {
     return false;
@@ -561,9 +572,17 @@ export function requireAdminAuth(
   if (cookieToken) {
     const verified = verifyAdminSessionToken(cookieToken, secret);
     if (verified.ok && verified.payload) {
-      if (
-        isAdminSessionRevoked(verified.payload.sid, { settingsStore: options.settingsStore })
-      ) {
+      let revoked: boolean;
+      try {
+        revoked = isAdminSessionRevoked(verified.payload.sid, {
+          settingsStore: options.settingsStore,
+        });
+      } catch {
+        // If the persisted revocation list cannot be read we cannot prove the session is live, so
+        // deny the request instead of failing open (Requirement 39.11).
+        return denied(503, "admin_authorization_unavailable");
+      }
+      if (revoked) {
         return denied(403, "admin_session_revoked");
       }
       return {

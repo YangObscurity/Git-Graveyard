@@ -123,10 +123,19 @@ export async function DELETE(request: Request): Promise<Response> {
     const verified = verifyAdminSessionToken(cookieToken, secret);
     if (verified.ok && verified.payload) {
       // Persist the revocation so it holds across requests and instances.
-      revokeAdminSession(verified.payload.sid, {
-        settingsStore,
-        expiresAt: verified.payload.exp,
-      });
+      try {
+        revokeAdminSession(verified.payload.sid, {
+          settingsStore,
+          expiresAt: verified.payload.exp,
+        });
+      } catch {
+        // The revocation could not be persisted; surface the failure instead of claiming a clean
+        // sign-out that might not hold across requests.
+        return Response.json(
+          { ok: false, error: "revocation_persist_failed" },
+          { status: 500 }
+        );
+      }
       revokedSessionId = verified.payload.sid;
     }
   }

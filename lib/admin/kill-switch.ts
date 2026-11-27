@@ -234,18 +234,16 @@ export class KillSwitchService {
   }
 
   private emit(runId: string, kind: string, data: Record<string, unknown>): void {
-    try {
-      this.eventStore.append(
-        redactEvent({
-          runId,
-          kind,
-          actor: "admin",
-          data: { refs: [], ...data },
-        })
-      );
-    } catch {
-      // Recording must never block the kill switch.
-    }
+    // Append failures are not swallowed: an action that cannot be recorded must surface so the
+    // caller does not believe the audit trail is complete.
+    this.eventStore.append(
+      redactEvent({
+        runId,
+        kind,
+        actor: "admin",
+        data: { refs: [], ...data },
+      })
+    );
   }
 }
 

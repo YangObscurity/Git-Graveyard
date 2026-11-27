@@ -79,15 +79,13 @@ export async function POST(request: Request, context: RouteContext): Promise<Res
     metadata: run.metadata,
   };
   const rollback = (): void => {
-    try {
-      runStore.updateRun(runId, {
-        isPublished: priorState.isPublished,
-        isRemoved: priorState.isRemoved,
-        metadata: priorState.metadata,
-      });
-    } catch {
-      // Best effort: the response already reports the failure.
-    }
+    // The caller decides how to surface a rollback failure; it must not be swallowed so the run row
+    // and the audit log can never silently diverge.
+    runStore.updateRun(runId, {
+      isPublished: priorState.isPublished,
+      isRemoved: priorState.isRemoved,
+      metadata: priorState.metadata,
+    });
   };
   const commit = (
     events: Array<{ kind: string; data: Record<string, unknown> }>,
@@ -98,7 +96,13 @@ export async function POST(request: Request, context: RouteContext): Promise<Res
         appendAdmin(event.kind, event.data);
       }
     } catch {
-      rollback();
+      try {
+        rollback();
+      } catch {
+        // The rollback itself failed, so the run row may have diverged from the audit log; report
+        // that distinctly instead of masking it as an ordinary append failure.
+        return Response.json({ ok: false, error: "audit_rollback_failed" }, { status: 500 });
+      }
       return Response.json({ ok: false, error: "audit_append_failed" }, { status: 500 });
     }
     return success();
@@ -129,11 +133,14 @@ export async function POST(request: Request, context: RouteContext): Promise<Res
           redactionFields: fields,
         },
       });
-      // Redaction marks the run reviewed, so record the matching review audit entry too.
+      // A single redaction event records the review inline (`reviewed: true`) so a partially-applied
+      // pair of appends can never leave the run row and the audit log out of sync.
       return commit(
         [
-          { kind: "admin.review", data: { actor: auth.actor.id, reason } },
-          { kind: "admin.redaction", data: { actor: auth.actor.id, reason, fields } },
+          {
+            kind: "admin.redaction",
+            data: { actor: auth.actor.id, reason, fields, reviewed: true },
+          },
         ],
         () => Response.json({ ok: true, action, run: updated })
       );

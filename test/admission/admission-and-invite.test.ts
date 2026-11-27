@@ -210,6 +210,27 @@ describe("InviteCodeService (Task 22.1)", () => {
     const afterWindow = service.verifyCode("gg_wrong", "9.9.9.9");
     assert.equal(afterWindow.ok === false ? afterWindow.reason : "", "not_found");
   });
+
+  it("bounds the per-IP attempt bucket so a rate-limited flood cannot grow it without bound", () => {
+    const { runStore } = makeHarness();
+    let now = 2_000_000;
+    const service = new InviteCodeService({
+      runStore,
+      now: () => now,
+      maxAttemptsPerIp: 3,
+      attemptWindowMs: 60_000,
+    });
+
+    for (let i = 0; i < 50; i += 1) {
+      now += 1;
+      const result = service.verifyCode("gg_wrong", "7.7.7.7");
+      if (i >= 3) {
+        assert.equal(result.ok === false ? result.reason : "", "rate_limited");
+      }
+    }
+    // Despite 50 requests inside the window the bucket never retains more than the cap.
+    assert.equal(service.attemptWindowSizeForIp("7.7.7.7"), 3);
+  });
 });
 
 describe("FifoQueue (Task 22.2)", () => {
@@ -343,6 +364,38 @@ describe("FifoQueue (Task 22.2)", () => {
     assert.ok(doneEvents.length >= 1);
     assert.equal(doneEvents[0].data.outcome, "cancelled");
   });
+
+  it("finalizes a cancelled run as done/cancelled with terminal events and a null position", () => {
+    let now = 0;
+    const { runStore, eventStore } = makeHarness();
+    const queue = new FifoQueue({ eventStore, runStore, now: () => now });
+    runStore.createRun({
+      runId: "cancel-terminal",
+      url: "https://example.test/a/b",
+      sha: "c".repeat(40),
+      phase: "queued",
+      queuePosition: 1,
+    });
+    queue.enqueue({ runId: "cancel-terminal" });
+    now = 4321;
+
+    const cancelled = queue.cancel("cancel-terminal");
+    assert.equal(cancelled?.runId, "cancel-terminal");
+    assert.equal(queue.depth, 0);
+    assert.equal(queue.getPosition("cancel-terminal"), null);
+
+    const run = runStore.getRun("cancel-terminal");
+    assert.equal(run?.phase, "done");
+    assert.equal(run?.outcome, "cancelled");
+    assert.equal(run?.queuePosition, null);
+    assert.equal(run?.endedAt, 4321);
+
+    assert.ok(eventStore.getEvents("cancel-terminal", { kind: "run.phase" }).length >= 1);
+    const doneEvents = eventStore.getEvents("cancel-terminal", { kind: "run.done" });
+    assert.ok(doneEvents.length >= 1);
+    assert.equal(doneEvents[0].data.outcome, "cancelled");
+    assert.equal(doneEvents[0].data.endedAt, 4321);
+  });
 });
 
 
@@ -382,19 +435,36 @@ describe("AdmissionController (Task 22.2)", () => {
     assert.equal(decision.admitted, false);
     assert.equal(decision.code, "QUEUE");
     assert.equal(decision.queueReason, "capacity");
+
+    // Requirement 41.11: the run is retained in the FIFO queue (never admitted) rather than lost.
+    const queue = new FifoQueue({ eventStore, runStore, queueDepth: 5 });
+    const retained = queue.enqueue({ runId: "capacity-queued", reason: decision.queueReason });
+    assert.equal(retained.ok, true);
+    const snapshot = queue.snapshot();
+    assert.equal(snapshot.depth, 1);
+    assert.deepEqual(
+      snapshot.entries.map((entry) => entry.runId),
+      ["capacity-queued"]
+    );
+    assert.equal(snapshot.entries[0].position, 1);
+    assert.equal(snapshot.entries[0].reason, "capacity");
+    assert.equal(queue.getPosition("capacity-queued"), 1);
   });
 
   it("enforces a single-Skeleton fallback when probe P8 / spike S4 shows capacity limits", () => {
     const { runStore } = makeHarness();
     const settings = new SettingsStore(":memory:");
     satisfyRequiredSettings(settings);
+    // A non-1 default so the clamp to 1 below is actually exercised.
+    settings.setSetting("parallelSoulStitchers", 4, { actor: "owner" });
     const controller = new AdmissionController({ settingsStore: settings, runStore });
-    assert.equal(controller.maxParallelSoulStitchers(), 1);
+    assert.equal(controller.maxParallelSoulStitchers(), 4);
     controller.noteCapacityLimit("probe_p8");
     assert.equal(controller.isCapacityLimited(), true);
     assert.equal(controller.maxParallelSoulStitchers(), 1);
     controller.clearCapacityLimit();
     assert.equal(controller.isCapacityLimited(), false);
+    assert.equal(controller.maxParallelSoulStitchers(), 4);
   });
 
   it("pauses admission until the rate-limit backoff expires", () => {
@@ -466,32 +536,37 @@ describe("AdmissionController (Task 22.2)", () => {
     assert.equal(alerts[0].data.ownerAlert, true);
   });
 
-  it("atomically reserves live-run slots so concurrent callers cannot exceed the ceiling", () => {
+  it("atomically reserves live-run slots so concurrent callers cannot exceed the ceiling", async () => {
     const { runStore, eventStore } = makeHarness();
     // concurrentLiveRuns is capped at the hard ceiling (5); the stub offers 99 to prove clamping.
     const settings = {
       getSetting: (key: string) => (key === "concurrentLiveRuns" ? 99 : undefined),
       validateRequiredSettings: () => ({ ok: true, missing: [] }),
     } as unknown as SettingsStore;
-    const controller = new AdmissionController({ settingsStore: settings, runStore, eventStore });
-    const cloud = { backendKind: "docker-cloud" };
+    // The controller's default backend is cloud, so `effectiveConcurrentLiveRuns()` resolves to the
+    // clamped ceiling (5) — the exact bound `reserveSlot` clamps every caller-supplied limit against.
+    const controller = new AdmissionController({
+      settingsStore: settings,
+      runStore,
+      eventStore,
+      backend: { kind: "docker-cloud" },
+    });
 
+    assert.equal(controller.effectiveConcurrentLiveRuns(), 5);
     assert.equal(controller.effectiveConcurrentLiveRuns("docker-cloud"), 5);
 
-    for (let i = 0; i < 5; i += 1) {
-      const decision = controller.checkAdmission({ ...cloud, runId: `live-${i}` });
-      assert.equal(decision.admitted, true, `run ${i} should be admitted`);
-    }
+    // Concurrent admissions claim slots atomically; no more than the ceiling may be admitted.
+    const decisions = await Promise.all(
+      Array.from({ length: 8 }, (_, i) =>
+        Promise.resolve().then(() => controller.checkAdmission({ runId: `live-${i}` }))
+      )
+    );
+    assert.equal(decisions.filter((decision) => decision.admitted).length, 5);
     assert.equal(controller.getReservedCount(), 5);
-
-    // The 6th distinct run queues: live + reserved (5) >= ceiling (5).
-    const overflow = controller.checkAdmission({ ...cloud, runId: "live-5" });
-    assert.equal(overflow.admitted, false);
-    assert.equal(overflow.code, "QUEUE");
-    assert.equal(controller.getReservedCount(), 5);
+    assert.ok(decisions.some((decision) => decision.code === "QUEUE"));
 
     // Re-admitting an already-reserved run is idempotent and never double-counts.
-    const reAdmit = controller.checkAdmission({ ...cloud, runId: "live-0" });
+    const reAdmit = controller.checkAdmission({ runId: "live-0" });
     assert.equal(reAdmit.admitted, true);
     assert.equal(controller.getReservedCount(), 5);
 
@@ -499,7 +574,7 @@ describe("AdmissionController (Task 22.2)", () => {
     assert.equal(controller.releaseSlot("live-2"), true);
     assert.equal(controller.releaseSlot("live-2"), false);
     assert.equal(controller.getReservedCount(), 4);
-    assert.equal(controller.admitRun("live-5", cloud).admitted, true);
+    assert.equal(controller.admitRun("live-8").admitted, true);
     assert.equal(controller.getReservedCount(), 5);
   });
 
@@ -519,6 +594,60 @@ describe("AdmissionController (Task 22.2)", () => {
       controller.checkAdmission({ backendKind: "instabox-docker", runId: "frac-1" }).admitted,
       true
     );
+  });
+
+  it("clamps a caller-supplied reserveSlot limit to the live-run ceiling", () => {
+    const { runStore, eventStore } = makeHarness();
+    const settings = {
+      getSetting: (key: string) => (key === "concurrentLiveRuns" ? 99 : undefined),
+      validateRequiredSettings: () => ({ ok: true, missing: [] }),
+    } as unknown as SettingsStore;
+    const controller = new AdmissionController({
+      settingsStore: settings,
+      runStore,
+      eventStore,
+      backend: { kind: "docker-cloud" },
+    });
+    assert.equal(controller.effectiveConcurrentLiveRuns(), 5);
+
+    // A caller passing an over-large limit cannot reserve past the ceiling (5).
+    for (let i = 0; i < 20; i += 1) {
+      controller.reserveSlot(`clamp-${i}`, Number.MAX_SAFE_INTEGER);
+    }
+    assert.equal(controller.getReservedCount(), 5);
+    assert.equal(controller.reserveSlot("clamp-overflow", 99), false);
+  });
+
+  it("fails closed when reading repoSizeCapKb throws, but admits when it is genuinely unset", () => {
+    const { runStore, eventStore } = makeHarness();
+    const throwing = {
+      getSetting: (key: string) => {
+        if (key === "repoSizeCapKb") {
+          throw new Error("settings store unavailable");
+        }
+        return undefined;
+      },
+      validateRequiredSettings: () => ({ ok: true, missing: [] }),
+    } as unknown as SettingsStore;
+    const errorController = new AdmissionController({
+      settingsStore: throwing,
+      runStore,
+      eventStore,
+    });
+    const denied = errorController.checkRepoSize(1);
+    assert.equal(denied.admitted, false);
+    assert.equal(denied.code, "SETTINGS_UNAVAILABLE");
+
+    const unset = {
+      getSetting: () => undefined,
+      validateRequiredSettings: () => ({ ok: true, missing: [] }),
+    } as unknown as SettingsStore;
+    const unsetController = new AdmissionController({
+      settingsStore: unset,
+      runStore,
+      eventStore,
+    });
+    assert.equal(unsetController.checkRepoSize(1_000_000).admitted, true);
   });
 });
 

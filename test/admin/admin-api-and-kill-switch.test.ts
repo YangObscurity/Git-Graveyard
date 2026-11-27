@@ -91,6 +91,7 @@ beforeEach(() => {
   process.env.ADMIN_SECRET = ADMIN_SECRET;
   delete process.env.ADMIN_TOKEN;
   delete process.env.ADMIN_KEY;
+  delete process.env.ADMIN_ACTOR_ID;
   resetAdminSessionState();
   resetFifoQueueRegistry();
   resetKillSwitchRegistry();
@@ -99,6 +100,7 @@ beforeEach(() => {
 
 afterEach(() => {
   process.env = savedEnv;
+  delete process.env.ADMIN_ACTOR_ID;
   resetAdminSessionState();
   resetFifoQueueRegistry();
   resetKillSwitchRegistry();
@@ -295,6 +297,51 @@ describe("Admin session and /api/admin/* authentication (Task 22.5)", () => {
       delete process.env.ADMIN_ACTOR_ID;
     }
   });
+
+  it("falls through a blank ADMIN_SECRET to ADMIN_TOKEN / ADMIN_KEY and fails closed when all blank", async () => {
+    // An empty ADMIN_SECRET must not shadow a configured ADMIN_TOKEN.
+    process.env.ADMIN_SECRET = "";
+    process.env.ADMIN_TOKEN = "token-secret-value";
+    try {
+      const viaToken = await inviteGet(
+        attach(
+          new Request("http://test/api/admin/invite-codes", {
+            headers: { "x-admin-token": "token-secret-value" },
+          })
+        )
+      );
+      assert.equal(viaToken.status, 200);
+    } finally {
+      delete process.env.ADMIN_TOKEN;
+    }
+
+    // A whitespace-only ADMIN_SECRET also falls through, this time to ADMIN_KEY.
+    process.env.ADMIN_SECRET = "   ";
+    process.env.ADMIN_KEY = "key-secret-value";
+    try {
+      const viaKey = await inviteGet(
+        attach(
+          new Request("http://test/api/admin/invite-codes", {
+            headers: { "x-admin-token": "key-secret-value" },
+          })
+        )
+      );
+      assert.equal(viaKey.status, 200);
+    } finally {
+      delete process.env.ADMIN_KEY;
+    }
+
+    // With every candidate blank/whitespace the module fails closed (503).
+    process.env.ADMIN_SECRET = "   ";
+    const unconfigured = await inviteGet(
+      attach(
+        new Request("http://test/api/admin/invite-codes", {
+          headers: { "x-admin-token": "anything" },
+        })
+      )
+    );
+    assert.equal(unconfigured.status, 503);
+  });
 });
 
 
@@ -480,7 +527,7 @@ describe("Admin run actions: review, redact, publish, hide (Task 22.5)", () => {
     assert.ok(stores.eventStore.getEvents("run-a", { kind: "admin.publish" }).length >= 1);
   });
 
-  it("redacts (marking the run reviewed) and hides with the owner removal marker", async () => {
+  it("redacts with a single inline-reviewed event then hides with the owner removal marker", async () => {
     stores.runStore.createRun({
       runId: "run-b",
       url: "https://example.test/a/b",
@@ -489,22 +536,35 @@ describe("Admin run actions: review, redact, publish, hide (Task 22.5)", () => {
       outcome: "resurrected",
     });
 
+    const sensitive = `ghp_${"a".repeat(32)}`;
     const redact = await runActionPost(
       attach(
         jsonRequest(
           "http://test/api/admin/runs/run-b",
-          { action: "redact", fields: ["logs"], reason: "secret" },
+          { action: "redact", fields: ["logs"], reason: `redact ${sensitive}` },
           { method: "POST", headers: adminHeaders() }
         )
       ),
       { params: { runId: "run-b" } }
     );
     assert.equal(redact.status, 200);
-    assert.ok(stores.eventStore.getEvents("run-b", { kind: "admin.redaction" }).length >= 1);
-    // Redaction marks the run reviewed and records the matching review audit entry.
+    // A single redaction event records the review inline; no separate admin.review append is made.
+    const redactionEvents = stores.eventStore.getEvents("run-b", { kind: "admin.redaction" });
+    assert.equal(redactionEvents.length, 1);
+    assert.equal(redactionEvents[0].data.reviewed, true);
+    assert.deepEqual(redactionEvents[0].data.fields, ["logs"]);
+    assert.equal(stores.eventStore.getEvents("run-b", { kind: "admin.review" }).length, 0);
+    // The run is marked reviewed and records the requested redaction fields.
     const redacted = stores.runStore.getRun("run-b");
     assert.equal((redacted?.metadata as Record<string, unknown>).reviewed, true);
-    assert.ok(stores.eventStore.getEvents("run-b", { kind: "admin.review" }).length >= 1);
+    assert.deepEqual(
+      (redacted?.metadata as Record<string, unknown>).redactionFields,
+      ["logs"]
+    );
+    // The sensitive token in the recorded event data is actually masked by the redactor.
+    const serialized = JSON.stringify(redactionEvents[0].data);
+    assert.ok(!serialized.includes(sensitive));
+    assert.ok(serialized.includes("[REDACTED]"));
 
     const hide = await runActionPost(
       attach(
@@ -576,6 +636,50 @@ describe("Admin run actions: review, redact, publish, hide (Task 22.5)", () => {
     assert.equal(run?.isPublished, false);
     assert.equal(run?.isRemoved, false);
     assert.equal(stores.eventStore.getEvents("rollback-run", { kind: "admin.publish" }).length, 0);
+  });
+
+  it("reports a distinct 500 when both the audit append and the rollback fail", async () => {
+    stores.runStore.createRun({
+      runId: "rollback-fail",
+      url: "https://example.test/a/b",
+      sha: "d".repeat(40),
+      phase: "done",
+      outcome: "resurrected",
+      metadata: { reviewed: true },
+    });
+
+    const originalAppend = stores.eventStore.append.bind(stores.eventStore);
+    const originalUpdate = stores.runStore.updateRun.bind(stores.runStore);
+    (stores.eventStore as unknown as { append: unknown }).append = () => {
+      throw new Error("audit store unavailable");
+    };
+    let updateCalls = 0;
+    (stores.runStore as unknown as { updateRun: unknown }).updateRun = (...args: unknown[]) => {
+      updateCalls += 1;
+      // The first updateRun is the publish mutation; the second is the rollback, which must fail.
+      if (updateCalls >= 2) {
+        throw new Error("rollback store unavailable");
+      }
+      return (originalUpdate as (...a: unknown[]) => unknown)(...args);
+    };
+    try {
+      const res = await runActionPost(
+        attach(
+          jsonRequest(
+            "http://test/api/admin/runs/rollback-fail",
+            { action: "publish" },
+            { method: "POST", headers: adminHeaders() }
+          )
+        ),
+        { params: { runId: "rollback-fail" } }
+      );
+      assert.equal(res.status, 500);
+      const body = (await res.json()) as { error?: string };
+      assert.equal(body.error, "audit_rollback_failed");
+    } finally {
+      (stores.eventStore as unknown as { append: unknown }).append = originalAppend;
+      (stores.runStore as unknown as { updateRun: unknown }).updateRun = originalUpdate;
+    }
   });
 });
 
@@ -757,6 +861,53 @@ describe("Kill switch (Task 22.5)", () => {
     assert.equal(body.state.pausedNewRuns, true);
     assert.equal(body.state.lastLevel, "pause_new_runs");
   });
+
+  it("rehydrates enforcement flags from the SettingsStore on every request", async () => {
+    const pause = await killPost(
+      attach(
+        jsonRequest(
+          "http://test/api/admin/kill-switch",
+          { level: "pause_new_runs", confirmed: true },
+          { method: "POST", headers: adminHeaders() }
+        )
+      )
+    );
+    assert.equal(pause.status, 200);
+
+    // Simulate an out-of-band persisted change (another worker) while the cached service stays warm.
+    stores.settingsStore.setSetting("killSwitch.pauseNewRuns", false, { actor: "owner" });
+
+    const get = await killGet(
+      attach(new Request("http://test/api/admin/kill-switch", { headers: adminHeaders() }))
+    );
+    assert.equal(get.status, 200);
+    const body = (await get.json()) as { state: { pausedNewRuns: boolean } };
+    // buildService rehydrates every request, so the persisted `false` wins over the cached `true`.
+    assert.equal(body.state.pausedNewRuns, false);
+  });
+
+  it("reports a 500 when the kill-switch state cannot be persisted", async () => {
+    const original = stores.settingsStore.setSettingsBatch.bind(stores.settingsStore);
+    (stores.settingsStore as unknown as { setSettingsBatch: unknown }).setSettingsBatch = () => {
+      throw new Error("settings store unavailable");
+    };
+    try {
+      const res = await killPost(
+        attach(
+          jsonRequest(
+            "http://test/api/admin/kill-switch",
+            { level: "pause_new_runs", confirmed: true },
+            { method: "POST", headers: adminHeaders() }
+          )
+        )
+      );
+      assert.equal(res.status, 500);
+      const body = (await res.json()) as { error?: string };
+      assert.equal(body.error, "kill_switch_persist_failed");
+    } finally {
+      (stores.settingsStore as unknown as { setSettingsBatch: unknown }).setSettingsBatch = original;
+    }
+  });
 });
 
 describe("Promotion audit sign-off (Task 22.5)", () => {
@@ -862,6 +1013,34 @@ describe("Promotion audit sign-off (Task 22.5)", () => {
     assert.equal(tamperedBody.present, true);
     assert.equal(tamperedBody.verified, false);
     assert.deepEqual(tamperedBody.record.items, { checks: ["a", "b", "evil"], score: 7 });
+  });
+
+  it("rejects prototype-pollution keys in the signed items without mutating Object.prototype", async () => {
+    // A `__proto__` own property (as produced by JSON.parse) must never reach a prototype.
+    const items = JSON.parse(
+      '{"checks":["a"],"__proto__":{"polluted":"yes"},"constructor":{"x":1}}'
+    ) as Record<string, unknown>;
+    const post = await promoPost(
+      attach(
+        jsonRequest(
+          "http://test/api/admin/promotion-audit",
+          { status: "passed", items },
+          { method: "POST", headers: adminHeaders() }
+        )
+      )
+    );
+    assert.equal(post.status, 201);
+    const posted = (await post.json()) as { verified: boolean; record: { items: unknown } };
+    assert.equal(posted.verified, true);
+
+    // The record still verifies on read and no global prototype was polluted.
+    const get = await promoGet(
+      attach(new Request("http://test/api/admin/promotion-audit", { headers: adminHeaders() }))
+    );
+    const body = (await get.json()) as { verified: boolean };
+    assert.equal(body.verified, true);
+    assert.equal(({} as Record<string, unknown>).polluted, undefined);
+    assert.equal((Object.prototype as Record<string, unknown>).polluted, undefined);
   });
 });
 

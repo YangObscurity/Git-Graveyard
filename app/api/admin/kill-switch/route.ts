@@ -79,15 +79,15 @@ function buildService(request: Request): { service: KillSwitchService; settings:
         remove: (runId) => queue.remove(runId),
       },
     });
-    // Cold start: restore enforcement flags from the persisted SettingsStore so
-    // isPausedNewRuns()/isStoppingGracefully() match what was previously executed.
-    service.rehydrateState({
-      pausedNewRuns: readBooleanSetting(settings, KILL_SWITCH_PAUSE_KEY),
-      stoppingGracefully: readBooleanSetting(settings, KILL_SWITCH_STOP_KEY),
-      lastLevel: readLastLevel(settings),
-    });
     killSwitchRegistry.__killSwitchServices.set(key, service);
   }
+  // Rehydrate on EVERY request (not only on cold start) so the enforced flags stay synchronized
+  // with the persisted SettingsStore values at all times.
+  service.rehydrateState({
+    pausedNewRuns: readBooleanSetting(settings, KILL_SWITCH_PAUSE_KEY),
+    stoppingGracefully: readBooleanSetting(settings, KILL_SWITCH_STOP_KEY),
+    lastLevel: readLastLevel(settings),
+  });
   return { service, settings };
 }
 
@@ -119,18 +119,16 @@ function mergedState(service: KillSwitchService, settings: SettingsStore): KillS
 
 function persistState(settings: SettingsStore, actor: string, service: KillSwitchService): void {
   const state = service.getState();
-  try {
-    settings.setSettingsBatch(
-      {
-        [KILL_SWITCH_PAUSE_KEY]: state.pausedNewRuns,
-        [KILL_SWITCH_STOP_KEY]: state.stoppingGracefully,
-        [KILL_SWITCH_LAST_LEVEL_KEY]: state.lastLevel,
-      },
-      { actor, reason: "kill switch state" }
-    );
-  } catch {
-    // Persistence is best effort; the shared in-memory service still holds the state.
-  }
+  // Persistence errors are NOT swallowed: the caller must know when the kill-switch state could not
+  // be written so it can report the failure instead of pretending the state is durable.
+  settings.setSettingsBatch(
+    {
+      [KILL_SWITCH_PAUSE_KEY]: state.pausedNewRuns,
+      [KILL_SWITCH_STOP_KEY]: state.stoppingGracefully,
+      [KILL_SWITCH_LAST_LEVEL_KEY]: state.lastLevel,
+    },
+    { actor, reason: "kill switch state" }
+  );
 }
 
 export async function GET(request: Request): Promise<Response> {
@@ -171,6 +169,12 @@ export async function POST(request: Request): Promise<Response> {
     actor: auth.actor.id,
     reason: typeof body.reason === "string" ? body.reason : undefined,
   });
-  persistState(settings, auth.actor.id, service);
+  try {
+    persistState(settings, auth.actor.id, service);
+  } catch {
+    // The kill switch ran, but its state could not be persisted; report the failure so the caller
+    // does not assume the state survived.
+    return Response.json({ ok: false, error: "kill_switch_persist_failed" }, { status: 500 });
+  }
   return Response.json({ ok: true, result, state: mergedState(service, settings) });
 }

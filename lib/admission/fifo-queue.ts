@@ -206,17 +206,31 @@ export class FifoQueue {
     if (!removed) {
       return null;
     }
+    const at = this.now();
     if (this.runStore) {
       try {
         this.runStore.updateRun(runId, {
           phase: "done",
           outcome: "cancelled",
-          endedAt: this.now(),
+          queuePosition: null,
+          endedAt: at,
         });
       } catch {
         // A missing run record must not prevent cancellation of its queue entry.
       }
     }
+    // Mirror `evictIdle`: a cancelled run must not stay stuck as `phase: "queued"`, so emit the
+    // terminal phase/done events the rest of the system listens for.
+    appendRedacted(this.eventStore, runId, "run.phase", this.actor, {
+      phase: "done",
+      reason: "cancelled",
+    });
+    appendRedacted(this.eventStore, runId, "run.done", this.actor, {
+      phase: "done",
+      outcome: "cancelled",
+      endedAt: at,
+      reason: "cancelled",
+    });
     return removed;
   }
 
