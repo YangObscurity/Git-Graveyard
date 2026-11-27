@@ -104,7 +104,6 @@ beforeEach(() => {
 
 afterEach(() => {
   process.env = savedEnv;
-  delete process.env.ADMIN_ACTOR_ID;
   resetAdminSessionState();
   resetFifoQueueRegistry();
   resetKillSwitchRegistry();
@@ -1249,10 +1248,11 @@ describe("Admin client identity (Task 22.5)", () => {
 
       assert.equal(DIRECT_CLIENT_IP_KEY, "direct");
       assert.equal(clientIpFromRequest(spoofed), "direct");
-      assert.equal(clientIpFromRequest(spoofed, { trustProxy: true }), "203.0.113.7");
+      // The trusted proxy overwrites X-Real-IP with the single client IP, so it wins.
+      assert.equal(clientIpFromRequest(spoofed, { trustProxy: true }), "203.0.113.8");
 
       const env = { ...process.env, TRUST_PROXY: "true" };
-      assert.equal(clientIpFromRequest(spoofed, { env }), "203.0.113.7");
+      assert.equal(clientIpFromRequest(spoofed, { env }), "203.0.113.8");
       assert.equal(clientIpFromRequest(spoofed, { trustProxy: false }), "direct");
     } finally {
       if (previous === undefined) {
@@ -1261,6 +1261,309 @@ describe("Admin client identity (Task 22.5)", () => {
         process.env.TRUST_PROXY = previous;
       }
     }
+  });
+
+  it("prefers the rightmost non-empty X-Forwarded-For hop when X-Real-IP is absent", () => {
+    const withoutRealIp = new Request("http://test/api/admin/session", {
+      headers: { "x-forwarded-for": "203.0.113.7, 10.0.0.1" },
+    });
+    // The rightmost entry is appended by the trusted proxy; the leftmost is client-spoofable.
+    assert.equal(clientIpFromRequest(withoutRealIp, { trustProxy: true }), "10.0.0.1");
+
+    const trailingEmpty = new Request("http://test/api/admin/session", {
+      headers: { "x-forwarded-for": "203.0.113.7, 10.0.0.1, " },
+    });
+    assert.equal(clientIpFromRequest(trailingEmpty, { trustProxy: true }), "10.0.0.1");
+
+    const blankRealIp = new Request("http://test/api/admin/session", {
+      headers: { "x-forwarded-for": "203.0.113.7, 10.0.0.1", "x-real-ip": "   " },
+    });
+    assert.equal(clientIpFromRequest(blankRealIp, { trustProxy: true }), "10.0.0.1");
+
+    const single = new Request("http://test/api/admin/session", {
+      headers: { "x-forwarded-for": "198.51.100.4" },
+    });
+    assert.equal(clientIpFromRequest(single, { trustProxy: true }), "198.51.100.4");
+  });
+});
+
+
+describe("Admin session GET hardening (Task 22.5)", () => {
+  it("marks both authenticated and unauthenticated session reads with Cache-Control: no-store", async () => {
+    const unauthenticated = await sessionGet(attach(new Request("http://test/api/admin/session")));
+    assert.equal(unauthenticated.status, 200);
+    assert.equal(unauthenticated.headers.get("cache-control"), "no-store");
+    const unauthBody = (await unauthenticated.json()) as { authenticated: boolean };
+    assert.equal(unauthBody.authenticated, false);
+
+    const signIn = await sessionPost(
+      new Request("http://test/api/admin/session", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: ADMIN_SECRET }),
+      })
+    );
+    const cookie = cookieFrom(signIn);
+    const authenticated = await sessionGet(
+      attach(new Request("http://test/api/admin/session", { headers: { cookie } }))
+    );
+    assert.equal(authenticated.status, 200);
+    assert.equal(authenticated.headers.get("cache-control"), "no-store");
+    const authBody = (await authenticated.json()) as { authenticated: boolean };
+    assert.equal(authBody.authenticated, true);
+  });
+
+  it("reports a configured authorization outage distinctly from an unconfigured deployment", async () => {
+    const signIn = await sessionPost(
+      new Request("http://test/api/admin/session", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: ADMIN_SECRET }),
+      })
+    );
+    const cookie = cookieFrom(signIn);
+
+    // The admin secret is configured, but reading the revocation store fails: this is a transient
+    // authorization outage, not an unconfigured deployment.
+    const brokenStore = {
+      getSetting: (key: string) => {
+        if (key === ADMIN_REVOKED_SESSIONS_SETTING_KEY) {
+          throw new Error("revocation store unavailable");
+        }
+        return undefined;
+      },
+    } as unknown as SettingsStore;
+
+    const outage = await sessionGet(
+      attach(new Request("http://test/api/admin/session", { headers: { cookie } }), {
+        settingsStore: brokenStore,
+      })
+    );
+    assert.equal(outage.status, 503);
+    assert.equal(outage.headers.get("cache-control"), "no-store");
+    const outageBody = (await outage.json()) as { error: string; configured: boolean };
+    assert.equal(outageBody.error, "admin_authorization_unavailable");
+    assert.equal(outageBody.configured, true);
+
+    // With no secret configured at all the module stays on the unconfigured path.
+    delete process.env.ADMIN_SECRET;
+    delete process.env.ADMIN_TOKEN;
+    delete process.env.ADMIN_KEY;
+    const unconfigured = await sessionGet(attach(new Request("http://test/api/admin/session")));
+    assert.equal(unconfigured.status, 503);
+    assert.equal(unconfigured.headers.get("cache-control"), "no-store");
+    const unconfiguredBody = (await unconfigured.json()) as {
+      error: string;
+      configured: boolean;
+    };
+    assert.equal(unconfiguredBody.error, "admin_auth_unconfigured");
+    assert.equal(unconfiguredBody.configured, false);
+  });
+});
+
+
+describe("Admin redaction field validation (Task 22.5)", () => {
+  it("rejects non-string / empty redaction fields with 400 while keeping valid names working", async () => {
+    stores.runStore.createRun({
+      runId: "redact-fields",
+      url: "https://example.test/a/b",
+      sha: "f".repeat(40),
+      phase: "done",
+      outcome: "resurrected",
+    });
+
+    const post = (fields: unknown): Promise<Response> =>
+      runActionPost(
+        attach(
+          jsonRequest(
+            "http://test/api/admin/runs/redact-fields",
+            { action: "redact", fields },
+            { method: "POST", headers: adminHeaders() }
+          )
+        ),
+        { params: { runId: "redact-fields" } }
+      );
+
+    const invalid = await post([{ object: true }]);
+    assert.equal(invalid.status, 400);
+    assert.equal(
+      ((await invalid.json()) as { error: string }).error,
+      "invalid_redaction_fields"
+    );
+
+    assert.equal((await post([123])).status, 400);
+    assert.equal((await post([""])).status, 400);
+    assert.equal((await post(["   "])).status, 400);
+    assert.equal((await post("logs")).status, 400);
+
+    // No run metadata or audit event was written for any rejected request.
+    assert.equal(
+      stores.eventStore.getEvents("redact-fields", { kind: "admin.redaction" }).length,
+      0
+    );
+
+    const ok = await post(["logs"]);
+    assert.equal(ok.status, 200);
+    assert.equal(((await ok.json()) as { ok: boolean }).ok, true);
+    assert.deepEqual(
+      (stores.runStore.getRun("redact-fields")?.metadata as Record<string, unknown>)
+        .redactionFields,
+      ["logs"]
+    );
+  });
+});
+
+
+describe("Admin invite-code body validation (Task 22.5)", () => {
+  it("rejects malformed JSON with 400 without minting a code, but keeps empty/{} bodies working", async () => {
+    const postRaw = (rawBody: string): Promise<Response> =>
+      invitePost(
+        attach(
+          new Request("http://test/api/admin/invite-codes", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", ...adminHeaders() },
+            body: rawBody,
+          })
+        )
+      );
+
+    const malformed = await postRaw("{not-json");
+    assert.equal(malformed.status, 400);
+    assert.equal(((await malformed.json()) as { error: string }).error, "invalid_json_body");
+
+    assert.equal((await postRaw("[1,2,3]")).status, 400);
+
+    // Nothing was created by the rejected requests.
+    const listAfterReject = await inviteGet(
+      attach(new Request("http://test/api/admin/invite-codes", { headers: adminHeaders() }))
+    );
+    assert.equal(
+      ((await listAfterReject.json()) as { inviteCodes: unknown[] }).inviteCodes.length,
+      0
+    );
+
+    // A genuinely empty body and a valid `{}` both fall back to the default creation behaviour.
+    const empty = await invitePost(
+      attach(
+        new Request("http://test/api/admin/invite-codes", { method: "POST", headers: adminHeaders() })
+      )
+    );
+    assert.equal(empty.status, 201);
+
+    const emptyObject = await invitePost(
+      attach(
+        jsonRequest(
+          "http://test/api/admin/invite-codes",
+          {},
+          { method: "POST", headers: adminHeaders() }
+        )
+      )
+    );
+    assert.equal(emptyObject.status, 201);
+
+    const listAfterOk = await inviteGet(
+      attach(new Request("http://test/api/admin/invite-codes", { headers: adminHeaders() }))
+    );
+    assert.equal(
+      ((await listAfterOk.json()) as { inviteCodes: unknown[] }).inviteCodes.length,
+      2
+    );
+  });
+});
+
+
+describe("Admin settings error separation (Task 22.5)", () => {
+  it("returns 400 for rejected values, 500 for storage failures and a distinct post-commit readback 500", async () => {
+    const patch = (body: unknown): Promise<Response> =>
+      settingsPatch(
+        attach(
+          jsonRequest("http://test/api/admin/settings", body, {
+            method: "PATCH",
+            headers: adminHeaders(),
+          })
+        )
+      );
+
+    // A known input-validation rejection is a caller error (400) with a stable code.
+    const invalid = await patch({ settings: { runWallClockMs: -1 } });
+    assert.equal(invalid.status, 400);
+    assert.equal(((await invalid.json()) as { error: string }).error, "invalid_setting");
+
+    // A storage write failure is a 500 with a stable code and no raw driver message.
+    const originalBatch = stores.settingsStore.setSettingsBatch.bind(stores.settingsStore);
+    (stores.settingsStore as unknown as { setSettingsBatch: unknown }).setSettingsBatch = () => {
+      throw new Error("disk exploded at /secret/path");
+    };
+    try {
+      const writeFail = await patch({ settings: { runWallClockMs: 500 } });
+      assert.equal(writeFail.status, 500);
+      const writeBody = (await writeFail.json()) as { error: string };
+      assert.equal(writeBody.error, "settings_write_failed");
+      assert.ok(!JSON.stringify(writeBody).includes("disk exploded"));
+    } finally {
+      (stores.settingsStore as unknown as { setSettingsBatch: unknown }).setSettingsBatch =
+        originalBatch;
+    }
+
+    // A readback failure after a successful commit is distinct and flags the batch as committed.
+    const originalGetAll = stores.settingsStore.getAllSettings.bind(stores.settingsStore);
+    (stores.settingsStore as unknown as { getAllSettings: unknown }).getAllSettings = () => {
+      throw new Error("readback failed");
+    };
+    try {
+      const readbackFail = await patch({ settings: { runWallClockMs: 600 } });
+      assert.equal(readbackFail.status, 500);
+      const readBody = (await readbackFail.json()) as { error: string; committed: boolean };
+      assert.equal(readBody.error, "settings_committed_readback_failed");
+      assert.equal(readBody.committed, true);
+    } finally {
+      (stores.settingsStore as unknown as { getAllSettings: unknown }).getAllSettings =
+        originalGetAll;
+    }
+
+    // The committed batch survived the readback failure.
+    assert.equal(stores.settingsStore.getSetting("runWallClockMs"), 600);
+  });
+});
+
+
+describe("Promotion audit nested reserved keys (Task 22.5)", () => {
+  it("forces verified:false when stored items carry a nested reserved key", async () => {
+    const post = await promoPost(
+      attach(
+        jsonRequest(
+          "http://test/api/admin/promotion-audit",
+          { status: "passed", items: { checks: ["a"] } },
+          { method: "POST", headers: adminHeaders() }
+        )
+      )
+    );
+    assert.equal(post.status, 201);
+    const posted = (await post.json()) as { record: { signature: string } };
+    assert.ok(posted.record.signature.length > 0);
+
+    // The signature covers the reserved-key-stripped payload, so injecting an own `__proto__` key
+    // into the stored items keeps the signature valid yet must NOT be reported as verified.
+    const stored = stores.settingsStore.getSetting<Record<string, unknown>>(
+      PROMOTION_AUDIT_SETTING_KEY
+    );
+    assert.ok(stored);
+    const poisonedItems = JSON.parse(
+      '{"checks":["a"],"__proto__":{"polluted":"yes"}}'
+    ) as Record<string, unknown>;
+    stores.settingsStore.setSetting(
+      PROMOTION_AUDIT_SETTING_KEY,
+      { ...stored, items: poisonedItems, signature: posted.record.signature },
+      { actor: "attacker" }
+    );
+
+    const res = await promoGet(
+      attach(new Request("http://test/api/admin/promotion-audit", { headers: adminHeaders() }))
+    );
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as { present: boolean; verified: boolean };
+    assert.equal(body.present, true);
+    assert.equal(body.verified, false);
   });
 });
 

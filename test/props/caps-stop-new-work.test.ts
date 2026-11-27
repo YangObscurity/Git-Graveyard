@@ -497,3 +497,64 @@ describe("Property 20: Credit exhaustion finalizes the run (Requirements 30.19, 
     }
   });
 });
+
+describe("Property 20: context cap steering escalates to cancellation (Requirement 30.7)", () => {
+  it("still emits cancel_turn after the context cap already latched steer_wrap_up", () => {
+    const db = new DatabaseSync(":memory:");
+    const eventStore = new EventStore(db);
+    const governor = new BudgetGovernor({
+      runId: "ctx-escalate",
+      eventStore,
+      caps: { contextPressurePercent: 40 },
+      codeCeiling: { contextPressurePercent: 100 },
+      contextCancelMarginPercent: 10,
+      now: () => 0,
+    });
+    try {
+      // Cross the context cap but stay below the cancel boundary: steer_wrap_up.
+      governor.recordContextPressure(45);
+      governor.evaluate();
+      assert.ok(governor.getExceededDimensions().includes("contextPressurePercent"));
+      assert.equal(governor.canDispatchPrompt("s1").allowed, false);
+
+      // The dimension is already latched, yet crossing cap + margin must still escalate.
+      governor.recordContextPressure(60);
+      governor.evaluate();
+
+      const exceeded = eventStore.getEvents("ctx-escalate", { kind: "budget.exceeded" });
+      assert.deepEqual(
+        exceeded.map((event) => event.data.action),
+        ["steer_wrap_up", "cancel_turn"]
+      );
+      assert.equal(governor.canDispatchSandboxExec().allowed, false);
+
+      // A later identical evaluation does not re-emit the escalation.
+      governor.evaluate();
+      assert.equal(eventStore.getEvents("ctx-escalate", { kind: "budget.exceeded" }).length, 2);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("escalates directly to cancel_turn when the first breach is already past the margin", () => {
+    const db = new DatabaseSync(":memory:");
+    const eventStore = new EventStore(db);
+    const governor = new BudgetGovernor({
+      runId: "ctx-direct",
+      eventStore,
+      caps: { contextPressurePercent: 40 },
+      codeCeiling: { contextPressurePercent: 100 },
+      contextCancelMarginPercent: 10,
+      now: () => 0,
+    });
+    try {
+      governor.recordContextPressure(80);
+      governor.evaluate();
+      const exceeded = eventStore.getEvents("ctx-direct", { kind: "budget.exceeded" });
+      assert.equal(exceeded.length, 1);
+      assert.equal(exceeded[0].data.action, "cancel_turn");
+    } finally {
+      db.close();
+    }
+  });
+});

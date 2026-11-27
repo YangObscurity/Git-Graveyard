@@ -18,12 +18,32 @@ interface InviteCodeBody {
   codeHash?: unknown;
 }
 
-async function readBody(request: Request): Promise<InviteCodeBody> {
+type BodyReadResult =
+  | { ok: true; body: InviteCodeBody }
+  | { ok: false };
+
+/**
+ * Distinguishes a genuinely empty body (treated as `{}`, keeping default invite-code creation) from
+ * a malformed/invalid JSON body (rejected so an unparseable request never silently mints a code).
+ */
+async function readBody(request: Request): Promise<BodyReadResult> {
+  let text: string;
   try {
-    const parsed = (await request.json()) as InviteCodeBody;
-    return parsed && typeof parsed === "object" ? parsed : {};
+    text = await request.text();
   } catch {
-    return {};
+    return { ok: true, body: {} };
+  }
+  if (text.trim().length === 0) {
+    return { ok: true, body: {} };
+  }
+  try {
+    const parsed: unknown = JSON.parse(text);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return { ok: true, body: parsed as InviteCodeBody };
+    }
+    return { ok: false };
+  } catch {
+    return { ok: false };
   }
 }
 
@@ -46,7 +66,11 @@ export async function POST(request: Request): Promise<Response> {
   if (!auth.ok) {
     return auth.response;
   }
-  const body = await readBody(request);
+  const parsedBody = await readBody(request);
+  if (!parsedBody.ok) {
+    return Response.json({ ok: false, error: "invalid_json_body" }, { status: 400 });
+  }
+  const body = parsedBody.body;
   const rawAllowedRunCount = body.allowedRunCount;
   if (rawAllowedRunCount !== undefined) {
     if (
@@ -103,7 +127,8 @@ export async function DELETE(request: Request): Promise<Response> {
   if (!auth.ok) {
     return auth.response;
   }
-  const body = await readBody(request);
+  const parsedBody = await readBody(request);
+  const body = parsedBody.ok ? parsedBody.body : {};
   const target =
     typeof body.codeHash === "string" && body.codeHash.trim().length > 0
       ? body.codeHash.trim()

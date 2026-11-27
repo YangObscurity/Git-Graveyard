@@ -79,6 +79,31 @@ function sanitizeValue(value: unknown): unknown {
 }
 
 /**
+ * True when `value` contains a reserved prototype-pollution key (`__proto__`, `constructor`,
+ * `prototype`) as an own property anywhere in its nested structure. `canonicalizeValue` strips these
+ * keys before signing, so a record whose stored `items` carry one would otherwise verify against a
+ * payload that never actually covered the unsigned nested key.
+ */
+function containsReservedKey(value: unknown): boolean {
+  if (Array.isArray(value)) {
+    return value.some(containsReservedKey);
+  }
+  if (value && typeof value === "object") {
+    const source = value as Record<string, unknown>;
+    for (const key of Object.keys(source)) {
+      if (key === "__proto__" || key === "constructor" || key === "prototype") {
+        return true;
+      }
+      if (containsReservedKey(source[key])) {
+        return true;
+      }
+    }
+    return false;
+  }
+  return false;
+}
+
+/**
  * Canonical signed payload. `items` is part of the HMAC-covered content, so altering the stored
  * `items` (audit checkbox set) invalidates `verified`.
  */
@@ -130,14 +155,18 @@ export async function GET(request: Request): Promise<Response> {
   const secret = getAdminSecret();
   let verified = false;
   if (record && secret) {
-    const expected = sign(secret, canonicalize(record));
-    const expectedBuf = Buffer.from(expected, "utf8");
-    const actualBuf = Buffer.from(record.signature, "utf8");
-    try {
-      verified =
-        expectedBuf.length === actualBuf.length && crypto.timingSafeEqual(expectedBuf, actualBuf);
-    } catch {
-      verified = false;
+    // A nested reserved key would have been stripped from the signed payload, so the record cannot
+    // be proven authentic: report it as unverified rather than accepting the stripped signature.
+    if (!containsReservedKey(record.items)) {
+      const expected = sign(secret, canonicalize(record));
+      const expectedBuf = Buffer.from(expected, "utf8");
+      const actualBuf = Buffer.from(record.signature, "utf8");
+      try {
+        verified =
+          expectedBuf.length === actualBuf.length && crypto.timingSafeEqual(expectedBuf, actualBuf);
+      } catch {
+        verified = false;
+      }
     }
   }
   return Response.json({ ok: true, record, verified, present: record !== null });

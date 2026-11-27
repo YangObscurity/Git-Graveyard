@@ -65,12 +65,26 @@ async function update(request: Request): Promise<Response> {
   }
 
   const store = resolveSettingsStore(request);
+  let entries: ReturnType<typeof store.setSettingsBatch>;
   try {
-    const entries = store.setSettingsBatch(updates, { actor: auth.actor.id, reason });
-    return Response.json({ ok: true, updated: entries, settings: store.getAllSettings() });
+    entries = store.setSettingsBatch(updates, { actor: auth.actor.id, reason });
   } catch (err) {
-    const message = err instanceof Error ? err.message : "invalid_setting";
-    return Response.json({ ok: false, error: message }, { status: 400 });
+    // A rejected value is a caller error (400); anything else is a storage failure that must not
+    // leak a raw driver message (500 with a stable code).
+    if (err instanceof TypeError || err instanceof RangeError) {
+      return Response.json({ ok: false, error: "invalid_setting" }, { status: 400 });
+    }
+    return Response.json({ ok: false, error: "settings_write_failed" }, { status: 500 });
+  }
+  // The batch is already committed at this point: a readback failure must be surfaced distinctly so
+  // it never implies the update itself failed.
+  try {
+    return Response.json({ ok: true, updated: entries, settings: store.getAllSettings() });
+  } catch {
+    return Response.json(
+      { ok: false, error: "settings_committed_readback_failed", committed: true },
+      { status: 500 }
+    );
   }
 }
 

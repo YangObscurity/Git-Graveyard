@@ -536,20 +536,28 @@ function isProxyTrustEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
  * only honored when an operator has explicitly opted in via `TRUST_PROXY=1|true` (or the
  * `{ trustProxy: true }` option). Otherwise a constant, non-spoofable `direct` key is returned so a
  * caller cannot mint fresh buckets by rotating headers.
+ *
+ * Proxy header contract: the trusted reverse proxy must overwrite `X-Real-IP` with the single client
+ * IP and *append* the peer it observed to the right of `X-Forwarded-For`. Resolution therefore
+ * prefers `X-Real-IP`, then the rightmost non-empty `X-Forwarded-For` entry — the leftmost entry is
+ * appended by the client itself and is trivially spoofable.
  */
 export function clientIpFromRequest(request: Request, options: ClientIpOptions = {}): string {
   const trustProxy = options.trustProxy ?? isProxyTrustEnabled(options.env);
   if (trustProxy) {
-    const forwarded = request.headers.get("x-forwarded-for");
-    if (forwarded && forwarded.trim().length > 0) {
-      const first = forwarded.split(",")[0].trim();
-      if (first.length > 0) {
-        return first;
-      }
-    }
     const realIp = request.headers.get("x-real-ip");
     if (realIp && realIp.trim().length > 0) {
       return realIp.trim();
+    }
+    const forwarded = request.headers.get("x-forwarded-for");
+    if (forwarded && forwarded.trim().length > 0) {
+      const hops = forwarded.split(",");
+      for (let i = hops.length - 1; i >= 0; i -= 1) {
+        const candidate = hops[i].trim();
+        if (candidate.length > 0) {
+          return candidate;
+        }
+      }
     }
   }
   return DIRECT_CLIENT_IP_KEY;

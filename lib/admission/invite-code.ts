@@ -128,6 +128,8 @@ export interface InviteCodeServiceOptions {
   maxAttemptsPerIp?: number;
   /** Sliding-window length in milliseconds. */
   attemptWindowMs?: number;
+  /** Minimum spacing (ms) between full bucket sweeps; defaults to the attempt window (at least 1s). */
+  pruneIntervalMs?: number;
   /** Number of random bytes used to mint the plaintext code. */
   codeBytes?: number;
 }
@@ -135,6 +137,8 @@ export interface InviteCodeServiceOptions {
 export const DEFAULT_MAX_ATTEMPTS_PER_IP = 5;
 export const DEFAULT_ATTEMPT_WINDOW_MS = 60_000;
 export const DEFAULT_CODE_BYTES = 24;
+/** Minimum spacing between full bucket sweeps so a rate-limited flood cannot force a sweep each hit. */
+export const DEFAULT_PRUNE_INTERVAL_MS = 1_000;
 /** Upper bound on distinct per-IP attempt buckets so spoofed keys cannot exhaust memory. */
 export const MAX_IP_TRACKING_BUCKETS = 10_000;
 /**
@@ -155,6 +159,10 @@ export class InviteCodeService {
   private readonly attemptWindowMs: number;
   private readonly codeBytes: number;
   private readonly attemptsByIp = new Map<string, AttemptBucket>();
+  /** Minimum spacing between full bucket sweeps; the sweep is throttled to this interval. */
+  private readonly pruneIntervalMs: number;
+  private lastPruneMs = 0;
+  private pruneSweeps = 0;
   /** Saturating, bounded global attempt counter for the current window (fallback limit). */
   private globalFallbackCount = 0;
   private globalFallbackWindowStart = 0;
@@ -173,6 +181,10 @@ export class InviteCodeService {
       typeof options.attemptWindowMs === "number" && options.attemptWindowMs > 0
         ? Math.max(1, Math.floor(options.attemptWindowMs))
         : DEFAULT_ATTEMPT_WINDOW_MS;
+    this.pruneIntervalMs =
+      typeof options.pruneIntervalMs === "number" && options.pruneIntervalMs > 0
+        ? Math.max(1, Math.floor(options.pruneIntervalMs))
+        : Math.min(this.attemptWindowMs, DEFAULT_PRUNE_INTERVAL_MS);
     this.codeBytes =
       typeof options.codeBytes === "number" && options.codeBytes >= 16
         ? Math.floor(options.codeBytes)
@@ -278,6 +290,10 @@ export class InviteCodeService {
     if (!direct) {
       return false;
     }
+    // Match the plaintext path: an expired code must not be consumable by its disclosed hash either.
+    if (typeof direct.expiresAt === "number" && this.now() > direct.expiresAt) {
+      return false;
+    }
     return this.runStore.consumeInviteCodeRun(direct.codeHash);
   }
   /**
@@ -353,15 +369,23 @@ export class InviteCodeService {
     // timestamp, so the per-IP array can never grow past `maxAttemptsPerIp` under a flood.
     if (pruned.length >= this.maxAttemptsPerIp) {
       this.attemptsByIp.set(ip, { timestamps: pruned, lastSeenMs: now });
-      this.pruneAttemptBuckets(cutoff);
+      // A rate-limited rejection must not force a full O(buckets) sweep on every hit; the sweep is
+      // time-throttled and the map stays bounded through new-key eviction below.
+      this.maybePruneAttemptBuckets(cutoff, now);
       const oldest = pruned[0];
       const retryAfterMs = Math.max(1, this.attemptWindowMs - (now - oldest));
       return { limited: true, retryAfterMs };
     }
 
+    const isNewKey = existing === undefined;
     pruned.push(now);
     this.attemptsByIp.set(ip, { timestamps: pruned, lastSeenMs: now });
-    this.pruneAttemptBuckets(cutoff);
+    if (isNewKey) {
+      // Bounded eviction on new-key insertion keeps the map from growing without bound even while
+      // the full sweep is throttled.
+      this.enforceBucketBound();
+    }
+    this.maybePruneAttemptBuckets(cutoff, now);
 
     // Saturating, bounded global fallback: when the per-IP map is saturated every bucket was
     // evicted at least once, so per-IP tracking is unreliable; a single bounded counter still caps
@@ -391,6 +415,7 @@ export class InviteCodeService {
    * tracking map without bound while active buckets survive longest.
    */
   private pruneAttemptBuckets(cutoff: number): void {
+    this.pruneSweeps += 1;
     for (const [key, bucket] of this.attemptsByIp) {
       const live = bucket.timestamps.filter((ts) => ts > cutoff);
       if (live.length === 0) {
@@ -399,6 +424,28 @@ export class InviteCodeService {
         bucket.timestamps = live;
       }
     }
+    this.enforceBucketBound();
+  }
+
+  /**
+   * Runs the full bucket sweep at most once per {@link pruneIntervalMs}. `lastSeenMs` bookkeeping and
+   * the per-request timestamp filter keep correctness (the bucket a request touches is always pruned
+   * inline) without paying an O(buckets) scan on every rate-limited rejection.
+   */
+  private maybePruneAttemptBuckets(cutoff: number, now: number): void {
+    if (now - this.lastPruneMs < this.pruneIntervalMs) {
+      return;
+    }
+    this.lastPruneMs = now;
+    this.pruneAttemptBuckets(cutoff);
+  }
+
+  /**
+   * Trims the per-instance tracking map down to {@link MAX_IP_TRACKING_BUCKETS} keys, evicting the
+   * least-recently-seen first. Cheap (a no-op) while the map is within its bound, so it can run on
+   * every new-key insertion.
+   */
+  private enforceBucketBound(): void {
     if (this.attemptsByIp.size <= MAX_IP_TRACKING_BUCKETS) {
       return;
     }
@@ -409,6 +456,16 @@ export class InviteCodeService {
     for (let i = 0; i < overflow && i < byLastSeen.length; i += 1) {
       this.attemptsByIp.delete(byLastSeen[i][0]);
     }
+  }
+
+  /** Number of distinct client attempt buckets currently retained (diagnostics / bounded-growth). */
+  trackedBucketCount(): number {
+    return this.attemptsByIp.size;
+  }
+
+  /** Number of full bucket sweeps performed; exposed so the throttling can be asserted. */
+  pruneSweepCount(): number {
+    return this.pruneSweeps;
   }
 
   /** Resolves a trimmed plaintext-or-hash value to its stored record, or `null`. */

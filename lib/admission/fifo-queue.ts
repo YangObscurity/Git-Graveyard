@@ -76,7 +76,30 @@ function appendRedacted(
 
 function resolveDefaultQueueDepth(): number {
   const raw = Number(process.env.QUEUE_DEPTH_CAP);
-  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 5;
+  return Number.isFinite(raw) && raw > 0 ? Math.max(1, Math.floor(raw)) : 5;
+}
+
+/**
+ * Deep-clones a queued run's `caps` so a caller cannot mutate a queued entry through the object it
+ * passed in, and a consumer of a returned snapshot cannot mutate the queue's stored caps.
+ */
+function cloneCaps(
+  caps: Record<string, unknown> | null | undefined
+): Record<string, unknown> | null {
+  if (!caps || typeof caps !== "object") {
+    return null;
+  }
+  try {
+    return structuredClone(caps);
+  } catch {
+    // A value that cannot be structured-cloned still must not be shared by reference.
+    return { ...caps };
+  }
+}
+
+/** Copies a queued entry with an isolated `caps` object so returned entries never alias the queue. */
+function cloneEntry(entry: QueueEntry): QueueEntry {
+  return { ...entry, caps: cloneCaps(entry.caps) };
 }
 
 export class FifoQueue {
@@ -127,7 +150,7 @@ export class FifoQueue {
 
     const existing = this.entries.find((entry) => entry.runId === runId);
     if (existing) {
-      return { ok: false, code: "DUPLICATE", entry: { ...existing } };
+      return { ok: false, code: "DUPLICATE", entry: cloneEntry(existing) };
     }
     if (this.entries.length >= this.queueDepth) {
       return { ok: false, code: "QUEUE_FULL" };
@@ -138,7 +161,7 @@ export class FifoQueue {
       url: input.url ?? null,
       sha: input.sha ?? null,
       inviteCodeHash: input.inviteCodeHash ?? null,
-      caps: input.caps ?? null,
+      caps: cloneCaps(input.caps),
       pushFlag: input.pushFlag === true,
       reason: input.reason ?? null,
       position: this.entries.length + 1,
@@ -156,7 +179,7 @@ export class FifoQueue {
     });
 
     this.reindexAndEmit(previous);
-    return { ok: true, entry: { ...entry } };
+    return { ok: true, entry: cloneEntry(entry) };
   }
 
   /** Removes and returns the head of the queue, emitting `run.queue_position` for shifted runs. */
@@ -167,7 +190,7 @@ export class FifoQueue {
     const previous = this.positionMap();
     const [head] = this.entries.splice(0, 1);
     this.reindexAndEmit(previous);
-    return { ...head };
+    return cloneEntry(head);
   }
 
   /** Removes a specific run, emitting `run.queue_position` for shifted runs. */
@@ -179,7 +202,7 @@ export class FifoQueue {
     const previous = this.positionMap();
     const [removed] = this.entries.splice(index, 1);
     this.reindexAndEmit(previous);
-    return { ...removed };
+    return cloneEntry(removed);
   }
 
   /** Moves a run to a new 1-based position, clamping into range (Requirement 31.14). */
@@ -197,7 +220,7 @@ export class FifoQueue {
     this.entries.splice(target - 1, 0, entry);
     this.reindexAndEmit(previous);
     const settled = this.entries.find((item) => item.runId === runId);
-    return settled ? { ...settled } : null;
+    return settled ? cloneEntry(settled) : null;
   }
 
   /** Cancels a queued run: removes it and marks the run cancelled when a RunStore is present. */
@@ -236,7 +259,7 @@ export class FifoQueue {
 
   /** Immutable copy of the current entries in FIFO order. */
   list(): QueueEntry[] {
-    return this.entries.map((entry) => ({ ...entry }));
+    return this.entries.map((entry) => cloneEntry(entry));
   }
 
   snapshot(): QueueSnapshot {
@@ -270,7 +293,7 @@ export class FifoQueue {
     const kept: QueueEntry[] = [];
     for (const entry of this.entries) {
       if (at - entry.queuedAt >= this.queueIdleLimitMs) {
-        expired.push({ ...entry });
+        expired.push(cloneEntry(entry));
       } else {
         kept.push(entry);
       }
