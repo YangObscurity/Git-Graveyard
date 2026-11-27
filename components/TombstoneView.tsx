@@ -11,11 +11,61 @@ import {
   escapePlainText,
 } from "@/lib/grimoire/autopsy";
 import { routes } from "@/lib/ui/run-routes";
+import { formatGithubResetTime } from "./GateView";
 import { SignalRuleGroups } from "./SignalRuleGroups";
 import { ReceiptViewer } from "./ReceiptViewer";
 import { ExhumeView } from "./ExhumeView";
 import { CryptOrnament } from "./ui/CryptOrnament";
 import { StatusPill } from "./ui/StatusPill";
+
+export interface TombstoneErrorInfo {
+  code: string;
+  message: string;
+  lookedFor?: string[];
+  filesLookedFor?: string[];
+  resetTime?: string;
+}
+
+/**
+ * Maps an autopsy error code to a plain-English title and explanation.
+ * Pure and exported so the state mapping can be unit-tested without a DOM.
+ */
+export function describeTombstoneError(errorInfo: TombstoneErrorInfo): {
+  title: string;
+  explanation: string;
+} {
+  let title = "Autopsy Encountered an Error";
+  let explanation = errorInfo.message;
+
+  if (errorInfo.code === "REPO_NOT_FOUND") {
+    title = "Repository Not Found";
+    explanation =
+      "The requested repository was not found or is private. Please ensure the repository is public and accessible on GitHub.";
+  } else if (errorInfo.code === "TOO_LARGE") {
+    title = "Repository Exceeds Size Limit";
+    explanation =
+      "The repository exceeds the size limits (maximum 20 MB compressed, 60 MB decompressed, or 2000 entries).";
+  } else if (errorInfo.code === "LANGUAGE_UNKNOWN") {
+    title = "Unsupported or Unknown Language";
+    const filesList = (
+      errorInfo.lookedFor ||
+      errorInfo.filesLookedFor || [
+        "package.json",
+        "setup.py",
+        "pyproject.toml",
+        "requirements.txt",
+      ]
+    ).join(", ");
+    explanation = `No supported programming language was detected in this repository. The Grimoire looked for: ${filesList}.`;
+  } else if (errorInfo.code === "RATE_LIMITED") {
+    title = "GitHub API Rate Limit Exceeded";
+    explanation = `The GitHub API rate limit has been exhausted. Rate limit resets at: ${formatGithubResetTime(
+      errorInfo.resetTime
+    )}.`;
+  }
+
+  return { title, explanation };
+}
 
 export interface TombstoneViewProps {
   owner: string;
@@ -154,39 +204,8 @@ export function TombstoneView({
 
   // Error States (Requirements 35.3 to 35.6)
   if (errorInfo) {
-    let errorTitle = "Autopsy Encountered an Error";
-    let errorExplanation = errorInfo.message;
-
-    if (errorInfo.code === "REPO_NOT_FOUND") {
-      // Requirement 35.3: Not-found-or-private message
-      errorTitle = "Repository Not Found";
-      errorExplanation =
-        "The requested repository was not found or is private. Please ensure the repository is public and accessible on GitHub.";
-    } else if (errorInfo.code === "TOO_LARGE") {
-      // Requirement 35.4: Size limit that was exceeded
-      errorTitle = "Repository Exceeds Size Limit";
-      errorExplanation =
-        "The repository exceeds the size limits (maximum 20 MB compressed, 60 MB decompressed, or 2000 entries).";
-    } else if (errorInfo.code === "LANGUAGE_UNKNOWN") {
-      // Requirement 35.5: Name the files Grimoire looked for
-      errorTitle = "Unsupported or Unknown Language";
-      const filesList = (
-        errorInfo.lookedFor ||
-        errorInfo.filesLookedFor || [
-          "package.json",
-          "setup.py",
-          "pyproject.toml",
-          "requirements.txt",
-        ]
-      ).join(", ");
-      errorExplanation = `No supported programming language was detected in this repository. The Grimoire looked for: ${filesList}.`;
-    } else if (errorInfo.code === "RATE_LIMITED") {
-      // Requirement 35.6: GitHub reset time
-      errorTitle = "GitHub API Rate Limit Exceeded";
-      errorExplanation = `The GitHub API rate limit has been exhausted. Rate limit resets at: ${
-        errorInfo.resetTime || "a later time"
-      }.`;
-    }
+    const { title: errorTitle, explanation: errorExplanation } =
+      describeTombstoneError(errorInfo);
 
     return (
       <div
@@ -252,6 +271,23 @@ export function TombstoneView({
     autopsy.signalChips || autopsy.chipsByRule || {};
 
   const totalSignals = autopsy.chips?.length ?? 0;
+
+  // Partial state: some manifests could not be read. The autopsy still renders
+  // in full, with a clear warning naming the unreadable manifests.
+  const partialRecord = autopsy as unknown as {
+    partial?: boolean;
+    unreadableManifests?: string[];
+    unreadable?: string[];
+    partialManifests?: string[];
+  };
+  const unreadableManifests = (
+    partialRecord.unreadableManifests ??
+    partialRecord.unreadable ??
+    partialRecord.partialManifests ??
+    []
+  ).filter((m): m is string => typeof m === "string" && m.length > 0);
+  const isPartial =
+    partialRecord.partial === true || unreadableManifests.length > 0;
 
   return (
     <div
@@ -321,6 +357,36 @@ export function TombstoneView({
         </div>
       )}
 
+      {/* Partial autopsy: some manifests could not be read */}
+      {isPartial && (
+        <div
+          data-testid="tombstone-partial-warning"
+          className="crypt-panel p-3.5 border-l-2 border-l-amber-400 text-xs text-parchment font-mono space-y-1.5"
+        >
+          <div className="flex items-center gap-2.5">
+            <StatusPill tone="amber" label="Partial" />
+            <span className="font-semibold text-amber-200">
+              Some manifests could not be read.
+            </span>
+          </div>
+          {unreadableManifests.length > 0 ? (
+            <ul
+              data-testid="tombstone-partial-manifests"
+              className="list-disc list-inside text-amber-200/90 space-y-0.5"
+            >
+              {unreadableManifests.map((m) => (
+                <li key={m}>{m}</li>
+              ))}
+            </ul>
+          ) : (
+            <p className="text-amber-200/90">
+              The remaining signals below are still complete for the files that
+              could be read.
+            </p>
+          )}
+        </div>
+      )}
+
       {/* ================================================================= */}
       {/* SECTION A: AUTOPSY CARD (Requirement 35.8, Requirement 5)         */}
       {/* ================================================================= */}
@@ -362,10 +428,25 @@ export function TombstoneView({
           {isAlive ? (
             <div
               data-testid="still-breathing-reasons"
-              className="text-xs text-emerald-300/90 pt-2 border-t border-white/10"
+              className="text-xs text-emerald-300/90 pt-2 border-t border-white/10 space-y-1.5"
             >
-              Checked: Repository is not archived, active within 24 calendar
-              months, and contains no fatal obsolescence signals.
+              <p className="font-semibold text-emerald-200">
+                This repository is still breathing.
+              </p>
+              <p className="text-emerald-300/85">
+                Checked: Repository is not archived, active within 24 calendar
+                months, and contains no fatal obsolescence signals.
+              </p>
+              {reasonsList.length > 0 && (
+                <ul
+                  data-testid="still-breathing-checked-list"
+                  className="list-disc list-inside text-emerald-200/90 space-y-0.5"
+                >
+                  {reasonsList.map((r) => (
+                    <li key={r}>{r}</li>
+                  ))}
+                </ul>
+              )}
             </div>
           ) : (
             reasonsList.length > 0 && (

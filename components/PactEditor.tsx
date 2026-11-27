@@ -699,11 +699,27 @@ export function PactEditor({
   // Approve Pact (Requirement 36.7: open Legion_Dashboard on approval)
   const handleApprove = async () => {
     setValidationError(null);
+    setCycleError(null);
     const activeTasks = tasks.filter((t) => !disabledTaskIds.includes(t.id));
     const approvedTaskIds = activeTasks.map((t) => t.id);
 
     if (approvedTaskIds.length === 0) {
       setValidationError("Cannot approve an empty Pact. Please enable at least one task.");
+      return;
+    }
+
+    // Requirement 36.9: reject approval when the active tasks contain a
+    // dependency cycle, naming the exact cycle path.
+    const approvalCycles = detectDependencyCyclesInTasks(
+      activeTasks.map((t) => ({
+        id: t.id,
+        dependencies: t.dependencies || t.depends || [],
+      }))
+    );
+    if (approvalCycles.length > 0) {
+      setCycleError(
+        `Dependency cycle detected: ${approvalCycles[0].join(" -> ")}`
+      );
       return;
     }
 
