@@ -44,6 +44,8 @@ import type {
   SkeletonSupervisorOptions,
 } from "../supervisor/types";
 import { redactEvent } from "../security/redactor";
+import type { HeadlessAskRequest } from "../acp/stream-parser";
+import { buildAskAutoDeniedEventData } from "../acp/headless-fallback";
 
 export type { FatalEventPayload };
 
@@ -404,9 +406,24 @@ export class RuntimeHost extends EventEmitter {
       Partial<Pick<SkeletonSupervisorOptions, "gateway">>
   ): SkeletonSupervisor {
     const userOnEvent = opts.onEvent;
+    // Requirement 17.11: when the caller omits the auto-deny hook, supply a
+    // production default that records the auto-denial on the RuntimeHost event
+    // stream, so a headless turn never fails closed for a missing hook.
+    const onAskAutoDeny =
+      opts.onAskAutoDeny ??
+      ((ask: HeadlessAskRequest) => {
+        this.emitEvent({
+          runId: opts.runId,
+          kind: "ask.auto_denied",
+          actor: "SkeletonSupervisor",
+          skeletonId: opts.skeletonId,
+          data: buildAskAutoDeniedEventData(ask),
+        });
+      });
     const supervisor = new SkeletonSupervisor({
       ...opts,
       gateway: opts.gateway ?? (this.gateway as any),
+      onAskAutoDeny,
       onEvent: async (evt: SkeletonSupervisorEvent) => {
         try {
           const { runId, kind, actor, skeletonId, ...extra } = evt as any;

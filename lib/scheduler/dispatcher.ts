@@ -18,6 +18,8 @@ import { getDefaultEventStore } from "../events/event-store";
 import { GitService, TaskWorktreeResult } from "../git/git-service";
 import type { PactRole } from "../pact/pact-parser";
 import type { RuntimeHost } from "../runtime/runtime-host";
+import type { HeadlessAskRequest } from "../acp/stream-parser";
+import { buildAskAutoDeniedEventData } from "../acp/headless-fallback";
 import {
   SkeletonSupervisor,
 } from "../supervisor/skeleton-supervisor";
@@ -162,6 +164,20 @@ export interface TaskDispatcherOptions {
     task: ScheduledTask,
     result: CandidateSubmissionResult
   ) => void | Promise<void>;
+  /**
+   * Probe results (P1/P14/S2) forwarded to every Supervisor the Dispatcher
+   * constructs, so a run that failed the ACP probe (P1) drives the Headless
+   * Fallback channel (Requirement 17.1).
+   */
+  probeResults?: Record<string, any>;
+  /** Approval bridge forwarded to the Headless Fallback channel (Requirement 17.7). */
+  onApproval?: SkeletonSupervisorOptions["onApproval"];
+  /**
+   * Auto-deny hook forwarded to the Headless Fallback channel (Requirement 17.11).
+   * When omitted, the Dispatcher supplies a production default that records an
+   * `ask.auto_denied` event through its event sink.
+   */
+  onAskAutoDeny?: SkeletonSupervisorOptions["onAskAutoDeny"];
 }
 
 /**
@@ -1177,6 +1193,17 @@ export class TaskDispatcher {
       ? curPath
       : `${localBin}${path.delimiter}${curPath}`;
 
+    // Requirement 17.11: forward an explicit auto-deny hook. When a host is
+    // present it supplies its own single default handler (forwarding one from the
+    // Dispatcher too would emit duplicate ask.auto_denied events), so the
+    // Dispatcher only builds its fallback when there is no host to delegate to
+    // and it has an event sink to record through.
+    const askAutoDeny =
+      this.options.onAskAutoDeny ??
+      (!this.host && (this.eventStore || this.options.emitEvent)
+        ? this.buildDefaultAskAutoDeny(skeletonId)
+        : undefined);
+
     const supervisorOpts: SkeletonSupervisorOptions = {
       runId: this.runId,
       skeletonId,
@@ -1213,6 +1240,13 @@ export class TaskDispatcher {
         watchdogLimitMs: isLive ? 180000 : 5000,
         settings: { watchdogLimitMs: isLive ? 180000 : 5000 },
       },
+      ...(this.options.probeResults
+        ? { probeResults: this.options.probeResults }
+        : {}),
+      ...(this.options.onApproval
+        ? { onApproval: this.options.onApproval }
+        : {}),
+      ...(askAutoDeny ? { onAskAutoDeny: askAutoDeny } : {}),
     };
 
     if (this.host && typeof this.host.createSupervisor === "function") {
@@ -1222,6 +1256,28 @@ export class TaskDispatcher {
       return this.options.supervisorFactory(supervisorOpts);
     }
     return new SkeletonSupervisor(supervisorOpts as any);
+  }
+
+  /**
+   * Builds the production default `onAskAutoDeny` handler: it records the
+   * auto-denial as an `ask.auto_denied` event through the Dispatcher's event
+   * sink so the Gateway observes every auto-denied headless `ask`
+   * (Requirement 17.11). The handler AWAITS the sink so an async write failure
+   * propagates to the Headless Fallback channel (which then fails the turn
+   * closed) instead of floating as an unhandled rejection.
+   */
+  private buildDefaultAskAutoDeny(
+    skeletonId: string
+  ): (ask: HeadlessAskRequest) => Promise<void> {
+    return async (ask: HeadlessAskRequest) => {
+      await this.emitEvent({
+        runId: this.runId,
+        kind: "ask.auto_denied",
+        actor: "SkeletonSupervisor",
+        skeletonId,
+        data: buildAskAutoDeniedEventData(ask),
+      });
+    };
   }
 
   private async commitDirtyWorktreeIfNeeded(

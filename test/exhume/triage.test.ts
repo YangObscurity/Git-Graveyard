@@ -119,6 +119,64 @@ describe("triage: Grimoire base analysis (Requirement 11.11)", () => {
     assert.ok(Array.isArray(summaryEvent.data?.refs));
   });
 
+  test("detects .py signals through the tree-sitter AST (detectPythonSignals)", async () => {
+    const recordedEvents: EventInput[] = [];
+
+    const files = [
+      {
+        path: "src/legacy.py",
+        manifestDir: "src",
+        content: 'note = "print y"\nprint x, \\\n    y\n',
+      },
+      {
+        path: "src/modern.js",
+        manifestDir: "src",
+        content: 'const request = require("request");\n',
+      },
+    ];
+
+    const result = await runGrimoireBaseAnalysis({
+      runId: "run-grimoire-py",
+      files,
+      events: recordedEvents,
+    });
+
+    // The tree-sitter AST flags the real multi-line `print` statement (line 2)
+    // and reports the whole statement as `matched` (its node text spans lines) —
+    // something the single-token lexical regex cannot do.
+    const printSignal = result.signals.find(
+      (s) => s.ruleId === "M1" && s.file === "src/legacy.py" && s.line === 2
+    );
+    assert.ok(printSignal, "expected an M1 print signal on the multi-line statement");
+    assert.ok(
+      printSignal!.matched.includes("\n"),
+      "AST `matched` must span the multi-line statement"
+    );
+
+    // The string literal on line 1 is ignored entirely by the AST.
+    assert.equal(
+      result.signals.filter(
+        (s) => s.file === "src/legacy.py" && s.line === 1
+      ).length,
+      0,
+      "string literal contents must not be flagged"
+    );
+
+    // Non-Python files still go through the synchronous detector.
+    assert.ok(
+      result.signals.some(
+        (s) => s.ruleId === "M2" && s.file === "src/modern.js"
+      ),
+      "expected the .js file to be handled by detectSignals"
+    );
+
+    // Events are emitted and the summary count matches the merged signals.
+    assert.ok(recordedEvents.some((e) => e.kind === "grimoire.signal"));
+    const summaryEvent = recordedEvents.find((e) => e.kind === "grimoire.summary");
+    assert.ok(summaryEvent);
+    assert.equal(summaryEvent.data?.signalsCount, result.signalsCount);
+  });
+
   test("scanBaseTreeFiles scans disk directory and ignores submodules and cache", async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "tree-scan-"));
     try {

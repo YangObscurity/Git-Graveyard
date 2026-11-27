@@ -11,11 +11,13 @@ import {
   seedRecordedRunsIntoStores,
 } from "../runs/recorded-runs-loader";
 import { getDefaultRunStore, RunStore, type RunRecord } from "../runs/run-store";
+import { getDefaultSettingsStore, SettingsStore } from "../admin/settings-store";
 
 interface InjectedStoreCarrier {
   runStore?: RunStore;
   eventStore?: EventStore;
   eventTap?: EventTap;
+  settingsStore?: SettingsStore;
 }
 
 interface GlobalStoreSlots {
@@ -25,6 +27,8 @@ interface GlobalStoreSlots {
   __sharedEventStore?: EventStore;
   __eventTap?: EventTap;
   __sharedEventTap?: EventTap;
+  __settingsStore?: SettingsStore;
+  __sharedSettingsStore?: SettingsStore;
   __runOrchestrator?: unknown;
 }
 
@@ -130,6 +134,70 @@ export function resolveEventStore(
   }
 
   return eventStore;
+}
+
+/**
+ * FIND-4 (Requirement 30.2): resolves the {@link SettingsStore} used to gate run starts. It mirrors
+ * {@link resolveRunStore} / {@link resolveEventStore}:
+ *   1. an injected `request.settingsStore` (tests / callers),
+ *   2. an injected `context.settingsStore`,
+ *   3. the process global `globalThis.__settingsStore`,
+ *   4. the shared `globalThis.__sharedSettingsStore` (set by `getDefaultSettingsStore`),
+ *   5. the default file-backed store (`SETTINGS_STORE_PATH`, then `/data/settings.db`, then tmp).
+ */
+export function resolveSettingsStore(request?: Request, context?: unknown): SettingsStore {
+  const req = getInjectedCarrier(request);
+  if (req?.settingsStore) {
+    return req.settingsStore;
+  }
+  const ctx = getInjectedCarrier(context);
+  if (ctx?.settingsStore) {
+    return ctx.settingsStore;
+  }
+
+  const g = globalThis as unknown as GlobalStoreSlots;
+  if (g.__settingsStore) {
+    return g.__settingsStore;
+  }
+  if (g.__sharedSettingsStore) {
+    return g.__sharedSettingsStore;
+  }
+
+  return getDefaultSettingsStore();
+}
+
+/**
+ * FIND-4: reports whether a settings store is *explicitly* configured for this process — one of the
+ * sources above (an injected request/context store, a process global, or `SETTINGS_STORE_PATH`) is
+ * present, or the process is a production server where the default file-backed store is the source
+ * of truth.
+ *
+ * The start-run route only enforces the Required_Settings gate when this is true, so a brand-new
+ * development/test/E2E environment that never configured a settings store keeps working as before,
+ * while a configured deployment (or any production process) still refuses to start runs until every
+ * Required_Setting has a value. The guard is never weakened wherever settings actually exist.
+ */
+export function isSettingsStoreConfigured(request?: Request, context?: unknown): boolean {
+  const req = getInjectedCarrier(request);
+  if (req?.settingsStore) {
+    return true;
+  }
+  const ctx = getInjectedCarrier(context);
+  if (ctx?.settingsStore) {
+    return true;
+  }
+
+  const g = globalThis as unknown as GlobalStoreSlots;
+  if (g.__settingsStore || g.__sharedSettingsStore) {
+    return true;
+  }
+
+  const envPath = process.env.SETTINGS_STORE_PATH;
+  if (typeof envPath === "string" && envPath.trim().length > 0) {
+    return true;
+  }
+
+  return process.env.NODE_ENV === "production";
 }
 
 export function resolveEventTap(request?: Request, context?: unknown): EventTap {

@@ -7,10 +7,16 @@ import {
   type RunRecord,
 } from "@/lib/runs/run-store";
 import {
+  isSettingsStoreConfigured,
   resolveActiveOrchestrator,
   resolveEventStore,
   resolveRunStore,
+  resolveSettingsStore,
 } from "@/lib/runtime/store-context";
+import {
+  RequiredSettingMissingError,
+  assertRequiredSettingsConfigured,
+} from "@/lib/admin/settings-store";
 import { redactEvent } from "@/lib/security/redactor";
 
 export const dynamic = "force-dynamic";
@@ -286,7 +292,30 @@ export async function POST(request: Request): Promise<Response> {
     );
   }
 
-  // 5. Check queue depth cap (Requirement 31.8)
+  // 5. Refuse to start when a Required_Setting has no value (Requirement 30.2).
+  //
+  // This gate runs *before* `createRun` / the FIFO enqueue: on failure it returns 503 with the
+  // missing keys and no run is created or queued.
+  if (isSettingsStoreConfigured(request)) {
+    try {
+      assertRequiredSettingsConfigured(resolveSettingsStore(request));
+    } catch (err) {
+      if (err instanceof RequiredSettingMissingError) {
+        return Response.json(
+          {
+            ok: false,
+            error: err.message,
+            code: "REQUIRED_SETTINGS_MISSING",
+            missing: [...err.missing],
+          },
+          { status: 503 }
+        );
+      }
+      throw err;
+    }
+  }
+
+  // 6. Check queue depth cap (Requirement 31.8)
   const queueDepthCap = Number(
     process.env.QUEUE_DEPTH_CAP ||
       (admission as Record<string, unknown> | null)?.queueDepthCap ||
@@ -306,19 +335,19 @@ export async function POST(request: Request): Promise<Response> {
     );
   }
 
-  // 6. Generate runId
+  // 7. Generate runId
   const runId =
     typeof customRunId === "string" && customRunId.trim()
       ? customRunId.trim()
       : `run-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
 
-  // 7. Enforce single live run capacity under instabox-docker (Requirement 31.10)
+  // 8. Enforce single live run capacity under instabox-docker (Requirement 31.10)
   // Under instabox-docker, capacity is 1 live run.
   // The run is appended to the FIFO queue with phase 'queued'.
   const queuePosition = fifoQueue.length + 1;
   const backendKind = process.env.EXECUTION_BACKEND ?? "instabox-docker";
 
-  // 8. Create run record with the run store (Requirement 31.6)
+  // 9. Create run record with the run store (Requirement 31.6)
   runStore.createRun({
     runId,
     url: cleanUrl,
@@ -336,7 +365,7 @@ export async function POST(request: Request): Promise<Response> {
     },
   });
 
-  // 9. Append run to FIFO queue held in module memory (Requirement 31.6)
+  // 10. Append run to FIFO queue held in module memory (Requirement 31.6)
   const queuedRun: QueuedRun = {
     runId,
     url: cleanUrl,
@@ -350,7 +379,7 @@ export async function POST(request: Request): Promise<Response> {
   };
   fifoQueue.push(queuedRun);
 
-  // 10. Emit run.queued and run.queue_position event through EventStore (Requirement 31.6)
+  // 11. Emit run.queued and run.queue_position event through EventStore (Requirement 31.6)
   const eventStore = resolveEventStore(request, undefined, runStore);
   eventStore.append(
     redactEvent({
@@ -388,7 +417,7 @@ export async function POST(request: Request): Promise<Response> {
     // isolated unit tests injecting request.runStore or orchestrator init error should not fail response
   }
 
-  // 11. Return HTTP 202 with runId
+  // 12. Return HTTP 202 with runId
   return Response.json(
     {
       ok: true,
