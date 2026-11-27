@@ -789,16 +789,41 @@ function makeMergeHarness(fixture: RepoFixture): MergeHarness {
       descendant = false;
     }
     if (!descendant) {
-      const tree = runGit(["rev-parse", `${candidateSha}^{tree}`], fixture.gitDir, home);
-      candidateSha = runGit(
-        [
-          "-c", "user.name=Test Runner",
-          "-c", "user.email=runner@example.test",
-          "commit-tree", tree, "-p", head, "-m", `merge ${candidate.taskId}`,
-        ],
-        fixture.gitDir,
-        home
+      // Tree-preserving replay of the candidate's changes onto the advanced
+      // integration head: cherry-pick the candidate commit in a temporary
+      // worktree so the files merged by earlier tasks (e.g. A.txt) survive
+      // alongside this candidate's files (e.g. B.txt). A `git commit-tree` with
+      // the candidate's own tree would overwrite them with its stale base tree.
+      const replayDir = fs.mkdtempSync(
+        path.join(fixture.tmpDir, `merge-${candidate.taskId}-`)
       );
+      fs.rmSync(replayDir, { recursive: true, force: true });
+      runGit(["worktree", "add", "--detach", replayDir, head], fixture.gitDir, home);
+      try {
+        runGit(
+          [
+            "-c",
+            "user.name=Test Runner",
+            "-c",
+            "user.email=runner@example.test",
+            "cherry-pick",
+            candidateSha,
+          ],
+          replayDir,
+          home
+        );
+        candidateSha = runGit(["rev-parse", "HEAD"], replayDir, home);
+      } finally {
+        try {
+          runGit(["worktree", "remove", "--force", replayDir], fixture.gitDir, home);
+        } catch {
+          // Ignore teardown failures; the fixture cleanup removes the temp dir.
+        }
+        fs.rmSync(replayDir, { recursive: true, force: true });
+      }
+      // Rebind the (test) candidate to the replayed commit so the verified merge
+      // evidence is bound to the sha this candidate is actually merged from.
+      (candidate as { candidateSha: string }).candidateSha = candidateSha;
     }
     const tree = runGit(["rev-parse", `${candidateSha}^{tree}`], fixture.gitDir, home);
     const rawDiff = childProcess
@@ -809,6 +834,10 @@ function makeMergeHarness(fixture: RepoFixture): MergeHarness {
       )
       .toString();
     const candidateSha256 = candidateSha256FromDiff(rawDiff);
+    // Bind the (test) candidate to the exact sha/bytes the verified merge
+    // consumes so the ParallelScheduler's evidence/candidate match check passes.
+    (candidate as { candidateSha: string }).candidateSha = candidateSha;
+    (candidate as { candidateSha256?: string }).candidateSha256 = candidateSha256;
     store.append({
       runId: fixture.runId,
       kind: "verdict",
@@ -1240,6 +1269,60 @@ describe("ParallelScheduler stop & abort (Task 20.4)", () => {
       fixture.cleanup();
     }
   });
+  it("abort() transitions queued in_review candidates out of in_review", async () => {
+    const fixture = createRepoFixture("abortqueued");
+    try {
+      const tasks = [
+        makePactTask("A", { filesInScope: ["src/a.ts"], line: 1 }),
+        makePactTask("B", { filesInScope: ["src/b.ts"], line: 2 }),
+      ];
+      const controller = makeControlledRunner(fixture.tmpDir);
+      const reviewGate: { release?: () => void } = {};
+      const wardenReview = async (
+        candidate: ParallelSchedulerCandidate
+      ): Promise<ParallelWardenDecision> => {
+        if (candidate.taskId === "A") {
+          await new Promise<void>((resolve) => {
+            reviewGate.release = resolve;
+          });
+        }
+        return { approved: true, candidateSha256: candidate.candidateSha256 };
+      };
+      const scheduler = makeScheduler(fixture, tasks, controller.runner, {
+        parallelCap: 2,
+        maxConcurrentWarden: 1,
+        wardenReview,
+      });
+
+      const runPromise = scheduler.run();
+      await waitFor(() => controller.pending().length >= 2);
+      controller.release("A");
+      controller.release("B");
+
+      // A's review is held, so B's candidate waits on the serialized queue while
+      // its task sits in `in_review`.
+      await waitFor(() => reviewGate.release !== undefined);
+      await waitFor(() =>
+        scheduler.getReviewQueue().some((candidate) => candidate.taskId === "B")
+      );
+      assert.equal(scheduler.getScheduler().getTask("B")!.state, "in_review");
+
+      scheduler.abort("user abort");
+
+      // abort() must immediately end every queued in_review candidate.
+      assert.notEqual(scheduler.getScheduler().getTask("B")!.state, "in_review");
+
+      reviewGate.release?.();
+      const summary = await drainRun(runPromise, controller, 5000);
+
+      assert.notEqual(summary.taskStates.A, "in_review");
+      assert.notEqual(summary.taskStates.B, "in_review");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+
 });
 
 
@@ -1466,10 +1549,6 @@ describe("ParallelScheduler verifies warden candidateSha256 (Task 20.4)", () => 
     try {
       const controller = makeControlledRunner(fixture.tmpDir);
       const harness = makeMergeHarness(fixture);
-      const runner: ParallelSchedulerRunner = async (ctx) => {
-        const res = await controller.runner(ctx);
-        return res.ok ? { ...res, candidateSha256: "AbCdEf0123456789" } : res;
-      };
       const scheduler = new ParallelScheduler({
         runId: fixture.runId,
         runsDir: fixture.runDir,
@@ -1479,10 +1558,11 @@ describe("ParallelScheduler verifies warden candidateSha256 (Task 20.4)", () => 
         approvedTaskIds: ["A"],
         parallelCap: 1,
         maxAttempts: 1,
-        runner,
-        wardenReview: async () => ({
+        runner: controller.runner,
+        // The approval carries the real candidate hash in a different case.
+        wardenReview: async (candidate) => ({
           approved: true,
-          candidateSha256: "abcdef0123456789",
+          candidateSha256: (candidate.candidateSha256 ?? "").toUpperCase(),
         }),
         mergeCandidate: harness.mergeCandidate,
       });
@@ -1496,6 +1576,164 @@ describe("ParallelScheduler verifies warden candidateSha256 (Task 20.4)", () => 
     }
   });
 });
+
+describe("ParallelScheduler fail-closed merge evidence (Task 20.4)", () => {
+  it("fails closed (merge_evidence_missing) without advancing the integration branch when no evidence is supplied", async () => {
+    const fixture = createRepoFixture("noevidence");
+    try {
+      const controller = makeControlledRunner(fixture.tmpDir);
+      const integrationRef = `graveyard/${fixture.runId}`;
+      const before = runGit(
+        ["rev-parse", integrationRef],
+        fixture.gitDir,
+        fixture.tmpDir
+      );
+      const scheduler = makeScheduler(
+        fixture,
+        [makePactTask("A", { filesInScope: ["src/a.ts"], line: 1 })],
+        controller.runner,
+        {
+          parallelCap: 1,
+          maxAttempts: 1,
+          wardenReview: makeApprovingWarden(),
+        }
+      );
+
+      const summary = await drainRun(scheduler.run(), controller);
+
+      assert.equal(summary.approved, 0);
+      assert.equal(summary.merged, 0);
+      const records = scheduler.getReviewRecords();
+      assert.equal(records.length, 1);
+      assert.equal(records[0].approved, false);
+      assert.equal(records[0].reason, "merge_evidence_missing");
+      const after = runGit(
+        ["rev-parse", integrationRef],
+        fixture.gitDir,
+        fixture.tmpDir
+      );
+      assert.equal(
+        after,
+        before,
+        "integration branch must not advance without verified merge evidence"
+      );
+      assert.equal(summary.taskStates.A, "failed");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("fails closed (merge_evidence_candidate_mismatch) when evidence binds a different candidateSha", async () => {
+    const fixture = createRepoFixture("mismatchsha");
+    try {
+      const controller = makeControlledRunner(fixture.tmpDir);
+      const integrationRef = `graveyard/${fixture.runId}`;
+      const before = runGit(
+        ["rev-parse", integrationRef],
+        fixture.gitDir,
+        fixture.tmpDir
+      );
+      const mergeCandidate: NonNullable<
+        ParallelSchedulerOptions["mergeCandidate"]
+      > = async (candidate) => ({
+        ok: true,
+        evidence: {
+          candidateSha: "0".repeat(40),
+          candidateSha256: candidate.candidateSha256,
+          verdict: {
+            candidateSha: candidate.candidateSha,
+            candidateSha256: candidate.candidateSha256,
+          },
+          gateResult: { ok: true, tree: "a".repeat(40) },
+          diff: candidate.diff ?? "diff",
+        } as unknown as TaskMergeEvidence,
+      });
+      const scheduler = makeScheduler(
+        fixture,
+        [makePactTask("A", { filesInScope: ["src/a.ts"], line: 1 })],
+        controller.runner,
+        {
+          parallelCap: 1,
+          maxAttempts: 1,
+          wardenReview: makeApprovingWarden(),
+          mergeCandidate,
+        }
+      );
+
+      const summary = await drainRun(scheduler.run(), controller);
+
+      assert.equal(summary.merged, 0);
+      const records = scheduler.getReviewRecords();
+      assert.equal(records.length, 1);
+      assert.equal(records[0].approved, false);
+      assert.equal(records[0].reason, "merge_evidence_candidate_mismatch");
+      const after = runGit(
+        ["rev-parse", integrationRef],
+        fixture.gitDir,
+        fixture.tmpDir
+      );
+      assert.equal(after, before, "mismatched evidence must not move git refs");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("fails closed (merge_evidence_candidate_mismatch) when evidence binds a different candidateSha256", async () => {
+    const fixture = createRepoFixture("mismatchsha256");
+    try {
+      const controller = makeControlledRunner(fixture.tmpDir);
+      const integrationRef = `graveyard/${fixture.runId}`;
+      const before = runGit(
+        ["rev-parse", integrationRef],
+        fixture.gitDir,
+        fixture.tmpDir
+      );
+      const mergeCandidate: NonNullable<
+        ParallelSchedulerOptions["mergeCandidate"]
+      > = async (candidate) => ({
+        ok: true,
+        evidence: {
+          candidateSha: candidate.candidateSha,
+          candidateSha256: "f".repeat(64),
+          verdict: {
+            candidateSha: candidate.candidateSha,
+            candidateSha256: "f".repeat(64),
+          },
+          gateResult: { ok: true, tree: "a".repeat(40) },
+          diff: candidate.diff ?? "diff",
+        } as unknown as TaskMergeEvidence,
+      });
+      const scheduler = makeScheduler(
+        fixture,
+        [makePactTask("A", { filesInScope: ["src/a.ts"], line: 1 })],
+        controller.runner,
+        {
+          parallelCap: 1,
+          maxAttempts: 1,
+          wardenReview: makeApprovingWarden(),
+          mergeCandidate,
+        }
+      );
+
+      const summary = await drainRun(scheduler.run(), controller);
+
+      assert.equal(summary.merged, 0);
+      const records = scheduler.getReviewRecords();
+      assert.equal(records.length, 1);
+      assert.equal(records[0].approved, false);
+      assert.equal(records[0].reason, "merge_evidence_candidate_mismatch");
+      const after = runGit(
+        ["rev-parse", integrationRef],
+        fixture.gitDir,
+        fixture.tmpDir
+      );
+      assert.equal(after, before, "mismatched evidence must not move git refs");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+});
+
 
 describe("ParallelScheduler verified merge & unblocking (Task 20.4)", () => {
   it("unblocks a dependent task (T2 depends on T1) to ready -> running -> merged after T1 merges", async () => {
@@ -1535,6 +1773,48 @@ describe("ParallelScheduler verified merge & unblocking (Task 20.4)", () => {
       fixture.cleanup();
     }
   });
+
+  it("merges parallel candidates tree-preservingly so both A.txt and B.txt survive", async () => {
+    const fixture = createRepoFixture("treesafe");
+    try {
+      const tasks = [
+        makePactTask("A", { filesInScope: ["src/a.ts"], line: 1 }),
+        makePactTask("B", { filesInScope: ["src/b.ts"], line: 2 }),
+      ];
+      const controller = makeControlledRunner(fixture.tmpDir);
+      const harness = makeMergeHarness(fixture);
+      const scheduler = makeScheduler(fixture, tasks, controller.runner, {
+        parallelCap: 2,
+        wardenReview: makeApprovingWarden(),
+        mergeCandidate: harness.mergeCandidate,
+      });
+
+      const summary = await drainRun(scheduler.run(), controller);
+
+      assert.equal(summary.taskStates.A, "merged");
+      assert.equal(summary.taskStates.B, "merged");
+      assert.equal(summary.merged, 2);
+
+      // The second merge must replay B onto the advanced integration head, so
+      // the integration commit carries BOTH files instead of only B's tree.
+      const integrationRef = `graveyard/${fixture.runId}`;
+      const aContent = runGit(
+        ["show", `${integrationRef}:A.txt`],
+        fixture.gitDir,
+        fixture.tmpDir
+      );
+      const bContent = runGit(
+        ["show", `${integrationRef}:B.txt`],
+        fixture.gitDir,
+        fixture.tmpDir
+      );
+      assert.equal(aContent.trim(), "A candidate");
+      assert.equal(bContent.trim(), "B candidate");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
 
   it("rejects a Warden approval that omits candidateSha256 (fail-closed)", async () => {
     const fixture = createRepoFixture("shamissing");
@@ -1612,6 +1892,55 @@ describe("ParallelScheduler verified merge & unblocking (Task 20.4)", () => {
       fixture.cleanup();
     }
   });
+
+  it("abort() while readCandidateDiff is pending never enqueues a candidate or hangs settle()", async () => {
+    const fixture = createRepoFixture("abortdiff");
+    try {
+      const controller = makeControlledRunner(fixture.tmpDir);
+      const worktreeDirs: string[] = [];
+      const runner: ParallelSchedulerRunner = async (context) => {
+        worktreeDirs.push(context.worktreeDir);
+        return { ok: true };
+      };
+      const scheduler = makeScheduler(
+        fixture,
+        [makePactTask("A", { filesInScope: ["src/a.ts"], line: 1 })],
+        runner,
+        { parallelCap: 1, maxAttempts: 1 }
+      );
+
+      // Park the worker inside readCandidateDiff() until we abort.
+      let releaseDiff: ((diff: string | undefined) => void) | undefined;
+      (scheduler as any).readCandidateDiff = () =>
+        new Promise<string | undefined>((resolve) => {
+          releaseDiff = resolve;
+        });
+
+      const runPromise = scheduler.run();
+      await waitFor(() => releaseDiff !== undefined);
+      assert.equal(worktreeDirs.length, 1);
+      assert.ok(fs.existsSync(worktreeDirs[0]));
+
+      scheduler.abort("stop");
+      releaseDiff!(undefined);
+
+      // A 5s deadline inside drainRun fails fast if settle() hangs.
+      const summary = await drainRun(runPromise, controller, 5000);
+
+      assert.equal(summary.aborted, true);
+      assert.equal(summary.candidatesProduced, 0);
+      assert.equal(scheduler.getReviewQueue().length, 0);
+      assert.equal(summary.taskStates.A, "abandoned");
+      assert.equal(
+        fs.existsSync(worktreeDirs[0]),
+        false,
+        "aborted worktree must be torn down"
+      );
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
 
   it("throwing onReview / onCleanup callbacks never lose slots or block rejection retries", async () => {
     const fixture = createRepoFixture("throwsafe");

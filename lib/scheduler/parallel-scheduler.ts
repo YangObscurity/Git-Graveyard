@@ -194,8 +194,9 @@ export interface ParallelSchedulerOptions extends SchedulerOptions {
   /**
    * Executes the verified merge for an approved candidate and returns the
    * evidence the composed `Scheduler.mergeTask` requires. When omitted, the
-   * decision's `mergeEvidence` is used, and failing that a verified git merge is
-   * performed against the integration branch.
+   * decision's `mergeEvidence` is used. When neither supplies verified evidence
+   * the approval fails closed: this dispatcher never fabricates merge evidence
+   * or mutates git refs itself.
    */
   mergeCandidate?: ParallelSchedulerMergeCandidate;
   /** When false, per-task worktrees are left in place after a slot settles. */
@@ -303,6 +304,72 @@ function extractMergeCandidateEvidence(
     return { reason: record.reason ?? "merge_candidate_rejected" };
   }
   return { evidence: produced as TaskMergeEvidence };
+}
+/**
+ * True when injected merge evidence is bound to the exact approved candidate:
+ * the evidence sha and sha256 must be non-empty and match the candidate's, and
+ * any `gitMerge.candidateSha` / `gitMerge.candidateSha256` must match as well
+ * (a sha256 comparison is trimmed and case-insensitive). Used to fail a merge
+ * closed BEFORE `Scheduler.mergeTask` can move any git refs.
+ */
+function mergeEvidenceMatchesCandidate(
+  evidence: TaskMergeEvidence,
+  candidate: ParallelSchedulerCandidate
+): boolean {
+  const record = evidence as unknown as Record<string, unknown>;
+  const asRecord = (value: unknown): Record<string, unknown> | undefined =>
+    value && typeof value === "object" && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : undefined;
+  const verdict = asRecord(record.verdict);
+  const gitMerge = asRecord(record.gitMerge);
+
+  const candidateSha = (candidate.candidateSha ?? "").trim();
+  const candidateSha256 = (candidate.candidateSha256 ?? "").trim().toLowerCase();
+
+  const evidenceSha =
+    record.candidateSha ??
+    (verdict ? verdict.candidateSha : undefined) ??
+    (gitMerge ? gitMerge.candidateSha : undefined);
+  if (
+    typeof evidenceSha !== "string" ||
+    evidenceSha.trim().length === 0 ||
+    evidenceSha.trim() !== candidateSha
+  ) {
+    return false;
+  }
+
+  const evidenceSha256 =
+    record.candidateSha256 ??
+    (verdict ? verdict.candidateSha256 : undefined) ??
+    (gitMerge ? gitMerge.candidateSha256 : undefined);
+  if (
+    typeof evidenceSha256 !== "string" ||
+    evidenceSha256.trim().length === 0 ||
+    candidateSha256.length === 0 ||
+    evidenceSha256.trim().toLowerCase() !== candidateSha256
+  ) {
+    return false;
+  }
+
+  if (gitMerge) {
+    if (
+      gitMerge.candidateSha !== undefined &&
+      (typeof gitMerge.candidateSha !== "string" ||
+        gitMerge.candidateSha.trim() !== candidateSha)
+    ) {
+      return false;
+    }
+    if (
+      gitMerge.candidateSha256 !== undefined &&
+      (typeof gitMerge.candidateSha256 !== "string" ||
+        gitMerge.candidateSha256.trim().toLowerCase() !== candidateSha256)
+    ) {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 /**
@@ -906,6 +973,15 @@ export class ParallelScheduler {
         worktree.worktreeDir,
         trimmedSha
       );
+
+      // Re-check the abort flag after the (awaited) diff read, before the task
+      // moves to in_review: an abort during diff reading must never enqueue a
+      // candidate or leave `settle()` waiting on a review that never ran.
+      if (controller.signal.aborted || this._aborted) {
+        this.abandonSafe(task.id, "aborted");
+        return;
+      }
+
       const runnerSha256 =
         typeof result.candidateSha256 === "string" &&
         result.candidateSha256.trim().length > 0
@@ -1066,6 +1142,12 @@ export class ParallelScheduler {
     }
     this._reviewQueue = [];
     for (const candidate of queued) {
+      // End every dequeued candidate, even those without a retained worktree, so
+      // an abort never leaves a queued task stuck in `in_review`.
+      this.abandonReviewedTask(
+        candidate.taskId,
+        this._abortReason ?? "aborted"
+      );
       const worktree = this._reviewWorktrees.get(candidate.taskId);
       if (!worktree) {
         continue;
@@ -1193,41 +1275,44 @@ export class ParallelScheduler {
 
   /**
    * Executes the verified merge for an approved candidate and applies it through
-   * the composed Scheduler. Merge precedence: an injected `mergeCandidate`, then
-   * the Warden decision's own `mergeEvidence`, then a verified git merge against
-   * the integration branch. Any failure is fail-closed: the caller rejects (and
-   * retries) instead of leaving the candidate stuck in `in_review`.
+   * the composed Scheduler. Verified merge evidence is taken ONLY from an
+   * injected `mergeCandidate` or the Warden decision's own `mergeEvidence`; when
+   * neither supplies evidence the approval fails closed. Any failure is
+   * fail-closed: the caller rejects (and retries) instead of leaving the
+   * candidate stuck in `in_review`.
    */
   private async performVerifiedMerge(
     candidate: ParallelSchedulerCandidate,
     decision: ParallelWardenDecision
   ): Promise<{ ok: boolean; reason?: string }> {
     let evidence: TaskMergeEvidence | undefined;
-    try {
-      if (typeof this.options.mergeCandidate === "function") {
-        const produced = await this.options.mergeCandidate(candidate, decision);
-        const extracted = extractMergeCandidateEvidence(produced);
-        if (!extracted.evidence) {
-          return {
-            ok: false,
-            reason: extracted.reason ?? "merge_candidate_rejected",
-          };
-        }
-        evidence = extracted.evidence;
-      } else if (decision.mergeEvidence) {
-        evidence = decision.mergeEvidence;
-      } else {
-        evidence = await this.buildDefaultMergeEvidence(candidate);
+    if (typeof this.options.mergeCandidate === "function") {
+      let produced: unknown;
+      try {
+        produced = await this.options.mergeCandidate(candidate, decision);
+      } catch (err) {
+        return {
+          ok: false,
+          reason: err instanceof Error ? err.message : String(err),
+        };
       }
-    } catch (err) {
-      return {
-        ok: false,
-        reason: err instanceof Error ? err.message : String(err),
-      };
+      const extracted = extractMergeCandidateEvidence(produced);
+      if (!extracted.evidence) {
+        return { ok: false, reason: "merge_evidence_missing" };
+      }
+      evidence = extracted.evidence;
+    } else if (decision.mergeEvidence) {
+      evidence = decision.mergeEvidence;
     }
 
     if (!evidence) {
       return { ok: false, reason: "merge_evidence_missing" };
+    }
+
+    // Bind the supplied evidence strictly to this approved candidate: a merge
+    // whose evidence names a different sha or sha256 must never move git refs.
+    if (!mergeEvidenceMatchesCandidate(evidence, candidate)) {
+      return { ok: false, reason: "merge_evidence_candidate_mismatch" };
     }
 
     let mergeRes: MergeTaskResult | undefined;
@@ -1245,9 +1330,19 @@ export class ParallelScheduler {
     }
 
     // Wait for the task-state emissions so the run loop only observes the merged
-    // state once the transition (and dependent releases) are committed.
+    // state once the transition (and dependent releases) are committed. A failed
+    // emission compensates (rolls back) the merge; swallow the rejection here and
+    // re-read the task state so the caller ALWAYS reaches
+    // `cleanupReviewedWorktree()` and `recordDecision()`.
     if (mergeRes.emissionPromise) {
-      await mergeRes.emissionPromise;
+      try {
+        await mergeRes.emissionPromise;
+      } catch {
+        // The scheduler already rolled back the merge; detected via state below.
+      }
+    }
+    if (this.scheduler.getTask(candidate.taskId)?.state !== "merged") {
+      return { ok: false, reason: "merge_emission_failed" };
     }
 
     return { ok: true };
@@ -1276,108 +1371,6 @@ export class ParallelScheduler {
     } catch {
       // A throwing cleanup observer must never block the slot release.
     }
-  }
-
-  /**
-   * Performs a real verified merge of the candidate into the integration branch
-   * and builds the `TaskMergeEvidence` the composed Scheduler requires. Returns
-   * `undefined` when the candidate cannot be merged (fail-closed).
-   */
-  private async buildDefaultMergeEvidence(
-    candidate: ParallelSchedulerCandidate
-  ): Promise<TaskMergeEvidence | undefined> {
-    const diff = candidate.diff;
-    const candidateSha256 =
-      (candidate.candidateSha256 ?? "").trim() ||
-      (diff && diff.trim().length > 0 ? candidateSha256FromDiff(diff) : "");
-    if (!candidateSha256) {
-      return undefined;
-    }
-
-    let tree: string;
-    let integrationHead: string;
-    try {
-      tree = (
-        await this.gitCapture(candidate.worktreeDir, [
-          "rev-parse",
-          "--verify",
-          "--end-of-options",
-          `${candidate.candidateSha}^{tree}`,
-        ])
-      ).trim();
-      integrationHead = (
-        await this.gitCapture(candidate.worktreeDir, [
-          "rev-parse",
-          "--verify",
-          "--end-of-options",
-          `refs/heads/${this._integrationBranch}`,
-        ])
-      ).trim();
-    } catch {
-      return undefined;
-    }
-    if (!tree || !integrationHead) {
-      return undefined;
-    }
-
-    const checks = {
-      install: { ok: true },
-      build: { ok: true },
-      accept: { ok: true },
-      tests: { ok: true },
-      noTestWeakening: { ok: true },
-    };
-    const verdict = {
-      verdict: "approve" as const,
-      status: "approve" as const,
-      candidateSha: candidate.candidateSha,
-      candidateSha256,
-      tree,
-      reasons: [{ text: "Warden approved the candidate", refs: ["cmd:true"] }],
-      checks,
-    };
-    const gateResult = { ok: true as const, tree };
-
-    let mergeProof: unknown;
-    try {
-      mergeProof = await (this.gitService as any).mergeCandidate({
-        runId: this._runId,
-        candidateSha: candidate.candidateSha,
-        expectedIntegrationHeadSha: integrationHead,
-        candidateSha256,
-        verdict,
-        verdictCandidateSha256: candidateSha256,
-        gateResult,
-        gitDir: this._gitDir,
-        runDir: this._runsDir,
-      });
-    } catch {
-      return undefined;
-    }
-    if (
-      !mergeProof ||
-      (mergeProof as { ok?: boolean }).ok !== true ||
-      (mergeProof as { merged?: boolean }).merged !== true
-    ) {
-      return undefined;
-    }
-
-    return {
-      verdict,
-      gateResult,
-      candidateSha: candidate.candidateSha,
-      candidateSha256,
-      tree,
-      gateTree: tree,
-      verdictTree: tree,
-      expectedHeadSha: integrationHead,
-      currentHeadSha: integrationHead,
-      integrationHeadSha: integrationHead,
-      diff,
-      taskId: candidate.taskId,
-      runId: this._runId,
-      gitMerge: mergeProof as TaskMergeEvidence["gitMerge"],
-    } as TaskMergeEvidence;
   }
 
   /**
@@ -1424,8 +1417,9 @@ export class ParallelScheduler {
     }
 
     if (decision.approved === true) {
-      // Approved candidates remain in_review for the Warden's merge gate; the
-      // ParallelScheduler owns dispatch + the serialized review queue only.
+      // An approved candidate whose merge succeeded was already transitioned to
+      // merged by `performVerifiedMerge` via the composed Scheduler; no further
+      // state change is required here.
       return;
     }
 
