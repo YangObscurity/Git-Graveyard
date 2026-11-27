@@ -1931,3 +1931,73 @@ SCRIPT_DIR="$(cd "$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
 });
 
 
+
+test("pushToFork: a refused (lock-held) push never leaks an askpass temp directory", async () => {
+  const sha = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+
+  const script = `#!/usr/bin/env bash
+SCRIPT_DIR="$(cd "$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
+"${process.execPath}" -e '
+  const args = process.argv.slice(1);
+  if (args.includes("rev-parse")) {
+    setTimeout(() => { process.stdout.write("${sha}\\\\n"); process.exit(0); }, 400);
+  } else {
+    process.exit(0);
+  }
+' -- "$@"
+`;
+
+  const isolatedTmp = fs.mkdtempSync(path.join(os.tmpdir(), "push-lock-leak-"));
+  const prevTmp = process.env.TMPDIR;
+  process.env.TMPDIR = isolatedTmp;
+  try {
+    await withFakeGitInPath(script, async () => {
+      const service = new GitService({
+        ownerLogin: "fork-owner",
+        sourceRepoUrl: "https://github.com/source-owner/source-repo",
+      });
+      const options = {
+        targetRepoUrl: "https://github.com/fork-owner/fork-repo",
+        runPhase: "done" as const,
+        invitePushFlag: true,
+        pushConfirm: true,
+        forkChecker: async () => "source-owner/source-repo",
+        token: "test-token",
+      };
+      const countAskpass = () =>
+        fs.readdirSync(isolatedTmp).filter((n) => n.startsWith("git-askpass-")).length;
+
+      const first = service.pushToFork("run-lock-leak", options);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      const before = countAskpass();
+      await assert.rejects(
+        service.pushToFork("run-lock-leak", options),
+        (err: unknown) => {
+          assert.ok(err instanceof GitServiceError);
+          assert.equal(err.code, "PUSH_LOCK_HELD");
+          return true;
+        }
+      );
+      const after = countAskpass();
+      assert.equal(
+        after,
+        before,
+        "a refused lock-held push must not create an askpass temp directory"
+      );
+
+      await first;
+      assert.equal(countAskpass(), 0, "askpass temp directories are always cleaned up");
+    });
+  } finally {
+    if (prevTmp === undefined) {
+      delete process.env.TMPDIR;
+    } else {
+      process.env.TMPDIR = prevTmp;
+    }
+    try {
+      fs.rmSync(isolatedTmp, { recursive: true, force: true });
+    } catch {}
+  }
+});
+

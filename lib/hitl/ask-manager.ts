@@ -8,6 +8,8 @@
 
 import type { EventStore } from "../events/event-store";
 import { checkBudgetIncreaseHardBlocks } from "../policy/hard-blocks";
+import { redactText } from "../security/redactor";
+import type { ApprovalManager } from "../gateway/approval-manager";
 
 export type HitlEventSink = Pick<EventStore, "append">;
 
@@ -127,6 +129,13 @@ export interface AskManagerOptions {
   eventStore: HitlEventSink;
   now?: () => number;
   approvalWaitMs?: number;
+  /**
+   * Optional approval-grant tracker. When supplied, resolved "Approve once"
+   * decisions register a one-time grant and "Approve this pattern for the run"
+   * decisions register a run-scoped pattern through the supplied manager,
+   * without duplicating grant state or emitting conflicting events.
+   */
+  approvalManager?: ApprovalManager;
 }
 
 export interface RaiseAskInput {
@@ -169,6 +178,7 @@ export interface DecideInput {
 export class AskManager {
   private readonly eventStore: HitlEventSink;
   private readonly now: () => number;
+  private readonly approvalManager?: ApprovalManager;
   readonly approvalWaitMs: number;
 
   private readonly asks = new Map<string, AskRecord>();
@@ -187,6 +197,7 @@ export class AskManager {
     this.eventStore = options.eventStore;
     this.now = options.now ?? (() => Date.now());
     this.approvalWaitMs = options.approvalWaitMs ?? DEFAULT_APPROVAL_WAIT_MS;
+    this.approvalManager = options.approvalManager;
   }
 
   /** Tracks the active Planner session for a run (Requirement 28.6). */
@@ -239,15 +250,19 @@ export class AskManager {
     const raisedAt = this.now();
     const expiresAt = input.expiresAt ?? raisedAt + this.approvalWaitMs;
     const options = ASK_OPTIONS.approve_command;
+    const commandText = redactText(input.commandText);
+    const cwd = redactText(input.cwd);
+    const reason = redactText(input.reason ?? input.riskClass);
+    const question = redactText(`Approve command '${commandText}' in ${cwd}?`);
 
     const ask: AskRecord = {
       askId: approvalId,
       runId: input.runId,
       kind: "approve_command",
-      question: `Approve command '${input.commandText}' in ${input.cwd}?`,
+      question,
       options,
       defaultAction: ASK_DEFAULTS.approve_command,
-      refs: [`cmd:${input.commandText}`],
+      refs: [`cmd:${commandText}`],
       status: "pending",
       raisedAt,
       expiresAt,
@@ -257,11 +272,11 @@ export class AskManager {
     const card: ApprovalCard = {
       approvalId,
       runId: input.runId,
-      commandText: input.commandText,
-      cwd: input.cwd,
+      commandText,
+      cwd,
       riskClass: input.riskClass,
       skeletonId: input.skeletonId,
-      reason: input.reason ?? input.riskClass,
+      reason,
       expiresAt,
       options,
     };
@@ -274,11 +289,11 @@ export class AskManager {
       "necromancer",
       {
         approvalId,
-        commandText: input.commandText,
-        cwd: input.cwd,
+        commandText,
+        cwd,
         riskClass: input.riskClass,
         skeletonId: input.skeletonId,
-        reason: card.reason,
+        reason,
         expiresAt,
         options: [...options],
         refs: ask.refs,
@@ -307,6 +322,13 @@ export class AskManager {
         "APPROVAL_ALREADY_RESOLVED"
       );
     }
+    if (this.now() >= ask.expiresAt) {
+      this.expireAsk(ask, this.now());
+      throw new AskManagerError(
+        `Approval '${approvalId}' expired before it was resolved`,
+        "APPROVAL_EXPIRED"
+      );
+    }
     const normalized = decision.trim();
     if (!ask.options.includes(normalized)) {
       throw new AskManagerError(
@@ -314,11 +336,10 @@ export class AskManager {
         "INVALID_DECISION"
       );
     }
-    ask.status = "answered";
-    ask.answer = normalized;
-    ask.answeredAt = this.now();
-    ask.effect = this.approvalEffect(normalized);
+    const effect = this.effectFor("approve_command", normalized);
+    const answeredAt = this.now();
 
+    // Event before commit: emit before mutating the ask.
     this.emit(
       ask.runId,
       "approval.resolved",
@@ -326,38 +347,55 @@ export class AskManager {
       {
         approvalId,
         decision: normalized,
-        effect: ask.effect,
+        effect,
         skeletonId: ask.skeletonId,
         refs: ask.refs,
       },
       ask.skeletonId,
       ask.taskId
     );
+
+    ask.status = "answered";
+    ask.answer = normalized;
+    ask.answeredAt = answeredAt;
+    ask.effect = effect;
+    this.delegateApprovalGrant(ask, normalized);
     return ask;
   }
 
-  private approvalEffect(decision: string): string {
-    switch (decision) {
-      case "Approve once":
-        return "run_once";
-      case "Approve this pattern for the run":
-        return "pattern_approved";
-      case "Deny and lay to rest":
-        return "denied_lay_to_rest";
-      default:
-        return "denied";
+  /**
+   * Registers grant tracking on the optional ApprovalManager without
+   * duplicating its state. Failures never override the recorded decision.
+   */
+  private delegateApprovalGrant(ask: AskRecord, decision: string): void {
+    const manager = this.approvalManager;
+    if (!manager || ask.kind !== "approve_command" || !ask.card) return;
+    const skeletonId = ask.skeletonId ?? ask.card.skeletonId;
+    try {
+      if (decision === "Approve once") {
+        manager.grantOnce(skeletonId, [ask.card.commandText], ask.card.cwd, undefined, ask.runId);
+      } else if (decision === "Approve this pattern for the run") {
+        manager.addPatternApproval(ask.runId, ask.card.commandText, {
+          command: ask.card.commandText,
+          cwd: ask.card.cwd,
+          skeletonId,
+          approvedBy: "user",
+          description: decision,
+        });
+      }
+    } catch {
+      // Grant tracking must never override the recorded decision.
     }
   }
-
 
   private effectFor(kind: AskKind, action: string): string {
     switch (kind) {
       case "approve_command":
         switch (action) {
           case "Approve once":
-            return "approved";
+            return "run_once";
           case "Approve this pattern for the run":
-            return "approved";
+            return "pattern_approved";
           case "Deny and lay to rest":
             return "denied_lay_to_rest";
           default:
@@ -410,16 +448,37 @@ export class AskManager {
     this.askSeq += 1;
     const askId = input.askId ?? `${input.runId}:ask:${this.askSeq}`;
     const raisedAt = this.now();
-    const options =
-      input.options && input.options.length > 0
-        ? [...input.options]
-        : [...ASK_OPTIONS[input.kind]];
+    const fixedOptions = ASK_OPTIONS[input.kind];
+    let options: string[];
+    if (input.options && input.options.length > 0) {
+      if (fixedOptions.length > 0) {
+        const matches =
+          input.options.length === fixedOptions.length &&
+          input.options.every((opt, i) => opt === fixedOptions[i]);
+        if (!matches) {
+          throw new AskManagerError(
+            `Options for '${input.kind}' must match the design-defined options (Requirement 28.9)`,
+            "INVALID_OPTIONS"
+          );
+        }
+        options = [...input.options];
+      } else {
+        options = [...input.options];
+      }
+    } else if (fixedOptions.length > 0) {
+      options = [...fixedOptions];
+    } else {
+      // Open-ended kinds (ambiguity) still need a default so every ask is
+      // answerable.
+      options = [ASK_DEFAULTS[input.kind]];
+    }
+    const question = redactText(input.question);
 
     const ask: AskRecord = {
       askId,
       runId: input.runId,
       kind: input.kind,
-      question: input.question,
+      question,
       options,
       defaultAction: ASK_DEFAULTS[input.kind],
       refs: Array.isArray(input.refs) ? [...input.refs] : [],
@@ -438,7 +497,7 @@ export class AskManager {
       {
         askId,
         kind: input.kind,
-        question: input.question,
+        question,
         options,
         defaultAction: ask.defaultAction,
         expiresAt: ask.expiresAt,
@@ -471,33 +530,118 @@ export class AskManager {
         "ASK_ALREADY_RESOLVED"
       );
     }
+    if (this.now() >= ask.expiresAt) {
+      this.expireAsk(ask, this.now());
+      throw new AskManagerError(
+        `Ask '${askId}' expired before it was answered`,
+        "ASK_EXPIRED"
+      );
+    }
     const normalized = answer.trim();
+    if (ask.kind === "exceed_budget" && normalized === "Raise the cap") {
+      throw new AskManagerError(
+        "Raise the cap must go through resolveBudgetAsk with ceiling validation",
+        "HARD_BLOCK_BUDGET_CEILING"
+      );
+    }
     if (!ask.options.includes(normalized)) {
       throw new AskManagerError(
         `Answer '${answer}' is not one of the design-defined options (Requirement 28.9)`,
         "INVALID_ANSWER"
       );
     }
-    ask.status = "answered";
-    ask.answer = normalized;
-    ask.answeredAt = this.now();
-    ask.effect = this.effectFor(ask.kind, normalized);
+    this.commitAskAnswer(ask, normalized);
+    return ask;
+  }
 
+  /**
+   * Event-before-commit: emits `ask.answered` before mutating the ask so a
+   * failed event write leaves the ask pending and safely retryable.
+   */
+  private commitAskAnswer(ask: AskRecord, answer: string): void {
+    const effect = this.effectFor(ask.kind, answer);
+    const answeredAt = this.now();
     this.emit(
       ask.runId,
       "ask.answered",
       "user",
       {
-        askId,
+        askId: ask.askId,
         kind: ask.kind,
-        answer: normalized,
-        effect: ask.effect,
+        answer,
+        effect,
         refs: ask.refs,
       },
       ask.skeletonId,
       ask.taskId
     );
-    return ask;
+    ask.status = "answered";
+    ask.answer = answer;
+    ask.answeredAt = answeredAt;
+    ask.effect = effect;
+  }
+
+  /**
+   * Emits the deadline outcome for an ask and then mutates it (event before
+   * commit). Shared by `expireAsks` and the pre-acceptance deadline checks.
+   */
+  private expireAsk(ask: AskRecord, at: number): ExpiredAskOutcome {
+    const effect = this.effectFor(ask.kind, ask.defaultAction);
+    if (ask.kind === "approve_command") {
+      this.emit(
+        ask.runId,
+        "approval.resolved",
+        "necromancer",
+        {
+          approvalId: ask.askId,
+          decision: ask.defaultAction,
+          effect,
+          reason: "deadline",
+          skeletonId: ask.skeletonId,
+          refs: ask.refs,
+        },
+        ask.skeletonId,
+        ask.taskId
+      );
+    } else {
+      this.emit(
+        ask.runId,
+        "ask.answered",
+        "necromancer",
+        {
+          askId: ask.askId,
+          kind: ask.kind,
+          answer: ask.defaultAction,
+          effect,
+          reason: "deadline",
+          refs: ask.refs,
+        },
+        ask.skeletonId,
+        ask.taskId
+      );
+    }
+
+    ask.status = "expired";
+    ask.expiredAt = at;
+    ask.answer = ask.defaultAction;
+    ask.effect = effect;
+
+    if (ask.kind === "exceed_budget") {
+      this.decide({
+        runId: ask.runId,
+        action: "finish_current_tasks_then_budget_stopped",
+        summary: "Budget ask timed out; finish current tasks then budget_stopped",
+        refs: ask.refs,
+      });
+    }
+
+    return {
+      askId: ask.askId,
+      runId: ask.runId,
+      kind: ask.kind,
+      defaultAction: ask.defaultAction,
+      effect,
+    };
   }
 
   /**
@@ -594,7 +738,26 @@ export class AskManager {
         "ASK_NOT_FOUND"
       );
     }
+    if (ask.status !== "pending") {
+      throw new AskManagerError(
+        `Ask '${input.askId}' is already ${ask.status}`,
+        "ASK_ALREADY_RESOLVED"
+      );
+    }
+    if (this.now() >= ask.expiresAt) {
+      this.expireAsk(ask, this.now());
+      throw new AskManagerError(
+        `Ask '${input.askId}' expired before it was answered`,
+        "ASK_EXPIRED"
+      );
+    }
     const normalized = input.answer.trim();
+    if (!ask.options.includes(normalized)) {
+      throw new AskManagerError(
+        `Answer '${input.answer}' is not one of the design-defined options (Requirement 28.9)`,
+        "INVALID_ANSWER"
+      );
+    }
     if (normalized === "Raise the cap") {
       if (input.requestedCap === undefined) {
         throw new AskManagerError(
@@ -616,7 +779,8 @@ export class AskManager {
         );
       }
     }
-    return this.answerAsk(input.askId, normalized);
+    this.commitAskAnswer(ask, normalized);
+    return ask;
   }
 
   /**
@@ -630,62 +794,7 @@ export class AskManager {
     for (const ask of this.asks.values()) {
       if (ask.status !== "pending") continue;
       if (ask.expiresAt > at) continue;
-
-      ask.status = "expired";
-      ask.expiredAt = at;
-      ask.answer = ask.defaultAction;
-      const effect = this.effectFor(ask.kind, ask.defaultAction);
-      ask.effect = effect;
-
-      if (ask.kind === "approve_command") {
-        this.emit(
-          ask.runId,
-          "approval.resolved",
-          "necromancer",
-          {
-            approvalId: ask.askId,
-            decision: ask.defaultAction,
-            effect,
-            reason: "deadline",
-            skeletonId: ask.skeletonId,
-            refs: ask.refs,
-          },
-          ask.skeletonId,
-          ask.taskId
-        );
-      } else {
-        this.emit(
-          ask.runId,
-          "ask.answered",
-          "necromancer",
-          {
-            askId: ask.askId,
-            kind: ask.kind,
-            answer: ask.defaultAction,
-            effect,
-            reason: "deadline",
-            refs: ask.refs,
-          },
-          ask.skeletonId,
-          ask.taskId
-        );
-        if (ask.kind === "exceed_budget") {
-          this.decide({
-            runId: ask.runId,
-            action: "finish_current_tasks_then_budget_stopped",
-            summary: "Budget ask timed out; finish current tasks then budget_stopped",
-            refs: ask.refs,
-          });
-        }
-      }
-
-      outcomes.push({
-        askId: ask.askId,
-        runId: ask.runId,
-        kind: ask.kind,
-        defaultAction: ask.defaultAction,
-        effect,
-      });
+      outcomes.push(this.expireAsk(ask, at));
     }
     return outcomes;
   }

@@ -12,6 +12,12 @@ import {
   normalizeCandidatePath,
   parseDiffPaths,
   PROTECTED_DIRECTORIES,
+  PRIVILEGE_COMMAND_HEADS,
+  SUDO_BINARIES,
+  PRIVILEGE_ESCALATION_BINARIES,
+  DESTRUCTIVE_HOST_BINARIES,
+  CONTAINER_SOCKET_MARKERS,
+  isHostBindVolumeMount,
 } from "../../lib/policy/hard-blocks";
 
 test("checkCommandHardBlocks: blocks sudo and raw privilege escalation", () => {
@@ -227,5 +233,136 @@ test("assertNoHardBlock: throws the structured denial and lifts nothing", () => 
       return true;
     }
   );
+});
+
+
+test("checkCommandHardBlocks: shared Tier 3 constants are exported and consistent", () => {
+  for (const bin of ["sudo", "sudoedit", "doas", "su", "pkexec"]) {
+    assert.equal(SUDO_BINARIES.has(bin), true);
+    assert.equal(PRIVILEGE_COMMAND_HEADS.has(bin), true);
+  }
+  for (const bin of ["setcap", "setuid", "chsh"]) {
+    assert.equal(PRIVILEGE_ESCALATION_BINARIES.has(bin), true);
+    assert.equal(PRIVILEGE_COMMAND_HEADS.has(bin), true);
+  }
+  for (const bin of ["mkfs", "mkfs.ext4", "shutdown", "reboot"]) {
+    assert.equal(DESTRUCTIVE_HOST_BINARIES.has(bin), true);
+  }
+  assert.deepEqual([...CONTAINER_SOCKET_MARKERS], [
+    "docker.sock",
+    "podman.sock",
+    "containerd.sock",
+    "crio.sock",
+  ]);
+});
+
+test("checkCommandHardBlocks: unwraps env/timeout/nohup and shell -c wrappers", () => {
+  const blocked: Array<[string[], string]> = [
+    [["env", "sudo", "id"], "HARD_BLOCK_SUDO"],
+    [["env", "su"], "HARD_BLOCK_SUDO"],
+    [["command", "sudo", "id"], "HARD_BLOCK_SUDO"],
+    [["exec", "sudo", "id"], "HARD_BLOCK_SUDO"],
+    [["timeout", "5", "sudo", "id"], "HARD_BLOCK_SUDO"],
+    [["nice", "-n", "5", "setcap", "cap_sys_admin+ep", "/tmp/x"], "HARD_BLOCK_PRIVILEGE_ESCALATION"],
+    [["nohup", "sudo", "id"], "HARD_BLOCK_SUDO"],
+    [["time", "sudo", "id"], "HARD_BLOCK_SUDO"],
+    [["sh", "-c", "sudo rm -rf /"], "HARD_BLOCK_SUDO"],
+    [["bash", "-c", "sudo id"], "HARD_BLOCK_SUDO"],
+    [["sh", "-c", "cat ok; sudo id"], "HARD_BLOCK_SUDO"],
+    [["python3", "-c", "os.system('sudo id')"], "HARD_BLOCK_SUDO"],
+    [["node", "-e", "require('child_process').execSync('sudo id')"], "HARD_BLOCK_SUDO"],
+  ];
+  for (const [argv, code] of blocked) {
+    const result = checkCommandHardBlocks(argv);
+    assert.equal(result.blocked, true, `${argv.join(" ")} must be blocked`);
+    assert.equal(result.code, code, `${argv.join(" ")} expected ${code}`);
+  }
+});
+
+test("checkCommandHardBlocks: sudo/privesc only at a command head position", () => {
+  // A filename argument that merely basenames to a privileged binary is fine.
+  assert.equal(checkCommandHardBlocks(["cat", "docs/su"]).blocked, false);
+  assert.equal(checkCommandHardBlocks(["ls", "-l", "bin/sudo"]).blocked, false);
+
+  // Real heads in any wrapped form are blocked.
+  for (const argv of [
+    ["su", "-"],
+    ["/usr/bin/sudo", "id"],
+    ["sh", "-c", "sudo id"],
+    ["env", "su"],
+  ]) {
+    const result = checkCommandHardBlocks(argv);
+    assert.equal(result.blocked, true, `${argv.join(" ")} must be blocked`);
+  }
+});
+
+test("checkCommandHardBlocks: -v/--volume host bind mounts require a host:container colon pair", () => {
+  // Bare paths (pytest -v /tests, grep -v /etc) are NOT host mounts.
+  assert.equal(checkCommandHardBlocks(["pytest", "-v", "/tests"]).blocked, false);
+  assert.equal(checkCommandHardBlocks(["grep", "-v", "/etc"]).blocked, false);
+
+  assert.equal(isHostBindVolumeMount(["pytest", "-v", "/tests"]), false);
+  assert.equal(isHostBindVolumeMount(["-v", "/:/host"]), true);
+  assert.equal(isHostBindVolumeMount(["--volume=/etc:/mnt"]), true);
+
+  for (const argv of [
+    ["docker", "run", "-v", "/:/host", "alpine"],
+    ["podman", "run", "--volume=/etc:/mnt", "img"],
+    ["docker", "run", "-v", "./local:/container", "img"],
+    ["docker", "run", "-v", "~/data:/container", "img"],
+  ]) {
+    const result = checkCommandHardBlocks(argv);
+    assert.equal(result.blocked, true, `${argv.join(" ")} must be blocked`);
+    assert.equal(result.code, "HARD_BLOCK_HOST_MOUNT");
+  }
+});
+
+test("checkCommandHardBlocks: dd blocks only the output operand", () => {
+  // Reading from a raw device is not a destructive write.
+  assert.equal(checkCommandHardBlocks(["dd", "if=/dev/sda", "of=/tmp/disk.img"]).blocked, false);
+  assert.equal(checkCommandHardBlocks(["dd", "if=/dev/zero", "of=/dev/sda"]).blocked, true);
+  assert.equal(checkCommandHardBlocks(["dd", "of=/dev/nvme0n1"]).blocked, true);
+  assert.equal(checkCommandHardBlocks(["dd", "of=/dev/mmcblk0"]).blocked, true);
+  assert.equal(checkCommandHardBlocks(["dd", "if=/dev/sda", "of=backup.img"]).blocked, false);
+});
+
+test("parseDiffPaths: deleted lines inside a hunk body are never read as file paths", () => {
+  const diff = [
+    "diff --git a/src/app.ts b/src/app.ts",
+    "--- a/src/app.ts",
+    "+++ b/src/app.ts",
+    "@@ -1,4 +1,4 @@",
+    "-removed line",
+    "--- a/not-a-real-header.txt",
+    "-- a double dash content line",
+    "+added line",
+    "diff --git a/src/next.ts b/src/next.ts",
+    "--- a/src/next.ts",
+    "+++ b/src/next.ts",
+  ].join("\n");
+
+  const paths = parseDiffPaths(diff);
+  assert.ok(paths.includes("src/app.ts"));
+  assert.ok(paths.includes("src/next.ts"));
+  assert.equal(
+    paths.some((p) => p.includes("not-a-real-header")),
+    false,
+    "hunk-body content must never be interpreted as a file path"
+  );
+  assert.equal(
+    paths.some((p) => p.includes("double dash")),
+    false,
+    "hunk-body content must never be interpreted as a file path"
+  );
+
+  // A deleted line that resembles a header only after the first hunk is ignored.
+  const intoProtected = [
+    "diff --git a/src/app.ts b/src/app.ts",
+    "--- a/src/app.ts",
+    "+++ b/src/app.ts",
+    "@@ -1 +1 @@",
+    "--- a/.kiro/steering/tech.md",
+  ].join("\n");
+  assert.equal(parseDiffPaths(intoProtected).includes(".kiro/steering/tech.md"), false);
 });
 

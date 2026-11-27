@@ -10,6 +10,7 @@ import {
   ASK_OPTIONS,
   ASK_DEFAULTS,
 } from "../../lib/hitl/ask-manager";
+import { ApprovalManager } from "../../lib/gateway/approval-manager";
 
 function createManager(options?: { now?: () => number; approvalWaitMs?: number }) {
   const store = new EventStore(":memory:");
@@ -312,4 +313,216 @@ test("AskManager: Raise the cap without an explicit requestedCap is refused", ()
   );
 });
 
+
+test("AskManager: answerAsk refuses to raise the budget cap directly", () => {
+  const { manager } = createManager();
+  const ask = manager.raiseAsk({
+    runId: "run-hitl-budget-bypass",
+    kind: "exceed_budget",
+    question: "raise the cap?",
+  });
+  assert.throws(
+    () => manager.answerAsk(ask.askId, "Raise the cap"),
+    (err: unknown) =>
+      err instanceof AskManagerError && err.code === "HARD_BLOCK_BUDGET_CEILING"
+  );
+  // The ask remains pending and is still resolvable through resolveBudgetAsk.
+  assert.equal(manager.getAsk(ask.askId)?.status, "pending");
+  const accepted = manager.resolveBudgetAsk({
+    askId: ask.askId,
+    answer: "Raise the cap",
+    currentCap: 10,
+    requestedCap: 20,
+    codeCeiling: 50,
+    globalCeiling: 100,
+  });
+  assert.equal(accepted.status, "answered");
+  assert.equal(accepted.effect, "cap_raised");
+});
+
+test("AskManager: expired asks are refused and expired with a deadline outcome", () => {
+  // Approval deadline.
+  let clock = 1_000;
+  const apprEnv = createManager({ now: () => clock, approvalWaitMs: 100 });
+  clock = 1_000;
+  const card = apprEnv.manager.requestApproval({
+    runId: "run-exp-approval",
+    commandText: "ls",
+    cwd: "/w",
+    riskClass: "safe",
+    skeletonId: "sk-1",
+  });
+  clock = 1_100;
+  assert.throws(
+    () => apprEnv.manager.resolveApproval(card.approvalId, "Approve once"),
+    (err: unknown) => err instanceof AskManagerError && err.code === "APPROVAL_EXPIRED"
+  );
+  assert.equal(apprEnv.manager.getAsk(card.approvalId)?.status, "expired");
+  const apprEvents = apprEnv.store.getEvents("run-exp-approval", { kind: "approval.resolved" });
+  assert.equal(apprEvents.length, 1);
+  assert.equal(apprEvents[0].data.reason, "deadline");
+
+  // Generic ask deadline.
+  let clock2 = 0;
+  const askEnv = createManager({ now: () => clock2, approvalWaitMs: 50 });
+  const ask = askEnv.manager.raiseAsk({
+    runId: "run-exp-ask",
+    kind: "plan_change",
+    question: "q?",
+  });
+  clock2 = 50;
+  assert.throws(
+    () => askEnv.manager.answerAsk(ask.askId, "Skip it"),
+    (err: unknown) => err instanceof AskManagerError && err.code === "ASK_EXPIRED"
+  );
+  assert.equal(ask.status, "expired");
+
+  // Budget ask deadline (checked before ceiling validation).
+  let clock3 = 0;
+  const budgetEnv = createManager({ now: () => clock3, approvalWaitMs: 25 });
+  const budget = budgetEnv.manager.raiseAsk({
+    runId: "run-exp-budget",
+    kind: "exceed_budget",
+    question: "q?",
+  });
+  clock3 = 25;
+  assert.throws(
+    () =>
+      budgetEnv.manager.resolveBudgetAsk({
+        askId: budget.askId,
+        answer: "Raise the cap",
+        currentCap: 10,
+        requestedCap: 40,
+        codeCeiling: 50,
+        globalCeiling: 100,
+      }),
+    (err: unknown) => err instanceof AskManagerError && err.code === "ASK_EXPIRED"
+  );
+});
+
+test("AskManager: ambiguity asks default to an answerable option", () => {
+  const { manager } = createManager();
+  const ask = manager.raiseAsk({
+    runId: "run-ambiguity",
+    kind: "ambiguity",
+    question: "which candidate?",
+  });
+  assert.deepEqual([...ask.options], [ASK_DEFAULTS.ambiguity]);
+  const answered = manager.answerAsk(ask.askId, ASK_DEFAULTS.ambiguity);
+  assert.equal(answered.status, "answered");
+  assert.equal(answered.effect, "evidence_backed_candidate");
+
+  // An explicit custom option for an open-ended kind is honoured.
+  const custom = manager.raiseAsk({
+    runId: "run-ambiguity",
+    kind: "ambiguity",
+    question: "pick?",
+    options: ["candidate-x"],
+  });
+  assert.deepEqual([...custom.options], ["candidate-x"]);
+});
+
+test("AskManager: fixed-option kinds reject custom options that differ from the design", () => {
+  const { manager } = createManager();
+  assert.throws(
+    () =>
+      manager.raiseAsk({
+        runId: "run-fixed-options",
+        kind: "conflict_choice",
+        question: "prefer?",
+        options: ["A", "B"],
+      }),
+    (err: unknown) => err instanceof AskManagerError && err.code === "INVALID_OPTIONS"
+  );
+  const ok = manager.raiseAsk({
+    runId: "run-fixed-options",
+    kind: "conflict_choice",
+    question: "prefer?",
+    options: [...ASK_OPTIONS.conflict_choice],
+  });
+  assert.deepEqual([...ok.options], [...ASK_OPTIONS.conflict_choice]);
+});
+
+
+
+test("AskManager: approval fields and ask questions are redacted before storing and emitting", () => {
+  const { store, manager } = createManager();
+  const card = manager.requestApproval({
+    runId: "run-redact",
+    commandText: "cat /root/notes.txt",
+    cwd: "/home/alice/work",
+    riskClass: "read",
+    skeletonId: "sk-1",
+    reason: "read /root/notes.txt",
+  });
+  assert.ok(card.commandText.includes("[REDACTED]"));
+  assert.ok(card.cwd.includes("[REDACTED]"));
+  assert.ok(card.reason.includes("[REDACTED]"));
+
+  const requested = store.getEvents("run-redact", { kind: "approval.requested" })[0];
+  assert.ok((requested.data.commandText as string).includes("[REDACTED]"));
+  assert.ok((requested.data.cwd as string).includes("[REDACTED]"));
+
+  const ask = manager.raiseAsk({
+    runId: "run-redact",
+    kind: "plan_change",
+    question: "the plan references /root/secret.md",
+  });
+  assert.ok(ask.question.includes("[REDACTED]"));
+});
+
+test("AskManager: approval effects are consistent for every design decision", () => {
+  const { manager } = createManager();
+  const raise = (runId: string) =>
+    manager.requestApproval({
+      runId,
+      commandText: "npm ci",
+      cwd: "/w",
+      riskClass: "safe",
+      skeletonId: "sk-eff",
+    });
+
+  assert.equal(
+    manager.resolveApproval(raise("run-eff-1").approvalId, "Approve once").effect,
+    "run_once"
+  );
+  assert.equal(
+    manager.resolveApproval(
+      raise("run-eff-2").approvalId,
+      "Approve this pattern for the run"
+    ).effect,
+    "pattern_approved"
+  );
+  assert.equal(
+    manager.resolveApproval(raise("run-eff-3").approvalId, "Deny and lay to rest").effect,
+    "denied_lay_to_rest"
+  );
+  assert.equal(manager.resolveApproval(raise("run-eff-4").approvalId, "Deny").effect, "denied");
+});
+
+test("AskManager: delegates grant tracking to a supplied ApprovalManager", () => {
+  const approvalManager = new ApprovalManager({ defaultWaitMs: 60_000 });
+  const store = new EventStore(":memory:");
+  const manager = new AskManager({ eventStore: store, approvalManager });
+
+  const once = manager.requestApproval({
+    runId: "run-deleg",
+    commandText: "npm ci",
+    cwd: "/w",
+    riskClass: "safe",
+    skeletonId: "sk-d",
+  });
+  manager.resolveApproval(once.approvalId, "Approve once");
+  assert.equal(approvalManager.consumeGrant("sk-d", ["npm ci"], "/w"), true);
+
+  const pattern = manager.requestApproval({
+    runId: "run-deleg",
+    commandText: "npm test",
+    cwd: "/w",
+    riskClass: "safe",
+    skeletonId: "sk-d",
+  });
+  manager.resolveApproval(pattern.approvalId, "Approve this pattern for the run");
+  assert.equal(approvalManager.isPatternApproved("run-deleg", ["npm test"]), true);
+});
 

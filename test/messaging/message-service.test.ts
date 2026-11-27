@@ -299,3 +299,227 @@ test("MessageService: emits a silence nudge past the silent limit", () => {
   );
 });
 
+
+test("MessageService: persists (redacted) message text in events", () => {
+  const { store, service } = createService();
+  const record = service.send({
+    runId: "run-msg-text",
+    from: "user",
+    to: "necromancer",
+    intent: "instruct",
+    text: "focus the python files",
+  });
+  const sent = store.getEvents("run-msg-text", { kind: "message.sent" });
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].data.msgId, record.id);
+  assert.equal(sent[0].data.text, "focus the python files");
+
+  service.send({
+    runId: "run-msg-text",
+    from: "user",
+    to: "necromancer",
+    intent: "instruct",
+    text: "read /root/secret-notes.md",
+  });
+  const last = store.getEvents("run-msg-text", { kind: "message.sent" }).at(-1);
+  assert.ok(typeof last?.data.text === "string");
+  assert.ok(
+    (last?.data.text as string).includes("[REDACTED]"),
+    "event text must be redacted"
+  );
+});
+
+test("MessageService: receiving a message never resets a Skeleton's silence clock", () => {
+  let clock = 0;
+  const { service } = createService({ now: () => clock });
+
+  service.registerSkeleton("sk-silent", 0);
+  clock = 1_000;
+  service.send({
+    runId: "run-silence-clock",
+    from: "user",
+    to: "sk-silent",
+    skeletonId: "sk-silent",
+    recipientRole: "bonesetter",
+    intent: "instruct",
+    text: "keep going",
+  });
+
+  clock = DEFAULT_SILENT_SKELETON_MS;
+  const nudged = service.checkSilence("run-silence-clock", "sk-silent", {
+    recipientRole: "bonesetter",
+  });
+  assert.equal(nudged.silent, true);
+  assert.equal(nudged.nudged, true);
+
+  // Explicit activity from the Skeleton resets the clock.
+  service.noteActivity("sk-silent", clock);
+  assert.equal(
+    service.checkSilence("run-silence-clock", "sk-silent", {
+      recipientRole: "bonesetter",
+    }).nudged,
+    false
+  );
+});
+
+test("MessageService: registerSkeleton and startedAt provide a silence baseline", () => {
+  let clock = 0;
+  const { service } = createService({ now: () => clock });
+  service.registerSkeleton("sk-reg", 0);
+  clock = DEFAULT_SILENT_SKELETON_MS + 5;
+  assert.equal(
+    service.checkSilence("run-reg", "sk-reg", { recipientRole: "bonesetter" }).nudged,
+    true
+  );
+
+  let clock2 = 0;
+  const store2 = new EventStore(":memory:");
+  const service2 = new MessageService({ eventStore: store2, now: () => clock2 });
+  clock2 = DEFAULT_SILENT_SKELETON_MS + 1;
+  const withStartedAt = service2.checkSilence("run-started", "sk-started", {
+    recipientRole: "bonesetter",
+    startedAt: 0,
+  });
+  assert.equal(withStartedAt.silent, true);
+  assert.equal(withStartedAt.nudged, true);
+});
+
+test("MessageService: resolveRole validates the actual recipient and reports ROLE_MISMATCH", () => {
+  const { service } = createService();
+  assert.throws(
+    () =>
+      service.send({
+        runId: "run-role-mismatch",
+        from: "user",
+        to: "warden",
+        recipientRole: "bonesetter",
+        intent: "add_review_focus",
+        text: "review this",
+      }),
+    (err: unknown) => err instanceof MessageError && err.code === "ROLE_MISMATCH"
+  );
+
+  const store = new EventStore(":memory:");
+  const mapped = new MessageService({
+    eventStore: store,
+    roleBySkeletonId: { "sk-map": "warden" },
+  });
+  assert.throws(
+    () =>
+      mapped.send({
+        runId: "run-role-map",
+        from: "necromancer",
+        to: "sk-map",
+        skeletonId: "sk-map",
+        recipientRole: "bonesetter",
+        intent: "add_review_focus",
+        text: "review",
+      }),
+    (err: unknown) => err instanceof MessageError && err.code === "ROLE_MISMATCH"
+  );
+  assert.doesNotThrow(() =>
+    mapped.send({
+      runId: "run-role-map",
+      from: "necromancer",
+      to: "sk-map",
+      skeletonId: "sk-map",
+      recipientRole: "warden",
+      intent: "add_review_focus",
+      text: "review",
+    })
+  );
+});
+
+test("MessageService: interrupt_now delivery is refused for the Warden and Scribe", () => {
+  const { service } = createService();
+  assert.throws(
+    () =>
+      service.send({
+        runId: "run-interrupt",
+        from: "user",
+        to: "scribe",
+        recipientRole: "scribe",
+        intent: "instruct",
+        text: "write now",
+        delivery: "interrupt_now",
+      }),
+    (err: unknown) => err instanceof MessageError && err.code === "FORBIDDEN_TARGET"
+  );
+  assert.throws(
+    () =>
+      service.send({
+        runId: "run-interrupt",
+        from: "user",
+        to: "warden",
+        recipientRole: "warden",
+        intent: "add_review_focus",
+        text: "look here",
+        delivery: "interrupt_now",
+      }),
+    (err: unknown) => err instanceof MessageError && err.code === "FORBIDDEN_TARGET"
+  );
+});
+
+test("MessageService: mailboxes are isolated per run and aggregate in insertion order", () => {
+  const { service } = createService();
+  service.send({
+    runId: "run-mbox-a",
+    from: "necromancer",
+    to: "bonesetter",
+    skeletonId: "sk-a",
+    recipientRole: "bonesetter",
+    intent: "instruct",
+    text: "a",
+  });
+  service.send({
+    runId: "run-mbox-b",
+    from: "necromancer",
+    to: "bonesetter",
+    skeletonId: "sk-b",
+    recipientRole: "bonesetter",
+    intent: "instruct",
+    text: "b",
+  });
+
+  assert.equal(service.getMailbox("bonesetter", "run-mbox-a").length, 1);
+  assert.equal(service.getMailbox("bonesetter", "run-mbox-a")[0].text, "a");
+  assert.equal(service.getMailbox("bonesetter", "run-mbox-b").length, 1);
+  const all = service.getMailbox("bonesetter");
+  assert.equal(all.length, 2);
+  assert.deepEqual(all.map((m) => m.text), ["a", "b"]);
+});
+
+test("MessageService: events are appended before in-memory commit (retryable)", () => {
+  let failNext = true;
+  const appended: Array<Record<string, unknown>> = [];
+  const store = {
+    append: (event: Record<string, unknown>) => {
+      if (failNext) {
+        failNext = false;
+        throw new Error("event store write failed");
+      }
+      appended.push(event);
+    },
+  };
+  const service = new MessageService({ eventStore: store as never });
+
+  const input = {
+    runId: "run-ebc",
+    from: "necromancer" as const,
+    to: "bonesetter",
+    skeletonId: "sk-ebc",
+    recipientRole: "bonesetter" as const,
+    intent: "instruct" as const,
+    text: "hello",
+  };
+
+  assert.throws(() => service.send(input));
+  assert.equal(service.listMessages().length, 0);
+  assert.equal(service.getMailbox("bonesetter").length, 0);
+
+  service.send(input);
+  assert.equal(service.listMessages().length, 1);
+  assert.equal(service.getMailbox("bonesetter").length, 1);
+  assert.equal(appended.length, 1);
+});
+
