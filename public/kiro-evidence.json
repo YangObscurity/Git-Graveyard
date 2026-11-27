@@ -1,0 +1,602 @@
+{
+  "schemaVersion": "v1",
+  "generatedFromSha": "00a1bab",
+  "specs": [
+    {
+      "path": ".kiro/specs/resurrection-engine/.config.kiro",
+      "name": "resurrection-engine"
+    },
+    {
+      "path": ".kiro/specs/resurrection-engine/design.md",
+      "name": "resurrection-engine"
+    },
+    {
+      "path": ".kiro/specs/resurrection-engine/requirements.md",
+      "name": "resurrection-engine"
+    },
+    {
+      "path": ".kiro/specs/resurrection-engine/tasks.md",
+      "name": "resurrection-engine"
+    },
+    {
+      "path": ".kiro/specs/resurrection/graveyard-fixtures-F-node-cjs-request/design.md",
+      "name": "graveyard-fixtures-F-node-cjs-request"
+    },
+    {
+      "path": ".kiro/specs/resurrection/graveyard-fixtures-F-node-cjs-request/requirements.md",
+      "name": "graveyard-fixtures-F-node-cjs-request"
+    },
+    {
+      "path": ".kiro/specs/resurrection/graveyard-fixtures-F-node-cjs-request/tasks.md",
+      "name": "graveyard-fixtures-F-node-cjs-request"
+    },
+    {
+      "path": ".kiro/specs/resurrection/graveyard-fixtures-F-node-webpack2/design.md",
+      "name": "graveyard-fixtures-F-node-webpack2"
+    },
+    {
+      "path": ".kiro/specs/resurrection/graveyard-fixtures-F-node-webpack2/requirements.md",
+      "name": "graveyard-fixtures-F-node-webpack2"
+    },
+    {
+      "path": ".kiro/specs/resurrection/graveyard-fixtures-F-node-webpack2/tasks.md",
+      "name": "graveyard-fixtures-F-node-webpack2"
+    },
+    {
+      "path": ".kiro/specs/resurrection/graveyard-fixtures-F-python2/design.md",
+      "name": "graveyard-fixtures-F-python2"
+    },
+    {
+      "path": ".kiro/specs/resurrection/graveyard-fixtures-F-python2/requirements.md",
+      "name": "graveyard-fixtures-F-python2"
+    },
+    {
+      "path": ".kiro/specs/resurrection/graveyard-fixtures-F-python2/tasks.md",
+      "name": "graveyard-fixtures-F-python2"
+    }
+  ],
+  "steering": [
+    {
+      "path": ".kiro/steering/modernization-rules.md",
+      "name": "modernization-rules",
+      "inclusion": "always"
+    },
+    {
+      "path": ".kiro/steering/product.md",
+      "name": "product",
+      "inclusion": "always"
+    },
+    {
+      "path": ".kiro/steering/structure.md",
+      "name": "structure",
+      "inclusion": "always"
+    },
+    {
+      "path": ".kiro/steering/tech.md",
+      "name": "tech",
+      "inclusion": "always"
+    }
+  ],
+  "hooks": [
+    {
+      "name": "rules-props",
+      "trigger": "PostFileSave",
+      "matcher": "lib/rules/.*\\.ts$",
+      "command": "npm run test:props"
+    },
+    {
+      "name": "task-golden",
+      "trigger": "PostTaskExec",
+      "command": "npm run test:golden"
+    },
+    {
+      "name": "guard-paths",
+      "trigger": "PreToolUse",
+      "command": "node scripts/hooks/guard-paths.mjs"
+    }
+  ],
+  "agents": [
+    {
+      "path": "lib/agents/templates/bonesetter.md",
+      "name": "bonesetter",
+      "description": "Bonesetter builder Skeleton that repairs package manifests and lock files",
+      "tools": [
+        "read",
+        "write",
+        "sandbox_exec",
+        "sandbox_log",
+        "report_task_result",
+        "ask",
+        "report_blocker",
+        "ack_message"
+      ],
+      "excludedTools": [
+        "shell",
+        "web",
+        "subagent"
+      ],
+      "permissions": [
+        {
+          "capability": "shell",
+          "effect": "deny"
+        },
+        {
+          "capability": "web_fetch",
+          "effect": "deny"
+        },
+        {
+          "capability": "web_search",
+          "effect": "deny"
+        },
+        {
+          "capability": "subagent",
+          "effect": "deny"
+        },
+        {
+          "capability": "fs_read",
+          "effect": "deny",
+          "match": [
+            "**/.env",
+            "**/.env.*",
+            "**/*.pem",
+            "**/id_*"
+          ]
+        },
+        {
+          "capability": "fs_write",
+          "effect": "deny",
+          "match": [
+            "**/.git/**",
+            "**/.kiro/**"
+          ]
+        },
+        {
+          "capability": "fs_write",
+          "effect": "allow",
+          "match": [
+            "**/package.json",
+            "**/package-lock.json",
+            "**/npm-shrinkwrap.json",
+            "**/yarn.lock",
+            "**/pnpm-lock.yaml",
+            "**/poetry.lock",
+            "**/Pipfile",
+            "**/Pipfile.lock",
+            "**/setup.py",
+            "**/pyproject.toml",
+            "**/requirements*.txt"
+          ]
+        }
+      ],
+      "modelTier": "Claude Sonnet 5.5",
+      "policyPreset": "read-workspace"
+    },
+    {
+      "path": "lib/agents/templates/exhumer.md",
+      "name": "exhumer",
+      "description": "Exhumer Skeleton triage session that reads harness logs and classifies failures",
+      "tools": [
+        "read",
+        "sandbox_exec",
+        "sandbox_log",
+        "report_task_result"
+      ],
+      "excludedTools": [
+        "shell",
+        "web",
+        "subagent"
+      ],
+      "permissions": [
+        {
+          "capability": "shell",
+          "effect": "deny"
+        },
+        {
+          "capability": "web_fetch",
+          "effect": "deny"
+        },
+        {
+          "capability": "web_search",
+          "effect": "deny"
+        },
+        {
+          "capability": "subagent",
+          "effect": "deny"
+        },
+        {
+          "capability": "fs_read",
+          "effect": "deny",
+          "match": [
+            "**/.env",
+            "**/.env.*",
+            "**/*.pem",
+            "**/id_*"
+          ]
+        },
+        {
+          "capability": "fs_write",
+          "effect": "deny"
+        }
+      ],
+      "modelTier": "Claude Haiku 5.5",
+      "policyPreset": "read-workspace"
+    },
+    {
+      "path": "lib/agents/templates/planner.md",
+      "name": "planner",
+      "description": "Planner Skeleton that writes the Pact and answers asks and revisions",
+      "tools": [
+        "read",
+        "write",
+        "report_task_result",
+        "ask"
+      ],
+      "excludedTools": [
+        "shell",
+        "web",
+        "subagent"
+      ],
+      "permissions": [
+        {
+          "capability": "shell",
+          "effect": "deny"
+        },
+        {
+          "capability": "web_fetch",
+          "effect": "deny"
+        },
+        {
+          "capability": "web_search",
+          "effect": "deny"
+        },
+        {
+          "capability": "subagent",
+          "effect": "deny"
+        },
+        {
+          "capability": "fs_read",
+          "effect": "deny",
+          "match": [
+            "**/.env",
+            "**/.env.*",
+            "**/*.pem",
+            "**/id_*"
+          ]
+        },
+        {
+          "capability": "fs_write",
+          "effect": "deny",
+          "match": [
+            "**/.git/**",
+            "**/.kiro/**"
+          ]
+        },
+        {
+          "capability": "fs_write",
+          "effect": "allow",
+          "match": [
+            "spec/**"
+          ]
+        }
+      ],
+      "modelTier": "Claude Opus 5.5",
+      "policyPreset": "edit-workspace"
+    },
+    {
+      "path": "lib/agents/templates/scribe.md",
+      "name": "scribe",
+      "description": "Scribe Skeleton that writes the run report reading with strict evidence citations",
+      "tools": [
+        "read",
+        "write",
+        "report_task_result",
+        "ack_message"
+      ],
+      "excludedTools": [
+        "shell",
+        "web",
+        "subagent"
+      ],
+      "permissions": [
+        {
+          "capability": "shell",
+          "effect": "deny"
+        },
+        {
+          "capability": "web_fetch",
+          "effect": "deny"
+        },
+        {
+          "capability": "web_search",
+          "effect": "deny"
+        },
+        {
+          "capability": "subagent",
+          "effect": "deny"
+        },
+        {
+          "capability": "fs_read",
+          "effect": "deny",
+          "match": [
+            "**/.env",
+            "**/.env.*",
+            "**/*.pem",
+            "**/*.key",
+            "**/id_*"
+          ]
+        },
+        {
+          "capability": "fs_write",
+          "effect": "deny",
+          "match": [
+            "**/.git/**",
+            "**/.kiro/**",
+            "**/.env",
+            "**/.env.*",
+            "**/*.pem",
+            "**/*.key",
+            "**/id_*"
+          ]
+        },
+        {
+          "capability": "fs_write",
+          "effect": "allow",
+          "match": [
+            "report/**"
+          ]
+        }
+      ],
+      "modelTier": "Claude Haiku 5.5",
+      "policyPreset": "edit-workspace"
+    },
+    {
+      "path": "lib/agents/templates/soul-stitcher.md",
+      "name": "soul-stitcher",
+      "description": "Soul-stitcher builder Skeleton that changes code in its own worktree for one task",
+      "tools": [
+        "read",
+        "write",
+        "sandbox_exec",
+        "sandbox_log",
+        "report_task_result",
+        "ask",
+        "report_blocker",
+        "ack_message",
+        "propose_task"
+      ],
+      "excludedTools": [
+        "shell",
+        "web",
+        "subagent"
+      ],
+      "permissions": [
+        {
+          "capability": "shell",
+          "effect": "deny"
+        },
+        {
+          "capability": "web_fetch",
+          "effect": "deny"
+        },
+        {
+          "capability": "web_search",
+          "effect": "deny"
+        },
+        {
+          "capability": "subagent",
+          "effect": "deny"
+        },
+        {
+          "capability": "fs_read",
+          "effect": "deny",
+          "match": [
+            "**/.env",
+            "**/.env.*",
+            "**/*.pem",
+            "**/id_*"
+          ]
+        },
+        {
+          "capability": "fs_write",
+          "effect": "deny",
+          "match": [
+            "**/.git/**",
+            "**/.kiro/**"
+          ]
+        }
+      ],
+      "modelTier": "Claude Sonnet 5.5 (Claude Opus 5.5 for tasks marked hard: yes)",
+      "policyPreset": "edit-workspace"
+    },
+    {
+      "path": "lib/agents/templates/warden.md",
+      "name": "warden",
+      "description": "Warden read-only reviewer Skeleton that reviews Candidate changes in isolated auditbox",
+      "tools": [
+        "read",
+        "sandbox_exec",
+        "sandbox_log",
+        "warden_verdict"
+      ],
+      "excludedTools": [
+        "shell",
+        "web",
+        "subagent"
+      ],
+      "permissions": [
+        {
+          "capability": "shell",
+          "effect": "deny"
+        },
+        {
+          "capability": "web_fetch",
+          "effect": "deny"
+        },
+        {
+          "capability": "web_search",
+          "effect": "deny"
+        },
+        {
+          "capability": "subagent",
+          "effect": "deny"
+        },
+        {
+          "capability": "fs_read",
+          "effect": "deny",
+          "match": [
+            "**/.env",
+            "**/.env.*",
+            "**/*.pem",
+            "**/id_*"
+          ]
+        },
+        {
+          "capability": "fs_write",
+          "effect": "deny"
+        }
+      ],
+      "modelTier": "Claude Opus 5.5",
+      "policyPreset": "read-workspace"
+    }
+  ],
+  "commitLinks": [
+    {
+      "sha": "94d8bbacbdac21a8192b493cf8f90138eccc5924",
+      "shortSha": "94d8bba",
+      "subject": "fix(wave-3): accept verified gg_admin_session cookies in run mutation authorization",
+      "refs": ""
+    },
+    {
+      "sha": "481c6c6becc3a8110b73fc56734fbdb82b27b3b7",
+      "shortSha": "481c6c6",
+      "subject": "fix(wave-3): preserve worktree on in-review graceful stop and update budget caps in place",
+      "refs": ""
+    },
+    {
+      "sha": "8fc22d9931e0573f69a616073041989a68223cd3",
+      "shortSha": "8fc22d9",
+      "subject": "fix(wave-3): build scribe evidence index only from authoritative runtime records",
+      "refs": ""
+    },
+    {
+      "sha": "1e6b05ebca9340e7990ea31a374beba8b739a9be",
+      "shortSha": "1e6b05e",
+      "subject": "fix(wave-3): preserve worker worktree when worker throws during graceful stop",
+      "refs": ""
+    },
+    {
+      "sha": "41c5ee86cf84cb27001aa1cc7c7d2ec949da0466",
+      "shortSha": "41c5ee8",
+      "subject": "fix(wave-3): wire per-run budget governor gates and boundary-aware graceful stop",
+      "refs": ""
+    },
+    {
+      "sha": "e7a3335fc543e60cbf0100b38d0366db79e83487",
+      "shortSha": "e7a3335",
+      "subject": "fix(wave-3): guard in-review cancellation, serialize skeleton reraise, and forward warden review focus",
+      "refs": ""
+    },
+    {
+      "sha": "e9fc66e3053570c1a46c177f115114684c9db852",
+      "shortSha": "e9fc66e",
+      "subject": "fix(wave-3): restart pipeline on reraise, propagate queue evictions, and preserve killed outcome on hard kill",
+      "refs": ""
+    },
+    {
+      "sha": "b5b1e1d26be088ab3fa9c9738bedfe0db52c53a3",
+      "shortSha": "b5b1e1d",
+      "subject": "fix(wave-3): harden redaction fail-closed rules, approval prefix scoping, dispatcher interrupts, queue sync, and kill-switch persistence",
+      "refs": ""
+    },
+    {
+      "sha": "839ac1161bbb213238818c5f094b84ec96afbd78",
+      "shortSha": "839ac11",
+      "subject": "fix(wave-3): wire run routes, admin queue, kill switch, and read-time field redaction to live runtime",
+      "refs": ""
+    },
+    {
+      "sha": "b64467e6d6512382d8351813bcf286642e9ea2f5",
+      "shortSha": "b64467e",
+      "subject": "fix(wave-3): preserve own __proto__ keys in queue clone and isolate post-send lookup",
+      "refs": ""
+    },
+    {
+      "sha": "0a4f16588376f1416f8185c1111ccc28e2e08bde",
+      "shortSha": "0a4f165",
+      "subject": "fix(wave-3): resolve review findings and secret-scan test fixture",
+      "refs": ""
+    },
+    {
+      "sha": "0bc8075d036a8e19c0db46cb3e78a57aa99ac98a",
+      "shortSha": "0bc8075",
+      "subject": "fix(wave-3): harden run routes, admin/admission/governor, scribe, and recovery",
+      "refs": ""
+    },
+    {
+      "sha": "0fe4bfe38578e739639cc720f69ab2ec07b6c61c",
+      "shortSha": "0fe4bfe",
+      "subject": "feat(scribe,recovery): add ScribeService, ReportCheck verification, failure recovery, and boot reconciliation",
+      "refs": ""
+    },
+    {
+      "sha": "1b07abb185324011111718b8e3c3c69cac594b74",
+      "shortSha": "1b07abb",
+      "subject": "feat(admission,admin): add invite codes, FIFO queue, BudgetGovernor, admin auth, and kill switch",
+      "refs": ""
+    },
+    {
+      "sha": "2a5792c07415ddddcd9fbd4e0761d4cdb79d2926",
+      "shortSha": "2a5792c",
+      "subject": "feat(api): add R4-10 mutating run routes, fork-push confirmation, and UI API wrappers",
+      "refs": ""
+    },
+    {
+      "sha": "bae74eb256cb5cf0e7510d16cedc901b7ccb9f40",
+      "shortSha": "bae74eb",
+      "subject": "docs(spec): check off Wave 2 tasks 19.3-19.10, 20.3-20.4, 21.1-21.3, 21.5",
+      "refs": ""
+    },
+    {
+      "sha": "9a976bfefa4355a9b3cf2322cbcaf55878a6492a",
+      "shortSha": "9a976bf",
+      "subject": "docs(steering): remove stale handoff file reference",
+      "refs": ""
+    },
+    {
+      "sha": "bf109b633cf1e1467cbce0fb439deeff230886c1",
+      "shortSha": "bf109b6",
+      "subject": "chore: add open-source governance, security gates, and AI PR audit configs",
+      "refs": ""
+    },
+    {
+      "sha": "3c90bd9e8c6ed77f31765520b36e1e5b8d07b472",
+      "shortSha": "3c90bd9",
+      "subject": "fix(final-check): report build as not run when there is no build script",
+      "refs": ""
+    },
+    {
+      "sha": "9a8f080f549fbb010061f881a1775128c1c36cec",
+      "shortSha": "9a8f080",
+      "subject": "fix(runtime): store each gateway event once",
+      "refs": ""
+    },
+    {
+      "sha": "1d7edf5057b8b417f99640c5280481bfddae1dbf",
+      "shortSha": "1d7edf5",
+      "subject": "docs(tasks): mark Increment 0-1 complete",
+      "refs": ""
+    },
+    {
+      "sha": "982a391e65695d4e305ebe077c13ffa70fe86bbf",
+      "shortSha": "982a391",
+      "subject": "fix(supervisor): never send OS process.kill to mocked child processes",
+      "refs": ""
+    },
+    {
+      "sha": "607ac84fc27bfe2794856047803f005e88cf7c38",
+      "shortSha": "607ac84",
+      "subject": "fix: address PR #1 audit findings in planner retry, run-model, and runtime",
+      "refs": ""
+    }
+  ]
+}
