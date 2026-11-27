@@ -31,6 +31,14 @@ export interface ResolveApprovalParams {
   resolvedBy?: string;
   ttlMs?: number;
   runId?: string;
+  /**
+   * Approval scope. `"once"` approves a single request; `"run_pattern"`
+   * records the resolved pattern for the run so later matching approvals
+   * auto-resolve.
+   */
+  scope?: string;
+  /** Explicit run-scoped command pattern for `approve_pattern` resolutions. */
+  pattern?: string;
   [key: string]: unknown;
 }
 
@@ -64,6 +72,46 @@ export interface ApprovalManagerOptions {
 export function sha256Argv(argv: string[]): string {
   const serialized = JSON.stringify(argv);
   return crypto.createHash("sha256").update(serialized).digest("hex");
+}
+
+/**
+ * Derives a conservative run-scoped command prefix from an approved argv: the
+ * program name plus the leading run of literal (non-flag) subcommand tokens.
+ * The result is a prefix, so `matchCommandPattern` still requires a word
+ * boundary before matching.
+ *
+ * A prefix is only safe when a literal subcommand immediately follows the
+ * executable. Whenever a flag precedes the first subcommand - or no subcommand
+ * is present at all - auto-derivation is refused and `undefined` is returned,
+ * because a bare executable prefix (e.g. `"node"`, `"git"`) would authorize any
+ * later invocation of that program (CWE-863). For instance,
+ * `["npm", "test", "--watch"]` yields `"npm test"` and `["git", "status"]`
+ * yields `"git status"`, while `["node", "-e", "…"]`,
+ * `["python", "-m", "unittest"]` and `["node"]` yield `undefined`. Callers must
+ * fall back to an explicit `pattern` or exact argv (one-time grant) matching.
+ */
+export function deriveCommandPrefix(
+  argv: readonly string[] | undefined
+): string | undefined {
+  if (!Array.isArray(argv) || argv.length === 0) return undefined;
+  const tokens = argv.filter(
+    (token) => typeof token === "string" && token.trim().length > 0
+  );
+  if (tokens.length === 0) return undefined;
+
+  // Require a literal subcommand right after the executable. An executable on
+  // its own, or one followed by flags (which may themselves introduce the real
+  // subcommand), cannot be widened into a safe prefix.
+  if (tokens[1] === undefined || tokens[1].startsWith("-")) {
+    return undefined;
+  }
+
+  const head: string[] = [tokens[0]];
+  for (let i = 1; i < tokens.length; i += 1) {
+    if (tokens[i].startsWith("-")) break;
+    head.push(tokens[i]);
+  }
+  return head.join(" ");
 }
 
 export class ApprovalManager {
@@ -260,6 +308,52 @@ export class ApprovalManager {
       },
     });
 
+    // Run-scoped pattern auto-approval: a command that already matches a
+    // pattern approved for this run resolves immediately with a one-time grant
+    // instead of raising a fresh pending card.
+    try {
+      if (
+        this.isPatternApproved(runId, actualArgv, {
+          cwd: canonicalCwd,
+          skeletonId: actualSkeletonId,
+        })
+      ) {
+        const approved: ApprovalRecord = {
+          ...request,
+          status: "approved",
+          resolvedAt: Date.now(),
+        };
+        this.records.set(approvalId, approved);
+        this.pendingRequests.delete(approvalId);
+        this.grantApproval(
+          approvalId,
+          actualSkeletonId,
+          actualArgv,
+          canonicalCwd,
+          approved.expiresAt,
+          runId
+        );
+        await this.emitEvent({
+          kind: "approval.resolved",
+          runId,
+          actor: "mcp_gateway",
+          skeletonId: actualSkeletonId,
+          data: {
+            approvalId,
+            decision: "approved",
+            argv: redactedArgv,
+            cwd: redactedCwd,
+            expiresAt: approved.expiresAt,
+            patternApproved: true,
+            refs: [],
+          },
+        });
+        return this.records.get(approvalId) ?? approved;
+      }
+    } catch {
+      // A pattern lookup failure must never break raising the request.
+    }
+
     return request;
   }
 
@@ -368,11 +462,17 @@ export class ApprovalManager {
     let rawReason: string | undefined;
     let resolvedBy = "user";
     let ttlMs: number | undefined;
+    let scope: string | undefined;
+    let explicitPattern: string | undefined;
 
     if (typeof resolution === "string") {
-      if (resolution === "approved") {
+      if (resolution === "approved" || resolution === "approve_once") {
         decision = "approved";
-      } else if (resolution === "denied") {
+        if (resolution === "approve_once") scope = "once";
+      } else if (resolution === "approve_pattern") {
+        decision = "approved";
+        scope = "run_pattern";
+      } else if (resolution === "denied" || resolution === "deny") {
         decision = "denied";
       } else {
         decision = "denied";
@@ -380,15 +480,36 @@ export class ApprovalManager {
       }
     } else if (typeof resolution === "object") {
       const raw = resolution.decision ?? resolution.status;
-      if (raw === "approved") {
+      if (typeof resolution.scope === "string") {
+        scope = resolution.scope;
+      }
+      if (typeof resolution.pattern === "string") {
+        explicitPattern = resolution.pattern;
+      }
+
+      // Canonical `approved`/`denied` decisions plus the API-facing aliases
+      // (`approve_once` / `approve_pattern` / `deny`) all normalize to the same
+      // approved/denied outcome so callers on either vocabulary interoperate.
+      if (
+        raw === "approved" ||
+        raw === "approve_once" ||
+        raw === "approve_pattern"
+      ) {
         decision = "approved";
+        if (raw === "approve_once" && scope === undefined) {
+          scope = "once";
+        }
+        if (raw === "approve_pattern" && scope === undefined) {
+          scope = "run_pattern";
+        }
       } else if (
         raw === "denied" ||
+        raw === "deny" ||
+        raw === "deny_and_lay_to_rest" ||
         raw === "rejected" ||
         raw === "cancelled" ||
         raw === "expired" ||
-        raw === "timeout" ||
-        raw === "deny"
+        raw === "timeout"
       ) {
         decision = "denied";
       } else {
@@ -469,6 +590,33 @@ export class ApprovalManager {
       req.runId
     );
     this.records.set(approvalId, req);
+
+    // Run-scoped pattern approval: a `run_pattern` scope (or the
+    // `approve_pattern` alias) records the resolved pattern for the run so any
+    // later approval check in the same run that matches it auto-approves. A
+    // `once` scope only ever approves the single request resolved here.
+    const effectivePatternArgv = rawInputs ? rawInputs.argv : req.argv;
+    const wantsRunPattern =
+      scope === "run_pattern" ||
+      scope === "pattern" ||
+      (typeof resolution === "object" &&
+        (resolution as ResolveApprovalParams).decision === "approve_pattern") ||
+      resolution === "approve_pattern";
+    if (wantsRunPattern) {
+      const derived =
+        (typeof explicitPattern === "string" ? explicitPattern : "").trim() ||
+        deriveCommandPrefix(effectivePatternArgv);
+      if (derived) {
+        this.addPatternApproval(req.runId, derived, {
+          command: Array.isArray(effectivePatternArgv)
+            ? effectivePatternArgv.join(" ")
+            : undefined,
+          cwd: rawInputs ? rawInputs.cwd : req.cwd,
+          skeletonId: req.skeletonId,
+          approvedBy: resolvedBy,
+        });
+      }
+    }
 
     await this.emitEvent({
       kind: "approval.resolved",
@@ -670,18 +818,53 @@ export class ApprovalManager {
     }
 
     const joined = argv.join(" ");
-    const cmd = argv[0];
 
     for (const pat of patterns) {
-      if (pat === cmd || pat === joined) {
-        return true;
-      }
-      if (matchCommandPattern(pat, argv)) {
+      if (this.patternMatchesCommand(pat, argv, joined)) {
         return true;
       }
     }
 
     return false;
+  }
+
+  /**
+   * Matches one recorded run-scoped pattern against an argv. Explicit regex and
+   * wildcard patterns keep their authored semantics; a plain prefix only matches
+   * on a word boundary. A bare executable pattern (a single token with no
+   * subcommand, e.g. `"node"` or `"git"`) matches only an exact command, so it
+   * can never widen to authorize arbitrary later invocations of that program
+   * (CWE-863).
+   */
+  private patternMatchesCommand(
+    pattern: string,
+    argv: string[],
+    joined: string
+  ): boolean {
+    const cleanPat = typeof pattern === "string" ? pattern.trim() : "";
+    if (!cleanPat) {
+      return false;
+    }
+
+    const isRegex = /^\/.+\/[gimsuy]*$/.test(cleanPat);
+    const isWildcard = cleanPat.includes("*") || cleanPat.includes("?");
+    if (isRegex || isWildcard) {
+      return matchCommandPattern(cleanPat, argv);
+    }
+
+    if (cleanPat === joined) {
+      return true;
+    }
+
+    // Without a literal subcommand a pattern must match the command exactly;
+    // only a multi-token prefix may match with a following word boundary.
+    if (!cleanPat.includes(" ") && !cleanPat.includes("\t")) {
+      return false;
+    }
+
+    return (
+      joined.startsWith(`${cleanPat} `) || joined.startsWith(`${cleanPat}\t`)
+    );
   }
 
   /**

@@ -23,6 +23,43 @@ import type { RunStore, RunRecord } from "../runs/run-store";
 import type { EventStore, EventEnvelope } from "../events/event-store";
 import type { RunPhase } from "../events/types";
 import { redactEvent } from "../security/redactor";
+import {
+  ADMIN_SESSION_COOKIE,
+  getAdminSecret,
+  isAdminSessionRevoked,
+  parseCookie,
+  verifyAdminSessionToken,
+} from "../admin/admin-session";
+import type { SettingsStore } from "../admin/settings-store";
+
+type ResolveSettingsStore = (request?: Request, context?: unknown) => SettingsStore;
+
+/**
+ * Lazily binds the runtime store context's `resolveSettingsStore`.
+ *
+ * A static `import` of `../runtime/store-context` would introduce a module-evaluation
+ * cycle (`pact-service` -> `pact-mutation` -> `store-context` -> `run-orchestrator` ->
+ * `pact-planner` -> `pact-service`) that trips the planner's module-level `PactService`
+ * wiring. Binding it on first use keeps the pact graph cycle-free while still resolving
+ * the per-request or shared `SettingsStore` exactly as the route layer does.
+ */
+let cachedResolveSettingsStore: ResolveSettingsStore | null | undefined;
+
+function getResolveSettingsStore(): ResolveSettingsStore | null {
+  if (cachedResolveSettingsStore !== undefined) {
+    return cachedResolveSettingsStore;
+  }
+  try {
+    const mod = require("../runtime/store-context") as {
+      resolveSettingsStore?: ResolveSettingsStore;
+    };
+    cachedResolveSettingsStore =
+      typeof mod.resolveSettingsStore === "function" ? mod.resolveSettingsStore : null;
+  } catch {
+    cachedResolveSettingsStore = null;
+  }
+  return cachedResolveSettingsStore;
+}
 
 // ---------------------------------------------------------------------------
 // Action & Mutation Types
@@ -238,7 +275,8 @@ function timingSafeTokenEqual(provided: string, expected: string): boolean {
 
 export function extractCallerCredentials(
   requestOrHeaders?: Request | Headers | Record<string, string | string[] | undefined>,
-  body?: Record<string, unknown>
+  body?: Record<string, unknown>,
+  options?: { settingsStore?: SettingsStore }
 ): CallerCredentials {
   let inviteCode: string | undefined;
 
@@ -341,6 +379,61 @@ export function extractCallerCredentials(
     );
   }
 
+  // A signed-in administrator (the `gg_admin_session` HMAC cookie issued by
+  // /api/admin/session) must authorize mutating run routes too, not just the
+  // legacy raw ADMIN_TOKEN / ADMIN_KEY paths above. This also covers the case
+  // where the server-only admin secret is configured without a legacy raw token.
+  if (!isAdmin) {
+    const signedSecret = getAdminSecret(process.env);
+    if (signedSecret) {
+      const headerAdminToken = getHeader("x-admin-token");
+      if (
+        headerAdminToken &&
+        headerAdminToken.trim().length > 0 &&
+        timingSafeTokenEqual(headerAdminToken.trim(), signedSecret)
+      ) {
+        isAdmin = true;
+      }
+
+      if (
+        !isAdmin &&
+        bearerToken &&
+        bearerToken.length > 0 &&
+        timingSafeTokenEqual(bearerToken, signedSecret)
+      ) {
+        isAdmin = true;
+      }
+
+      if (!isAdmin) {
+        const signedCookieToken = parseCookie(
+          getHeader("cookie") ?? null,
+          ADMIN_SESSION_COOKIE
+        );
+        if (signedCookieToken) {
+          const verified = verifyAdminSessionToken(signedCookieToken, signedSecret);
+          if (verified.ok && verified.payload) {
+            const settingsStore =
+              options?.settingsStore ??
+              getResolveSettingsStore()?.(
+                requestOrHeaders instanceof Request ? requestOrHeaders : undefined
+              );
+            let revoked = true;
+            try {
+              revoked = isAdminSessionRevoked(verified.payload.sid, { settingsStore });
+            } catch {
+              // A revocation lookup that throws cannot prove the session is live, so fail
+              // closed: never grant admin on error.
+              revoked = true;
+            }
+            if (!revoked) {
+              isAdmin = true;
+            }
+          }
+        }
+      }
+    }
+  }
+
   return { inviteCode, isAdmin };
 }
 
@@ -374,9 +467,10 @@ export function checkRunAuthorization(
   run: RunRecord,
   requestOrHeaders?: Request | Headers | Record<string, string | string[] | undefined>,
   body?: Record<string, unknown>,
-  runStore?: RunStore
+  runStore?: RunStore,
+  options?: { settingsStore?: SettingsStore }
 ): AuthCheckResult {
-  const creds = extractCallerCredentials(requestOrHeaders, body);
+  const creds = extractCallerCredentials(requestOrHeaders, body, options);
 
   if (creds.isAdmin) {
     return { authorized: true, status: 200 };
@@ -419,12 +513,13 @@ export function authorizeMutatingRunRequest(
   requestOrHeaders: Request | Headers | Record<string, string | string[] | undefined>,
   body: Record<string, unknown> | undefined,
   runStore: RunStore,
-  actionLabel = "modify this run"
+  actionLabel = "modify this run",
+  options?: { settingsStore?: SettingsStore }
 ): Response | null {
   if (!run?.inviteCodeHash) {
     return null;
   }
-  const creds = extractCallerCredentials(requestOrHeaders, body);
+  const creds = extractCallerCredentials(requestOrHeaders, body, options);
   if (creds.isAdmin) {
     return null;
   }

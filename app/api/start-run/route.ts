@@ -17,6 +17,7 @@ import {
   RequiredSettingMissingError,
   assertRequiredSettingsConfigured,
 } from "@/lib/admin/settings-store";
+import { resolveFifoQueue } from "@/lib/admission/fifo-queue";
 import { redactEvent } from "@/lib/security/redactor";
 
 export const dynamic = "force-dynamic";
@@ -128,6 +129,10 @@ if (!globalState.__admission) {
   };
 }
 
+function numberSetting(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
 export async function POST(request: Request): Promise<Response> {
   // 1. Check if admission is paused or unavailable (Requirements 34.1, 34.8)
   const admission = resolveAdmission(request);
@@ -173,6 +178,29 @@ export async function POST(request: Request): Promise<Response> {
         },
         { status: 503 }
       );
+    }
+  }
+
+  // 1b. Refuse new live runs when the persisted kill switch paused new runs (Requirement 39.10).
+  // The Admin kill switch persists `killSwitch.pauseNewRuns`; live admission must honor it even when
+  // the in-memory admission interface has not (yet) observed the pause.
+  if (isSettingsStoreConfigured(request)) {
+    try {
+      const settings = resolveSettingsStore(request);
+      if (settings.getSetting("killSwitch.pauseNewRuns") === true) {
+        return Response.json(
+          {
+            ok: false,
+            code: "PAUSED",
+            status: "paused",
+            reason: "paused by owner",
+            error: "Live runs are currently paused by the owner",
+          },
+          { status: 503 }
+        );
+      }
+    } catch {
+      // A settings read failure must not crash admission.
     }
   }
 
@@ -407,6 +435,51 @@ export async function POST(request: Request): Promise<Response> {
       },
     }) as any
   );
+
+  // 11b. Mirror the admitted run into the resolved FIFO queue so the Admin queue view
+  // (`GET /api/admin/queue`) always reflects a run submitted through this route. The queue shares
+  // this request's RunStore / EventStore, dedupes by runId, and keeps positions synchronized.
+  try {
+    let queueDepth: number | undefined;
+    let queueIdleLimitMs: number | undefined;
+    // Only read settings from an explicitly configured/injected store: resolving the default
+    // file-backed store here would materialize a shared settings store and change admission
+    // behaviour for later requests that never configured one.
+    if (isSettingsStoreConfigured(request)) {
+      const settings = resolveSettingsStore(request);
+      queueDepth = numberSetting(settings.getSetting("queueDepth"));
+      queueIdleLimitMs = numberSetting(settings.getSetting("queueIdleLimitMs"));
+    }
+    // Sync the mirror queue's depth capacity with this route's admission cap: every run accepted
+    // with HTTP 202 must be enqueuable into the FIFO queue the Admin view reads, otherwise it could
+    // never be seen or managed there. Keep the larger of the admission cap and the settings value.
+    const mirrorQueueDepth =
+      Number.isFinite(queueDepthCap) && queueDepthCap > 0
+        ? Math.max(
+            queueDepthCap,
+            typeof queueDepth === "number" && Number.isFinite(queueDepth) ? queueDepth : 0
+          )
+        : queueDepth;
+    const fifo = resolveFifoQueue({
+      eventStore,
+      runStore,
+      queueDepth: mirrorQueueDepth,
+      queueIdleLimitMs,
+    });
+    if (!fifo.has(runId)) {
+      fifo.enqueue({
+        runId,
+        url: cleanUrl,
+        sha: cleanSha,
+        inviteCodeHash: details.codeHash ?? null,
+        caps: details.caps ?? null,
+        pushFlag: Boolean(details.pushFlag),
+        queuedAt: queuedRun.queuedAt,
+      });
+    }
+  } catch {
+    // The in-memory admission queue above remains authoritative if the FIFO mirror cannot be built.
+  }
 
   try {
     const orchestrator = resolveActiveOrchestrator(request);

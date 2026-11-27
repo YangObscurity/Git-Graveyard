@@ -662,7 +662,7 @@ Implementation plan for the resurrection engine (design Revision 4). It follows 
     - Verify parallel Scheduler dispatch enforces slot concurrency limits, priority order, and independent git worktree isolation
     - _Requirements: 14.5, 17.8, 23.5, 23.14_
 
-- [ ] 21. [Teammate — Pure Code, API Routes & Property Tests] Messaging, human-in-the-loop tiers, hard blocks, fork push and their mutating API routes for messages, approvals, asks, skeleton actions and run control
+- [x] 21. [Teammate — Pure Code, API Routes & Property Tests] Messaging, human-in-the-loop tiers, hard blocks, fork push and their mutating API routes for messages, approvals, asks, skeleton actions and run control
   - [x] 21.1 Implement two-way messaging service and Skeleton mailbox management
     - Implement MessageService in lib/messaging/message-service.ts storing message events in EventStore and maintaining per-skeleton mailboxes
     - Handle delivery strategies by queueing for _session/steer or post-command prompt injection, or immediate turn cancellation for Interrupt now
@@ -681,7 +681,7 @@ Implementation plan for the resurrection engine (design Revision 4). It follows 
     - Implement pushToFork(runId) in lib/git/git-service.ts holding exclusive write tokens and validating fork ownership, done run phase, and invite push flag
     - Restrict fork push refspec exclusively to new branch graveyard/<runId>, ensuring no push or comment ever targets the source repository, and emit push.requested and push.result
     - _Requirements: 27.13, 27.14, 27.15, 29.1, 29.2, 29.3, 29.5, 29.6, 29.7, 29.8, 29.9, 29.10, 29.11, 29.12, 29.13, 29.14_
-  - [ ] 21.4 Implement mutating Next.js API route handlers for run operations
+  - [x] 21.4 Implement mutating Next.js API route handlers for run operations
     - Implement app/api/runs/[runId]/messages/route.ts validating caller run ownership and delivering structured messages to MessageService
     - Implement app/api/runs/[runId]/approvals/[approvalId]/route.ts and app/api/runs/[runId]/asks/[askId]/route.ts handling user decisions and ask resolutions
     - Implement app/api/runs/[runId]/skeletons/[skeletonId]/actions/route.ts and app/api/runs/[runId]/control/route.ts executing skeleton management and run pausing and stopping
@@ -692,30 +692,30 @@ Implementation plan for the resurrection engine (design Revision 4). It follows 
     - Implement fast-check property test in test/props/no-upstream-writes.test.ts verifying all Git write operations target only verified owner forks on graveyard/<runId> branches with push flag enabled, never targeting source repository
     - **Validates: Requirements 29.1, 29.2, 29.3, 29.7**
 
-- [ ] 22. [Teammate — Pure Code, Admin API & Property Tests] Admission, invite codes, FIFO queue, budgets and caps
-  - [ ] 22.1 Implement Invite Code generator, storage, and authentication service
+- [x] 22. [Teammate — Pure Code, Admin API & Property Tests] Admission, invite codes, FIFO queue, budgets and caps
+  - [x] 22.1 Implement Invite Code generator, storage, and authentication service
     - Implement InviteCodeService in lib/admission/invite-code.ts generating hashed invite codes with expiration timestamps, run quotas, and default push: false
     - Restrict invite code creation to signed-in Admin sessions, displaying full plaintext code strictly once upon creation
     - Track and enforce IP-based rate limiting on invite code verification attempts to prevent brute force abuse
     - Validate invite codes against hash storage on run submission, rejecting expired or exhausted tokens
     - _Requirements: 29.4, 31.1, 31.2, 31.3, 31.4, 31.5_
-  - [ ] 22.2 Implement FIFO admission queue, capacity management, and rate limit backoff
+  - [x] 22.2 Implement FIFO admission queue, capacity management, and rate limit backoff
     - Implement FifoQueue in lib/admission/fifo-queue.ts managing run queuing, depth limits, queue idle timeouts, and emitting run.queued and run.queue_position
     - Implement AdmissionController in lib/admission/admission-controller.ts checking required settings, repo size cap, and backend capacity for dev and production
     - Retain runs queued with reason capacity when cloud backend capacity reports zero, and enforce single Skeleton fallback if probe P8 or spike S4 shows capacity limits
     - Handle Kiro rate limit backoff and pause queue, and halt admissions without retries while preserving queue and alerting Owner on ACP auth failure
     - _Requirements: 31.6, 31.7, 31.8, 31.9, 31.10, 31.11, 31.14, 31.15, 31.16, 41.11, 41.13, 41.15, 45.8_
-  - [ ] 22.3 Implement BudgetGovernor runtime metering and multi-dimensional cap enforcement
+  - [x] 22.3 Implement BudgetGovernor runtime metering and multi-dimensional cap enforcement
     - Implement BudgetGovernor in lib/governor/budget-governor.ts tracking prompt durations, skeleton prompt counts, turn tool calls, and run wall-clock excluding Pact waits
     - Emit budget.warning at 80 percent threshold and budget.exceeded at 100 percent cap on any dimension, prompting exceed_budget while letting current commands finish
     - Enforce credit limits per run and day if probe P5 reveals credit reporting, or enforce wall-clock and tool call caps only without estimating credits
     - Handle context usage thresholds by steering skeleton wrap-up before cancellation, enforce Code_Ceiling boundaries, and end runs budget_stopped upon credit exhaustion
     - _Requirements: 30.1, 30.2, 30.3, 30.4, 30.5, 30.6, 30.7, 30.8, 30.9, 30.10, 30.11, 30.12, 30.13, 30.14, 30.15, 30.16, 30.17, 30.18, 30.19, 30.21, 45.16_
-  - [ ]* 22.4 Write property test for Caps stop new work
+  - [x]* 22.4 Write property test for Caps stop new work
     - **Property 20: Caps stop new work (P20)**
     - Implement fast-check property test in test/props/caps-stop-new-work.test.ts verifying that after budget.exceeded is emitted on any capped dimension, no subsequent session/prompt or sandbox_exec is dispatched unless an explicit grant raises the cap within the code ceiling
     - **Validates: Requirements 30.7**
-  - [ ] 22.5 Implement the Admin session, the admin service and the /api/admin routes
+  - [x] 22.5 Implement the Admin session, the admin service and the /api/admin routes
     - Implement lib/admin/admin-session.ts with the sign-in method the Owner records for open decision V20; the admin secret stays in the Necromancer and out of the UI bundle, and every /api/admin route refuses a request without a valid Admin session.
     - Implement the app/api/admin/ routes for Invite_Codes (create, list, revoke), budget settings (an audit entry on every change), the queue (remove, move, cancel), publish, redact and hide for finished runs, and the pre-promotion audit sign-off record.
     - Implement lib/admin/kill-switch.ts with three levels: pause new runs (Admission stops admitting and keeps the queue), stop gracefully (running Skeletons end at their next tool boundary and worktrees are kept) and hard kill (affected runs end with outcome killed); each level reports how many runs it affects before it acts, and each action is recorded as an admin.kill event.
@@ -723,31 +723,31 @@ Implementation plan for the resurrection engine (design Revision 4). It follows 
     - _Requirements: 28.3, 30.18, 31.1, 31.14, 32.3, 33.4, 39.10, 39.11_
 
 - [ ] 23. [Teammate — Code & Mocked Recovery Tests; Owner — Live Container OOM/TTL Verification] Scribe report check and failure handling
-  - [ ] 23.1 Implement Scribe agent template, lifecycle orchestration, and report drafting
+  - [x] 23.1 Implement Scribe agent template, lifecycle orchestration, and report drafting
     - Create committed Scribe agent template in lib/agents/templates/scribe.md configuring Claude Haiku 5.5, edit-workspace preset, and write tool restricted to report/**
     - Implement ScribeService in lib/scribe/scribe-service.ts raising the Scribe upon final_check completion
     - Render deterministic Findings section from RunStore event records using structured templates without model generation
     - Prompt Scribe to draft Scribe's reading narrative requiring strict evidence citations for all numeric and status assertions
     - _Requirements: 14.1, 14.2, 14.8, 14.9, 14.10, 14.11, 14.12, 14.13, 14.15, 14.18, 26.4, 26.5_
-  - [ ] 23.2 Implement Report_Check evidence verification, retry, and report finalization
+  - [x] 23.2 Implement Report_Check evidence verification, retry, and report finalization
     - Implement ReportCheck in lib/scribe/report-check.ts verifying all numerals and status claims against stored cmd:, file:, gh:, or ev: evidence markers
     - Re-raise Scribe once with specific unbacked claims upon initial verification failure
     - Drop Scribe's reading and substitute verified evidence fallback notice if verification fails on second attempt
     - Emit report.checked and assign run outcome among resurrected, resurrected_build_only, partial, or not_resurrected displaying baseline and new installation errors side by side
     - _Requirements: 26.6, 26.7, 26.8, 26.9, 26.16, 26.17, 41.1, 41.2, 41.3, 41.25_
-  - [ ] 23.3 Implement Skeleton supervisor failure handling and process recovery
+  - [x] 23.3 Implement Skeleton supervisor failure handling and process recovery
     - Implement failure recovery handlers in lib/supervisor/failure-recovery.ts verifying active model against role tier and checking MCP gateway connectivity, failing with model_mismatch or gateway_missing before sending prompts
     - Handle kiro-cli crashes and broken pipes by preserving worktrees and logs, emitting Recovering state, and respawning once via session/load without prompt re-transmission
     - Continue dispatching open Pact tasks in lib/supervisor/failure-recovery.ts when a task is skipped after reaching maximum Warden rejection rounds
     - Enforce security containment by quarantining worktrees on secret detection or symlink escapes, and log anomalies on PermissionBroker watchdog timeouts
     - _Requirements: 41.4, 41.5, 41.6, 41.12, 41.19, 41.20, 41.21, 41.22, 41.23, 41.24_
-  - [ ] 23.4 Implement boot reconciliation, Box recovery, and external failure handlers
+  - [x] 23.4 Implement boot reconciliation, Box recovery, and external failure handlers
     - Implement boot reconciliation in lib/recovery/boot-reconciliation.ts reading RunStore, reaping orphaned kiro-cli processes by pidfile, and destroying orphan boxes
     - Emit system.worker_restart, pause run clocks during recovery, and fail runs whose containers are lost with outcome error while preserving all collected evidence
     - Monitor ExecutionBackend events for container OOM, exit, or TTL expiration, recreating box once, rerunning failed command, and tagging oomKilled or timedOut
     - Enforce cooldowns on GitHub 403 and 429 rate limits and transition runs to budget_stopped when Kiro API credits are exhausted
     - _Requirements: 41.7, 41.8, 41.9, 41.10, 41.16, 41.17, 41.18_
-  - [ ] 23.5 Write unit and integration tests for Report_Check verification and failure recovery
+  - [x] 23.5 Write unit and integration tests for Report_Check verification and failure recovery
     - Test Report_Check in test/scribe/report-check.test.ts verifying marker resolution for numerals and status keywords, single retry behavior, and section dropping
     - Test Skeleton supervisor error paths in test/recovery/failure-recovery.test.ts verifying model_mismatch, gateway_missing, silence nudges, and crash recovery
     - Test boot reconciliation and box recovery in test/recovery/failure-recovery.test.ts verifying pidfile process cleanup, container recreation, and rate limit handling

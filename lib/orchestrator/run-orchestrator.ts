@@ -72,6 +72,13 @@ import {
 } from "../lifecycle/run-finalizer";
 import type { SkeletonSupervisor } from "../supervisor/skeleton-supervisor";
 import {
+  MessageService,
+  type MessageEventSink,
+  type MessageRecord,
+  type MessageServiceOptions,
+  type SendMessageInput,
+} from "../messaging/message-service";
+import {
   CLAUDE_OPUS_5_5_MODEL_ID,
   getAssignedModelForRole,
 } from "../agents/model-allowlist";
@@ -86,6 +93,11 @@ import {
   releaseRunNetworkPolicy,
 } from "../backend/network-policy";
 import type { BaselineCommandRow } from "../exhume/death-certificate";
+import {
+  BudgetGovernor,
+  BUDGET_DIMENSIONS,
+  type BudgetCaps,
+} from "../governor/budget-governor";
 
 /**
  * Input options for approving a Pact draft.
@@ -174,6 +186,8 @@ export interface RunExecutionHandle {
   lifecycleManager: LifecycleManager;
   scheduler?: Scheduler;
   dispatcher?: TaskDispatcher;
+  /** Per-run budget governor enforcing the run's caps; consulted by the gateway and dispatcher. */
+  budgetGovernor?: BudgetGovernor;
   deathCertificate?: DeathCertificate;
   pactDraft?: PactDraftResult;
   finalCheckResult?: FinalCheckResult;
@@ -184,11 +198,57 @@ export interface RunExecutionHandle {
   pause(): void;
   resume(): void;
   stop(reason?: string): Promise<void>;
+  /**
+   * Boundary-aware graceful stop: ends the run at its next tool boundary without aborting the
+   * in-flight worker turn or deleting its worktree.
+   */
+  stopGracefully?(reason?: string): Promise<void>;
   kill(reason?: string): Promise<void>;
   approvePact(approval?: PactApprovalInput): Promise<void>;
   revisePact(feedback: string): Promise<PactDraftResult>;
   resolveApproval(approvalId: string, resolution?: any): Promise<any>;
   answerAsk(askId: string, answer: any): Promise<any>;
+}
+
+/**
+ * Reads the budget caps a run grants: any finite, non-negative `BUDGET_DIMENSIONS` key from the
+ * `caps` record and, when present, from a nested `caps.budget` record. Unknown keys (e.g.
+ * `runParallelCap`) are ignored, so a non-budget cap never becomes a budget dimension.
+ */
+function extractBudgetCaps(raw?: Record<string, unknown> | null): BudgetCaps {
+  const out: BudgetCaps = {};
+  const read = (source: Record<string, unknown> | null | undefined): void => {
+    if (!source || typeof source !== "object") {
+      return;
+    }
+    for (const dim of BUDGET_DIMENSIONS) {
+      const value = source[dim];
+      if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+        out[dim] = value;
+      }
+    }
+  };
+  read(raw);
+  const nestedBudget =
+    raw && typeof raw.budget === "object" && raw.budget !== null
+      ? (raw.budget as Record<string, unknown>)
+      : undefined;
+  read(nestedBudget);
+  return out;
+}
+
+/** True when two cap maps enforce exactly the same dimensions at the same values. */
+function budgetCapsEqual(a: BudgetCaps, b: BudgetCaps): boolean {
+  const keys = new Set<keyof BudgetCaps>([
+    ...(Object.keys(a) as Array<keyof BudgetCaps>),
+    ...(Object.keys(b) as Array<keyof BudgetCaps>),
+  ]);
+  for (const key of keys) {
+    if (a[key] !== b[key]) {
+      return false;
+    }
+  }
+  return true;
 }
 
 /**
@@ -286,6 +346,37 @@ function createFallbackDeathCertificate(
 }
 
 /**
+ * MessageService bound to a RunOrchestrator. Beyond persisting each message it
+ * hands the stored record back to the orchestrator, which routes it to the
+ * active run: an `interrupt_now` delivery reaches the live
+ * `TaskDispatcher.interruptSkeleton(...)` and a queued delivery steers the
+ * addressed Skeleton through `TaskDispatcher.sendInstruction(...)`.
+ */
+class OrchestratorMessageService extends MessageService {
+  private readonly onSent?: (record: MessageRecord) => void;
+
+  constructor(
+    options: MessageServiceOptions,
+    onSent?: (record: MessageRecord) => void
+  ) {
+    super(options);
+    this.onSent = onSent;
+  }
+
+  override send(input: SendMessageInput): MessageRecord {
+    const record = super.send(input);
+    if (this.onSent) {
+      try {
+        this.onSent(record);
+      } catch {
+        // Delivery is best-effort and must never fail the send itself.
+      }
+    }
+    return record;
+  }
+}
+
+/**
  * End-to-end production run lifecycle orchestrator coordinating
  * bounded live-run admission and the full pipeline:
  * queued -> exhume -> plan -> pact_review -> legion -> final_check -> report -> done.
@@ -296,11 +387,23 @@ export class RunOrchestrator extends EventEmitter {
   readonly runsDir: string;
   readonly options: RunOrchestratorOptions;
   readonly maxConcurrentRuns: number;
+  /**
+   * Runtime-consumed message service backed by the host EventStore. Kept on the
+   * orchestrator so message routes reuse one mailbox/sequence across requests
+   * and an `interrupt_now` delivery can reach the active dispatcher.
+   */
+  public readonly messageService: MessageService;
 
   private readonly queue: string[] = [];
   private readonly activeRuns: Map<string, RunExecutionHandle> = new Map();
   private readonly runDeferreds: Map<string, Deferred<PactApprovalInput>> =
     new Map();
+  /**
+   * Every runId this orchestrator has admitted or started. It is the ownership
+   * marker for the shared `globalThis.__admissionQueue`: only entries for these
+   * runs are ever touched, so entries written by another surface are preserved.
+   */
+  private readonly ownedRunIds: Set<string> = new Set();
 
   private isAdmissionPausedState = false;
   private isStoppedState = false;
@@ -322,9 +425,47 @@ export class RunOrchestrator extends EventEmitter {
         runsDir: this.runsDir,
       });
 
+    this.messageService = new OrchestratorMessageService(
+      {
+        // Backed by the host's event store, with a tolerant sink so a host
+        // without a usable store (isolated unit tests) still yields a working
+        // service instead of throwing at construction.
+        eventStore: {
+          append: (input) =>
+            this.host?.eventStore?.append?.(input as never) as never,
+        } as MessageEventSink,
+      },
+      (record) => this.routeMessageToActiveRun(record)
+    );
+
     // Register global hook
     const g = globalThis as unknown as { __runOrchestrator?: unknown };
     g.__runOrchestrator = this;
+  }
+
+  /**
+   * Routes a stored message to the run's active dispatcher: `interrupt_now`
+   * interrupts the addressed Skeleton, and any other delivery steers it. Runs
+   * with no active handle simply keep the message in the mailbox.
+   */
+  private routeMessageToActiveRun(record: MessageRecord): void {
+    const handle = this.activeRuns.get(record.runId);
+    const dispatcher = handle?.dispatcher;
+    if (!dispatcher) {
+      return;
+    }
+    const target = record.skeletonId ?? record.to;
+    try {
+      if (record.delivery === "interrupt_now") {
+        void dispatcher.interruptSkeleton(target).catch(() => {});
+      } else {
+        void dispatcher
+          .sendInstruction(target, record.text, record.delivery)
+          .catch(() => {});
+      }
+    } catch {
+      // The message is already stored; delivery is best-effort.
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -362,6 +503,9 @@ export class RunOrchestrator extends EventEmitter {
       throw new TypeError("runId must be a non-empty string");
     }
 
+    // From here on the orchestrator owns this run's admission-queue entry.
+    this.ownedRunIds.add(runId);
+
     if (this.activeRuns.has(runId)) {
       return { queuePosition: 0, runId };
     }
@@ -381,6 +525,7 @@ export class RunOrchestrator extends EventEmitter {
       });
     } catch {}
 
+    this.syncAdmissionQueue();
     void this.processQueue();
 
     return { queuePosition, runId };
@@ -415,6 +560,53 @@ export class RunOrchestrator extends EventEmitter {
       },
     });
 
+    this.syncAdmissionQueue();
+    return true;
+  }
+
+  /**
+   * Removes a run from the admission queue without cancelling its record: the
+   * run simply stops waiting for a slot. Returns false when the run is not
+   * queued here.
+   */
+  public removeQueuedRun(runId: string): boolean {
+    const idx = this.queue.indexOf(runId);
+    if (idx === -1) {
+      return false;
+    }
+
+    this.queue.splice(idx, 1);
+    this.updateQueuePositions();
+
+    try {
+      this.host.runStore.updateRun(runId, { queuePosition: null });
+    } catch {}
+
+    this.syncAdmissionQueue();
+    return true;
+  }
+
+  /**
+   * Moves a queued run to a 1-based position within the admission queue,
+   * clamped to the queue bounds, and renumbers every position. Returns false
+   * when the run is not queued here.
+   */
+  public moveQueuedRun(runId: string, position: number): boolean {
+    const from = this.queue.indexOf(runId);
+    if (from === -1) {
+      return false;
+    }
+    const target = Math.min(
+      Math.max(1, Math.floor(typeof position === "number" ? position : from + 1)),
+      this.queue.length
+    );
+    const to = target - 1;
+    if (to !== from) {
+      this.queue.splice(from, 1);
+      this.queue.splice(to, 0, runId);
+    }
+    this.updateQueuePositions();
+    this.syncAdmissionQueue();
     return true;
   }
 
@@ -424,6 +616,7 @@ export class RunOrchestrator extends EventEmitter {
       this.cancelQueuedRun(runId);
     }
     this.queue.length = 0;
+    this.syncAdmissionQueue();
     return drained;
   }
 
@@ -433,6 +626,84 @@ export class RunOrchestrator extends EventEmitter {
       try {
         this.host.runStore.updateRun(id, { queuePosition: i + 1 });
       } catch {}
+    }
+  }
+
+  /**
+   * Mirrors the orchestrator's internal admission queue into the shared
+   * `globalThis.__admissionQueue` the runtime host and diagnostics read.
+   *
+   * Ownership is explicit. Only entries whose run is owned by this orchestrator
+   * (`ownedRunIds`) are managed: the currently queued runs are rebuilt in queue
+   * order, reusing each entry and its richer fields and renumbering positions;
+   * an owned run that is no longer queued (started, cancelled or removed) has
+   * its entry dropped. Every other entry was written by a different surface and
+   * is preserved untouched, keeping its order and extra fields intact.
+   */
+  private syncAdmissionQueue(): void {
+    const g = globalThis as unknown as {
+      __admissionQueue?: Array<{ runId?: string; queuePosition?: number }>;
+    };
+    if (!Array.isArray(g.__admissionQueue)) {
+      return;
+    }
+
+    const existing = new Map<
+      string,
+      { runId?: string; queuePosition?: number }
+    >();
+    const unowned: Array<{ runId?: string; queuePosition?: number }> = [];
+    for (const entry of g.__admissionQueue) {
+      const isOwned =
+        entry &&
+        typeof entry === "object" &&
+        typeof entry.runId === "string" &&
+        this.ownedRunIds.has(entry.runId);
+      if (!isOwned) {
+        // Written by another surface: keep the entry and its fields as-is.
+        unowned.push(entry);
+        continue;
+      }
+      // Collect the richer field set already recorded for a queued run; owned
+      // runs that are no longer queued are intentionally left out and removed.
+      if (!existing.has(entry.runId as string)) {
+        existing.set(entry.runId as string, entry);
+      }
+    }
+
+    const next = this.queue.map((runId, index) => {
+      const entry = existing.get(runId) ?? { runId };
+      entry.runId = runId;
+      entry.queuePosition = index + 1;
+      return entry;
+    });
+
+    g.__admissionQueue.length = 0;
+    for (const entry of next) {
+      g.__admissionQueue.push(entry);
+    }
+    for (const entry of unowned) {
+      g.__admissionQueue.push(entry);
+    }
+  }
+
+  /**
+   * Removes exactly one run's entries from the shared admission queue, leaving
+   * every other entry - including unowned ones - untouched. Called when a run
+   * leaves the queue to begin execution.
+   */
+  private removeRunFromAdmissionQueue(runId: string): void {
+    const g = globalThis as unknown as {
+      __admissionQueue?: Array<{ runId?: string; queuePosition?: number }>;
+    };
+    if (!Array.isArray(g.__admissionQueue)) {
+      return;
+    }
+    for (let i = g.__admissionQueue.length - 1; i >= 0; i -= 1) {
+      const entry = g.__admissionQueue[i];
+      if (entry && typeof entry === "object" && entry.runId === runId) {
+        g.__admissionQueue.splice(i, 1);
+      }
     }
   }
 
@@ -447,14 +718,32 @@ export class RunOrchestrator extends EventEmitter {
       !this.isAdmissionPausedState &&
       !this.isStoppedState
     ) {
-      const nextRunId = this.queue.shift();
-      if (nextRunId) {
-        this.updateQueuePositions();
-        try {
-          this.startRun(nextRunId);
-        } catch {
-          // ignore run start errors in queue drain
-        }
+      const nextRunId = this.queue[0];
+      if (!nextRunId) {
+        break;
+      }
+
+      // A queued run whose record was already finalized (`phase: "done"`, e.g.
+      // idle eviction via `FifoQueue.evictIdle()` or a kill while queued) must
+      // never start. Drop it from both the internal and the shared admission
+      // queues, then keep draining the next non-terminal queued run.
+      const queuedRecord = this.host.runStore.getRun(nextRunId);
+      if (queuedRecord && queuedRecord.phase === "done") {
+        this.removeQueuedRun(nextRunId);
+        this.removeRunFromAdmissionQueue(nextRunId);
+        this.syncAdmissionQueue();
+        continue;
+      }
+
+      this.queue.shift();
+      this.updateQueuePositions();
+      // `startRun` removes the dequeued run from the shared admission queue
+      // and re-syncs, so the managed entries stay correct without wiping the
+      // entries this orchestrator does not own.
+      try {
+        this.startRun(nextRunId);
+      } catch {
+        // ignore run start errors in queue drain
       }
     }
   }
@@ -467,14 +756,63 @@ export class RunOrchestrator extends EventEmitter {
     return this.activeRuns.get(runId);
   }
 
+  /**
+   * Builds the inert handle returned for a run whose record is already terminal
+   * (`phase: "done"`). It starts no pipeline, owns no boxes, and resolves
+   * immediately, so `startRun` can fail closed without ever executing a
+   * finished run.
+   */
+  private buildTerminalRunHandle(runId: string): RunExecutionHandle {
+    const lm = new LifecycleManager({
+      runId,
+      initialPhase: "done",
+      emit: (evt) => {
+        this.emitEvent(evt as any);
+      },
+    });
+    return {
+      runId,
+      lifecycleManager: lm,
+      getPhase: () => lm.phase,
+      pause: () => {},
+      resume: () => {},
+      stop: async () => {},
+      kill: async () => {},
+      approvePact: async () => {},
+      revisePact: async () => ({}) as never,
+      resolveApproval: async () => null,
+      answerAsk: async () => null,
+      promise: Promise.resolve({} as FinalizeRunResult),
+    };
+  }
+
   public startRun(runId: string): RunExecutionHandle {
     if (!runId || typeof runId !== "string") {
       throw new TypeError("runId must be a non-empty string");
     }
 
+    // Starting a run makes the orchestrator its owner for admission purposes.
+    this.ownedRunIds.add(runId);
+
     const existingHandle = this.activeRuns.get(runId);
     if (existingHandle) {
       return existingHandle;
+    }
+
+    // A run whose record already finished (`phase: "done"`, e.g. idle eviction
+    // or a kill while queued) must never be started: drop it from the internal
+    // and shared admission queues, spawn no LifecycleManager / run execution,
+    // and hand back an inert terminal handle.
+    const preStartRecord = this.host.runStore.getRun(runId);
+    if (preStartRecord && preStartRecord.phase === "done") {
+      const qIdx = this.queue.indexOf(runId);
+      if (qIdx >= 0) {
+        this.queue.splice(qIdx, 1);
+        this.updateQueuePositions();
+      }
+      this.removeRunFromAdmissionQueue(runId);
+      this.syncAdmissionQueue();
+      return this.buildTerminalRunHandle(runId);
     }
 
     // Remove from queue if present
@@ -483,6 +821,11 @@ export class RunOrchestrator extends EventEmitter {
       this.queue.splice(qIdx, 1);
       this.updateQueuePositions();
     }
+
+    // The run is beginning execution, so it no longer waits in the shared
+    // admission queue: drop its entry cleanly without disturbing unowned ones.
+    this.removeRunFromAdmissionQueue(runId);
+    this.syncAdmissionQueue();
 
     // Ensure run record exists
     let runRecord = this.host.runStore.getRun(runId);
@@ -521,6 +864,10 @@ export class RunOrchestrator extends EventEmitter {
       stop: async (reason?: string) => {
         stopRequestedReason = reason ?? "User stopped run";
         await this.stopRun(runId, stopRequestedReason);
+      },
+      stopGracefully: async (reason?: string) => {
+        stopRequestedReason = reason ?? "Graceful stop requested";
+        await this.stopRunGracefully(runId, stopRequestedReason);
       },
       kill: async (reason?: string) => {
         killedReason = reason ?? "Admin killed run";
@@ -618,10 +965,40 @@ export class RunOrchestrator extends EventEmitter {
       startedAt: run?.startedAt ?? Date.now(),
     });
 
+    // Per-run budget governor: caps are read from the run record. It is registered on the gateway so
+    // a `sandbox_exec` for this run is refused once any capped dimension is crossed, and passed to
+    // the TaskDispatcher so it gates worker/Warden prompts.
+    const initialCaps = extractBudgetCaps(run?.caps ?? null);
+    const budgetGovernor = new BudgetGovernor({
+      runId,
+      eventStore: this.host.eventStore,
+      runStore: this.host.runStore,
+      caps: initialCaps,
+    });
+    handle.budgetGovernor = budgetGovernor;
+    try {
+      (this.host.gateway as any)?.registerRunBudgetGovernor?.(runId, budgetGovernor);
+    } catch {
+      // A gateway that cannot register the governor must not abort the run.
+    }
+
     try {
       // 1. Exhume phase
       if (isFatal() || (lm.phase as string) === "done") {
         return await this.finalizeAborted(runId, lm, "error", "Fatal quarantine");
+      }
+
+      // A cap already crossed before dispatch must not start new work.
+      if (this.budgetBlocksDispatch(budgetGovernor, handle.scheduler)) {
+        return await this.executeEarlyExit(
+          runId,
+          handle,
+          "budget_stopped",
+          "Budget exceeded before exhume",
+          gitDir,
+          runDir,
+          baseSha
+        );
       }
 
       lm.transitionTo("exhume");
@@ -802,6 +1179,17 @@ export class RunOrchestrator extends EventEmitter {
       }
 
       // 2. Plan phase
+      if (this.budgetBlocksDispatch(budgetGovernor, handle.scheduler)) {
+        return await this.executeEarlyExit(
+          runId,
+          handle,
+          "budget_stopped",
+          "Budget exceeded before plan",
+          gitDir,
+          runDir,
+          baseSha
+        );
+      }
       lm.transitionTo("plan");
       this.host.runStore.updateRun(runId, { phase: "plan" });
 
@@ -979,8 +1367,14 @@ export class RunOrchestrator extends EventEmitter {
 
       let approvalInput: PactApprovalInput;
       if (this.options.autoApprovePact === false) {
-        // Await approval
-        approvalInput = await approvalDeferred.promise;
+        // Await approval. The run wall clock must exclude the Pact review / approval wait
+        // (Requirement 30.12), so pause the budget governor's clock across the wait.
+        budgetGovernor.pauseClockForPact();
+        try {
+          approvalInput = await approvalDeferred.promise;
+        } finally {
+          budgetGovernor.resumeClockFromPact();
+        }
       } else {
         // Auto approve or use already-received approval
         approvalInput = {
@@ -996,6 +1390,23 @@ export class RunOrchestrator extends EventEmitter {
             approvedTaskIds: approvalInput.approvedTaskIds,
             caps: approvalInput.caps,
           },
+        });
+      }
+
+      // A Pact approval may raise (or lower) the caps. Update the running governor's caps in place so
+      // its accumulated metering (`totalToolCalls`, prompt counts) and its run wall clock (including
+      // the Pact-wait exclusion) survive the grant. Rebuilding the governor here would reset that
+      // usage to zero and silently forgive the tool calls / wall-clock time Exhume and Plan already
+      // spent, letting Legion exceed a cap the run had already crossed.
+      const approvalCaps: BudgetCaps = {
+        ...extractBudgetCaps(approvalInput.caps as Record<string, unknown> | undefined),
+        ...extractBudgetCaps(approvalInput.budget as Record<string, unknown> | undefined),
+      };
+      const mergedCaps: BudgetCaps = { ...initialCaps, ...approvalCaps };
+      if (!budgetCapsEqual(initialCaps, mergedCaps)) {
+        budgetGovernor.updateCaps(mergedCaps, {
+          actor: approvalInput.approvedBy ?? "pact-approval",
+          reason: "Pact approval updated run budget caps",
         });
       }
 
@@ -1042,6 +1453,7 @@ export class RunOrchestrator extends EventEmitter {
         wardenRunner: this.options.wardenRunner,
         wardenReviewer: this.options.wardenReviewer,
         pollIntervalMs: this.options.pollIntervalMs ?? 20,
+        budgetGovernor,
         emitEvent: (evt) => {
           this.emitEvent(evt as any);
         },
@@ -1070,14 +1482,20 @@ export class RunOrchestrator extends EventEmitter {
         );
       }
 
-      if (stopReason || dispatcher.stopped || scheduler.isStopRequested) {
+      if (
+        stopReason ||
+        dispatcher.stopped ||
+        dispatcher.gracefulStopped ||
+        scheduler.isStopRequested ||
+        scheduler.isBudgetExceeded
+      ) {
         const outcome = scheduler.isBudgetExceeded ? "budget_stopped" : "cancelled";
         lm.setOutcome(outcome);
         return await this.executeEarlyExit(
           runId,
           handle,
           outcome,
-          stopReason ?? scheduler.stopReason ?? "Stopped",
+          stopReason ?? scheduler.stopReason ?? scheduler.budgetReason ?? "Stopped",
           gitDir,
           runDir,
           baseSha
@@ -1329,6 +1747,13 @@ export class RunOrchestrator extends EventEmitter {
 
       return finalizeResult;
     } finally {
+      // The run is over: drop its gateway registrations so a later run cannot inherit them.
+      try {
+        (this.host.gateway as any)?.clearRunGracefulStop?.(runId);
+        (this.host.gateway as any)?.unregisterRunBudgetGovernor?.(runId);
+      } catch {
+        // Dropping gateway registrations must never mask the run's real result.
+      }
       await this.teardownRunResources(runId);
     }
   }
@@ -1389,6 +1814,31 @@ export class RunOrchestrator extends EventEmitter {
 
 
 
+  /**
+   * True when the run's budget already blocks new work. Latches the Scheduler flag when a scheduler
+   * exists so the run finalizes with `budget_stopped`.
+   */
+  private budgetBlocksDispatch(
+    governor: BudgetGovernor | undefined,
+    scheduler: Scheduler | undefined
+  ): boolean {
+    if (!governor) {
+      return false;
+    }
+    const gate = governor.canDispatchPrompt("orchestrator");
+    const snapshot = governor.snapshot();
+    if (gate.allowed && !snapshot.exceededAny) {
+      return false;
+    }
+    const dims = gate.allowed ? snapshot.exceeded : gate.dimensions;
+    try {
+      scheduler?.setBudgetExceeded(true, `Budget exceeded: ${dims.join(", ")}`);
+    } catch {
+      // Latching the flag is best-effort; the run still finalizes as budget_stopped.
+    }
+    return true;
+  }
+
   private async executeEarlyExit(
     runId: string,
     handle: RunExecutionHandle,
@@ -1400,6 +1850,13 @@ export class RunOrchestrator extends EventEmitter {
   ): Promise<FinalizeRunResult> {
     const lm = handle.lifecycleManager;
     lm.setOutcome(outcome);
+
+    // Graceful-stop contract: keep every worker's worktree (uncommitted edits included) on disk.
+    // Worktree removal belongs solely to the dispatcher's hard-stop/abort settle path; this
+    // early-exit path never touches a worktree, so a graceful stop's preserved worktrees survive.
+    if ((handle as any).gracefulStop === true) {
+      // Nothing to do: preserved worker worktrees stay in place on disk.
+    }
 
     if (lm.phase !== "report" && lm.canTransitionTo("report", { isEarlyExit: true, reason })) {
       try {
@@ -2411,6 +2868,31 @@ srv.listen(8080, "0.0.0.0");
     }
   }
 
+  /**
+   * Boundary-aware graceful stop: marks the run as stopping gracefully, tells the gateway to refuse
+   * any NEW `sandbox_exec` for the run, and asks the dispatcher to let every in-flight worker settle
+   * at its next tool boundary. Unlike {@link stopRun} it never aborts a live turn and never deletes
+   * a worktree, so the worker's uncommitted edits survive.
+   */
+  public async stopRunGracefully(
+    runId: string,
+    reason = "Graceful stop requested"
+  ): Promise<void> {
+    const handle = this.activeRuns.get(runId);
+    if (handle) {
+      (handle as any).stopRequestedReason = reason;
+      (handle as any).gracefulStop = true;
+    }
+    try {
+      (this.host.gateway as any)?.markRunGracefulStop?.(runId);
+    } catch {
+      // A gateway that cannot observe the marker must not abort the graceful stop.
+    }
+    if (handle?.dispatcher) {
+      await handle.dispatcher.stopGracefully(reason);
+    }
+  }
+
   public async killRun(runId: string, reason = "Admin killed run"): Promise<void> {
     const handle = this.activeRuns.get(runId);
     if (handle) {
@@ -2642,12 +3124,78 @@ srv.listen(8080, "0.0.0.0");
     resolution?: any
   ): Promise<any> {
     if (this.host.gateway?.approvalManager) {
+      // Scope the resolution to this run so the ApprovalManager's own run
+      // binding is enforced even when the caller omits it, and a cross-run
+      // approval fails closed rather than resolving against the wrong run.
+      const scoped =
+        resolution && typeof resolution === "object"
+          ? { ...(resolution as Record<string, unknown>), runId }
+          : resolution;
       return this.host.gateway.approvalManager.resolveApproval(
         approvalId,
-        resolution
+        scoped
       );
     }
     return null;
+  }
+
+  /**
+   * Push configuration the push-fork route needs to hand a confirmed push to
+   * the real GitService: the service, the run's git/runtime directories, and
+   * the owner/checker/token credentials configured on the orchestrator. The
+   * route reads this so a confirmed push is never left without a fork checker.
+   */
+  public getPushForkConfig(runId: string): {
+    gitService: GitService;
+    gitDir: string;
+    runDir: string;
+    ownerLogin: string | undefined;
+    forkChecker: ForkChecker | undefined;
+    token: string | undefined;
+  } {
+    const runDir = path.join(this.runsDir, runId);
+    const gitDir = path.join(runDir, "git");
+    return {
+      gitService: this.gitService,
+      gitDir,
+      runDir,
+      ownerLogin: this.options.ownerLogin,
+      forkChecker: this.options.forkChecker,
+      token: this.options.githubToken,
+    };
+  }
+
+  /**
+   * Performs a confirmed push of the run's branch to its fork through the
+   * orchestrator's GitService, wiring the configured owner login, fork checker,
+   * token and run git/runtime directories so the GitService can verify the
+   * target really is the owner's fork before touching the network.
+   */
+  public async pushRunToFork(
+    runId: string,
+    params: {
+      targetRepoUrl: string;
+      sourceRepoUrl: string;
+      branchName: string;
+      pushConfirm: boolean;
+      eventStore?: EventStore;
+    }
+  ): Promise<unknown> {
+    const { gitDir, runDir } = this.getPushForkConfig(runId);
+    return this.gitService.pushToFork(runId, {
+      targetRepoUrl: params.targetRepoUrl,
+      sourceRepoUrl: params.sourceRepoUrl,
+      branchName: params.branchName,
+      runPhase: "done",
+      invitePushFlag: true,
+      pushConfirm: params.pushConfirm,
+      ownerLogin: this.options.ownerLogin,
+      forkChecker: this.options.forkChecker,
+      token: this.options.githubToken,
+      gitDir,
+      runDir,
+      eventStore: params.eventStore as never,
+    });
   }
 
   public async answerAsk(

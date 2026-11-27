@@ -1,0 +1,446 @@
+import { z } from "zod";
+import { authorizeMutatingRunRequest } from "@/lib/pact/pact-mutation";
+import {
+  MessageError,
+  MessageService,
+  type MessageEventSink,
+  type MessageRecord,
+} from "@/lib/messaging/message-service";
+import {
+  isSafeRunId,
+  resolveActiveOrchestrator,
+  resolveEventStore,
+  resolveRunStore,
+} from "@/lib/runtime/store-context";
+import { redactEvent } from "@/lib/security/redactor";
+import type { EventEnvelope, EventStore } from "@/lib/events/event-store";
+
+export const dynamic = "force-dynamic";
+export const runtime = "nodejs";
+
+interface RouteContext {
+  params: Promise<{ runId: string }> | { runId: string };
+}
+
+const RECIPIENT_ROLES = [
+  "necromancer",
+  "planner",
+  "exhumer",
+  "bonesetter",
+  "soul-stitcher",
+  "warden",
+  "scribe",
+] as const;
+
+const messageBodySchema = z.object({
+  to: z.string().min(1, "to is required"),
+  intent: z.string().min(1, "intent is required"),
+  text: z.string().optional(),
+  delivery: z.enum(["after_command", "interrupt_now"]).optional(),
+  recipientRole: z.enum(RECIPIENT_ROLES).optional(),
+  refs: z.array(z.string()).optional(),
+  skeletonId: z.string().optional(),
+  inviteCode: z.string().optional(),
+  adminToken: z.string().optional(),
+});
+
+/** Status code for a refused message: hard blocks and forbidden targets are 403. */
+function statusForMessageError(err: MessageError): number {
+  switch (err.code) {
+    case "HARD_BLOCK":
+    case "FORBIDDEN_TARGET":
+    case "FORBIDDEN_WARDEN_INSTRUCTION":
+      return 403;
+    default:
+      return 400;
+  }
+}
+
+/** True for a non-empty Skeleton id that cannot escape its single URL slot. */
+function isSafeSkeletonId(value: unknown): value is string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 256) {
+    return false;
+  }
+  if (value.startsWith("-")) return false;
+  if (value.includes("/") || value.includes("\\")) return false;
+  if (value.includes("..")) return false;
+  if (/[\u0000-\u001f]/.test(value)) return false;
+  return true;
+}
+
+const SKELETON_EVENT_KINDS: readonly string[] = [
+  "skeleton.raised",
+  "skeleton.state",
+  "skeleton.interrupted",
+  "skeleton.reraised",
+  "skeleton.laid_to_rest",
+  "skeleton.instruction",
+  "skeleton.tool_call",
+  "skeleton.tool_result",
+  "skeleton.log",
+  "skeleton.usage",
+];
+
+/** True when an event names this Skeleton at either the envelope or data level. */
+function eventNamesSkeleton(event: EventEnvelope, skeletonId: string): boolean {
+  if (event.skeletonId === skeletonId) return true;
+  const data = event.data as Record<string, unknown> | undefined;
+  return data?.skeletonId === skeletonId;
+}
+
+function runOwnsSkeleton(
+  eventStore: EventStore,
+  runId: string,
+  skeletonId: string
+): boolean {
+  try {
+    const events = eventStore.getEvents(runId, {
+      kind: [...SKELETON_EVENT_KINDS],
+    });
+    return events.some((event) => eventNamesSkeleton(event, skeletonId));
+  } catch {
+    return false;
+  }
+}
+
+function otherRunOwnsSkeleton(
+  eventStore: EventStore,
+  runId: string,
+  skeletonId: string
+): boolean {
+  try {
+    const runIds =
+      typeof eventStore.getRunIds === "function" ? eventStore.getRunIds() : [];
+    for (const other of runIds) {
+      if (other === runId) continue;
+      const events = eventStore.getEvents(other, {
+        kind: [...SKELETON_EVENT_KINDS],
+      });
+      if (events.some((event) => eventNamesSkeleton(event, skeletonId))) {
+        return true;
+      }
+    }
+  } catch {
+    // An unreadable run index means ownership cannot be disproven.
+  }
+  return false;
+}
+
+/** Best-effort positive check of an active handle's exposed Skeleton state. */
+function handleKnowsSkeleton(handle: unknown, skeletonId: string): boolean {
+  if (!handle || typeof handle !== "object") return false;
+  const source = handle as Record<string, unknown>;
+  const dispatcher = source.dispatcher as Record<string, unknown> | undefined;
+  const scheduler = source.scheduler as Record<string, unknown> | undefined;
+  const containers = [
+    source.skeletons,
+    source.tasks,
+    dispatcher?.skeletons,
+    dispatcher?.tasks,
+    scheduler?.skeletons,
+  ];
+  for (const container of containers) {
+    if (container instanceof Map && container.has(skeletonId)) return true;
+    if (container instanceof Set && container.has(skeletonId)) return true;
+    if (Array.isArray(container)) {
+      const found = container.some((entry) => {
+        if (entry === skeletonId) return true;
+        if (!entry || typeof entry !== "object") return false;
+        const record = entry as Record<string, unknown>;
+        return record.id === skeletonId || record.skeletonId === skeletonId;
+      });
+      if (found) return true;
+    }
+    if (container && typeof container === "object" && !Array.isArray(container)) {
+      if (Object.prototype.hasOwnProperty.call(container, skeletonId)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Verifies that a message-addressed Skeleton belongs to the run in the URL.
+ * Ownership is proven by the active handle's own Skeleton state or this run's
+ * `skeleton.*` events; a Skeleton that another run's log owns is a mismatch.
+ */
+function verifySkeletonOwnership(
+  eventStore: EventStore,
+  runId: string,
+  skeletonId: string,
+  handle: unknown
+): "ok" | "mismatch" | "unknown" {
+  if (handleKnowsSkeleton(handle, skeletonId)) return "ok";
+  if (runOwnsSkeleton(eventStore, runId, skeletonId)) return "ok";
+  if (otherRunOwnsSkeleton(eventStore, runId, skeletonId)) return "mismatch";
+  return "unknown";
+}
+
+/**
+ * Persistent MessageService per EventStore, used only when no injected or active
+ * orchestrator supplies one (isolated route tests). Caching by EventStore keeps
+ * mailbox state and the message sequence alive across POSTs, so message ids
+ * increment (`:msg:1`, `:msg:2`, ...) instead of resetting on every request.
+ */
+const fallbackMessageServices = new WeakMap<EventStore, MessageService>();
+
+/**
+ * Reuses an injected/active MessageService when the request, context or active
+ * orchestrator carries one. Otherwise builds (once per EventStore) a service
+ * whose event sink redacts every appended event before it reaches the
+ * EventStore.
+ */
+function resolveMessageService(
+  request: Request,
+  context: RouteContext | undefined,
+  eventStore: EventStore
+): MessageService {
+  const req = request as unknown as { messageService?: unknown };
+  const ctx = context as unknown as { messageService?: unknown } | undefined;
+  const orchestrator = resolveActiveOrchestrator(request, context) as
+    | { messageService?: unknown }
+    | null;
+  const candidate =
+    req?.messageService ?? ctx?.messageService ?? orchestrator?.messageService;
+  if (candidate && typeof (candidate as MessageService).send === "function") {
+    return candidate as MessageService;
+  }
+
+  const cached = fallbackMessageServices.get(eventStore);
+  if (cached) {
+    return cached;
+  }
+
+  const sink: MessageEventSink = {
+    append: (input) =>
+      eventStore.append(
+        redactEvent(input as unknown as Record<string, unknown>) as never
+      ),
+  };
+  const service = new MessageService({ eventStore: sink });
+  fallbackMessageServices.set(eventStore, service);
+  return service;
+}
+
+export async function POST(
+  request: Request,
+  context: RouteContext
+): Promise<Response> {
+  const resolvedParams = await Promise.resolve(context?.params);
+  let runId = resolvedParams?.runId;
+
+  if (!runId) {
+    try {
+      const url = new URL(request.url);
+      const match = url.pathname.match(/\/api\/runs\/([^/?#]+)\/messages/);
+      if (match) {
+        runId = decodeURIComponent(match[1]);
+      }
+    } catch {}
+  }
+
+  if (!isSafeRunId(runId)) {
+    return Response.json(
+      { ok: false, error: "Invalid or missing runId" },
+      { status: 400 }
+    );
+  }
+
+  let rawBody: unknown;
+  try {
+    rawBody = await request.json();
+  } catch {
+    return Response.json(
+      { ok: false, error: "Invalid JSON body" },
+      { status: 400 }
+    );
+  }
+
+  const parsed = messageBodySchema.safeParse(rawBody);
+  if (!parsed.success) {
+    return Response.json(
+      { ok: false, error: "Validation error", issues: parsed.error.issues },
+      { status: 400 }
+    );
+  }
+
+  const body = parsed.data;
+  const runStore = resolveRunStore(request);
+  const eventStore = resolveEventStore(request, undefined, runStore);
+
+  const run = runStore.getRun(runId);
+  const events = eventStore.getEvents(runId, { limit: 1 });
+
+  if (!run && events.length === 0) {
+    return Response.json(
+      { ok: false, error: "Run not found" },
+      { status: 404 }
+    );
+  }
+
+  const authError = authorizeMutatingRunRequest(
+    run,
+    request,
+    rawBody as Record<string, unknown>,
+    runStore,
+    "send messages for this run"
+  );
+  if (authError) {
+    return authError;
+  }
+
+  // A Skeleton-addressed message must name a Skeleton safe for a single route
+  // slot and owned by this run; a cross-run Skeleton id fails closed.
+  if (body.skeletonId !== undefined) {
+    if (!isSafeSkeletonId(body.skeletonId)) {
+      return Response.json(
+        { ok: false, error: "Invalid skeletonId" },
+        { status: 400 }
+      );
+    }
+    const orchestrator = resolveActiveOrchestrator(request, context);
+    const handle = orchestrator?.getActiveRun?.(runId);
+    const ownership = verifySkeletonOwnership(
+      eventStore,
+      runId,
+      body.skeletonId,
+      handle
+    );
+    if (ownership === "mismatch") {
+      return Response.json(
+        {
+          ok: false,
+          error: "Skeleton does not belong to this run",
+          code: "SKELETON_RUN_MISMATCH",
+        },
+        { status: 403 }
+      );
+    }
+    if (ownership !== "ok") {
+      return Response.json(
+        {
+          ok: false,
+          error: "Skeleton ownership could not be verified for this run",
+          code: "SKELETON_NOT_OWNED",
+        },
+        { status: 403 }
+      );
+    }
+  }
+
+  const service = resolveMessageService(request, context, eventStore);
+
+  let message: MessageRecord;
+  try {
+    message = service.send({
+      runId,
+      from: "user",
+      to: body.to,
+      intent: body.intent as never,
+      text: body.text,
+      delivery: body.delivery,
+      refs: body.refs,
+      skeletonId: body.skeletonId,
+      recipientRole: body.recipientRole,
+    });
+  } catch (err) {
+    if (err instanceof MessageError) {
+      return Response.json(
+        { ok: false, error: err.message, code: err.code },
+        { status: statusForMessageError(err) }
+      );
+    }
+    // An unexpected storage failure is not a refusal: it is reported generically
+    // so the internal exception (which may carry paths or query detail) never
+    // reaches the caller.
+    return Response.json(
+      { ok: false, error: "Message could not be persisted" },
+      { status: 500 }
+    );
+  }
+
+  return Response.json({ ok: true, runId, message }, { status: 200 });
+}
+
+
+
+function readMessages(
+  events: ReturnType<EventStore["getEvents"]>
+): Record<string, unknown>[] {
+  const messages: Record<string, unknown>[] = [];
+  for (const event of events) {
+    if (event.kind !== "message.sent") continue;
+    const data = (event.data ?? {}) as Record<string, unknown>;
+    messages.push({
+      id: data.msgId,
+      seq: event.seq,
+      ts: event.ts,
+      from: data.from,
+      to: data.to,
+      intent: data.intent,
+      text: data.text,
+      state: data.state,
+      delivery: data.delivery,
+      cc: data.cc,
+      skeletonId: data.skeletonId,
+      refs: Array.isArray(data.refs) ? data.refs : [],
+    });
+  }
+  return messages;
+}
+
+export async function GET(
+  request: Request,
+  context: RouteContext
+): Promise<Response> {
+  const resolvedParams = await Promise.resolve(context?.params);
+  let runId = resolvedParams?.runId;
+
+  if (!runId) {
+    try {
+      const url = new URL(request.url);
+      const match = url.pathname.match(/\/api\/runs\/([^/?#]+)\/messages/);
+      if (match) {
+        runId = decodeURIComponent(match[1]);
+      }
+    } catch {}
+  }
+
+  if (!isSafeRunId(runId)) {
+    return Response.json(
+      { ok: false, error: "Invalid or missing runId" },
+      { status: 400 }
+    );
+  }
+
+  const runStore = resolveRunStore(request);
+  const eventStore = resolveEventStore(request, undefined, runStore);
+
+  const run = runStore.getRun(runId);
+  const events = eventStore.getEvents(runId);
+
+  if (!run && events.length === 0) {
+    return Response.json(
+      { ok: false, error: "Run not found" },
+      { status: 404 }
+    );
+  }
+
+  const authError = authorizeMutatingRunRequest(
+    run,
+    request,
+    undefined,
+    runStore,
+    "read messages for this run"
+  );
+  if (authError) {
+    return authError;
+  }
+
+  return Response.json(
+    { ok: true, runId, messages: readMessages(events) },
+    { status: 200, headers: { "Cache-Control": "no-store" } }
+  );
+}
+

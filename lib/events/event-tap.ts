@@ -113,8 +113,145 @@ export function redactEvent(
 
 interface AdminRedactionInfo {
   redactedSeqs: Set<number>;
+  redactedFields: Set<string>;
   extraSecrets: Set<string>;
   extraPatterns: RegExp[];
+}
+
+/**
+ * Maps every logical redaction field the Admin can request to the event data keys it governs. The
+ * admin redact action records the requested logical fields on `admin.redaction`; at read time each
+ * requested field expands to the keys below (subject to the event kind) and the matching values are
+ * replaced on the served event, so a stored payload is never returned to a reader unmasked.
+ */
+const REDACTION_FIELD_KEYS: Record<string, readonly string[]> = {
+  logs: ["log", "logs", "stdout", "stderr", "output", "tail", "lines", "chunk"],
+  stdout: ["stdout"],
+  stderr: ["stderr"],
+  diff: ["diff", "patch", "changes"],
+  messages: ["text", "body", "message", "content"],
+  prompts: ["prompt", "input", "text"],
+  commands: ["command", "cmd", "argv"],
+  report: ["report", "reading", "narrative", "findings", "markdown"],
+};
+
+/**
+ * The logical redaction fields that read-time enforcement can actually honor. The admin redact
+ * route validates every requested field against this list, so a stored redaction can never name a
+ * field that the read path is unable to scrub.
+ */
+export const ALLOWED_REDACTION_FIELDS: readonly string[] = Object.keys(
+  REDACTION_FIELD_KEYS
+);
+
+// Fields such as `messages`, `prompts` and `commands` only govern events of their own kind.
+function fieldAppliesToKind(field: string, kind: string): boolean {
+  const lower = kind.toLowerCase();
+  switch (field) {
+    case "messages":
+      return lower.startsWith("message") || lower.includes("message");
+    case "prompts":
+      return lower.startsWith("prompt") || lower.includes("prompt");
+    case "commands":
+      return (
+        lower.startsWith("command") ||
+        lower.includes("command") ||
+        lower === "cmd.output"
+      );
+    default:
+      return true;
+  }
+}
+
+function collectFieldDataKeys(fields: Set<string>, kind: string): Set<string> {
+  const keys = new Set<string>();
+  for (const field of fields) {
+    const mapped = REDACTION_FIELD_KEYS[field];
+    if (!mapped || !fieldAppliesToKind(field, kind)) {
+      continue;
+    }
+    for (const key of mapped) {
+      keys.add(key);
+    }
+  }
+  return keys;
+}
+
+interface ScrubResult {
+  value: unknown;
+  changed: boolean;
+}
+
+function scrubMatchedValue(value: unknown): ScrubResult {
+  if (value === DEFAULT_REDACTION_MASK) {
+    return { value, changed: false };
+  }
+  if (typeof value === "string" || Array.isArray(value)) {
+    return { value: DEFAULT_REDACTION_MASK, changed: true };
+  }
+  if (typeof value === "object" && value !== null) {
+    return { value: DEFAULT_REDACTION_MASK, changed: true };
+  }
+  return { value, changed: false };
+}
+
+// Recursively scrubs any nested key whose name matches a requested logical field.
+function scrubNestedValue(value: unknown, fields: Set<string>): ScrubResult {
+  if (Array.isArray(value)) {
+    let changed = false;
+    const next = value.map((item) => {
+      const result = scrubNestedValue(item, fields);
+      if (result.changed) changed = true;
+      return result.value;
+    });
+    return { value: next, changed };
+  }
+  if (value !== null && typeof value === "object") {
+    let changed = false;
+    const next: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+      if (fields.has(key)) {
+        const result = scrubMatchedValue(entry);
+        if (result.changed) changed = true;
+        next[key] = result.value;
+      } else {
+        const result = scrubNestedValue(entry, fields);
+        if (result.changed) changed = true;
+        next[key] = result.value;
+      }
+    }
+    return { value: next, changed };
+  }
+  return { value, changed: false };
+}
+
+function scrubEventDataFields(
+  data: Record<string, unknown>,
+  rootKeys: Set<string>,
+  fields: Set<string>
+): ScrubResult {
+  let changed = false;
+  const next: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(data)) {
+    if (key === "refs") {
+      next[key] = entry;
+      continue;
+    }
+    if (rootKeys.has(key) || fields.has(key)) {
+      const result = scrubMatchedValue(entry);
+      if (result.changed) changed = true;
+      next[key] = result.value;
+    } else {
+      // Recurse with the same expanded mapped key set the root level matches against, so nested
+      // keys (e.g. a nested `stdout`/`stderr`/`output` under `fields: ["logs"]`) are scrubbed at
+      // every depth. `rootKeys` never contains `refs`, so the root-level `refs` exception holds for
+      // nested objects as well.
+      const result = scrubNestedValue(entry, rootKeys);
+      if (result.changed) changed = true;
+      next[key] = result.value;
+    }
+  }
+  return { value: next, changed };
 }
 
 export class EventTap {
@@ -259,58 +396,63 @@ export class EventTap {
   // Read path: query admin.redaction events and apply read-time redaction (Requirement 32.14)
   private getAdminRedactionInfo(runId: string): AdminRedactionInfo {
     const redactedSeqs = new Set<number>();
+    const redactedFields = new Set<string>();
     const extraSecrets = new Set<string>();
     const extraPatterns: RegExp[] = [];
 
-    try {
-      const redactions = this.eventStore.getEvents(runId, {
-        kind: "admin.redaction",
-      });
-      for (const red of redactions) {
-        const d = red.data as Record<string, unknown> | undefined;
-        if (!d) continue;
+    // Fail closed: if the owner redaction rules cannot be loaded this query throws and the error
+    // propagates out of getEvents/iterateEvents/getEvent, so a reader aborts instead of being served
+    // stored events that may still contain secrets.
+    const redactions = this.eventStore.getEvents(runId, {
+      kind: "admin.redaction",
+    });
+    for (const red of redactions) {
+      const d = red.data as Record<string, unknown> | undefined;
+      if (!d) continue;
 
-        if (typeof d.targetSeq === "number") {
-          redactedSeqs.add(d.targetSeq);
+      if (typeof d.targetSeq === "number") {
+        redactedSeqs.add(d.targetSeq);
+      }
+      if (typeof d.seq === "number") {
+        redactedSeqs.add(d.seq);
+      }
+      if (typeof d.redactedSeq === "number") {
+        redactedSeqs.add(d.redactedSeq);
+      }
+      if (Array.isArray(d.targetSeqs)) {
+        for (const s of d.targetSeqs) {
+          if (typeof s === "number") redactedSeqs.add(s);
         }
-        if (typeof d.seq === "number") {
-          redactedSeqs.add(d.seq);
+      }
+      if (Array.isArray(d.redactedSeqs)) {
+        for (const s of d.redactedSeqs) {
+          if (typeof s === "number") redactedSeqs.add(s);
         }
-        if (typeof d.redactedSeq === "number") {
-          redactedSeqs.add(d.redactedSeq);
+      }
+      if (Array.isArray(d.secrets)) {
+        for (const s of d.secrets) {
+          if (typeof s === "string" && s.length > 0) extraSecrets.add(s);
         }
-        if (Array.isArray(d.targetSeqs)) {
-          for (const s of d.targetSeqs) {
-            if (typeof s === "number") redactedSeqs.add(s);
-          }
+      }
+      if (Array.isArray(d.fields)) {
+        for (const f of d.fields) {
+          if (typeof f === "string" && f.length > 0) redactedFields.add(f);
         }
-        if (Array.isArray(d.redactedSeqs)) {
-          for (const s of d.redactedSeqs) {
-            if (typeof s === "number") redactedSeqs.add(s);
-          }
-        }
-        if (Array.isArray(d.secrets)) {
-          for (const s of d.secrets) {
-            if (typeof s === "string" && s.length > 0) extraSecrets.add(s);
-          }
-        }
-        if (Array.isArray(d.patterns)) {
-          for (const p of d.patterns) {
-            if (typeof p === "string" && p.length > 0) {
-              try {
-                extraPatterns.push(new RegExp(p, "g"));
-              } catch {
-                // Ignore invalid regex string in event data
-              }
+      }
+      if (Array.isArray(d.patterns)) {
+        for (const p of d.patterns) {
+          if (typeof p === "string" && p.length > 0) {
+            try {
+              extraPatterns.push(new RegExp(p, "g"));
+            } catch {
+              // Ignore invalid regex string in event data
             }
           }
         }
       }
-    } catch {
-      // If table query fails, continue without admin redactions
     }
 
-    return { redactedSeqs, extraSecrets, extraPatterns };
+    return { redactedSeqs, redactedFields, extraSecrets, extraPatterns };
   }
 
   private applyReadRedaction(
@@ -340,7 +482,46 @@ export class EventTap {
       patterns: [...this.customPatterns, ...adminInfo.extraPatterns],
     };
 
-    return redactEvent(currentEvent, readOptions);
+    currentEvent = redactEvent(currentEvent, readOptions);
+
+    // Read-time field enforcement: a requested redaction field is applied to every stored event of
+    // the run except the `admin.redaction` audit record itself, which must stay intact.
+    if (
+      adminInfo.redactedFields.size > 0 &&
+      currentEvent.kind !== "admin.redaction"
+    ) {
+      currentEvent = this.applyFieldRedaction(
+        currentEvent,
+        adminInfo.redactedFields
+      );
+    }
+
+    return currentEvent;
+  }
+
+  private applyFieldRedaction(
+    event: EventEnvelope,
+    fields: Set<string>
+  ): EventEnvelope {
+    const data = (event.data ?? { refs: [] }) as Record<string, unknown>;
+    const rootKeys = collectFieldDataKeys(fields, event.kind);
+    const scrubbed = scrubEventDataFields(data, rootKeys, fields);
+    if (!scrubbed.changed) {
+      return event;
+    }
+    const next = scrubbed.value as Record<string, unknown>;
+    const refs = Array.isArray(next.refs)
+      ? (next.refs as unknown[]).map((ref) => String(ref))
+      : [];
+    return {
+      ...event,
+      data: {
+        ...next,
+        refs,
+        redacted: true,
+        redactedByOwner: true,
+      },
+    };
   }
 
   getEvents(runId: string, options?: GetEventsOptions): EventEnvelope[] {
