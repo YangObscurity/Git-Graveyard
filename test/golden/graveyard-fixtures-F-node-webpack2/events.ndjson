@@ -1,0 +1,9 @@
+{"seq":0,"kind":"signal","ruleId":"M3","file":"index.js","line":1,"column":10,"matched":"require('lodash')","confidence":"high","manifestDir":"."}
+{"seq":1,"kind":"signal","ruleId":"M3","file":"index.js","line":7,"column":0,"matched":"module.exports","confidence":"high","manifestDir":"."}
+{"seq":2,"kind":"signal","ruleId":"M6","file":"package.json","line":1,"column":1,"matched":"missing lock file","confidence":"high","manifestDir":"."}
+{"seq":3,"kind":"signal","ruleId":"M3","file":"webpack.config.js","line":1,"column":13,"matched":"require('path')","confidence":"high","manifestDir":"."}
+{"seq":4,"kind":"signal","ruleId":"M3","file":"webpack.config.js","line":2,"column":16,"matched":"require('webpack')","confidence":"high","manifestDir":"."}
+{"seq":5,"kind":"signal","ruleId":"M3","file":"webpack.config.js","line":4,"column":0,"matched":"module.exports","confidence":"high","manifestDir":"."}
+{"seq":6,"kind":"signal","ruleId":"M4","file":"webpack.config.js","line":14,"column":25,"matched":"CommonsChunkPlugin","confidence":"high","manifestDir":"."}
+{"seq":7,"kind":"verdict","status":"dead","deadReasons":["deprecation_signal"],"lifespanYears":"unknown","yearsDead":0}
+{"seq":8,"kind":"gate.result","gate":"syntax","ok":true,"files":[],"reasons":[]}
