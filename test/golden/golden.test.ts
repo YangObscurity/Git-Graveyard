@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { bakeFixture } from "../../scripts/fixtures/bake";
+import { bakeFixture, bakeFixtureArtifacts } from "../../scripts/fixtures/bake";
 
 describe("Golden test runner: compares fresh output with committed bytes", () => {
   const currentDir = path.dirname(fileURLToPath(import.meta.url));
@@ -30,8 +30,11 @@ describe("Golden test runner: compares fresh output with committed bytes", () =>
       const fixtureDir = path.join(fixturesDir, fixtureFolder);
       const committedGoldenDir = path.join(currentDir, folderName);
 
-      it(`matches committed all.patch byte-for-byte for ${folderName}`, () => {
-        const freshOutput = bakeFixture(fixtureDir);
+      it(`matches committed all.patch byte-for-byte for ${folderName}`, async () => {
+        const freshOutput = await bakeFixtureArtifacts(
+          fixtureDir,
+          bakeFixture(fixtureDir)
+        );
         const committedPatchPath = path.join(committedGoldenDir, "all.patch");
 
         assert.ok(

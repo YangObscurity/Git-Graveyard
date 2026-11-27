@@ -1,0 +1,1 @@
+This repository is a test fixture designed to verify the Grimoire Python 2 to Python 3 migration guidance (rule M1). It mixes a legacy `setup.py`, a report module and one helper that keeps residue the grimoire never rewrites.

@@ -7,6 +7,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { GitService, GitServiceError } from "../../lib/git/git-service";
 import { candidateSha256FromDiff } from "../../lib/merge/candidate-hash";
+import { EventStore } from "../../lib/events/event-store";
 
 interface TestRepoContext {
   tmpDir: string;
@@ -913,6 +914,7 @@ test("pushToFork: target owner must equal configured owner login case-insensitiv
   await assert.rejects(
     async () => {
       await serviceNoOwner.pushToFork("run-owner-1", {
+        pushConfirm: true,
         targetRepoUrl: "https://github.com/fork-owner/fork-repo",
         runPhase: "done",
         invitePushFlag: true,
@@ -935,6 +937,7 @@ test("pushToFork: target owner must equal configured owner login case-insensitiv
   await assert.rejects(
     async () => {
       await serviceOwnerMismatch.pushToFork("run-owner-2", {
+        pushConfirm: true,
         targetRepoUrl: "https://github.com/fork-owner/fork-repo",
         runPhase: "done",
         invitePushFlag: true,
@@ -958,6 +961,7 @@ test("pushToFork: target owner must equal configured owner login case-insensitiv
   await assert.rejects(
     async () => {
       await serviceCaseMatch.pushToFork("run-owner-3", {
+        pushConfirm: true,
         targetRepoUrl: "https://github.com/fork-owner/fork-repo",
         runPhase: "done",
         invitePushFlag: true,
@@ -985,6 +989,7 @@ test("pushToFork: fork checker validation and default deny", async () => {
   await assert.rejects(
     async () => {
       await service.pushToFork("run-fork-1", {
+        pushConfirm: true,
         targetRepoUrl: "https://github.com/fork-owner/fork-repo",
         runPhase: "done",
         invitePushFlag: true,
@@ -1002,6 +1007,7 @@ test("pushToFork: fork checker validation and default deny", async () => {
   await assert.rejects(
     async () => {
       await service.pushToFork("run-fork-2", {
+        pushConfirm: true,
         targetRepoUrl: "https://github.com/fork-owner/fork-repo",
         runPhase: "done",
         invitePushFlag: true,
@@ -1020,6 +1026,7 @@ test("pushToFork: fork checker validation and default deny", async () => {
   await assert.rejects(
     async () => {
       await service.pushToFork("run-fork-3", {
+        pushConfirm: true,
         targetRepoUrl: "https://github.com/fork-owner/fork-repo",
         runPhase: "done",
         invitePushFlag: true,
@@ -1038,6 +1045,7 @@ test("pushToFork: fork checker validation and default deny", async () => {
   await assert.rejects(
     async () => {
       await service.pushToFork("run-fork-4", {
+        pushConfirm: true,
         targetRepoUrl: "https://github.com/fork-owner/fork-repo",
         runPhase: "done",
         invitePushFlag: true,
@@ -1056,6 +1064,7 @@ test("pushToFork: fork checker validation and default deny", async () => {
   await assert.rejects(
     async () => {
       await service.pushToFork("run-fork-5", {
+        pushConfirm: true,
         targetRepoUrl: "https://github.com/fork-owner/fork-repo",
         runPhase: "done",
         invitePushFlag: true,
@@ -1082,6 +1091,7 @@ test("pushToFork: write token validation (refusal on missing token)", async () =
   await assert.rejects(
     async () => {
       await service.pushToFork("run-token-1", {
+        pushConfirm: true,
         targetRepoUrl: "https://github.com/fork-owner/fork-repo",
         runPhase: "done",
         invitePushFlag: true,
@@ -1151,6 +1161,7 @@ SCRIPT_DIR="$(cd "$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
     });
 
     const res = await service.pushToFork("run-askpass-01", {
+      pushConfirm: true,
       targetRepoUrl: "https://github.com/fork-owner/fork-repo",
       runPhase: "done",
       invitePushFlag: true,
@@ -1233,6 +1244,7 @@ SCRIPT_DIR="$(cd "$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
     await assert.rejects(
       async () => {
         await service.pushToFork("run-err-redact-01", {
+          pushConfirm: true,
           targetRepoUrl: "https://github.com/fork-owner/fork-repo",
           runPhase: "done",
           invitePushFlag: true,
@@ -1290,6 +1302,7 @@ SCRIPT_DIR="$(cd "$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
     });
 
     const res = await service.pushToFork(ctx.runId, {
+      pushConfirm: true,
       targetRepoUrl: "https://github.com/target-owner/source-repo",
       runPhase: "done",
       invitePushFlag: true,
@@ -1387,6 +1400,7 @@ SCRIPT_DIR="$(cd "$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
 
     // Network command: pushToFork
     await service.pushToFork("run-proto-01", {
+      pushConfirm: true,
       targetRepoUrl: "https://github.com/target-owner/source-repo",
       runPhase: "done",
       invitePushFlag: true,
@@ -1547,6 +1561,7 @@ test("rule 4: pushToFork - strict https://github.com/<owner>/<repo> target URL a
     await assert.rejects(
       async () => {
         await noWriteTokenService.pushToFork("run-r4-5", {
+          pushConfirm: true,
           targetRepoUrl: "https://github.com/owner-login/fork-repo",
           runPhase: "done",
           invitePushFlag: true,
@@ -1732,5 +1747,357 @@ test("rule 6: mergeCandidate keeps server-computed candidateSha256 and compare-a
   });
   assert.equal(casRes.ok, false);
   assert.equal(casRes.merged, false);
+});
+
+test("pushToFork: refuses an explicit negative push confirmation", async () => {
+  const service = new GitService({
+    ownerLogin: "fork-owner",
+    sourceRepoUrl: "https://github.com/source-owner/source-repo",
+  });
+
+  await assert.rejects(
+    async () => {
+      await service.pushToFork("run-confirm-1", {
+        targetRepoUrl: "https://github.com/fork-owner/fork-repo",
+        runPhase: "done",
+        invitePushFlag: true,
+        pushConfirm: false,
+        forkChecker: async () => "source-owner/source-repo",
+        token: "test-token",
+      });
+    },
+    (err: unknown) => {
+      assert.ok(err instanceof GitServiceError);
+      assert.equal(err.code, "PUSH_NOT_CONFIRMED");
+      return true;
+    }
+  );
+});
+test("pushToFork: omitted or undefined push confirmation is refused fail-closed", async () => {
+  const service = new GitService({
+    ownerLogin: "fork-owner",
+    sourceRepoUrl: "https://github.com/source-owner/source-repo",
+  });
+
+  let checkerCalls = 0;
+  const forkChecker = async () => {
+    checkerCalls += 1;
+    return "source-owner/source-repo";
+  };
+
+  // Omitted pushConfirm (undefined) is refused.
+  await assert.rejects(
+    async () => {
+      await service.pushToFork("run-confirm-omit", {
+        targetRepoUrl: "https://github.com/fork-owner/fork-repo",
+        runPhase: "done",
+        invitePushFlag: true,
+        forkChecker,
+        token: "test-token",
+      });
+    },
+    (err: unknown) => {
+      assert.ok(err instanceof GitServiceError);
+      assert.equal(err.code, "PUSH_NOT_CONFIRMED");
+      return true;
+    }
+  );
+
+  // An explicit undefined pushConfirm is refused too.
+  await assert.rejects(
+    async () => {
+      await service.pushToFork("run-confirm-undefined", {
+        targetRepoUrl: "https://github.com/fork-owner/fork-repo",
+        runPhase: "done",
+        invitePushFlag: true,
+        pushConfirm: undefined,
+        forkChecker,
+        token: "test-token",
+      });
+    },
+    (err: unknown) => {
+      assert.ok(err instanceof GitServiceError);
+      assert.equal(err.code, "PUSH_NOT_CONFIRMED");
+      return true;
+    }
+  );
+
+  // Fail-closed: the refusal happens before any fork verification or remote work.
+  assert.equal(checkerCalls, 0);
+});
+
+
+
+test("pushToFork: emits push.requested and push.result without leaking the token", async () => {
+  const secretToken = ["gh", "p_", "event", "secret", "token", "9876"].join("");
+  const sha = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+
+  const script = `#!/usr/bin/env bash
+SCRIPT_DIR="$(cd "$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
+"${process.execPath}" -e '
+  const args = process.argv.slice(1);
+  if (args.includes("rev-parse")) {
+    process.stdout.write("${sha}\\n");
+    process.exit(0);
+  }
+  if (args.includes("push")) {
+    process.stdout.write("Everything up-to-date\\n");
+    process.exit(0);
+  }
+  process.exit(0);
+' -- "$@"
+`;
+
+  await withFakeGitInPath(script, async () => {
+    const eventStore = new EventStore(":memory:");
+    const service = new GitService({
+      ownerLogin: "fork-owner",
+      sourceRepoUrl: "https://github.com/source-owner/source-repo",
+    });
+
+    const res = await service.pushToFork("run-push-events", {
+      pushConfirm: true,
+      targetRepoUrl: "https://github.com/fork-owner/fork-repo",
+      runPhase: "done",
+      invitePushFlag: true,
+      forkChecker: async () => "source-owner/source-repo",
+      token: secretToken,
+      eventStore,
+    });
+    assert.equal(res.ok, true);
+
+    const requested = eventStore.getEvents("run-push-events", { kind: "push.requested" });
+    assert.equal(requested.length, 1);
+    assert.equal(requested[0].data.branch, "graveyard/run-push-events");
+
+    const result = eventStore.getEvents("run-push-events", { kind: "push.result" });
+    assert.equal(result.length, 1);
+    assert.equal(result[0].data.ok, true);
+    assert.equal(result[0].data.commitSha, sha);
+
+    const serialized = JSON.stringify(
+      eventStore.getEvents("run-push-events", {
+        kinds: ["push.requested", "push.result"],
+      })
+    );
+    assert.equal(serialized.includes(secretToken), false, "token must never appear in events");
+  });
+});
+
+test("pushToFork: emitEvent receives redacted push events without duplicated fields", async () => {
+  const secretToken = ["gh", "p_", "emit", "path", "secret", "token", "2468"].join("");
+  const sha = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+
+  const script = `#!/usr/bin/env bash
+"${process.execPath}" -e '
+  const args = process.argv.slice(1);
+  if (args.includes("rev-parse")) {
+    process.stdout.write("${sha}");
+    process.exit(0);
+  }
+  if (args.includes("push")) {
+    const token = process.env.GIT_WRITE_TOKEN || "";
+    process.stdout.write("Everything up-to-date " + token);
+    process.stderr.write("write token: " + token);
+    process.exit(0);
+  }
+  process.exit(0);
+' -- "$@"
+`;
+
+  await withFakeGitInPath(script, async () => {
+    const emitted: Array<{
+      runId: string;
+      kind: string;
+      actor: string;
+      data: Record<string, unknown>;
+      ts: number;
+    }> = [];
+    const service = new GitService({
+      ownerLogin: "fork-owner",
+      sourceRepoUrl: "https://github.com/source-owner/source-repo",
+    });
+
+    const res = await service.pushToFork("run-push-emit", {
+      pushConfirm: true,
+      targetRepoUrl: "https://github.com/fork-owner/fork-repo",
+      runPhase: "done",
+      invitePushFlag: true,
+      forkChecker: async () => "source-owner/source-repo",
+      token: secretToken,
+      emitEvent: (evt) => emitted.push(evt),
+    });
+    assert.equal(res.ok, true);
+
+    const requested = emitted.find((e) => e.kind === "push.requested");
+    assert.ok(requested, "push.requested must be emitted");
+    assert.equal(requested.runId, "run-push-emit");
+    assert.equal(requested.data.branch, "graveyard/run-push-emit");
+    assert.equal(
+      requested.data.targetRepoUrl,
+      "https://github.com/fork-owner/fork-repo"
+    );
+    // branch/targetRepoUrl live only at the data top level; runId is not nested.
+    assert.equal("runId" in requested.data, false);
+    assert.deepEqual(Object.keys(requested.data).sort(), [
+      "branch",
+      "refs",
+      "targetRepoUrl",
+    ]);
+
+    const result = emitted.find((e) => e.kind === "push.result");
+    assert.ok(result, "push.result must be emitted");
+    assert.equal(result.runId, "run-push-emit");
+    assert.equal(result.data.ok, true);
+    assert.equal(result.data.commitSha, sha);
+    assert.equal(result.data.branch, "graveyard/run-push-emit");
+    assert.equal("runId" in result.data, false);
+    assert.deepEqual(Object.keys(result.data).sort(), [
+      "branch",
+      "commitSha",
+      "ok",
+      "refs",
+      "stderr",
+      "stdout",
+      "targetRepoUrl",
+    ]);
+
+    // The fake git echoes the write token on stdout and stderr, so these
+    // assertions fail immediately if redaction regresses.
+    assert.equal(
+      String(result.data.stdout).includes(secretToken),
+      false,
+      "push.result stdout must not contain the write token"
+    );
+    assert.equal(
+      String(result.data.stderr).includes(secretToken),
+      false,
+      "push.result stderr must not contain the write token"
+    );
+    assert.ok(
+      String(result.data.stdout).includes("[REDACTED]"),
+      "push.result stdout must show the write token was redacted"
+    );
+
+    // The redacting emitter must never surface the write token.
+    assert.equal(JSON.stringify(emitted).includes(secretToken), false);
+  });
+});
+
+test("pushToFork: holds an exclusive write lock per run", async () => {
+  const sha = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+
+  const script = `#!/usr/bin/env bash
+SCRIPT_DIR="$(cd "$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
+"${process.execPath}" -e '
+  const args = process.argv.slice(1);
+  if (args.includes("rev-parse")) {
+    setTimeout(() => { process.stdout.write("${sha}\\n"); process.exit(0); }, 400);
+  } else {
+    process.exit(0);
+  }
+' -- "$@"
+`;
+
+  await withFakeGitInPath(script, async () => {
+    const service = new GitService({
+      ownerLogin: "fork-owner",
+      sourceRepoUrl: "https://github.com/source-owner/source-repo",
+    });
+    const options = {
+      targetRepoUrl: "https://github.com/fork-owner/fork-repo",
+      runPhase: "done" as const,
+      invitePushFlag: true,
+      pushConfirm: true,
+      forkChecker: async () => "source-owner/source-repo",
+      token: "test-token",
+    };
+
+    const first = service.pushToFork("run-lock-1", options);
+    await new Promise((resolve) => setTimeout(resolve, 120));
+
+    await assert.rejects(
+      service.pushToFork("run-lock-1", options),
+      (err: unknown) => {
+        assert.ok(err instanceof GitServiceError);
+        assert.equal(err.code, "PUSH_LOCK_HELD");
+        return true;
+      }
+    );
+
+    const res = await first;
+    assert.equal(res.ok, true);
+  });
+});
+
+
+
+test("pushToFork: a refused (lock-held) push never leaks an askpass temp directory", async () => {
+  const sha = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+
+  const script = `#!/usr/bin/env bash
+SCRIPT_DIR="$(cd "$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
+"${process.execPath}" -e '
+  const args = process.argv.slice(1);
+  if (args.includes("rev-parse")) {
+    setTimeout(() => { process.stdout.write("${sha}\\\\n"); process.exit(0); }, 400);
+  } else {
+    process.exit(0);
+  }
+' -- "$@"
+`;
+
+  const isolatedTmp = fs.mkdtempSync(path.join(os.tmpdir(), "push-lock-leak-"));
+  const prevTmp = process.env.TMPDIR;
+  process.env.TMPDIR = isolatedTmp;
+  try {
+    await withFakeGitInPath(script, async () => {
+      const service = new GitService({
+        ownerLogin: "fork-owner",
+        sourceRepoUrl: "https://github.com/source-owner/source-repo",
+      });
+      const options = {
+        targetRepoUrl: "https://github.com/fork-owner/fork-repo",
+        runPhase: "done" as const,
+        invitePushFlag: true,
+        pushConfirm: true,
+        forkChecker: async () => "source-owner/source-repo",
+        token: "test-token",
+      };
+      const countAskpass = () =>
+        fs.readdirSync(isolatedTmp).filter((n) => n.startsWith("git-askpass-")).length;
+
+      const first = service.pushToFork("run-lock-leak", options);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      const before = countAskpass();
+      await assert.rejects(
+        service.pushToFork("run-lock-leak", options),
+        (err: unknown) => {
+          assert.ok(err instanceof GitServiceError);
+          assert.equal(err.code, "PUSH_LOCK_HELD");
+          return true;
+        }
+      );
+      const after = countAskpass();
+      assert.equal(
+        after,
+        before,
+        "a refused lock-held push must not create an askpass temp directory"
+      );
+
+      await first;
+      assert.equal(countAskpass(), 0, "askpass temp directories are always cleaned up");
+    });
+  } finally {
+    if (prevTmp === undefined) {
+      delete process.env.TMPDIR;
+    } else {
+      process.env.TMPDIR = prevTmp;
+    }
+    try {
+      fs.rmSync(isolatedTmp, { recursive: true, force: true });
+    } catch {}
+  }
 });
 

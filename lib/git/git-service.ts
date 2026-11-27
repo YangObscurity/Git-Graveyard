@@ -5,6 +5,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { candidateSha256FromDiff } from "../merge/candidate-hash";
 import type { GateResultInput } from "../merge/types";
+import type { EventStore } from "../events/event-store";
+import { redactEvent } from "../security/redactor";
 import { isCheckPassing, validateWardenVerdict } from "../warden/warden-review";
 
 export const GIT_HOOKS_FLAG = "core.hooksPath=/dev/null";
@@ -18,6 +20,19 @@ export const GIT_ISOLATION_FLAGS: readonly string[] = [
   "-c",
   GIT_PROTOCOL_ALLOW_FLAG,
 ];
+
+// The GitService holds the only GitHub write operation. A single in-process
+// exclusive write lock per run prevents two concurrent fork pushes for the same
+// run from interleaving (Requirement 29.1).
+const activePushLocks = new Set<string>();
+
+export function isPushLocked(runId: string): boolean {
+  return activePushLocks.has(runId);
+}
+
+export function activePushLockCount(): number {
+  return activePushLocks.size;
+}
 
 export class RepoSizeExceededError extends Error {
   readonly ok = false as const;
@@ -456,6 +471,22 @@ export interface PushToForkOptions {
   runPhase?: string;
   token?: string;
   branchName?: string;
+  /** Explicit push confirmation (Tier 1 push_confirm); `false` is a refusal. */
+  pushConfirm?: boolean;
+  /** Optional event sink for `push.requested` / `push.result`. */
+  eventStore?: Pick<EventStore, "append">;
+  /**
+   * Optional redacting event emitter. When supplied it receives the fully
+   * redacted `push.requested` / `push.result` events and takes precedence over
+   * `eventStore`.
+   */
+  emitEvent?: (event: {
+    runId: string;
+    kind: string;
+    actor: string;
+    data: Record<string, unknown>;
+    ts: number;
+  }) => void;
 }
 
 export interface PushToForkResult {
@@ -2879,6 +2910,15 @@ export class GitService {
       );
     }
 
+    // pushConfirm must be exactly true. A missing value is a refusal: the
+    // confirmation is fail-closed, so `undefined` never authorizes a push.
+    if (options.pushConfirm !== true) {
+      throw new GitServiceError(
+        "pushToFork refused: explicit push confirmation was not given (Requirement 29.5)",
+        "PUSH_NOT_CONFIRMED"
+      );
+    }
+
     // Target owner must equal configured owner login, compared case-insensitively.
     const configuredOwner = (
       options.ownerLogin ??
@@ -3017,11 +3057,45 @@ export class GitService {
       );
     }
 
-    // GIT_ASKPASS helper script in fresh temporary directory with mode 0700
-    const askpassDir = fs.mkdtempSync(path.join(os.tmpdir(), "git-askpass-"));
-    fs.chmodSync(askpassDir, 0o700);
-    const helperScriptPath = path.join(askpassDir, "askpass.sh");
-    const scriptContent = `#!/bin/sh
+    // Acquire the exclusive write lock BEFORE creating any temporary askpass
+    // directory so a held lock or a setup failure never leaks a temp dir.
+    if (activePushLocks.has(effectiveRunId)) {
+      throw new GitServiceError(
+        `pushToFork refused: exclusive fork push lock for run '${effectiveRunId}' is already held (Requirement 29.1)`,
+        "PUSH_LOCK_HELD"
+      );
+    }
+    activePushLocks.add(effectiveRunId);
+
+    const emitPushEvent = (kind: string, data: Record<string, unknown>): void => {
+      const event = {
+        runId: effectiveRunId,
+        kind,
+        actor: "necromancer",
+        data: { branch, targetRepoUrl: targetUrl, ...data },
+        ts: Date.now(),
+      };
+      const redacted = redactEvent(event);
+      try {
+        if (typeof options.emitEvent === "function") {
+          options.emitEvent(redacted);
+          return;
+        }
+        const sink = options.eventStore;
+        if (!sink || typeof sink.append !== "function") return;
+        sink.append(redacted);
+      } catch {
+        // Event recording must never abort a push decision.
+      }
+    };
+
+    let askpassDir: string | null = null;
+    try {
+      // GIT_ASKPASS helper script in fresh temporary directory with mode 0700
+      askpassDir = fs.mkdtempSync(path.join(os.tmpdir(), "git-askpass-"));
+      fs.chmodSync(askpassDir, 0o700);
+      const helperScriptPath = path.join(askpassDir, "askpass.sh");
+      const scriptContent = `#!/bin/sh
 case "$1" in
   *[Uu]sername*)
     echo "x-access-token"
@@ -3031,17 +3105,18 @@ case "$1" in
     ;;
 esac
 `;
-    fs.writeFileSync(helperScriptPath, scriptContent, {
-      mode: 0o700,
-      encoding: "utf8",
-    });
-    fs.chmodSync(helperScriptPath, 0o700);
+      fs.writeFileSync(helperScriptPath, scriptContent, {
+        mode: 0o700,
+        encoding: "utf8",
+      });
+      fs.chmodSync(helperScriptPath, 0o700);
 
-    const runRoot = options.runDir ?? path.join(this.runsDir, effectiveRunId);
-    const gitDir = options.gitDir ?? path.join(runRoot, "git");
-    const hostGitDir = resolveHostGitDir(gitDir);
+      const runRoot = options.runDir ?? path.join(this.runsDir, effectiveRunId);
+      const gitDir = options.gitDir ?? path.join(runRoot, "git");
+      const hostGitDir = resolveHostGitDir(gitDir);
 
-    try {
+      emitPushEvent("push.requested", {});
+
       const shaRes = await this.#execGitInternal([
         "--git-dir",
         hostGitDir,
@@ -3078,6 +3153,13 @@ esac
         true
       );
 
+      emitPushEvent("push.result", {
+        ok: true,
+        commitSha,
+        stdout: redactCredentials(pushRes.stdout ?? "", token),
+        stderr: redactCredentials(pushRes.stderr ?? "", token),
+      });
+
       return {
         ok: true,
         runId: effectiveRunId,
@@ -3090,6 +3172,10 @@ esac
     } catch (err: any) {
       const cleanMessage = redactCredentials(err.message ?? "", token);
       const cleanStderr = redactCredentials(err.stderr ?? "", token);
+      emitPushEvent("push.result", {
+        ok: false,
+        reason: cleanMessage,
+      });
       throw new GitServiceError(
         cleanMessage,
         err.code ?? "GIT_COMMAND_FAILED",
@@ -3097,10 +3183,13 @@ esac
         cleanStderr
       );
     } finally {
-      try {
-        fs.rmSync(askpassDir, { recursive: true, force: true });
-      } catch {
-        // Ignore cleanup failure
+      activePushLocks.delete(effectiveRunId);
+      if (askpassDir) {
+        try {
+          fs.rmSync(askpassDir, { recursive: true, force: true });
+        } catch {
+          // Ignore cleanup failure
+        }
       }
     }
   }
