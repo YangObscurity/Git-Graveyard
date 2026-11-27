@@ -154,6 +154,21 @@ describe("Grimoire bundle templates (Requirements 10.1, 10.2, 10.10)", () => {
     assert.equal(rows.find((row) => row.ruleId === "M3")?.fired, false);
   });
 
+  it("extracts backtick-wrapped paths that contain a comma", () => {
+    const design = [
+      "## Mapping",
+      "",
+      "| Rule | Fired | Finding | Target | Files |",
+      "|---|---|---|---|---|",
+      "| M1 | yes | f | t | `a,b.py`, `plain.py` |",
+      "",
+      "## Next",
+    ].join("\n");
+    const rows = extractMappingRows(design);
+    assert.equal(rows.length, 1);
+    assert.deepEqual(rows[0].files, ["a,b.py", "plain.py"]);
+  });
+
   it("renders compatibility and behavior notes from the patch steps", () => {
     const bundle = generateBundle(baseInput());
     assert.match(bundle.design, /^## Compatibility notes$/m);
@@ -365,6 +380,27 @@ describe("Outcome labels and deterministic output (Requirements 10.7-10.10)", ()
     assert.equal(tasks.filter((task) => task.ruleId === "M6").length, 1);
     assert.equal(tasks.filter((task) => task.ruleId === "M7").length, 0);
   });
+
+  it("normalizes an explicit manual task target before deduping", () => {
+    const tasks = collectManualTasks(
+      baseInput({
+        manualTasks: [
+          { ruleId: "M6", target: ".", description: "explicit" },
+          { ruleId: "M6", target: "./", description: "duplicate once normalized" },
+          { ruleId: "M5", target: "packages\\a\\", description: "windows separators" },
+        ],
+      })
+    );
+    const m6 = tasks.filter((task) => task.ruleId === "M6");
+    assert.equal(m6.length, 1, "keys must be deduped after normalizing the target");
+    assert.equal(m6[0].target, ".");
+    const m5 = tasks.filter((task) => task.ruleId === "M5");
+    assert.equal(m5.length, 2);
+    assert.ok(
+      m5.some((task) => task.target === "packages/a"),
+      "the explicit target must be normalized to forward slashes"
+    );
+  });
 });
 
 function outcomeStatusCounts(design: string): Record<string, number> {
@@ -440,6 +476,31 @@ describe("Outcome task counts and unknown line ordering (Requirements 6.3, 10.5,
       counts.reduce((sum, entry) => sum + entry.count, 0),
       total
     );
+  });
+
+  it("treats an explicit taskStatusCounts as authoritative without mixing derived counts", () => {
+    const input = baseInput({ taskStatusCounts: { merged: 2 } });
+    const bundle = generateBundle(input);
+    const provided = resolvedStatusCounts(input, bundle.patchTasks, bundle.manualTasks);
+    const derived = resolvedStatusCounts(
+      baseInput(),
+      bundle.patchTasks,
+      bundle.manualTasks
+    );
+
+    assert.equal(provided.find((entry) => entry.status === "merged")?.count, 2);
+    // `pending` is omitted from taskStatusCounts, so it must read 0 rather than
+    // the derived value from the patch and manual tasks.
+    assert.equal(provided.find((entry) => entry.status === "pending")?.count, 0);
+    assert.notEqual(
+      derived.find((entry) => entry.status === "pending")?.count,
+      0,
+      "the derived pending count must be non-zero to prove the values are not mixed"
+    );
+
+    const rendered = outcomeStatusCounts(bundle.design);
+    assert.equal(rendered.pending, 0);
+    assert.equal(rendered.merged, 2);
   });
 
   it("orders a lower line number before a higher one for the same file and reason", () => {
