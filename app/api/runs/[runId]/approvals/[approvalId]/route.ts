@@ -8,6 +8,7 @@ import {
   resolveRunStore,
 } from "@/lib/runtime/store-context";
 import { redactEvent } from "@/lib/security/redactor";
+import type { EventStore } from "@/lib/events/event-store";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -40,6 +41,104 @@ function isSafePathSegment(value: unknown): value is string {
   if (value.includes("..")) return false;
   if (/[\u0000-\u001f]/.test(value)) return false;
   return true;
+}
+
+type ApprovalOwnership = "ok" | "mismatch" | "unknown";
+
+/** Reads an approval record from any accessor an approval manager exposes. */
+function readApprovalRecord(
+  manager: unknown,
+  approvalId: string
+): { runId?: unknown } | undefined {
+  if (!manager || typeof manager !== "object") return undefined;
+  const accessors = ["getApproval", "getApprovalRecord"] as const;
+  for (const name of accessors) {
+    const fn = (manager as Record<string, unknown>)[name] as
+      | ((id: string) => unknown)
+      | undefined;
+    if (typeof fn !== "function") continue;
+    try {
+      const record = fn.call(manager, approvalId);
+      if (record && typeof record === "object") {
+        return record as { runId?: unknown };
+      }
+    } catch {
+      // A throwing accessor means the manager cannot vouch for the request.
+    }
+  }
+  return undefined;
+}
+
+/** Approval managers reachable from the active orchestrator or runtime host. */
+function collectApprovalManagers(orchestrator: unknown): unknown[] {
+  const managers: unknown[] = [];
+  const orch = orchestrator as
+    | {
+        approvalManager?: unknown;
+        host?: { gateway?: { approvalManager?: unknown } };
+      }
+    | null
+    | undefined;
+  if (orch?.approvalManager) managers.push(orch.approvalManager);
+  const hostManager = orch?.host?.gateway?.approvalManager;
+  if (hostManager) managers.push(hostManager);
+  try {
+    const gatewayManager = getRuntimeHost()?.gateway?.approvalManager;
+    if (gatewayManager && gatewayManager !== hostManager) {
+      managers.push(gatewayManager);
+    }
+  } catch {
+    // No runtime host configured; ownership falls back to the event log.
+  }
+  return managers;
+}
+
+/**
+ * Verifies that an approval belongs to the run in the URL before it is resolved.
+ * A manager record or this run's own `approval.requested` events prove
+ * ownership; a record or request event bound to another run is a mismatch, so a
+ * cross-run approval fails closed before any resolver is invoked.
+ */
+function verifyApprovalOwnership(
+  orchestrator: unknown,
+  eventStore: EventStore,
+  runId: string,
+  approvalId: string
+): ApprovalOwnership {
+  for (const manager of collectApprovalManagers(orchestrator)) {
+    const record = readApprovalRecord(manager, approvalId);
+    if (record && typeof record.runId === "string") {
+      return record.runId === runId ? "ok" : "mismatch";
+    }
+  }
+
+  const owns = (owner: string): boolean => {
+    try {
+      const events = eventStore.getEvents(owner, { kind: "approval.requested" });
+      return events.some(
+        (event) =>
+          (event.data as Record<string, unknown> | undefined)?.approvalId ===
+          approvalId
+      );
+    } catch {
+      return false;
+    }
+  };
+
+  if (owns(runId)) return "ok";
+
+  try {
+    const runIds =
+      typeof eventStore.getRunIds === "function" ? eventStore.getRunIds() : [];
+    for (const other of runIds) {
+      if (other === runId) continue;
+      if (owns(other)) return "mismatch";
+    }
+  } catch {
+    // An unreadable run index means ownership cannot be disproven.
+  }
+
+  return "unknown";
 }
 
 export async function POST(
@@ -120,8 +219,28 @@ export async function POST(
     pattern: body.pattern,
   };
 
-  let resolved = false;
   const orchestrator = resolveActiveOrchestrator(request, context);
+
+  // Ownership is proven before any resolver runs: an approval bound to another
+  // run fails closed here rather than being resolved against this run.
+  const ownership = verifyApprovalOwnership(
+    orchestrator,
+    eventStore,
+    runId,
+    approvalId
+  );
+  if (ownership === "mismatch") {
+    return Response.json(
+      {
+        ok: false,
+        error: "Approval does not belong to this run",
+        code: "APPROVAL_RUN_MISMATCH",
+      },
+      { status: 403 }
+    );
+  }
+
+  let resolved = false;
   if (orchestrator && typeof orchestrator.resolveApproval === "function") {
     try {
       const res = await orchestrator.resolveApproval(

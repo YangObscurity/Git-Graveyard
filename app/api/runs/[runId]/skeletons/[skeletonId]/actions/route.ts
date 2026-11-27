@@ -7,6 +7,7 @@ import {
   resolveRunStore,
 } from "@/lib/runtime/store-context";
 import { redactEvent } from "@/lib/security/redactor";
+import type { EventEnvelope, EventStore } from "@/lib/events/event-store";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -96,37 +97,164 @@ async function callFirst(
   return false;
 }
 
-/** Forwards the action to the active dispatcher/warden when one is attached. */
+/** Outcome of forwarding one action to the active dispatcher/warden. */
+interface DispatchOutcome {
+  dispatched: boolean;
+  hadActiveHandle: boolean;
+}
+
+const SKELETON_EVENT_KINDS: readonly string[] = [
+  "skeleton.raised",
+  "skeleton.state",
+  "skeleton.interrupted",
+  "skeleton.reraised",
+  "skeleton.laid_to_rest",
+  "skeleton.instruction",
+  "skeleton.tool_call",
+  "skeleton.tool_result",
+  "skeleton.log",
+  "skeleton.usage",
+];
+
+/** True when an event names this Skeleton at either the envelope or data level. */
+function eventNamesSkeleton(event: EventEnvelope, skeletonId: string): boolean {
+  if (event.skeletonId === skeletonId) return true;
+  const data = event.data as Record<string, unknown> | undefined;
+  return data?.skeletonId === skeletonId;
+}
+
+/** True when this run's own log already attributes the Skeleton to it. */
+function skeletonOwnedByRun(
+  eventStore: EventStore,
+  runId: string,
+  skeletonId: string
+): boolean {
+  try {
+    const events = eventStore.getEvents(runId, {
+      kind: [...SKELETON_EVENT_KINDS],
+    });
+    return events.some((event) => eventNamesSkeleton(event, skeletonId));
+  } catch {
+    return false;
+  }
+}
+
+/** True when another run's log attributes the Skeleton to that other run. */
+function skeletonOwnedByAnotherRun(
+  eventStore: EventStore,
+  runId: string,
+  skeletonId: string
+): boolean {
+  try {
+    const runIds =
+      typeof eventStore.getRunIds === "function" ? eventStore.getRunIds() : [];
+    for (const other of runIds) {
+      if (other === runId) continue;
+      const events = eventStore.getEvents(other, {
+        kind: [...SKELETON_EVENT_KINDS],
+      });
+      if (events.some((event) => eventNamesSkeleton(event, skeletonId))) {
+        return true;
+      }
+    }
+  } catch {
+    // An unreadable run index means ownership cannot be disproven.
+  }
+  return false;
+}
+
+/** Best-effort positive check of an active handle's exposed Skeleton state. */
+function handleKnowsSkeleton(handle: unknown, skeletonId: string): boolean {
+  if (!handle || typeof handle !== "object") return false;
+  const source = handle as Record<string, unknown>;
+  const dispatcher = source.dispatcher as Record<string, unknown> | undefined;
+  const scheduler = source.scheduler as Record<string, unknown> | undefined;
+  const containers = [
+    source.skeletons,
+    source.tasks,
+    dispatcher?.skeletons,
+    dispatcher?.tasks,
+    scheduler?.skeletons,
+  ];
+  for (const container of containers) {
+    if (container instanceof Map && container.has(skeletonId)) return true;
+    if (container instanceof Set && container.has(skeletonId)) return true;
+    if (Array.isArray(container)) {
+      const found = container.some((entry) => {
+        if (entry === skeletonId) return true;
+        if (!entry || typeof entry !== "object") return false;
+        const record = entry as Record<string, unknown>;
+        return record.id === skeletonId || record.skeletonId === skeletonId;
+      });
+      if (found) return true;
+    }
+    if (container && typeof container === "object" && !Array.isArray(container)) {
+      if (Object.prototype.hasOwnProperty.call(container, skeletonId)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+type SkeletonOwnership = "ok" | "mismatch" | "unknown";
+
+/**
+ * Verifies that a Skeleton belongs to the run in the URL. An active handle's
+ * own Skeleton state or this run's `skeleton.*` events prove ownership; the same
+ * Skeleton appearing under a different run's log is a cross-run mismatch.
+ */
+function verifySkeletonOwnership(
+  eventStore: EventStore,
+  runId: string,
+  skeletonId: string,
+  handle: unknown
+): SkeletonOwnership {
+  if (handleKnowsSkeleton(handle, skeletonId)) return "ok";
+  if (skeletonOwnedByRun(eventStore, runId, skeletonId)) return "ok";
+  if (skeletonOwnedByAnotherRun(eventStore, runId, skeletonId)) return "mismatch";
+  return "unknown";
+}
+
+/**
+ * Forwards the action to the active dispatcher/warden. Only Skeleton-scoped
+ * methods are ever invoked: a per-Skeleton interrupt or re-raise must never
+ * cascade into a global pause/resume of the whole run. A dispatched call that
+ * throws or rejects propagates to the caller so the route can answer with an
+ * error instead of recording a false success.
+ */
 async function forwardToDispatcher(
   handle: { dispatcher?: unknown; warden?: unknown } | undefined,
   action: CanonicalAction,
   skeletonId: string,
   body: z.infer<typeof skeletonActionSchema>
-): Promise<void> {
-  if (!handle) return;
+): Promise<DispatchOutcome> {
+  if (!handle) return { dispatched: false, hadActiveHandle: false };
   const dispatcher = handle.dispatcher;
+  let dispatched = false;
   switch (action) {
     case "interrupt":
-      (await callFirst(dispatcher, ["interruptSkeleton"], skeletonId)) ||
-        (await callFirst(dispatcher, ["pause"]));
+      dispatched = await callFirst(dispatcher, ["interruptSkeleton"], skeletonId);
       break;
     case "reraise":
-      (await callFirst(dispatcher, ["resume"])) ||
-        (await callFirst(dispatcher, ["reraiseSkeleton"], skeletonId));
+      dispatched = await callFirst(dispatcher, ["reraiseSkeleton"], skeletonId);
       break;
     case "lay_to_rest":
-      await callFirst(dispatcher, ["layToRest"], skeletonId, body.choice);
+      dispatched = await callFirst(dispatcher, ["layToRest"], skeletonId, body.choice);
       break;
     case "send_instruction":
-      (await callFirst(dispatcher, ["sendInstruction"], skeletonId, body.instruction)) ||
+      dispatched =
+        (await callFirst(dispatcher, ["sendInstruction"], skeletonId, body.instruction)) ||
         (await callFirst(dispatcher, ["instruct"], skeletonId, body.instruction));
       break;
     case "add_review_focus":
-      (await callFirst(handle.warden, ["addReviewFocus"], skeletonId, body.focus)) ||
+      dispatched =
+        (await callFirst(handle.warden, ["addReviewFocus"], skeletonId, body.focus)) ||
         (await callFirst(handle.warden, ["addFocus"], skeletonId, body.focus)) ||
         (await callFirst(dispatcher, ["addReviewFocus"], skeletonId, body.focus));
       break;
   }
+  return { dispatched, hadActiveHandle: true };
 }
 
 export async function POST(
@@ -217,14 +345,43 @@ export async function POST(
 
   const orchestrator = resolveActiveOrchestrator(request, context);
   const handle = orchestrator?.getActiveRun?.(runId);
+
+  // Ownership: a Skeleton raised by one run may only be controlled through that
+  // run. A Skeleton known to belong to a different run fails closed.
+  const ownership = verifySkeletonOwnership(eventStore, runId, skeletonId, handle);
+  if (ownership === "mismatch") {
+    return Response.json(
+      {
+        ok: false,
+        error: "Skeleton does not belong to this run",
+        code: "SKELETON_RUN_MISMATCH",
+      },
+      { status: 403 }
+    );
+  }
+
+  let outcome: DispatchOutcome;
   try {
-    await forwardToDispatcher(handle, action, skeletonId, body);
+    outcome = await forwardToDispatcher(handle, action, skeletonId, body);
   } catch {
     // A dispatcher that throws or rejects is surfaced as a failure; the run
     // must not record a success audit event for an action that never landed.
     return Response.json(
       { ok: false, error: "Failed to dispatch the skeleton action" },
       { status: 502 }
+    );
+  }
+
+  // An attached dispatcher that never accepted the action means it did not
+  // land: fail closed rather than recording a false success event.
+  if (outcome.hadActiveHandle && !outcome.dispatched) {
+    return Response.json(
+      {
+        ok: false,
+        error: "The active dispatcher did not accept this skeleton action",
+        code: "SKELETON_ACTION_NOT_DISPATCHED",
+      },
+      { status: 409 }
     );
   }
 

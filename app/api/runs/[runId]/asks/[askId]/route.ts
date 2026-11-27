@@ -111,6 +111,29 @@ function resolveAskManager(
   return null;
 }
 
+/**
+ * Reads the kind of an ask this run raised (`ask.raised`). Used to keep a
+ * pending `push_confirm` from being consumed without an initiated push.
+ */
+function findAskKind(
+  eventStore: EventStore,
+  runId: string,
+  askId: string
+): string | null {
+  try {
+    const events = eventStore.getEvents(runId, { kind: "ask.raised" });
+    for (let i = events.length - 1; i >= 0; i -= 1) {
+      const data = events[i].data as Record<string, unknown> | undefined;
+      if (data?.askId === askId) {
+        return typeof data.kind === "string" ? data.kind : null;
+      }
+    }
+  } catch {
+    // An unreadable log leaves the ask kind unknown.
+  }
+  return null;
+}
+
 export async function POST(
   request: Request,
   context: RouteContext
@@ -191,6 +214,11 @@ export async function POST(
   const orchestrator = resolveActiveOrchestrator(request, context);
   const askManager = resolveAskManager(request, context, orchestrator);
 
+  // An active handler is any attached AskManager or orchestrator. When one is
+  // present only it may accept the answer; an unhandled answer must not be
+  // recorded as resolved.
+  const hasActiveHandler = Boolean(askManager) || Boolean(orchestrator);
+
   // Ownership: an ask raised by one run may only be answered through that run.
   const ownership = verifyAskOwnership(askManager, eventStore, runId, askId);
   if (ownership === "mismatch") {
@@ -210,12 +238,16 @@ export async function POST(
     );
   }
 
+  let handlerThrew = false;
+
   if (askManager) {
     try {
       if (await askManager.answerAsk(askId, body.answer)) {
         handled = true;
       }
-    } catch {}
+    } catch {
+      handlerThrew = true;
+    }
   }
 
   // Dispatch to the orchestrator only when the AskManager did not already
@@ -225,7 +257,47 @@ export async function POST(
       if (await orchestrator.answerAsk(runId, askId, body.answer)) {
         handled = true;
       }
-    } catch {}
+    } catch {
+      handlerThrew = true;
+    }
+  }
+
+  if (!handled) {
+    // An attached handler refused or failed: record nothing and fail closed so
+    // no misleading `ask.answered` event is written.
+    if (hasActiveHandler) {
+      if (handlerThrew) {
+        return Response.json(
+          {
+            ok: false,
+            error: "The ask handler failed to answer",
+            code: "ASK_HANDLER_ERROR",
+          },
+          { status: 500 }
+        );
+      }
+      return Response.json(
+        {
+          ok: false,
+          error: "No active handler accepted this answer",
+          code: "ASK_NOT_HANDLED",
+        },
+        { status: 409 }
+      );
+    }
+
+    // Offline store-only mode: no handler is attached. A pending `push_confirm`
+    // must not be consumed here, because only the push route performs the push.
+    if (findAskKind(eventStore, runId, askId) === "push_confirm") {
+      return Response.json(
+        {
+          ok: false,
+          error: "This push confirmation must be answered through the push route",
+          code: "PUSH_CONFIRM_NOT_HANDLED",
+        },
+        { status: 409 }
+      );
+    }
   }
 
   eventStore.append(

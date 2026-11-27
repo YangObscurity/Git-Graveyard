@@ -117,6 +117,78 @@ function targetsSourceRepo(targetFork: string, sourceUrl: string): boolean {
 }
 
 /**
+ * True when a repository URL is a recognized GitHub spelling that carries no
+ * embedded credentials in its authority (`https://user:pass@host/...`). SSH and
+ * scp spellings canonicalize without a URL authority and are accepted.
+ */
+function isCanonicalSourceUrl(raw: string): boolean {
+  const trimmed = raw.trim();
+  if (!trimmed) return false;
+  if (!canonicalRepoSlug(trimmed)) return false;
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(trimmed)) {
+    try {
+      const parsed = new URL(trimmed);
+      if (parsed.username || parsed.password) return false;
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+type AuthoritativeSourceResult =
+  | { sourceUrl: string }
+  | { status: number; error: string; code: string };
+
+/**
+ * Resolves the one authoritative source repository for a push strictly from the
+ * run record. The caller-supplied `sourceRepoUrl` is never trusted: it is only
+ * accepted when it canonicalizes to the same repository as `run.url`, so it can
+ * never retarget a push onto the upstream source. A `run.url` that is not a
+ * canonical, credential-free GitHub repository is refused outright.
+ */
+function resolveAuthoritativeSourceUrl(
+  runUrl: unknown,
+  providedSourceUrl: unknown
+): AuthoritativeSourceResult {
+  const authoritative =
+    typeof runUrl === "string" && runUrl.trim().length > 0 ? runUrl.trim() : null;
+  if (!authoritative) {
+    return {
+      status: 400,
+      error: "The source repository is unknown",
+      code: "MISSING_SOURCE_URL",
+    };
+  }
+
+  if (!isCanonicalSourceUrl(authoritative)) {
+    return {
+      status: 403,
+      error: "The run source repository URL is not canonical",
+      code: "INVALID_SOURCE_URL",
+    };
+  }
+
+  if (
+    providedSourceUrl !== undefined &&
+    providedSourceUrl !== null &&
+    String(providedSourceUrl).trim().length > 0
+  ) {
+    const provided = canonicalRepoSlug(String(providedSourceUrl));
+    const expected = canonicalRepoSlug(authoritative);
+    if (!provided || !expected || provided !== expected) {
+      return {
+        status: 403,
+        error: "The supplied source repository does not match this run",
+        code: "SOURCE_REPO_MISMATCH",
+      };
+    }
+  }
+
+  return { sourceUrl: authoritative };
+}
+
+/**
  * Defense-in-depth: the fork target must be exactly
  * `https://github.com/<owner>/<repo>` with an optional `.git` suffix, carrying
  * no embedded credentials and no HTTP / file / SSH / alternate-host endpoint.
@@ -194,7 +266,11 @@ function findPendingPushConfirmAsk(
       });
       order.push(askId);
     } else if (event.kind === "ask.answered") {
-      answered.add(askId);
+      // Only an answer an active handler actually processed consumes the ask. A
+      // recorded refusal (`handled: false`) must leave the confirmation pending.
+      if (data.handled !== false) {
+        answered.add(askId);
+      }
     }
   }
 
@@ -340,6 +416,21 @@ export async function POST(
 
   const branch = run.pushBranch ?? `graveyard/${runId}`;
 
+  // The run record is the only authority for the source repository: a
+  // caller-supplied sourceRepoUrl can never retarget a push onto the upstream
+  // source. A mismatch is refused before any confirmation or git operation.
+  const sourceResolution = resolveAuthoritativeSourceUrl(
+    run.url,
+    body.sourceRepoUrl
+  );
+  if ("status" in sourceResolution) {
+    return Response.json(
+      { ok: false, error: sourceResolution.error, code: sourceResolution.code },
+      { status: sourceResolution.status }
+    );
+  }
+  const authoritativeSourceUrl = sourceResolution.sourceUrl;
+
   // Step 1: confirmation gate. Without an explicit confirmation the route only
   // raises the ask; it never touches the fork.
   if (body.confirmed !== true) {
@@ -430,13 +521,7 @@ export async function POST(
     );
   }
 
-  const sourceUrl = body.sourceRepoUrl ?? run.url ?? null;
-  if (!sourceUrl) {
-    return Response.json(
-      { ok: false, error: "The source repository is unknown" },
-      { status: 400 }
-    );
-  }
+  const sourceUrl = authoritativeSourceUrl;
 
   if (targetsSourceRepo(targetFork, sourceUrl)) {
     return Response.json(
