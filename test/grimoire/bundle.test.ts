@@ -14,8 +14,10 @@ import {
   generateBundle,
   isPatchWorthyStep,
   normalizePatchSteps,
+  normalizeUnknowns,
   parseBundleTasks,
   renderTasks,
+  resolvedStatusCounts,
   resolveEngineVersion,
   type BundleInput,
 } from "../../lib/grimoire/bundle";
@@ -362,6 +364,125 @@ describe("Outcome labels and deterministic output (Requirements 10.7-10.10)", ()
     );
     assert.equal(tasks.filter((task) => task.ruleId === "M6").length, 1);
     assert.equal(tasks.filter((task) => task.ruleId === "M7").length, 0);
+  });
+});
+
+function outcomeStatusCounts(design: string): Record<string, number> {
+  const line = design.split("\n").find((entry) => entry.includes("task status counts:"));
+  assert.ok(line, "design.md must render the Outcome task status counts");
+  const payload = line
+    .replace(/^.*task status counts:\s*/, "")
+    .replace(/\s*\(Requirements.*$/, "");
+  const counts: Record<string, number> = {};
+  for (const part of payload.split(",")) {
+    const [status, value] = part.trim().split("=");
+    counts[status] = Number(value);
+  }
+  return counts;
+}
+
+describe("Outcome task counts and unknown line ordering (Requirements 6.3, 10.5, 10.7)", () => {
+  it("counts checked manual tasks in merged so the status counts sum to the total task count", () => {
+    const input = baseInput();
+    const bundle = generateBundle(input);
+    const counts = resolvedStatusCounts(input, bundle.patchTasks, bundle.manualTasks);
+    const total = bundle.patchTasks.length + bundle.manualTasks.length;
+
+    assert.equal(total, 4);
+    assert.equal(bundle.manualTasks.filter((task) => task.checked).length, 1);
+    assert.equal(
+      counts.find((entry) => entry.status === "merged")?.count,
+      2,
+      "merged must include the checked M6 manual task"
+    );
+    assert.equal(
+      counts.reduce((sum, entry) => sum + entry.count, 0),
+      total,
+      "pending + merged must equal the total number of tasks"
+    );
+
+    const rendered = outcomeStatusCounts(bundle.design);
+    assert.equal(rendered.merged, 2);
+    assert.equal(
+      Object.values(rendered).reduce((sum, value) => sum + value, 0),
+      total
+    );
+  });
+
+  it("counts a checked manual task as merged even when no patch task exists", () => {
+    const input = baseInput({
+      signals: [],
+      steps: [],
+      driftedDependencies: [],
+      removedDependencies: [],
+      m2Fired: false,
+      unknowns: [],
+      pythonFileLabels: {},
+      manualTasks: [
+        { ruleId: "M5", target: ".", description: "review drifted dependency `webpack`" },
+        {
+          ruleId: "M6",
+          target: ".",
+          description: "run `npm install --package-lock-only --ignore-scripts`",
+          checked: true,
+        },
+      ],
+    });
+    const bundle = generateBundle(input);
+    const counts = resolvedStatusCounts(input, bundle.patchTasks, bundle.manualTasks);
+    const total = bundle.patchTasks.length + bundle.manualTasks.length;
+
+    assert.equal(bundle.patchTasks.length, 0);
+    assert.equal(total, 2);
+    assert.equal(counts.find((entry) => entry.status === "pending")?.count, 1);
+    assert.equal(counts.find((entry) => entry.status === "merged")?.count, 1);
+    assert.equal(
+      counts.reduce((sum, entry) => sum + entry.count, 0),
+      total
+    );
+  });
+
+  it("orders a lower line number before a higher one for the same file and reason", () => {
+    const items = normalizeUnknowns([
+      { ruleId: "M1", reason: "py2_residue", file: "tools/build.py", line: 10 },
+      { ruleId: "M1", reason: "py2_residue", file: "tools/build.py", line: 7 },
+    ]);
+    assert.deepEqual(
+      items.map((item) => item.line),
+      ["7", "10"],
+      "line 7 must sort before line 10 within the same file and reason"
+    );
+
+    const design = generateBundle(
+      baseInput({
+        unknowns: [
+          { ruleId: "M1", reason: "py2_residue", file: "tools/build.py", line: 10 },
+          { ruleId: "M1", reason: "py2_residue", file: "tools/build.py", line: 7 },
+        ],
+      })
+    ).design;
+    const idx7 = design.indexOf("tools/build.py:7");
+    const idx10 = design.indexOf("tools/build.py:10");
+    assert.ok(idx7 >= 0 && idx10 >= 0, "both unknown lines must render");
+    assert.ok(idx7 < idx10, "design.md must render line 7 before line 10");
+  });
+
+  it("keeps a non-numeric line value without coercing it during the sort", () => {
+    const items = normalizeUnknowns([
+      { ruleId: "M1", reason: "py2_residue", file: "a.py", line: Number.NaN },
+      { ruleId: "M1", reason: "py2_residue", file: "a.py", line: 7 },
+    ]);
+    assert.equal(items.length, 2);
+    // `NaN` never parses as a number, so it takes the lexical fallback and stays intact.
+    assert.deepEqual(items.map((item) => item.line).sort(), ["7", "NaN"]);
+    assert.deepEqual(
+      normalizeUnknowns([
+        { ruleId: "M1", reason: "py2_residue", file: "a.py", line: Number.NaN },
+        { ruleId: "M1", reason: "py2_residue", file: "a.py", line: 7 },
+      ]),
+      items,
+      "the fallback ordering must be deterministic across runs"
+    );
   });
 });
 

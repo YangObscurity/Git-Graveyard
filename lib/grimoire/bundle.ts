@@ -544,7 +544,7 @@ export function renderRequirements(
   return out.join("\n");
 }
 
-function normalizeUnknowns(
+export function normalizeUnknowns(
   unknowns: readonly UnknownRecord[]
 ): Array<{ reason: string; file: string; line: string }> {
   const seen = new Set<string>();
@@ -561,12 +561,17 @@ function normalizeUnknowns(
   items.sort((a, b) => {
     if (a.reason !== b.reason) return a.reason < b.reason ? -1 : 1;
     if (a.file !== b.file) return a.file < b.file ? -1 : 1;
-    return a.line < b.line ? -1 : a.line > b.line ? 1 : 0;
+    const na = Number(a.line);
+    const nb = Number(b.line);
+    if (!Number.isNaN(na) && !Number.isNaN(nb)) {
+      return na < nb ? -1 : na > nb ? 1 : 0;
+    }
+    return a.line.localeCompare(b.line);
   });
   return items;
 }
 
-function resolvedStatusCounts(
+export function resolvedStatusCounts(
   input: BundleInput,
   patchTasks: readonly BundlePatchTaskRecord[],
   manualTasks: readonly BundleManualTaskRecord[]
@@ -581,7 +586,7 @@ function resolvedStatusCounts(
     running: 0,
     in_review: 0,
     rejected: 0,
-    merged: checkedPatch,
+    merged: checkedPatch + checkedManual,
     failed: 0,
     abandoned: 0,
     skipped: 0,
