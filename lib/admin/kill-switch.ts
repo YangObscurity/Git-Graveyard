@@ -173,7 +173,7 @@ export class KillSwitchService {
       case "stop_gracefully":
         this.stoppingGracefully = true;
         for (const runId of preview.affectedRunIds) {
-          this.emit(runId, "system.worker_state", {
+          this.emit(runId, "system.worker_state", actor, {
             action: "stop_gracefully",
             level,
             actor,
@@ -209,10 +209,10 @@ export class KillSwitchService {
     }
 
     if (preview.affectedRunIds.length === 0) {
-      this.emit(SYSTEM_RUN_ID, "admin.kill", { level, actor, reason, affectedRunCount: 0 });
+      this.emit(SYSTEM_RUN_ID, "admin.kill", actor, { level, actor, reason, affectedRunCount: 0 });
     } else {
       for (const runId of preview.affectedRunIds) {
-        this.emit(runId, "admin.kill", {
+        this.emit(runId, "admin.kill", actor, {
           level,
           actor,
           reason,
@@ -233,17 +233,65 @@ export class KillSwitchService {
     };
   }
 
-  private emit(runId: string, kind: string, data: Record<string, unknown>): void {
+  private emit(
+    runId: string,
+    kind: string,
+    actor: string,
+    data: Record<string, unknown>
+  ): void {
     // Append failures are not swallowed: an action that cannot be recorded must surface so the
     // caller does not believe the audit trail is complete.
     this.eventStore.append(
       redactEvent({
         runId,
         kind,
-        actor: "admin",
+        actor,
         data: { refs: [], ...data },
       })
     );
   }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Process-wide registry shared with the Admin kill-switch route
+// ---------------------------------------------------------------------------------------------
+
+const killSwitchRegistry = globalThis as unknown as {
+  __killSwitchServices?: WeakMap<object, KillSwitchService>;
+  __killSwitchUnpersistedAuthority?: WeakSet<object>;
+};
+
+/**
+ * Returns (creating on first use) the process-wide `RunStore` -> {@link KillSwitchService} registry,
+ * so successive Admin calls observe the same in-memory pause/stop state while distinct stores
+ * (tests, other processes) stay isolated.
+ */
+export function killSwitchServiceRegistry(): WeakMap<object, KillSwitchService> {
+  if (!killSwitchRegistry.__killSwitchServices) {
+    killSwitchRegistry.__killSwitchServices = new WeakMap<object, KillSwitchService>();
+  }
+  return killSwitchRegistry.__killSwitchServices;
+}
+
+/**
+ * Marks a store key as the authoritative kill-switch state after a failed `persistState` write. A
+ * later rehydrate from the (stale) persisted `SettingsStore` must not silently revert the pause/stop.
+ */
+export function markKillSwitchUnpersistedAuthority(key: object): void {
+  if (!killSwitchRegistry.__killSwitchUnpersistedAuthority) {
+    killSwitchRegistry.__killSwitchUnpersistedAuthority = new WeakSet<object>();
+  }
+  killSwitchRegistry.__killSwitchUnpersistedAuthority.add(key);
+}
+
+/** True once a failed persistence write made the in-memory kill-switch state authoritative. */
+export function isKillSwitchUnpersistedAuthority(key: object): boolean {
+  return killSwitchRegistry.__killSwitchUnpersistedAuthority?.has(key) === true;
+}
+
+/** Clears the shared kill-switch registry (used by tests between fixtures). */
+export function resetKillSwitchRegistry(): void {
+  killSwitchRegistry.__killSwitchServices = new WeakMap<object, KillSwitchService>();
+  killSwitchRegistry.__killSwitchUnpersistedAuthority = new WeakSet<object>();
 }
 

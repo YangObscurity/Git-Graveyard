@@ -9,12 +9,20 @@ import { EventStore } from "@/lib/events/event-store";
 import { SettingsStore } from "@/lib/admin/settings-store";
 import {
   ADMIN_REVOKED_SESSIONS_SETTING_KEY,
+  AdminRevocationStoreError,
   DIRECT_CLIENT_IP_KEY,
+  PROMOTION_AUDIT_SETTING_KEY,
   clientIpFromRequest,
+  isAdminSessionRevoked,
   resetAdminSessionState,
+  revokeAdminSession,
 } from "@/lib/admin/admin-session";
 import { resetFifoQueueRegistry, resolveFifoQueue } from "@/lib/admission/fifo-queue";
-import { KillSwitchService, type KillSwitchLevel } from "@/lib/admin/kill-switch";
+import {
+  KillSwitchService,
+  resetKillSwitchRegistry,
+  type KillSwitchLevel,
+} from "@/lib/admin/kill-switch";
 
 import {
   GET as sessionGet,
@@ -25,11 +33,7 @@ import { GET as inviteGet, POST as invitePost } from "@/app/api/admin/invite-cod
 import { GET as settingsGet, PATCH as settingsPatch } from "@/app/api/admin/settings/route";
 import { GET as queueGet, POST as queuePost } from "@/app/api/admin/queue/route";
 import { POST as runActionPost } from "@/app/api/admin/runs/[runId]/route";
-import {
-  GET as killGet,
-  POST as killPost,
-  resetKillSwitchRegistry,
-} from "@/app/api/admin/kill-switch/route";
+import { GET as killGet, POST as killPost } from "@/app/api/admin/kill-switch/route";
 import { GET as promoGet, POST as promoPost } from "@/app/api/admin/promotion-audit/route";
 
 const ADMIN_SECRET = "test-admin-secret-value";
@@ -260,6 +264,48 @@ describe("Admin session and /api/admin/* authentication (Task 22.5)", () => {
       attach(new Request("http://test/api/admin/invite-codes", { headers: { cookie } }))
     );
     assert.equal(afterRestart.status, 403);
+  });
+
+  it("fails closed when the persisted revocation payload is malformed", () => {
+    // A non-object payload is malformed rather than "no revocations".
+    stores.settingsStore.setSetting(ADMIN_REVOKED_SESSIONS_SETTING_KEY, "not-an-object", {
+      actor: "owner",
+    });
+    assert.throws(
+      () => isAdminSessionRevoked("sid-1", { settingsStore: stores.settingsStore }),
+      AdminRevocationStoreError
+    );
+
+    // An object whose `sessions` is not an array is malformed as well.
+    stores.settingsStore.setSetting(ADMIN_REVOKED_SESSIONS_SETTING_KEY, { sessions: "nope" }, {
+      actor: "owner",
+    });
+    assert.throws(
+      () => isAdminSessionRevoked("sid-2", { settingsStore: stores.settingsStore }),
+      AdminRevocationStoreError
+    );
+
+    // An absent payload is simply "no revocations" and must not throw.
+    stores.settingsStore.setSetting(ADMIN_REVOKED_SESSIONS_SETTING_KEY, null, { actor: "owner" });
+    assert.equal(
+      isAdminSessionRevoked("sid-3", { settingsStore: stores.settingsStore }),
+      false
+    );
+  });
+
+  it("persists several revocations without losing any to a read-modify-write race", () => {
+    const settingsStore = stores.settingsStore;
+    revokeAdminSession("session-a", { settingsStore, now: 1000, expiresAt: 9_999_999_999_999 });
+    revokeAdminSession("session-b", { settingsStore, now: 1000, expiresAt: 9_999_999_999_999 });
+    revokeAdminSession("session-c", { settingsStore, now: 1000, expiresAt: 9_999_999_999_999 });
+
+    const persisted = settingsStore.getSetting<{ sessions?: Array<{ sessionId: string }> }>(
+      ADMIN_REVOKED_SESSIONS_SETTING_KEY
+    );
+    const ids = (persisted?.sessions ?? []).map((session) => session.sessionId);
+    assert.ok(ids.includes("session-a"));
+    assert.ok(ids.includes("session-b"));
+    assert.ok(ids.includes("session-c"));
   });
 
   it("derives the session actor from a server-trusted principal, ignoring body.actor", async () => {
@@ -908,6 +954,49 @@ describe("Kill switch (Task 22.5)", () => {
       (stores.settingsStore as unknown as { setSettingsBatch: unknown }).setSettingsBatch = original;
     }
   });
+
+  it("records the operator as the top-level actor of the admin.kill event", () => {
+    const service = new KillSwitchService({
+      runStore: stores.runStore,
+      eventStore: stores.eventStore,
+    });
+    service.execute("pause_new_runs", { actor: "ops-7", reason: "drill" });
+
+    const events = stores.eventStore.getEvents("system", { kind: "admin.kill" });
+    assert.ok(events.length >= 1);
+    assert.equal(events[events.length - 1].actor, "ops-7");
+  });
+
+  it("keeps an active pause authoritative when the kill-switch state cannot be persisted", async () => {
+    const original = stores.settingsStore.setSettingsBatch.bind(stores.settingsStore);
+    (stores.settingsStore as unknown as { setSettingsBatch: unknown }).setSettingsBatch = () => {
+      throw new Error("settings store unavailable");
+    };
+    try {
+      const res = await killPost(
+        attach(
+          jsonRequest(
+            "http://test/api/admin/kill-switch",
+            { level: "pause_new_runs", confirmed: true },
+            { method: "POST", headers: adminHeaders() }
+          )
+        )
+      );
+      assert.equal(res.status, 500);
+    } finally {
+      (stores.settingsStore as unknown as { setSettingsBatch: unknown }).setSettingsBatch = original;
+    }
+
+    // The write failed, so nothing was persisted — but the in-memory pause must survive the next
+    // request's rehydrate instead of being silently reverted from the (stale) empty store.
+    assert.equal(stores.settingsStore.getSetting("killSwitch.pauseNewRuns"), undefined);
+    const get = await killGet(
+      attach(new Request("http://test/api/admin/kill-switch", { headers: adminHeaders() }))
+    );
+    assert.equal(get.status, 200);
+    const body = (await get.json()) as { state: { pausedNewRuns: boolean } };
+    assert.equal(body.state.pausedNewRuns, true);
+  });
 });
 
 describe("Promotion audit sign-off (Task 22.5)", () => {
@@ -947,7 +1036,7 @@ describe("Promotion audit sign-off (Task 22.5)", () => {
 
   it("returns verified:false without throwing for a non-ASCII signature", async () => {
     stores.settingsStore.setSetting(
-      "promotionAudit",
+      PROMOTION_AUDIT_SETTING_KEY,
       {
         actor: "owner",
         signedAt: Date.now(),
@@ -993,10 +1082,10 @@ describe("Promotion audit sign-off (Task 22.5)", () => {
     assert.deepEqual(untamperedBody.record.items, { checks: ["a", "b"], score: 7 });
 
     // Tamper the stored items; the HMAC (which now covers items) no longer matches.
-    const stored = stores.settingsStore.getSetting<Record<string, unknown>>("promotionAudit");
+    const stored = stores.settingsStore.getSetting<Record<string, unknown>>(PROMOTION_AUDIT_SETTING_KEY);
     assert.ok(stored);
     stores.settingsStore.setSetting(
-      "promotionAudit",
+      PROMOTION_AUDIT_SETTING_KEY,
       { ...stored, items: { checks: ["a", "b", "evil"], score: 7 } },
       { actor: "attacker" }
     );
@@ -1032,6 +1121,18 @@ describe("Promotion audit sign-off (Task 22.5)", () => {
     assert.equal(post.status, 201);
     const posted = (await post.json()) as { verified: boolean; record: { items: unknown } };
     assert.equal(posted.verified, true);
+
+    // The persisted items are stripped of the prototype-pollution keys.
+    const stored = stores.settingsStore.getSetting<{ items: Record<string, unknown> }>(
+      PROMOTION_AUDIT_SETTING_KEY
+    );
+    assert.ok(stored);
+    assert.ok(!Object.prototype.hasOwnProperty.call(stored.items, "__proto__"));
+    assert.ok(!Object.prototype.hasOwnProperty.call(stored.items, "constructor"));
+    assert.deepEqual(Object.keys(stored.items), ["checks"]);
+    const postedItems = posted.record.items as Record<string, unknown>;
+    assert.ok(!Object.prototype.hasOwnProperty.call(postedItems, "__proto__"));
+    assert.ok(!Object.prototype.hasOwnProperty.call(postedItems, "constructor"));
 
     // The record still verifies on read and no global prototype was polluted.
     const get = await promoGet(

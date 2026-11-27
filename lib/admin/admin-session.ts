@@ -236,6 +236,8 @@ export function bearerTokenFromAuthorization(authorization: string | null): stri
 
 /** Key under which revoked admin session ids are persisted for cross-request visibility. */
 export const ADMIN_REVOKED_SESSIONS_SETTING_KEY = "admin.revokedSessions";
+/** SettingsStore key holding the signed pre-promotion Security_Access_Audit record. */
+export const PROMOTION_AUDIT_SETTING_KEY = "promotionAudit";
 /** A non-spoofable client key used when no trusted proxy is configured. */
 export const DIRECT_CLIENT_IP_KEY = "direct";
 /** Process-wide ceiling on failed admin logins within the window, independent of the client key. */
@@ -255,6 +257,20 @@ interface PersistedRevocation {
   sessionId: string;
   revokedAt: number;
   expiresAt: number | null;
+}
+
+/**
+ * Thrown when the persisted admin revocation payload is present but malformed (not an object, or an
+ * object without an array `sessions`). It is deliberately an error rather than an empty list so a
+ * corrupted store fails closed instead of silently un-revoking sessions.
+ */
+export class AdminRevocationStoreError extends Error {
+  readonly code = "ADMIN_REVOCATION_STORE_INVALID";
+
+  constructor(message = "Persisted admin revocation state is malformed") {
+    super(message);
+    this.name = "AdminRevocationStoreError";
+  }
 }
 
 interface AdminSessionState {
@@ -307,14 +323,18 @@ function readPersistedRevocations(
     return [];
   }
   // A read error must propagate so the caller can fail closed: it must never be mistaken for "no
-  // persisted revocations" (which would let a revoked cookie through).
+  // persisted revocations" (which would let a revoked cookie through). A malformed payload is also
+  // treated as an error rather than being discarded as an empty list.
   const raw = store.getSetting<unknown>(ADMIN_REVOKED_SESSIONS_SETTING_KEY);
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+  if (raw === undefined || raw === null) {
     return [];
+  }
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw new AdminRevocationStoreError();
   }
   const sessions = (raw as Record<string, unknown>).sessions;
   if (!Array.isArray(sessions)) {
-    return [];
+    throw new AdminRevocationStoreError();
   }
   const out: PersistedRevocation[] = [];
   for (const item of sessions) {
@@ -336,6 +356,13 @@ function readPersistedRevocations(
   return out;
 }
 
+/**
+ * Per-`SettingsStore` promise queue serializing the read-modify-write in
+ * {@link persistRevokedSession}. Two overlapping in-process revocations that both read the stored
+ * list, append their own id and write the result back could otherwise lose one of the two ids.
+ */
+const revocationWriteQueue = new WeakMap<object, Promise<void>>();
+
 function persistRevokedSession(
   store: SettingsStore | undefined,
   sessionId: string,
@@ -347,15 +374,36 @@ function persistRevokedSession(
   }
   // Persistence errors are NOT swallowed: a revocation that cannot be written must surface so the
   // caller can report the failure instead of silently leaving a session un-revoked across requests.
-  const kept = readPersistedRevocations(store, revokedAt).filter(
-    (entry) => entry.sessionId !== sessionId
-  );
-  kept.push({ sessionId, revokedAt, expiresAt });
-  store.setSetting(
-    ADMIN_REVOKED_SESSIONS_SETTING_KEY,
-    { sessions: kept },
-    { actor: "admin-session", reason: "admin session revocation" }
-  );
+  const key = store as unknown as object;
+  const write = (): void => {
+    const kept = readPersistedRevocations(store, revokedAt).filter(
+      (entry) => entry.sessionId !== sessionId
+    );
+    kept.push({ sessionId, revokedAt, expiresAt });
+    store.setSetting(
+      ADMIN_REVOKED_SESSIONS_SETTING_KEY,
+      { sessions: kept },
+      { actor: "admin-session", reason: "admin session revocation" }
+    );
+  };
+
+  const pending = revocationWriteQueue.get(key);
+  if (!pending) {
+    // No write is in flight for this store: apply synchronously so the caller observes its own
+    // revocation immediately and a persistence error propagates to the caller (which fails closed).
+    write();
+    return;
+  }
+  // A write is already in flight for this store: chain behind it so the two read-modify-write
+  // operations cannot both read the same list and overwrite each other.
+  const next = pending.then(write, write);
+  revocationWriteQueue.set(key, next);
+  const clear = (): void => {
+    if (revocationWriteQueue.get(key) === next) {
+      revocationWriteQueue.delete(key);
+    }
+  };
+  next.then(clear, clear);
 }
 
 export function revokeAdminSession(

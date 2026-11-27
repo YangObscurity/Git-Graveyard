@@ -1,11 +1,13 @@
 import * as crypto from "node:crypto";
 import { resolveSettingsStore } from "@/lib/runtime/store-context";
-import { getAdminSecret, requireAdminAuth } from "@/lib/admin/admin-session";
+import {
+  PROMOTION_AUDIT_SETTING_KEY,
+  getAdminSecret,
+  requireAdminAuth,
+} from "@/lib/admin/admin-session";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
-
-export const PROMOTION_AUDIT_SETTING_KEY = "promotionAudit";
 
 interface PromotionAuditBody {
   status?: unknown;
@@ -46,6 +48,30 @@ function canonicalizeValue(value: unknown): unknown {
         continue;
       }
       out[key] = canonicalizeValue(source[key]);
+    }
+    return out;
+  }
+  return value;
+}
+
+/**
+ * Returns a plain-object copy of `items` with prototype-pollution keys removed. Unlike
+ * {@link canonicalizeValue} this preserves insertion order and a normal `Object.prototype`, so the
+ * persisted record deep-equals the caller-supplied items while never carrying `__proto__` /
+ * `constructor` / `prototype`.
+ */
+function sanitizeValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(sanitizeValue);
+  }
+  if (value && typeof value === "object") {
+    const source = value as Record<string, unknown>;
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(source)) {
+      if (key === "__proto__" || key === "constructor" || key === "prototype") {
+        continue;
+      }
+      out[key] = sanitizeValue(source[key]);
     }
     return out;
   }
@@ -134,7 +160,9 @@ export async function POST(request: Request): Promise<Response> {
     : "signed";
   const actor = auth.actor.id;
   const signedAt = Date.now();
-  const items = body.items ?? null;
+  // Strip prototype-pollution keys before the items are signed AND stored, so neither the signature
+  // nor the persisted record can carry `__proto__` / `constructor` / `prototype`.
+  const items = sanitizeValue(body.items ?? null);
   const canonical = canonicalize({ actor, signedAt, status, items });
   const signature = sign(secret, canonical);
 

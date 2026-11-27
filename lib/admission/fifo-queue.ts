@@ -98,11 +98,11 @@ export class FifoQueue {
     this.actor = options.actor ?? "necromancer";
     this.queueDepth =
       typeof options.queueDepth === "number" && options.queueDepth > 0
-        ? Math.floor(options.queueDepth)
+        ? Math.max(1, Math.floor(options.queueDepth))
         : resolveDefaultQueueDepth();
     this.queueIdleLimitMs =
       typeof options.queueIdleLimitMs === "number" && options.queueIdleLimitMs > 0
-        ? Math.floor(options.queueIdleLimitMs)
+        ? Math.max(1, Math.floor(options.queueIdleLimitMs))
         : Number.POSITIVE_INFINITY;
   }
 

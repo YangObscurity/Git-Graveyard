@@ -98,10 +98,13 @@ export type GrantCapIncreaseResult =
         | "UNKNOWN_DIMENSION"
         | "CAP_NOT_RAISED"
         | "CODE_CEILING_EXCEEDED"
-        | "GLOBAL_CEILING_EXCEEDED";
+        | "GLOBAL_CEILING_EXCEEDED"
+        | "RUN_TERMINAL";
       dimension: BudgetDimension;
       newCap: number;
       ceiling?: number;
+      /** Present only for `RUN_TERMINAL`: the run already ended (credits exhausted). */
+      reason?: "run_terminal";
     };
 
 const DIMENSION_SET = new Set<string>(BUDGET_DIMENSIONS);
@@ -313,6 +316,16 @@ export class BudgetGovernor {
 
   setCreditsReported(reported: boolean): void {
     this.creditsReported = reported;
+    if (!reported) {
+      // Credits recorded earlier (or a stream that no longer reports them) must not leave a wedged
+      // latch: drop the credit dimensions from the exceedance set and clear the ask when nothing
+      // else remains exceeded.
+      this.exceededDimensions.delete("creditsPerRun");
+      this.exceededDimensions.delete("creditsPerDay");
+      if (this.exceededDimensions.size === 0) {
+        this.pendingAsk = null;
+      }
+    }
   }
 
   isCreditsReported(): boolean {
@@ -438,6 +451,11 @@ export class BudgetGovernor {
    */
   evaluate(now?: number): BudgetSnapshot {
     const at = typeof now === "number" ? now : this.now();
+    // Once credit exhaustion finalized the run the terminal events are already recorded: stop
+    // evaluating so nothing (in particular another `budget.exceeded`) is emitted after `run.done`.
+    if (this.isTerminal()) {
+      return this.snapshot(at);
+    }
     for (const dim of BUDGET_DIMENSIONS) {
       const cap = this.caps.get(dim);
       if (cap === undefined) {
@@ -463,7 +481,10 @@ export class BudgetGovernor {
           }
           this.emit("budget.exceeded", data);
           if (dim === "creditsPerRun" || dim === "creditsPerDay") {
+            // `handleCreditExhaustion` emits the terminal `run.done`; stop the loop immediately so
+            // no further `budget.exceeded` lands after it.
             this.handleCreditExhaustion(at);
+            break;
           }
         }
       } else if (cap > 0 && value >= (cap * this.warningPercent) / 100) {
@@ -488,7 +509,7 @@ export class BudgetGovernor {
   canDispatchPrompt(skeletonId: string, now?: number): BudgetDispatchGate {
     void skeletonId;
     this.evaluate(now);
-    if (this.exceededDimensions.size > 0) {
+    if (this.isTerminal() || this.exceededDimensions.size > 0) {
       return {
         allowed: false,
         reason: "budget_exceeded",
@@ -500,7 +521,7 @@ export class BudgetGovernor {
 
   canDispatchSandboxExec(now?: number): BudgetDispatchGate {
     this.evaluate(now);
-    if (this.exceededDimensions.size > 0) {
+    if (this.isTerminal() || this.exceededDimensions.size > 0) {
       return {
         allowed: false,
         reason: "budget_exceeded",
@@ -508,6 +529,11 @@ export class BudgetGovernor {
       };
     }
     return { allowed: true };
+  }
+
+  /** True once the run is terminal because credits were exhausted. */
+  private isTerminal(): boolean {
+    return this.creditExhaustionHandled || this.runOutcome === "budget_stopped";
   }
 
   /**
@@ -564,6 +590,11 @@ export class BudgetGovernor {
     newCap: number,
     input: GrantCapIncreaseInput
   ): GrantCapIncreaseResult {
+    // A run that already ended from credit exhaustion is terminal: raising a cap can never
+    // legitimately re-open work, so refuse the grant instead of clearing the terminal block.
+    if (this.isTerminal()) {
+      return { ok: false, code: "RUN_TERMINAL", reason: "run_terminal", dimension, newCap };
+    }
     if (!isDimension(dimension)) {
       return { ok: false, code: "UNKNOWN_DIMENSION", dimension, newCap };
     }

@@ -231,6 +231,33 @@ describe("InviteCodeService (Task 22.1)", () => {
     // Despite 50 requests inside the window the bucket never retains more than the cap.
     assert.equal(service.attemptWindowSizeForIp("7.7.7.7"), 3);
   });
+
+  it("clamps a fractional maxAttemptsPerIp / attemptWindowMs / allowedRunCount up to at least one", () => {
+    const { runStore } = makeHarness();
+    let now = 1_000_000;
+    const service = new InviteCodeService({
+      runStore,
+      now: () => now,
+      maxAttemptsPerIp: 0.5,
+      attemptWindowMs: 0.5,
+    });
+
+    // A fractional positive run count must not floor down to zero.
+    const created = service.createCode({ allowedRunCount: 0.5 }, { adminSession: true });
+    assert.equal(created.record.allowedRunCount, 1);
+
+    // The per-IP attempt ceiling is at least 1: the second attempt is already rate-limited.
+    const first = service.verifyCode("gg_wrong", "5.5.5.5");
+    assert.equal(first.ok === false ? first.reason : "", "not_found");
+    const second = service.verifyCode("gg_wrong", "5.5.5.5");
+    assert.equal(second.ok, false);
+    assert.equal(second.ok === false ? second.reason : "", "rate_limited");
+
+    // The attempt window is at least 1ms, so the earlier attempt ages out one tick later.
+    now += 1;
+    const after = service.verifyCode("gg_wrong", "5.5.5.5");
+    assert.equal(after.ok === false ? after.reason : "", "not_found");
+  });
 });
 
 describe("FifoQueue (Task 22.2)", () => {
@@ -396,6 +423,19 @@ describe("FifoQueue (Task 22.2)", () => {
     assert.equal(doneEvents[0].data.outcome, "cancelled");
     assert.equal(doneEvents[0].data.endedAt, 4321);
   });
+
+  it("clamps a fractional queueDepth / queueIdleLimitMs up to at least one", () => {
+    const { eventStore } = makeHarness();
+    const queue = new FifoQueue({ eventStore, queueDepth: 0.5, queueIdleLimitMs: 0.5 });
+
+    // A fractional positive cap / window must not floor down to zero (a zero cap would reject all).
+    assert.equal(queue.cap, 1);
+    assert.equal(queue.idleLimitMs, 1);
+    assert.equal(queue.enqueue({ runId: "frac-1" }).ok, true);
+    const full = queue.enqueue({ runId: "frac-2" });
+    assert.equal(full.ok, false);
+    assert.equal(full.ok === false ? full.code : "", "QUEUE_FULL");
+  });
 });
 
 
@@ -536,7 +576,7 @@ describe("AdmissionController (Task 22.2)", () => {
     assert.equal(alerts[0].data.ownerAlert, true);
   });
 
-  it("atomically reserves live-run slots so concurrent callers cannot exceed the ceiling", async () => {
+  it("caps reserved live-run slots at the ceiling across sequential admissions and is idempotent", () => {
     const { runStore, eventStore } = makeHarness();
     // concurrentLiveRuns is capped at the hard ceiling (5); the stub offers 99 to prove clamping.
     const settings = {
@@ -555,11 +595,9 @@ describe("AdmissionController (Task 22.2)", () => {
     assert.equal(controller.effectiveConcurrentLiveRuns(), 5);
     assert.equal(controller.effectiveConcurrentLiveRuns("docker-cloud"), 5);
 
-    // Concurrent admissions claim slots atomically; no more than the ceiling may be admitted.
-    const decisions = await Promise.all(
-      Array.from({ length: 8 }, (_, i) =>
-        Promise.resolve().then(() => controller.checkAdmission({ runId: `live-${i}` }))
-      )
+    // Sequential admissions claim slots synchronously; no more than the ceiling may be admitted.
+    const decisions = Array.from({ length: 8 }, (_, i) =>
+      controller.checkAdmission({ runId: `live-${i}` })
     );
     assert.equal(decisions.filter((decision) => decision.admitted).length, 5);
     assert.equal(controller.getReservedCount(), 5);
@@ -576,6 +614,59 @@ describe("AdmissionController (Task 22.2)", () => {
     assert.equal(controller.getReservedCount(), 4);
     assert.equal(controller.admitRun("live-8").admitted, true);
     assert.equal(controller.getReservedCount(), 5);
+  });
+
+  it("ignores a non-finite reserveSlot limit and requires finite backend capacity", () => {
+    const { runStore, eventStore } = makeHarness();
+    const settings = {
+      getSetting: (key: string) => (key === "concurrentLiveRuns" ? 99 : undefined),
+      validateRequiredSettings: () => ({ ok: true, missing: [] }),
+    } as unknown as SettingsStore;
+    const controller = new AdmissionController({
+      settingsStore: settings,
+      runStore,
+      eventStore,
+      backend: { kind: "docker-cloud" },
+    });
+    assert.equal(controller.effectiveConcurrentLiveRuns(), 5);
+
+    // A NaN / Infinity limit must not bypass the ceiling check: it falls back to the effective limit.
+    for (let i = 0; i < 20; i += 1) {
+      controller.reserveSlot(`nan-${i}`, Number.NaN);
+    }
+    assert.equal(controller.getReservedCount(), 5);
+    for (let i = 0; i < 20; i += 1) {
+      controller.reserveSlot(`inf-${i}`, Number.POSITIVE_INFINITY);
+    }
+    assert.equal(controller.getReservedCount(), 5);
+
+    // A non-finite backend capacity is treated as unreported, never as free capacity.
+    const nanBackend = new AdmissionController({
+      settingsStore: settings,
+      runStore,
+      eventStore,
+      backend: { kind: "docker-cloud", capacity: () => Number.NaN },
+    });
+    assert.deepEqual(nanBackend.resolveBackendCapacity(), { reported: false, available: null });
+
+    const infiniteBackend = new AdmissionController({
+      settingsStore: settings,
+      runStore,
+      eventStore,
+      backend: { kind: "docker-cloud", capacity: Number.POSITIVE_INFINITY },
+    });
+    assert.deepEqual(infiniteBackend.resolveBackendCapacity(), {
+      reported: false,
+      available: null,
+    });
+
+    const finiteBackend = new AdmissionController({
+      settingsStore: settings,
+      runStore,
+      eventStore,
+      backend: { kind: "docker-cloud", capacity: 3 },
+    });
+    assert.deepEqual(finiteBackend.resolveBackendCapacity(), { reported: true, available: 3 });
   });
 
   it("never floors a fractional concurrency setting down to zero", () => {

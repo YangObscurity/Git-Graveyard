@@ -165,7 +165,6 @@ describe("Property 20: Cap grants within the Code_Ceiling (Requirement 30.7, 30.
       "toolCallsPerRun",
       "promptsPerSkeleton",
       "toolCallsPerTurn",
-      "creditsPerRun",
       "contextPressurePercent"
     );
 
@@ -387,6 +386,112 @@ describe("Property 20: Credit exhaustion finalizes the run (Requirements 30.19, 
 
       assert.ok(eventStore.getEvents("credit-run", { kind: "system.worker_state" }).length >= 1);
       assert.equal(governor.getRunOutcome(), "budget_stopped");
+    } finally {
+      db.close();
+    }
+  });
+
+  it("refuses every cap grant and keeps dispatch blocked once the run is terminal", () => {
+    const db = new DatabaseSync(":memory:");
+    const eventStore = new EventStore(db);
+    const governor = new BudgetGovernor({
+      runId: "terminal-run",
+      eventStore,
+      caps: { creditsPerRun: 1, toolCallsPerRun: 2 },
+      codeCeiling: { creditsPerRun: 100, toolCallsPerRun: 100 },
+      now: () => 500,
+    });
+    try {
+      governor.recordCredits(5);
+      governor.evaluate();
+      assert.equal(governor.getRunOutcome(), "budget_stopped");
+
+      // The credit dimension cannot be raised once the run has ended.
+      const refusedCredit = governor.grantCapIncrease("creditsPerRun", 50, { actor: "owner" });
+      assert.equal(refusedCredit.ok, false);
+      assert.equal(refusedCredit.ok === false ? refusedCredit.code : "", "RUN_TERMINAL");
+      assert.equal(refusedCredit.ok === false ? refusedCredit.reason : "", "run_terminal");
+
+      // Nor can an unrelated dimension be raised to re-open a terminal run.
+      const refusedTool = governor.grantCapIncrease("toolCallsPerRun", 50, { actor: "owner" });
+      assert.equal(refusedTool.ok, false);
+      assert.equal(refusedTool.ok === false ? refusedTool.code : "", "RUN_TERMINAL");
+
+      assert.equal(governor.canDispatchPrompt("s1").allowed, false);
+      assert.equal(governor.canDispatchSandboxExec().allowed, false);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("keeps dispatch blocked when the run is terminal with no exceeded dimension latched", () => {
+    const governor = new BudgetGovernor({
+      runId: "terminal-direct",
+      caps: { toolCallsPerRun: 10 },
+      now: () => 0,
+    });
+    governor.markCreditExhausted();
+    assert.equal(governor.getRunOutcome(), "budget_stopped");
+    // No dimension was measured as exceeded, yet the terminal run must still refuse new work.
+    assert.equal(governor.getExceededDimensions().length, 0);
+    assert.equal(governor.canDispatchPrompt("s1").allowed, false);
+    assert.equal(governor.canDispatchSandboxExec().allowed, false);
+
+    const refused = governor.grantCapIncrease("toolCallsPerRun", 20, { actor: "owner" });
+    assert.equal(refused.ok, false);
+    assert.equal(refused.ok === false ? refused.code : "", "RUN_TERMINAL");
+  });
+
+  it("clears the credit exceedance latch and pendingAsk when credits become unreported", () => {
+    const db = new DatabaseSync(":memory:");
+    const eventStore = new EventStore(db);
+    const governor = new BudgetGovernor({
+      runId: "unreported-run",
+      eventStore,
+      caps: { creditsPerDay: 5 },
+      now: () => 0,
+    });
+    try {
+      governor.recordCredits(9);
+      governor.evaluate();
+      assert.ok(governor.getExceededDimensions().includes("creditsPerDay"));
+      assert.equal(governor.snapshot().pendingAsk, "exceed_budget");
+
+      governor.setCreditsReported(false);
+      assert.equal(governor.getExceededDimensions().length, 0);
+      assert.equal(governor.snapshot().pendingAsk, null);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("emits no budget.exceeded after the terminal run.done when credits are exhausted", () => {
+    const db = new DatabaseSync(":memory:");
+    const eventStore = new EventStore(db);
+    const governor = new BudgetGovernor({
+      runId: "order-run",
+      eventStore,
+      caps: { creditsPerRun: 1, creditsPerDay: 1 },
+      now: () => 100,
+    });
+    try {
+      governor.recordCredits(2);
+      governor.evaluate();
+
+      const events = eventStore.getEvents("order-run");
+      const doneIndex = events.findIndex((event) => event.kind === "run.done");
+      assert.ok(doneIndex >= 0);
+      // The credit dimension that exceeded is reported before the terminal event ...
+      assert.ok(
+        events.slice(0, doneIndex).some((event) => event.kind === "budget.exceeded")
+      );
+      // ... and nothing is emitted after run.done (a later dimension must not append behind it).
+      assert.equal(
+        events
+          .slice(doneIndex + 1)
+          .filter((event) => event.kind === "budget.exceeded").length,
+        0
+      );
     } finally {
       db.close();
     }

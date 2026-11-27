@@ -167,11 +167,11 @@ export class InviteCodeService {
     this.now = options.now ?? (() => Date.now());
     this.maxAttemptsPerIp =
       typeof options.maxAttemptsPerIp === "number" && options.maxAttemptsPerIp > 0
-        ? Math.floor(options.maxAttemptsPerIp)
+        ? Math.max(1, Math.floor(options.maxAttemptsPerIp))
         : DEFAULT_MAX_ATTEMPTS_PER_IP;
     this.attemptWindowMs =
       typeof options.attemptWindowMs === "number" && options.attemptWindowMs > 0
-        ? Math.floor(options.attemptWindowMs)
+        ? Math.max(1, Math.floor(options.attemptWindowMs))
         : DEFAULT_ATTEMPT_WINDOW_MS;
     this.codeBytes =
       typeof options.codeBytes === "number" && options.codeBytes >= 16
@@ -199,8 +199,10 @@ export class InviteCodeService {
     const salt = generateSalt(16);
     const codeHash = hashInviteCode(code, salt);
     const allowed =
-      typeof input?.allowedRunCount === "number" && input.allowedRunCount >= 0
-        ? Math.floor(input.allowedRunCount)
+      typeof input?.allowedRunCount === "number" &&
+      Number.isFinite(input.allowedRunCount) &&
+      input.allowedRunCount >= 0
+        ? Math.max(1, Math.floor(input.allowedRunCount))
         : 1;
 
     const record = this.runStore.storeHashedInviteCode({

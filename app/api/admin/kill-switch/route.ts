@@ -8,6 +8,9 @@ import { resolveFifoQueue } from "@/lib/admission/fifo-queue";
 import {
   KILL_SWITCH_LEVELS,
   KillSwitchService,
+  isKillSwitchUnpersistedAuthority,
+  killSwitchServiceRegistry,
+  markKillSwitchUnpersistedAuthority,
   type KillSwitchLevel,
   type KillSwitchState,
 } from "@/lib/admin/kill-switch";
@@ -45,25 +48,23 @@ const KILL_SWITCH_PAUSE_KEY = "killSwitch.pauseNewRuns";
 const KILL_SWITCH_STOP_KEY = "killSwitch.stopGracefully";
 const KILL_SWITCH_LAST_LEVEL_KEY = "killSwitch.lastLevel";
 
-const killSwitchRegistry = globalThis as unknown as {
-  __killSwitchServices?: WeakMap<object, KillSwitchService>;
-};
-
 /**
  * Returns the shared {@link KillSwitchService} bound to a particular `RunStore`, so successive Admin
  * calls observe the same pause/stop state while distinct stores (tests, other processes) stay
  * isolated. A shared instance is required because the service mutates in-memory state on `execute`.
  */
-function buildService(request: Request): { service: KillSwitchService; settings: SettingsStore } {
+function buildService(request: Request): {
+  service: KillSwitchService;
+  settings: SettingsStore;
+  storeKey: object;
+} {
   const runStore = resolveRunStore(request);
   const eventStore = resolveEventStore(request, undefined, runStore);
   const settings = resolveSettingsStore(request);
+  const storeKey = runStore as unknown as object;
 
-  if (!killSwitchRegistry.__killSwitchServices) {
-    killSwitchRegistry.__killSwitchServices = new WeakMap<object, KillSwitchService>();
-  }
-  const key = runStore as unknown as object;
-  let service = killSwitchRegistry.__killSwitchServices.get(key);
+  const services = killSwitchServiceRegistry();
+  let service = services.get(storeKey);
   if (!service) {
     const queue = resolveFifoQueue({
       eventStore,
@@ -79,21 +80,20 @@ function buildService(request: Request): { service: KillSwitchService; settings:
         remove: (runId) => queue.remove(runId),
       },
     });
-    killSwitchRegistry.__killSwitchServices.set(key, service);
+    services.set(storeKey, service);
   }
   // Rehydrate on EVERY request (not only on cold start) so the enforced flags stay synchronized
-  // with the persisted SettingsStore values at all times.
-  service.rehydrateState({
-    pausedNewRuns: readBooleanSetting(settings, KILL_SWITCH_PAUSE_KEY),
-    stoppingGracefully: readBooleanSetting(settings, KILL_SWITCH_STOP_KEY),
-    lastLevel: readLastLevel(settings),
-  });
-  return { service, settings };
-}
-
-/** Clears the shared kill-switch registry (used by tests between fixtures). */
-export function resetKillSwitchRegistry(): void {
-  killSwitchRegistry.__killSwitchServices = new WeakMap<object, KillSwitchService>();
+  // with the persisted SettingsStore values at all times — unless a prior `persistState` failure
+  // made the in-memory state authoritative, in which case rehydrating would silently revert the
+  // active pause/stop.
+  if (!isKillSwitchUnpersistedAuthority(storeKey)) {
+    service.rehydrateState({
+      pausedNewRuns: readBooleanSetting(settings, KILL_SWITCH_PAUSE_KEY),
+      stoppingGracefully: readBooleanSetting(settings, KILL_SWITCH_STOP_KEY),
+      lastLevel: readLastLevel(settings),
+    });
+  }
+  return { service, settings, storeKey };
 }
 
 function readBooleanSetting(settings: SettingsStore, key: string): boolean {
@@ -153,7 +153,7 @@ export async function POST(request: Request): Promise<Response> {
     return Response.json({ ok: false, error: "invalid_level" }, { status: 400 });
   }
 
-  const { service, settings } = buildService(request);
+  const { service, settings, storeKey } = buildService(request);
   const preview = service.preview(body.level);
 
   const confirmed = body.confirmed === true || body.confirm === true;
@@ -172,8 +172,10 @@ export async function POST(request: Request): Promise<Response> {
   try {
     persistState(settings, auth.actor.id, service);
   } catch {
-    // The kill switch ran, but its state could not be persisted; report the failure so the caller
-    // does not assume the state survived.
+    // The kill switch ran, but its state could not be persisted. Keep the in-memory state
+    // authoritative for this store so a later request's rehydrate cannot silently revert the active
+    // pause/stop, and report the failure so the caller does not assume the state survived.
+    markKillSwitchUnpersistedAuthority(storeKey);
     return Response.json({ ok: false, error: "kill_switch_persist_failed" }, { status: 500 });
   }
   return Response.json({ ok: true, result, state: mergedState(service, settings) });

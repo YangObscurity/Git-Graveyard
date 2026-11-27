@@ -323,7 +323,7 @@ export class AdmissionController {
     }
 
     const backendKind = input.backendKind ?? this.backendKind();
-    const capacity = this.readBackendCapacity();
+    const capacity = this.resolveBackendCapacity();
     const limit = this.effectiveConcurrentLiveRuns(backendKind);
 
     // Requirement 41.11: a cloud backend reporting no free slot retains the run queued.
@@ -405,7 +405,7 @@ export class AdmissionController {
       return true;
     }
     const effective =
-      typeof limit === "number"
+      typeof limit === "number" && Number.isFinite(limit)
         ? Math.min(limit, this.effectiveConcurrentLiveRuns())
         : this.effectiveConcurrentLiveRuns();
     if (this.countLiveRuns() + this.reservedRunIds.size >= effective) {
@@ -463,14 +463,22 @@ export class AdmissionController {
     return "instabox-docker";
   }
 
-  private readBackendCapacity(): { reported: boolean; available: number | null } {
+  /**
+   * Resolves the ExecutionBackend's advertised capacity. Only a finite number is ever reported as an
+   * available slot; a non-finite value (NaN / Infinity) is treated as unreported so it can never be
+   * mistaken for free capacity.
+   */
+  resolveBackendCapacity(): { reported: boolean; available: number | null } {
     const backend = this.backend;
     if (!backend) {
       return { reported: false, available: null };
     }
     const capacity = backend.capacity;
     if (typeof capacity === "number") {
-      return { reported: true, available: capacity };
+      // A non-finite capacity (NaN / Infinity) must never be reported as available capacity.
+      return Number.isFinite(capacity)
+        ? { reported: true, available: capacity }
+        : { reported: false, available: null };
     }
     if (typeof capacity !== "function") {
       return { reported: false, available: null };
