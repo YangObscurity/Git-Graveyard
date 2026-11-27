@@ -89,11 +89,27 @@ def strip_bom(source: str) -> str:
     return source
 
 
-def check_source(source: str, name: str, feature_version) -> dict:
-    """Parses one source string and returns the oracle record for it."""
+def normalize_source(source):
+    """Strips an optional UTF-8 BOM from ``str`` or ``bytes`` input.
+
+    Byte strings are returned as bytes so that ``ast.parse`` decodes them
+    itself: invalid UTF-8 then fails explicitly instead of being silently
+    replaced with U+FFFD. Only the BOM, which ``ast.parse`` rejects in place, is
+    removed.
+    """
+    if isinstance(source, (bytes, bytearray)):
+        data = bytes(source)
+        if data.startswith(b"\xef\xbb\xbf"):
+            return data[3:]
+        return data
+    return strip_bom(source)
+
+
+def check_source(source, name: str, feature_version) -> dict:
+    """Parses one source (``str`` or ``bytes``) and returns the oracle record."""
     errors = []
     try:
-        ast.parse(strip_bom(source), filename=name, feature_version=feature_version)
+        ast.parse(normalize_source(source), filename=name, feature_version=feature_version)
     except SyntaxError as exc:
         errors.append(
             {
@@ -101,6 +117,15 @@ def check_source(source: str, name: str, feature_version) -> dict:
                 "line": exc.lineno if exc.lineno is not None else 1,
                 "column": exc.offset if exc.offset is not None else 0,
                 "text": (exc.text or "").rstrip("\n"),
+            }
+        )
+    except (UnicodeDecodeError, ValueError) as exc:
+        errors.append(
+            {
+                "message": str(exc) or exc.__class__.__name__,
+                "line": 1,
+                "column": 0,
+                "text": "",
             }
         )
     return {
@@ -111,21 +136,31 @@ def check_source(source: str, name: str, feature_version) -> dict:
     }
 
 
-def check_file(path: str, feature_version) -> dict:
-    """Reads one file as UTF-8 and returns its oracle record."""
+def check_file(path: str, feature_version):
+    """Reads one file as raw bytes; returns ``(record, io_error)``.
+
+    The raw bytes are handed to :func:`check_source` unchanged (apart from an
+    optional UTF-8 BOM) so that invalid UTF-8 fails explicitly. ``io_error`` is
+    true when the file cannot be read at all, so the caller can exit with the
+    documented I/O error code.
+    """
     name = path.replace(os.sep, "/")
     try:
         with open(path, "rb") as handle:
             raw = handle.read()
     except OSError as exc:
-        return {
-            "ok": False,
-            "file": name,
-            "featureVersion": format_feature_version(feature_version),
-            "errors": [{"message": "unreadable: %s" % exc, "line": 1, "column": 0, "text": ""}],
-        }
-    source = raw.decode("utf-8-sig", errors="replace")
-    return check_source(source, name, feature_version)
+        return (
+            {
+                "ok": False,
+                "file": name,
+                "featureVersion": format_feature_version(feature_version),
+                "errors": [
+                    {"message": "unreadable: %s" % exc, "line": 1, "column": 0, "text": ""}
+                ],
+            },
+            True,
+        )
+    return check_source(raw, name, feature_version), False
 
 
 def iter_python_files(root: str):
@@ -217,11 +252,15 @@ def main(argv=None) -> int:
         return 2
 
     records = []
+    io_error = False
     for path, literal in targets:
         if literal is not None:
             records.append(check_source(literal, path.replace(os.sep, "/"), feature_version))
         else:
-            records.append(check_file(path, feature_version))
+            record, failed = check_file(path, feature_version)
+            records.append(record)
+            if failed:
+                io_error = True
 
     if args.json:
         for record in records:
@@ -230,6 +269,8 @@ def main(argv=None) -> int:
         for record in records:
             print(format_human(record))
 
+    if io_error:
+        return 2
     return 0 if all(record["ok"] for record in records) else 1
 
 

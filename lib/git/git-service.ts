@@ -3044,31 +3044,8 @@ export class GitService {
       );
     }
 
-    // GIT_ASKPASS helper script in fresh temporary directory with mode 0700
-    const askpassDir = fs.mkdtempSync(path.join(os.tmpdir(), "git-askpass-"));
-    fs.chmodSync(askpassDir, 0o700);
-    const helperScriptPath = path.join(askpassDir, "askpass.sh");
-    const scriptContent = `#!/bin/sh
-case "$1" in
-  *[Uu]sername*)
-    echo "x-access-token"
-    ;;
-  *)
-    echo "\${GIT_WRITE_TOKEN:-\$GIT_ASKPASS_TOKEN}"
-    ;;
-esac
-`;
-    fs.writeFileSync(helperScriptPath, scriptContent, {
-      mode: 0o700,
-      encoding: "utf8",
-    });
-    fs.chmodSync(helperScriptPath, 0o700);
-
-    const runRoot = options.runDir ?? path.join(this.runsDir, effectiveRunId);
-    const gitDir = options.gitDir ?? path.join(runRoot, "git");
-    const hostGitDir = resolveHostGitDir(gitDir);
-
-    // Acquire the exclusive write lock before touching the remote.
+    // Acquire the exclusive write lock BEFORE creating any temporary askpass
+    // directory so a held lock or a setup failure never leaks a temp dir.
     if (activePushLocks.has(effectiveRunId)) {
       throw new GitServiceError(
         `pushToFork refused: exclusive fork push lock for run '${effectiveRunId}' is already held (Requirement 29.1)`,
@@ -3093,13 +3070,38 @@ esac
       }
     };
 
-    emitPushEvent("push.requested", {
-      runId: effectiveRunId,
-      branch,
-      targetRepoUrl: targetUrl,
-    });
-
+    let askpassDir: string | null = null;
     try {
+      // GIT_ASKPASS helper script in fresh temporary directory with mode 0700
+      askpassDir = fs.mkdtempSync(path.join(os.tmpdir(), "git-askpass-"));
+      fs.chmodSync(askpassDir, 0o700);
+      const helperScriptPath = path.join(askpassDir, "askpass.sh");
+      const scriptContent = `#!/bin/sh
+case "$1" in
+  *[Uu]sername*)
+    echo "x-access-token"
+    ;;
+  *)
+    echo "\${GIT_WRITE_TOKEN:-\$GIT_ASKPASS_TOKEN}"
+    ;;
+esac
+`;
+      fs.writeFileSync(helperScriptPath, scriptContent, {
+        mode: 0o700,
+        encoding: "utf8",
+      });
+      fs.chmodSync(helperScriptPath, 0o700);
+
+      const runRoot = options.runDir ?? path.join(this.runsDir, effectiveRunId);
+      const gitDir = options.gitDir ?? path.join(runRoot, "git");
+      const hostGitDir = resolveHostGitDir(gitDir);
+
+      emitPushEvent("push.requested", {
+        runId: effectiveRunId,
+        branch,
+        targetRepoUrl: targetUrl,
+      });
+
       const shaRes = await this.#execGitInternal([
         "--git-dir",
         hostGitDir,
@@ -3173,10 +3175,12 @@ esac
       );
     } finally {
       activePushLocks.delete(effectiveRunId);
-      try {
-        fs.rmSync(askpassDir, { recursive: true, force: true });
-      } catch {
-        // Ignore cleanup failure
+      if (askpassDir) {
+        try {
+          fs.rmSync(askpassDir, { recursive: true, force: true });
+        } catch {
+          // Ignore cleanup failure
+        }
       }
     }
   }

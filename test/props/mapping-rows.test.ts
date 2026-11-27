@@ -119,4 +119,31 @@ describe("Property 5: mapping rows (Requirement 6.2)", () => {
       { numRuns: 100 }
     );
   });
+
+  it("round-trips a backtick path that contains a comma (Requirement 6.2)", () => {
+    const input: BundleInput = {
+      owner: "graveyard-fixtures",
+      repo: "F-props",
+      asOf: "2026-11-08T00:00:00Z",
+      targetRuntime: { kind: "node", value: ">=22" },
+      m2Fired: false,
+      preset: true,
+      steps: [],
+      signals: [
+        {
+          ruleId: "M2",
+          file: "a,b.js",
+          line: 1,
+          column: 1,
+          matched: "require('request')",
+          confidence: "high",
+          manifestDir: ".",
+        },
+      ],
+    };
+    const rendered = extractMappingRows(generateBundle(input).design);
+    const m2 = rendered.find((row) => row.ruleId === "M2");
+    assert.ok(m2, "the M2 mapping row must be rendered");
+    assert.deepEqual(m2!.files, ["a,b.js"]);
+  });
 });

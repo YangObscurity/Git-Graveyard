@@ -23,6 +23,7 @@ import type { PatchStep } from "../../lib/grimoire/gate-js";
 import {
   generateBundle,
   resolveEngineVersion,
+  normalizeBundlePath,
   POETRY_LOCK_COMMAND,
   DEFAULT_NPM_LOCK_COMMAND,
   type BundleInput,
@@ -108,6 +109,24 @@ export function readFixtureFiles(fixtureDir: string): InventoryInputFile[] {
   return files;
 }
 
+/**
+ * Parses JSON text into a non-null, non-array plain object. Anything else
+ * (a JSON `null`, an array, a scalar, or unparseable text) yields `{}` so that
+ * property access on the result is always safe.
+ */
+export function parsePackageJson(text: string): Record<string, unknown> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return {};
+  }
+  if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+    return parsed as Record<string, unknown>;
+  }
+  return {};
+}
+
 export function bakeFixture(fixtureDir: string): BakedFixtureOutput {
   const metaPath = path.join(fixtureDir, "meta.json");
   if (!fs.existsSync(metaPath)) {
@@ -189,12 +208,7 @@ export function bakeFixture(fixtureDir: string): BakedFixtureOutput {
 
   const pkgInputFile = files.find((f) => f.path === "package.json");
   if (pkgInputFile && typeof pkgInputFile.content === "string") {
-    let pkgJson: Record<string, unknown> = {};
-    try {
-      pkgJson = JSON.parse(pkgInputFile.content);
-    } catch {
-      pkgJson = {};
-    }
+    const pkgJson = parsePackageJson(pkgInputFile.content);
 
     if (m2Fired) {
       const manifestRes = updateM2Manifest(pkgJson, {
@@ -269,17 +283,45 @@ export async function collectPythonPlan(fixtureDir: string): Promise<PythonPlanD
 
   await initPythonParser();
 
-  const manifests = files
-    .filter((f) => typeof f.content === "string" && PY_MANIFEST_RE.test(f.path))
-    .map((f) => ({ path: f.path, content: f.content as string }));
-  const declared = checkDeclaredPythonVersion(manifests);
+  const manifestsByDir = new Map<
+    string,
+    Array<{ path: string; content: string }>
+  >();
+  for (const f of files) {
+    if (typeof f.content !== "string" || !PY_MANIFEST_RE.test(f.path)) continue;
+    const dir = path.posix.dirname(f.path.replace(/\\/g, "/")) || ".";
+    const list = manifestsByDir.get(dir) ?? [];
+    list.push({ path: f.path, content: f.content });
+    manifestsByDir.set(dir, list);
+  }
+
+  // Each Python project is checked against the manifests of its own nearest
+  // ancestor manifest directory, so unrelated subproject declarations are not
+  // flattened across the repository.
+  const declaredByDir = new Map<string, boolean>();
+  for (const [dir, manifests] of manifestsByDir) {
+    declaredByDir.set(dir, checkDeclaredPythonVersion(manifests).py2Only);
+  }
+  const declaredFor = (manifestDir: string): boolean => {
+    let dir = normalizeBundlePath(manifestDir) || ".";
+    for (;;) {
+      if (declaredByDir.has(dir)) return declaredByDir.get(dir) as boolean;
+      if (dir === "." || dir === "") return false;
+      const parent = path.posix.dirname(dir);
+      dir = parent === "" ? "." : parent;
+    }
+  };
 
   const steps: PatchStep[] = [];
   const labels: Record<string, "m1-clean" | "m1-partial"> = {};
   const unknowns: UnknownRecord[] = [];
   for (const sf of pythonFiles) {
     const content = typeof sf.content === "string" ? sf.content : "";
-    const result = analyzePython(content, sf.path, { py2Only: declared.py2Only });
+    const manifestDir =
+      typeof sf.manifestDir === "string" ? sf.manifestDir : ".";
+    const result = analyzePython(content, sf.path, {
+      py2Only: declaredFor(manifestDir),
+    });
     labels[result.file] = result.label;
     unknowns.push(...result.unknowns);
     if (result.reverted || result.acceptedEdits.length > 0) {
@@ -314,19 +356,30 @@ export function planFixtureRuntime(
   let targetRuntime: BundleTargetRuntime | null = null;
 
   const pkgFile = files.find((f) => f.path === "package.json");
-  let pkgJson: Record<string, unknown> = {};
-  if (pkgFile && typeof pkgFile.content === "string") {
-    try {
-      pkgJson = JSON.parse(pkgFile.content) as Record<string, unknown>;
-    } catch {
-      pkgJson = {};
-    }
-  }
+  const pkgJson =
+    pkgFile && typeof pkgFile.content === "string"
+      ? parsePackageJson(pkgFile.content)
+      : {};
 
   const engines = pkgJson.engines as Record<string, unknown> | undefined;
   const engineNode = typeof engines?.node === "string" ? engines.node : null;
   if (m2Fired) {
-    targetRuntime = { kind: "node", value: ">=22" };
+    // Reuse updateM2Manifest's version decision: a stricter but valid
+    // constraint (for example `>=24`) is preserved, and `>=22` is only written
+    // when `engines.node` is missing or below 22.
+    const manifestRes = updateM2Manifest(pkgJson, {
+      stillImportsRequest: false,
+      m2Fired: true,
+      filePath: "package.json",
+    });
+    const nextEngines = manifestRes.manifest.engines as
+      | Record<string, unknown>
+      | undefined;
+    const nextNode =
+      nextEngines && typeof nextEngines.node === "string"
+        ? nextEngines.node
+        : ">=22";
+    targetRuntime = { kind: "node", value: nextNode };
   } else if (engineNode) {
     targetRuntime = { kind: "node", value: engineNode };
   }
@@ -363,7 +416,11 @@ export function planFixtureRuntime(
       targetRuntime = targetRuntime ?? { kind: "python", value: declared.declared };
     }
     const poetry = /\[tool\.poetry\]/.test(pyproject.content);
-    lockCommands["."] = poetry ? POETRY_LOCK_COMMAND : "unknown";
+    // Only a Python-owned manifest directory sets the Python lock command; a
+    // Node manifest that already owns `.` keeps its npm lock command.
+    if (!("." in lockCommands)) {
+      lockCommands["."] = poetry ? POETRY_LOCK_COMMAND : "unknown";
+    }
   } else if (hasPython && !targetRuntime) {
     targetRuntime = { kind: "unspecified", value: "unspecified" };
   }
@@ -381,6 +438,8 @@ export interface BakedFixtureArtifacts {
   owner: string;
   repo: string;
   folderName: string;
+  /** M2 diffs plus non-reverted M1 Python diffs, joined with `"\n"`. */
+  allPatch: string;
   requirements: string;
   design: string;
   tasks: string;
@@ -405,6 +464,32 @@ export async function bakeFixtureArtifacts(
   const files = readFixtureFiles(fixtureDir);
   const python = await collectPythonPlan(fixtureDir);
   const runtime = planFixtureRuntime(files, registryJson, result.m2Steps.length > 0);
+
+  // `all.patch` carries the M2 diffs plus every non-reverted M1 Python diff,
+  // sorted by file for determinism.
+  const m1Diffs = python.steps
+    .filter(
+      (step) =>
+        !step.reverted &&
+        typeof step.diff === "string" &&
+        step.diff.trim().length > 0
+    )
+    .slice()
+    .sort((a, b) => {
+      const fa = a.file ?? "";
+      const fb = b.file ?? "";
+      return fa < fb ? -1 : fa > fb ? 1 : 0;
+    })
+    .map((step) => step.diff as string);
+  const allPatchParts: string[] = [];
+  if (result.allPatch.length > 0) allPatchParts.push(result.allPatch);
+  allPatchParts.push(...m1Diffs);
+  const allPatch = allPatchParts.join("\n");
+
+  const hasOriginalUnparseable = [
+    ...result.reportJson.unknowns,
+    ...python.unknowns,
+  ].some((unknown) => unknown.reason === "original_unparseable");
 
   const bundle = generateBundle({
     owner: result.owner,
@@ -456,7 +541,7 @@ export async function bakeFixtureArtifacts(
       seq: events.length,
       kind: "gate.result",
       gate: "syntax",
-      ok: bundle.patchSteps.every((step) => !step.reverted),
+      ok: bundle.patchSteps.every((step) => !step.reverted) && !hasOriginalUnparseable,
       files: bundle.patchSteps.map((step) => step.file),
       reasons: revertedSteps.map((step) => step.revertReason ?? "all_edits_rejected"),
     })
@@ -467,7 +552,7 @@ export async function bakeFixtureArtifacts(
     repo: result.repo,
     sha: meta.sha,
     gate: "syntax",
-    ok: revertedSteps.length === 0,
+    ok: revertedSteps.length === 0 && !hasOriginalUnparseable,
     engineVersion: resolveEngineVersion(),
     signals: result.reportJson.signals.length,
     patchSteps: bundle.patchSteps.length,
@@ -480,12 +565,56 @@ export async function bakeFixtureArtifacts(
     owner: result.owner,
     repo: result.repo,
     folderName: `${result.owner}-${result.repo}`,
+    allPatch,
     requirements: bundle.requirements,
     design: bundle.design,
     tasks: bundle.tasks,
     eventsNdjson: events.map((line) => line + "\n").join(""),
     verifyResultJson: JSON.stringify(verifyResult, null, 2) + "\n",
   };
+}
+
+/**
+ * Rejects an untrusted path segment (an `owner`, a `repo`, or a derived folder
+ * name) that could escape its output directory: a `/`, a `\`, a `..`, or an
+ * empty string is not allowed.
+ */
+export function assertSafeSegment(value: string, label: string): void {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.includes("/") ||
+    value.includes("\\") ||
+    value.includes("..")
+  ) {
+    throw new Error(`unsafe ${label}: ${JSON.stringify(value)}`);
+  }
+}
+
+/** Asserts that a resolved child path stays strictly inside its resolved parent. */
+export function assertInside(child: string, parent: string, label: string): void {
+  const resolvedChild = path.resolve(child);
+  const resolvedParent = path.resolve(parent);
+  const relative = path.relative(resolvedParent, resolvedChild);
+  if (relative === "" || relative.startsWith("..") || path.isAbsolute(relative)) {
+    throw new Error(`${label} escapes ${resolvedParent}: ${resolvedChild}`);
+  }
+}
+
+/** Validates one fixture's owner, repo, folder name and resolved output paths. */
+function validateFixtureOutput(
+  item: { owner: string; repo: string },
+  folderName: string,
+  goldenFolder: string,
+  specFolder: string,
+  goldenDir: string,
+  specsDir: string
+): void {
+  assertSafeSegment(item.owner, "owner");
+  assertSafeSegment(item.repo, "repo");
+  assertSafeSegment(folderName, "folderName");
+  assertInside(goldenFolder, goldenDir, "golden folder");
+  assertInside(specFolder, specsDir, "specs folder");
 }
 
 export async function runBake(options?: BakeOptions): Promise<void> {
@@ -520,9 +649,17 @@ export async function runBake(options?: BakeOptions): Promise<void> {
       const artifacts = await bakeFixtureArtifacts(fixtureDir, result);
       const goldenFolder = path.join(goldenDir, artifacts.folderName);
       const specFolder = path.join(specsDir, artifacts.folderName);
+      validateFixtureOutput(
+        item,
+        artifacts.folderName,
+        goldenFolder,
+        specFolder,
+        goldenDir,
+        specsDir
+      );
 
       const fresh: Array<[string, string]> = [
-        [path.join(goldenFolder, "all.patch"), result.allPatch],
+        [path.join(goldenFolder, "all.patch"), artifacts.allPatch],
         [
           path.join(goldenFolder, "report.json"),
           JSON.stringify(result.reportJson, null, 2) + "\n",
@@ -567,11 +704,19 @@ export async function runBake(options?: BakeOptions): Promise<void> {
     const artifacts = await bakeFixtureArtifacts(fixtureDir, result);
     const goldenFolder = path.join(goldenDir, artifacts.folderName);
     const specFolder = path.join(specsDir, artifacts.folderName);
+    validateFixtureOutput(
+      item,
+      artifacts.folderName,
+      goldenFolder,
+      specFolder,
+      goldenDir,
+      specsDir
+    );
 
     fs.mkdirSync(goldenFolder, { recursive: true });
     fs.mkdirSync(specFolder, { recursive: true });
 
-    fs.writeFileSync(path.join(goldenFolder, "all.patch"), result.allPatch, "utf8");
+    fs.writeFileSync(path.join(goldenFolder, "all.patch"), artifacts.allPatch, "utf8");
     fs.writeFileSync(
       path.join(goldenFolder, "report.json"),
       JSON.stringify(result.reportJson, null, 2) + "\n",
