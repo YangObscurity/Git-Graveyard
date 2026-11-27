@@ -735,6 +735,7 @@ describe("ParallelScheduler concurrency & dispatch (Task 20.4)", () => {
         parallelCap: 2,
         globalCap: 3,
         runningMax: 4,
+        wardenReview: async () => ({ approved: true }),
       });
       // min over the SPECIFIED bounds only; default 1 when none is specified.
       assert.equal(
@@ -780,6 +781,7 @@ describe("ParallelScheduler concurrency & dispatch (Task 20.4)", () => {
       const controller = makeControlledRunner(fixture.tmpDir);
       const scheduler = makeScheduler(fixture, tasks, controller.runner, {
         parallelCap: 2,
+        wardenReview: async () => ({ approved: true }),
       });
 
       const runPromise = scheduler.run();
@@ -860,6 +862,7 @@ describe("ParallelScheduler concurrency & dispatch (Task 20.4)", () => {
       const controller = makeControlledRunner(fixture.tmpDir);
       const scheduler = makeScheduler(fixture, tasks, controller.runner, {
         parallelCap: 3,
+        wardenReview: async () => ({ approved: true }),
       });
 
       const runPromise = scheduler.run();
@@ -1056,6 +1059,255 @@ describe("ParallelScheduler stop & abort (Task 20.4)", () => {
       for (const dir of worktrees) {
         assert.equal(fs.existsSync(dir), false, `${dir} torn down`);
       }
+    } finally {
+      fixture.cleanup();
+    }
+  });
+});
+
+
+describe("ParallelScheduler pause & resume (Task 20.4)", () => {
+  it("pause() keeps the loop alive so resume() finishes queued tasks after slots drain", async () => {
+    const fixture = createRepoFixture("pause");
+    try {
+      const tasks = [
+        makePactTask("A", { filesInScope: ["src/a.ts"], line: 1 }),
+        makePactTask("B", { filesInScope: ["src/b.ts"], line: 2 }),
+        makePactTask("C", { filesInScope: ["src/c.ts"], line: 3 }),
+      ];
+      const controller = makeControlledRunner(fixture.tmpDir);
+      const scheduler = makeScheduler(fixture, tasks, controller.runner, {
+        parallelCap: 2,
+        wardenReview: async () => ({ approved: true }),
+      });
+
+      const runPromise = scheduler.run();
+      await waitFor(() => controller.pending().length >= 2);
+      assert.deepEqual(scheduler.getDispatchSequence().slice(0, 2), ["A", "B"]);
+
+      scheduler.pause();
+      assert.equal(scheduler.isPaused, true);
+
+      // The two running slots drain while paused; the queued task must NOT be
+      // dispatched and the loop must NOT exit.
+      controller.release("A");
+      controller.release("B");
+      await waitFor(() => scheduler.getStatus().activeSlots === 0);
+      assert.equal(scheduler.getStatus().activeSlots, 0);
+      assert.equal(scheduler.getDispatchSequence().includes("C"), false);
+
+      let settled = false;
+      void runPromise.then(
+        () => {
+          settled = true;
+        },
+        () => {
+          settled = true;
+        }
+      );
+      await new Promise<void>((resolve) => setTimeout(resolve, 30));
+      assert.equal(
+        settled,
+        false,
+        "run() must stay pending while paused with queued work"
+      );
+
+      // resume() wakes the loop, dispatches the queued task and finishes the run.
+      scheduler.resume();
+      await waitFor(() => controller.pending().includes("C"));
+      controller.release("C");
+      const summary = await runPromise;
+
+      assert.equal(summary.dispatched, 3);
+      assert.deepEqual(scheduler.getDispatchSequence(), ["A", "B", "C"]);
+      assert.equal(summary.taskStates.C, "in_review");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+});
+
+
+describe("ParallelScheduler defers worktree cleanup until after Warden review (Task 20.4)", () => {
+  it("keeps candidate.worktreeDir intact during wardenReview and cleans it up only afterwards", async () => {
+    const fixture = createRepoFixture("wardenclean");
+    try {
+      const controller = makeControlledRunner(fixture.tmpDir);
+      const observed: Array<{ taskId: string; dir: string; existed: boolean }> =
+        [];
+      const wardenReview = async (
+        candidate: ParallelSchedulerCandidate
+      ): Promise<ParallelWardenDecision> => {
+        observed.push({
+          taskId: candidate.taskId,
+          dir: candidate.worktreeDir,
+          existed: fs.existsSync(candidate.worktreeDir),
+        });
+        return { approved: true };
+      };
+      const scheduler = makeScheduler(
+        fixture,
+        [makePactTask("A", { filesInScope: ["src/a.ts"], line: 1 })],
+        controller.runner,
+        { parallelCap: 1, wardenReview }
+      );
+
+      const summary = await drainRun(scheduler.run(), controller);
+
+      assert.equal(observed.length, 1);
+      assert.equal(
+        observed[0].existed,
+        true,
+        "candidate.worktreeDir must exist inside wardenReview"
+      );
+      assert.equal(
+        fs.existsSync(observed[0].dir),
+        false,
+        "worktree must be cleaned up only after wardenReview returns"
+      );
+      assert.equal(summary.approved, 1);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+});
+
+
+describe("ParallelScheduler fail-closed Warden default (Task 20.4)", () => {
+  it("omitting wardenReview fails closed with zero approvals", async () => {
+    const fixture = createRepoFixture("failclosed");
+    try {
+      const controller = makeControlledRunner(fixture.tmpDir);
+      const scheduler = makeScheduler(
+        fixture,
+        [makePactTask("A", { filesInScope: ["src/a.ts"], line: 1 })],
+        controller.runner,
+        { parallelCap: 1 }
+      );
+
+      const summary = await drainRun(scheduler.run(), controller);
+
+      assert.equal(summary.approved, 0, "no candidate may be approved");
+      const records = scheduler.getReviewRecords();
+      assert.ok(records.length > 0, "candidates were still reviewed");
+      assert.ok(records.every((record) => record.approved === false));
+      assert.ok(
+        records.every((record) => record.reason === "warden_review_missing")
+      );
+      // Attempts exhaust and the task fails rather than merging.
+      assert.equal(summary.taskStates.A, "failed");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+});
+
+describe("ParallelScheduler retry accounting (Task 20.4)", () => {
+  it("exhausting maxAttempts does not over-count summary.retried or fire onRetry", async () => {
+    const fixture = createRepoFixture("retrymax");
+    try {
+      const controller = makeControlledRunner(fixture.tmpDir);
+      const retries: Array<[string, number, string]> = [];
+      let reviews = 0;
+      const wardenReview = async (): Promise<ParallelWardenDecision> => {
+        reviews += 1;
+        return { approved: false, reason: "changes requested" };
+      };
+      const scheduler = makeScheduler(
+        fixture,
+        [makePactTask("A", { filesInScope: ["src/a.ts"], line: 1 })],
+        controller.runner,
+        {
+          parallelCap: 1,
+          maxAttempts: 2,
+          wardenReview,
+          onRetry: (taskId, attempt, reason) => {
+            retries.push([taskId, attempt, reason]);
+          },
+        }
+      );
+
+      const summary = await drainRun(scheduler.run(), controller);
+
+      // Attempt 1 -> rejected -> retried once. Attempt 2 -> rejected -> failed
+      // (attempts exhausted) without incrementing the retry counter.
+      assert.equal(reviews, 2);
+      assert.equal(summary.dispatched, 2);
+      assert.equal(summary.retried, 1);
+      assert.equal(summary.taskStates.A, "failed");
+      assert.equal(retries.length, 1);
+      assert.equal(retries[0][0], "A");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+});
+
+
+describe("ParallelScheduler verifies warden candidateSha256 (Task 20.4)", () => {
+  it("rejects an approval whose candidateSha256 does not match the candidate", async () => {
+    const fixture = createRepoFixture("shamismatch");
+    try {
+      const runner: ParallelSchedulerRunner = async () => ({
+        ok: true,
+        candidateSha: "0".repeat(40),
+        candidateSha256: "abcdef0123456789",
+      });
+      const scheduler = new ParallelScheduler({
+        runId: fixture.runId,
+        runsDir: fixture.runDir,
+        gitDir: fixture.gitDir,
+        integrationBranch: `graveyard/${fixture.runId}`,
+        tasks: [makePactTask("A", { filesInScope: ["src/a.ts"], line: 1 })],
+        approvedTaskIds: ["A"],
+        parallelCap: 1,
+        maxAttempts: 1,
+        runner,
+        wardenReview: async () => ({
+          approved: true,
+          reason: "looks good",
+          candidateSha256: "ffffffffffffffff",
+        }),
+      });
+
+      const summary = await scheduler.run();
+      assert.equal(summary.approved, 0);
+      const records = scheduler.getReviewRecords();
+      assert.equal(records.length, 1);
+      assert.equal(records[0].approved, false);
+      assert.equal(records[0].reason, "candidateSha256_mismatch");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("accepts an approval whose candidateSha256 matches case-insensitively", async () => {
+    const fixture = createRepoFixture("shamatch");
+    try {
+      const runner: ParallelSchedulerRunner = async () => ({
+        ok: true,
+        candidateSha: "1".repeat(40),
+        candidateSha256: "AbCdEf0123456789",
+      });
+      const scheduler = new ParallelScheduler({
+        runId: fixture.runId,
+        runsDir: fixture.runDir,
+        gitDir: fixture.gitDir,
+        integrationBranch: `graveyard/${fixture.runId}`,
+        tasks: [makePactTask("A", { filesInScope: ["src/a.ts"], line: 1 })],
+        approvedTaskIds: ["A"],
+        parallelCap: 1,
+        maxAttempts: 1,
+        runner,
+        wardenReview: async () => ({
+          approved: true,
+          candidateSha256: "abcdef0123456789",
+        }),
+      });
+
+      const summary = await scheduler.run();
+      assert.equal(summary.approved, 1);
+      assert.equal(summary.taskStates.A, "in_review");
     } finally {
       fixture.cleanup();
     }

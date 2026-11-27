@@ -83,6 +83,12 @@ export interface ParallelSchedulerCandidate {
 export interface ParallelWardenDecision {
   approved: boolean;
   reason?: string;
+  /**
+   * When present and `approved` is true, the reviewed candidate hash. It is
+   * verified (case-insensitive, trimmed) against the candidate's
+   * `candidateSha256`; a mismatch rejects the candidate fail-closed.
+   */
+  candidateSha256?: string;
 }
 
 /** A candidate plus the Warden decision recorded for it. */
@@ -256,6 +262,13 @@ export class ParallelScheduler {
   private readonly _inFlight: Set<Promise<void>> = new Set();
   private readonly _slotContexts: Map<string, ParallelSlotContext> = new Map();
   private readonly _worktrees: Map<string, TaskWorktreeResult> = new Map();
+  /**
+   * Worktrees retained for candidates that are queued/undergoing the serialized
+   * Warden review. They are cleaned up only AFTER `wardenReview(candidate)`
+   * returns, so `candidate.worktreeDir` stays intact and inspectable throughout
+   * review.
+   */
+  private readonly _reviewWorktrees: Map<string, TaskWorktreeResult> = new Map();
   private readonly _freeSlots: Set<number> = new Set();
   private _slotCounter = 0;
 
@@ -289,7 +302,12 @@ export class ParallelScheduler {
     }
     this.options = options;
     this.runner = options.runner;
-    this.wardenReview = options.wardenReview ?? (() => ({ approved: true }));
+    // Fail-closed default: a run without an injected Warden reviewer must never
+    // approve a candidate, so the loop simply rejects (and eventually fails)
+    // every candidate it produces.
+    this.wardenReview =
+      options.wardenReview ??
+      (() => ({ approved: false, reason: "warden_review_missing" }));
 
     this._now = options.now ?? Date.now;
     this._runId = options.runId ?? `run-${this._now()}`;
@@ -471,7 +489,9 @@ export class ParallelScheduler {
     if (this._aborted) return;
     this._aborted = true;
     this._abortReason = reason;
-    this._reviewQueue = [];
+    // Tear down any candidate worktrees still awaiting review so an abort never
+    // leaks them (their reviews will never run).
+    this.discardQueuedReviews();
     for (const slot of this._active.values()) {
       try {
         slot.controller.abort();
@@ -556,13 +576,28 @@ export class ParallelScheduler {
       if (!this.isBusy()) {
         // Idle: nothing active and no queued work. Try one more dispatch pass to
         // avoid an idle loop, then stop when no slot can make progress.
-        if (!this._paused && !this._stopRequested && !this._aborted) {
+        const canDispatch =
+          !this._paused && !this._stopRequested && !this._aborted;
+        if (canDispatch) {
           this.dispatchReady();
           if (this.isBusy()) {
             continue;
           }
         }
-        break;
+        // Paused while non-terminal tasks remain (pending / ready / blocked):
+        // never exit the loop, or `resume()` would have nothing left to resume.
+        // Wait cleanly so `resume()`, `stop()`, or `abort()` wakes the loop and
+        // it either resumes dispatch or exits.
+        const pausedWithWork =
+          this._paused &&
+          !this._stopRequested &&
+          !this._aborted &&
+          this.hasNonTerminalWork();
+        if (!pausedWithWork) {
+          break;
+        }
+        await this.waitForActivity();
+        continue;
       }
 
       await this.waitForActivity();
@@ -602,6 +637,23 @@ export class ParallelScheduler {
       this._wardenActive > 0 ||
       this._reviewQueue.length > 0
     );
+  }
+
+  /**
+   * True when the composed Scheduler still owns non-terminal tasks the run loop
+   * could still act on (pending / ready / blocked). Used to keep the loop alive
+   * while paused so `resume()` can continue dispatching instead of the loop
+   * exiting early.
+   */
+  private hasNonTerminalWork(): boolean {
+    return this.scheduler
+      .getTasks()
+      .some(
+        (task) =>
+          task.state === "pending" ||
+          task.state === "ready" ||
+          task.state === "blocked"
+      );
   }
 
   private notify(): void {
@@ -701,6 +753,10 @@ export class ParallelScheduler {
     record: ActiveSlot
   ): Promise<void> {
     let worktree: TaskWorktreeResult | null = null;
+    // When a candidate is enqueued for Warden review, ownership of the worktree
+    // cleanup handle moves to the serialized review so `candidate.worktreeDir`
+    // stays intact and inspectable throughout review.
+    let retainedForReview = false;
     const modelId = task.modelTier;
     try {
       worktree = await this.gitService.createTaskWorktree({
@@ -740,7 +796,8 @@ export class ParallelScheduler {
       }
 
       const candidateSha =
-        result.candidateSha ?? this.resolveHeadSha(worktree.worktreeDir);
+        result.candidateSha ??
+        (await this.resolveHeadSha(worktree.worktreeDir));
       if (!candidateSha || candidateSha.trim().length === 0) {
         this.failSafe(task.id, "missing_candidate_sha");
         return;
@@ -764,6 +821,12 @@ export class ParallelScheduler {
       };
       this._candidates.push(candidate);
       this._reviewQueue.push(candidate);
+      // Hand the worktree cleanup handle to the serialized Warden review instead
+      // of tearing it down here; the worker slot still frees immediately below so
+      // parallel workers continue on other tasks.
+      this._reviewWorktrees.set(task.id, worktree);
+      this._worktrees.delete(task.id);
+      retainedForReview = true;
       this.options.onCandidate?.(candidate);
     } catch (err) {
       if (controller.signal.aborted || this._aborted || isAbortError(err)) {
@@ -772,16 +835,10 @@ export class ParallelScheduler {
         this.failSafe(task.id, err instanceof Error ? err.message : String(err));
       }
     } finally {
-      if (worktree) {
-        if (this._cleanupWorktrees) {
-          try {
-            await worktree.cleanup();
-          } catch {
-            // Deterministic teardown must never surface as a run failure.
-          }
-        }
-        this._worktrees.delete(task.id);
-        this.options.onCleanup?.(task.id, worktree.worktreeDir);
+      if (worktree && !retainedForReview) {
+        // The worker failed/errored before enqueuing a candidate (or was
+        // abandoned): no review will own this worktree, so tear it down here.
+        await this.cleanupWorktree(task.id, worktree);
       }
       this.releaseSlot(slotIndex);
       this._slotContexts.delete(task.id);
@@ -791,13 +848,41 @@ export class ParallelScheduler {
     }
   }
 
-  private resolveHeadSha(worktreeDir: string): string {
-    const out = childProcess.execFileSync(
-      this.gitService.gitBinary,
-      [...GIT_ISOLATION_FLAGS, "rev-parse", "HEAD"],
-      { cwd: worktreeDir, encoding: "utf8" }
-    );
-    return String(out).trim();
+  /**
+   * Deterministically tears down a task worktree (when `cleanupWorktrees` is
+   * enabled) and drops its tracking entry. A teardown failure never surfaces as
+   * a run failure.
+   */
+  private async cleanupWorktree(
+    taskId: string,
+    worktree: TaskWorktreeResult
+  ): Promise<void> {
+    this._worktrees.delete(taskId);
+    if (this._cleanupWorktrees) {
+      try {
+        await worktree.cleanup();
+      } catch {
+        // Deterministic teardown must never surface as a run failure.
+      }
+    }
+    this.options.onCleanup?.(taskId, worktree.worktreeDir);
+  }
+
+  private resolveHeadSha(worktreeDir: string): Promise<string> {
+    return new Promise<string>((resolve, reject) => {
+      childProcess.execFile(
+        this.gitService.gitBinary,
+        [...GIT_ISOLATION_FLAGS, "rev-parse", "HEAD"],
+        { cwd: worktreeDir, encoding: "utf8" },
+        (err, stdout) => {
+          if (err) {
+            reject(err);
+            return;
+          }
+          resolve(String(stdout).trim());
+        }
+      );
+    });
   }
 
   private failSafe(taskId: string, reason: string): void {
@@ -819,6 +904,41 @@ export class ParallelScheduler {
   // ---------------------------------------------------------------------------
   // Serialized Warden review queue
   // ---------------------------------------------------------------------------
+
+  /**
+   * Drops every candidate still waiting on the review queue (used by `abort()`),
+   * tearing down their retained worktrees so an aborted run never leaks them.
+   * The teardowns are tracked in `_inFlight` so `settle()` awaits them.
+   */
+  private discardQueuedReviews(): void {
+    const queued = this._reviewQueue;
+    if (queued.length === 0) {
+      return;
+    }
+    this._reviewQueue = [];
+    for (const candidate of queued) {
+      const worktree = this._reviewWorktrees.get(candidate.taskId);
+      if (!worktree) {
+        continue;
+      }
+      this._reviewWorktrees.delete(candidate.taskId);
+      const base = (async () => {
+        if (this._cleanupWorktrees) {
+          try {
+            await worktree.cleanup();
+          } catch {
+            // Deterministic teardown must never surface as a run failure.
+          }
+        }
+        this.options.onCleanup?.(candidate.taskId, worktree.worktreeDir);
+      })();
+      let tracked!: Promise<void>;
+      tracked = base.finally(() => {
+        this._inFlight.delete(tracked);
+      });
+      this._inFlight.add(tracked);
+    }
+  }
 
   private pumpReviewQueue(): void {
     if (this._aborted) {
@@ -846,22 +966,62 @@ export class ParallelScheduler {
   private async reviewLoop(
     candidate: ParallelSchedulerCandidate
   ): Promise<void> {
+    let decision: ParallelWardenDecision;
     try {
-      const decision = await this.wardenReview(candidate);
-      this.recordDecision(
-        candidate,
-        decision ?? { approved: false, reason: "no_decision" }
-      );
+      decision = (await this.wardenReview(candidate)) ?? {
+        approved: false,
+        reason: "no_decision",
+      };
     } catch (err) {
-      this.recordDecision(candidate, {
+      decision = {
         approved: false,
         reason: err instanceof Error ? err.message : String(err),
-      });
+      };
+    }
+    try {
+      // When an approval carries a candidate hash, verify it against the
+      // candidate (case-insensitive, trimmed). A mismatch rejects fail-closed.
+      if (
+        decision.approved === true &&
+        typeof decision.candidateSha256 === "string"
+      ) {
+        const expected = (candidate.candidateSha256 ?? "").trim().toLowerCase();
+        const provided = decision.candidateSha256.trim().toLowerCase();
+        if (expected.length === 0 || provided !== expected) {
+          decision = { approved: false, reason: "candidateSha256_mismatch" };
+        }
+      }
+      // The Warden review has finished, so the retained worktree may be torn
+      // down. Do this BEFORE recordDecision re-queues the task for a retry, so
+      // the retry never races the teardown for the same worktree path.
+      await this.cleanupReviewedWorktree(candidate.taskId);
+      this.recordDecision(candidate, decision);
     } finally {
       this._wardenActive -= 1;
       this.notify();
       this.pumpReviewQueue();
     }
+  }
+
+  /**
+   * Tears down the worktree retained for a reviewed candidate, if any. Called
+   * only after `wardenReview(candidate)` has returned so `candidate.worktreeDir`
+   * stayed intact and inspectable throughout review.
+   */
+  private async cleanupReviewedWorktree(taskId: string): Promise<void> {
+    const worktree = this._reviewWorktrees.get(taskId);
+    if (!worktree) {
+      return;
+    }
+    this._reviewWorktrees.delete(taskId);
+    if (this._cleanupWorktrees) {
+      try {
+        await worktree.cleanup();
+      } catch {
+        // Deterministic teardown must never surface as a run failure.
+      }
+    }
+    this.options.onCleanup?.(taskId, worktree.worktreeDir);
   }
 
   private recordDecision(
@@ -889,17 +1049,22 @@ export class ParallelScheduler {
     }
 
     // Rejected: re-queue for retry while attempts remain (tracked by the
-    // composed Scheduler), otherwise the task is failed.
-    this._retried += 1;
-    this.options.onRetry?.(
-      candidate.taskId,
-      task.attempts,
-      decision.reason ?? "warden_rejected"
-    );
+    // composed Scheduler), otherwise the task is failed. Count a retry only when
+    // the task actually became ready again, so exhausting `maxAttempts` never
+    // over-counts `summary.retried` / fires `onRetry` for a failing task.
     this.scheduler.rejectTask(candidate.taskId, {
       reason: decision.reason ?? "warden_rejected",
       retry: true,
     });
+    const rejectedTask = this.scheduler.getTask(candidate.taskId);
+    if (rejectedTask?.state === "ready") {
+      this._retried += 1;
+      this.options.onRetry?.(
+        candidate.taskId,
+        rejectedTask.attempts,
+        decision.reason ?? "warden_rejected"
+      );
+    }
     this.notify();
   }
 }
