@@ -2533,5 +2533,212 @@ describe("Kill switch stop_gracefully against a live RunOrchestrator + TaskDispa
       } catch {}
     }
   });
+
+  it("preserves the worker's worktree when it throws after a graceful stop is requested", async () => {
+    satisfyRequiredSettings(stores.settingsStore);
+
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "kill-graceful-throw-"));
+    const runsDir = path.join(tmpRoot, "runs");
+    const runId = "run-graceful-throw-live";
+    const gitDir = path.join(runsDir, runId, "git");
+    fs.mkdirSync(gitDir, { recursive: true });
+
+    const runGit = (args: string[], cwd = gitDir): string =>
+      childProcess
+        .execFileSync("git", args, {
+          cwd,
+          encoding: "utf8",
+          env: {
+            PATH: process.env.PATH,
+            LANG: "C.UTF-8",
+            HOME: tmpRoot,
+            GIT_CONFIG_NOSYSTEM: "1",
+            GIT_TERMINAL_PROMPT: "0",
+          } as unknown as NodeJS.ProcessEnv,
+        })
+        .trim();
+    runGit(["init", "--initial-branch=main", "."]);
+    runGit(["config", "user.name", "Test Runner"]);
+    runGit(["config", "user.email", "runner@example.test"]);
+    fs.writeFileSync(
+      path.join(gitDir, "package.json"),
+      JSON.stringify({ name: "kill-graceful-throw", version: "1.0.0" }, null, 2),
+      "utf8"
+    );
+    fs.writeFileSync(path.join(gitDir, "base.txt"), "base\n", "utf8");
+    runGit(["add", "."]);
+    runGit(["commit", "-m", "Initial commit"]);
+    const baseSha = runGit(["rev-parse", "HEAD"]);
+    runGit(["branch", `graveyard/${runId}`, baseSha]);
+
+    const host = new RuntimeHost({
+      skipReconcile: true,
+      runStore: stores.runStore,
+      eventStore: stores.eventStore,
+      logStore: new LogStore({ dir: path.join(tmpRoot, "logs") }),
+      closeStoresOnShutdown: false,
+    });
+    const gitService = new GitService({ runsDir });
+
+    stores.runStore.createRun({
+      runId,
+      url: "https://github.com/git-graveyard/example-repo",
+      sha: baseSha,
+      phase: "queued",
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+
+    const pactMarkdown = `
+- [ ] T1. First task
+  - role: bonesetter
+  - depends:
+  - files: one.txt
+  - accept: node test.js
+  - hard: no
+  - rules: M1
+- [ ] T2. Second task
+  - role: bonesetter
+  - depends:
+  - files: two.txt
+  - accept: node test.js
+  - hard: no
+  - rules: M1
+`;
+
+    let workerStartedResolve: () => void = () => undefined;
+    const workerStarted = new Promise<void>((resolve) => {
+      workerStartedResolve = resolve;
+    });
+    let releaseWorkerResolve: () => void = () => undefined;
+    const workerGate = new Promise<void>((resolve) => {
+      releaseWorkerResolve = resolve;
+    });
+
+    let workerInvocations = 0;
+    let capturedWorktreeDir = "";
+    let uncommittedPath = "";
+
+    const workerRunner = async (ctx: WorkerContext): Promise<void> => {
+      workerInvocations += 1;
+      capturedWorktreeDir = ctx.worktreeDir;
+      uncommittedPath = path.join(ctx.worktreeDir, "uncommitted-edit.txt");
+      fs.writeFileSync(uncommittedPath, "uncommitted worker edit\n", "utf8");
+      workerStartedResolve();
+      // Hold the turn open until the graceful stop has landed, then fail the way a
+      // worker does right after a tool call is refused at the boundary.
+      await workerGate;
+      throw new Error("worker failed after graceful-stop tool refusal");
+    };
+
+    const exhumeRunner = async (ctx: ExhumeRunnerContext) => ({
+      healthy: false,
+      deathCertificate: createDeathCertificate({
+        runId: ctx.runId,
+        baseSha: ctx.baseSha,
+        install: { step: "install", status: "passed", command: "npm install" },
+        build: { step: "build", status: "passed", command: "npm run build" },
+        test: { step: "test", status: "failed", command: "npm test", exitCode: 1 },
+        failures: [{ step: "test", class: "syntax_error", message: "boom" }],
+      }),
+      rows: [],
+      manifestInspection: {} as any,
+      wallClockTimeoutHit: false,
+    });
+
+    const planRunner = async (ctx: PlanRunnerContext) => {
+      const parsed = parsePact(pactMarkdown);
+      return {
+        ok: true as const,
+        draftId: `pact-${ctx.runId}-v1`,
+        sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        markdown: pactMarkdown,
+        tasks: parsed.tasks,
+        version: 1,
+        coverage: {
+          ok: true,
+          covered: true,
+          coveredFailures: [],
+          uncoveredFailures: [],
+          missingFailures: [],
+        },
+      };
+    };
+
+    const wardenRunner = async (ctx: WardenReviewContext) =>
+      buildVerdictRecord(ctx.candidateSha, {
+        diff: ctx.diff,
+        candidateSha256: ctx.candidateSha256,
+        tree: ctx.candidateTree,
+        install: { ok: true, ref: "cmd:install" },
+        build: { ok: true, ref: "cmd:build" },
+        accept: { ok: true, ref: "cmd:accept", exitCode: 0 },
+        tests: { ok: true, ref: "cmd:tests" },
+        noTestWeakening: true,
+      });
+
+    const finalCheckRunner = async (_ctx: FinalCheckContext) => ({
+      ok: true,
+      passed: true,
+      installPassed: true,
+      buildPassed: true,
+      testsPassed: true,
+      hasTests: true,
+    });
+
+    const orchestrator = new RunOrchestrator({
+      host,
+      gitService,
+      runsDir,
+      exhumeRunner,
+      planRunner,
+      workerRunner,
+      wardenRunner,
+      finalCheckRunner,
+    });
+    (globalThis as unknown as { __runOrchestrator?: unknown }).__runOrchestrator = orchestrator;
+
+    try {
+      const handle = orchestrator.startRun(runId);
+      await workerStarted;
+      assert.equal(stores.runStore.getRun(runId)?.phase, "legion");
+
+      const postPromise = killPostLevel("stop_gracefully");
+      await waitFor(() => handle.dispatcher?.gracefulStopped === true);
+
+      // The worker now fails at the boundary, exactly as it would after a tool refusal.
+      releaseWorkerResolve();
+      const res = await postPromise;
+      assert.equal(res.status, 200);
+      await handle.promise;
+
+      // The uncommitted edit and its worktree survive the failed worker.
+      assert.equal(workerInvocations, 1);
+      assert.ok(
+        fs.existsSync(capturedWorktreeDir),
+        "the worker's worktree directory must still exist after a graceful-stop failure"
+      );
+      assert.ok(
+        fs.existsSync(uncommittedPath),
+        "the worker's uncommitted edit must survive a graceful-stop failure"
+      );
+
+      // The failed task left "running" and no candidate was merged.
+      assert.equal(handle.scheduler?.getTasksByState("running").length ?? 0, 0);
+      assert.equal(handle.scheduler?.getTasksByState("merged").length ?? 0, 0);
+      assert.equal(runGit(["rev-parse", `graveyard/${runId}`]), baseSha);
+    } finally {
+      releaseWorkerResolve();
+      try {
+        await orchestrator.shutdown();
+      } catch {}
+      try {
+        await host.stop({ closeStores: false });
+      } catch {}
+      try {
+        fs.rmSync(tmpRoot, { recursive: true, force: true });
+      } catch {}
+    }
+  });
 });
 

@@ -539,6 +539,29 @@ export class TaskDispatcher {
   }
 
   /**
+   * Settles a pipeline that reached an exit boundary while a graceful stop is
+   * active. Unlike {@link settleCancelledPipeline} it always keeps the worker's
+   * worktree (with any uncommitted edits) on disk, moves the task cleanly out of
+   * `"running"` / `"in_review"`, and releases its live slot. It NEVER calls
+   * `cleanupWorktree`, `failTask` or `rejectTask` with a retry: a worker that
+   * failed or threw at its boundary must not have its worktree deleted before
+   * the operator can inspect or recover it.
+   */
+  private async settleGracefulStopPipeline(
+    active: ActiveTaskTracking,
+    worktreeRes: TaskWorktreeResult
+  ): Promise<void> {
+    active.preserveWorktree = true;
+    this.preservedWorktrees.set(active.taskId, worktreeRes);
+    this.transitionTaskOutOfRunning(
+      active,
+      this.stopReason ?? "Graceful stop requested"
+    );
+    this.releaseActiveSkeletonSlot(active);
+    this.tasksProcessed++;
+  }
+
+  /**
    * Decides whether an abort should keep the task's worktree for a possible
    * re-raise. Only a task that stays re-raisable keeps its worktree on disk: a
    * `keep_commits` lay-to-rest still abandons the task (its commits stay on the
@@ -1399,6 +1422,15 @@ export class TaskDispatcher {
       return;
     }
 
+    if (this.isGracefulStopState) {
+      // Boundary-aware graceful stop: the worker settled at its tool boundary. Never merge and never
+      // delete the worktree -- keep it (with any uncommitted edits) so the operator can inspect or
+      // recover the work, then move the task cleanly out of "running" and release its slot. A worker
+      // that failed or threw at its boundary is settled here too, so its worktree is never deleted.
+      await this.settleGracefulStopPipeline(activeTracking, worktreeRes);
+      return;
+    }
+
     if (workerFailed) {
       const reason =
         workerError?.message ??
@@ -1411,20 +1443,6 @@ export class TaskDispatcher {
       }
       await this.cleanupWorktree(worktreeRes.worktreeDir, task.id);
       this.activeTasks.delete(task.id);
-      this.tasksProcessed++;
-      return;
-    }
-
-    if (this.isGracefulStopState) {
-      // Boundary-aware graceful stop: the worker settled at its tool boundary. Never merge and never
-      // delete the worktree -- keep it (with any uncommitted edits) so the operator can inspect or
-      // recover the work, then move the task cleanly out of "running" and release its slot.
-      this.preservedWorktrees.set(task.id, worktreeRes);
-      this.transitionTaskOutOfRunning(
-        activeTracking,
-        this.stopReason ?? "Graceful stop requested"
-      );
-      this.releaseActiveSkeletonSlot(activeTracking);
       this.tasksProcessed++;
       return;
     }
@@ -1447,6 +1465,12 @@ export class TaskDispatcher {
       try {
         await this.commitDirtyWorktreeIfNeeded(worktreeRes.worktreeDir, task);
       } catch (err: any) {
+        if (this.isGracefulStopState) {
+          // A graceful stop landed while committing: never fail/retry or delete the
+          // worktree (it still holds the worker's edits) -- keep it and settle cleanly.
+          await this.settleGracefulStopPipeline(activeTracking, worktreeRes);
+          return;
+        }
         const reason = `Failed to commit task changes: ${err?.message ?? String(err)}`;
         if (task.attempts >= task.maxAttempts) {
           this.scheduler.failTask(task.id, reason);
@@ -1461,14 +1485,31 @@ export class TaskDispatcher {
       }
     }
 
+    if (this.isGracefulStopState) {
+      // A graceful stop landed while the worktree was being committed: never enqueue a
+      // candidate -- keep the worktree (with any uncommitted edits) and settle cleanly.
+      await this.settleGracefulStopPipeline(activeTracking, worktreeRes);
+      return;
+    }
+
     if (task.state === "running") {
       this.scheduler.markInReview(task.id);
     }
 
     await this.withMergeLock(async () => {
-      if (abortController.signal.aborted || this.isStoppedState) {
+      if (
+        abortController.signal.aborted ||
+        this.isStoppedState ||
+        this.isGracefulStopState
+      ) {
         // A lay-to-rest / interrupt / stop landed while the task was waiting for
         // the merge lock: never touch git and never merge.
+        if (this.isGracefulStopState) {
+          // Keep the worker's worktree (with any uncommitted edits) and settle the task
+          // cleanly out of "in_review" without merging or deleting it.
+          await this.settleGracefulStopPipeline(activeTracking, worktreeRes);
+          return;
+        }
         await this.settleCancelledPipeline(activeTracking, worktreeRes);
         return;
       }
@@ -1477,6 +1518,12 @@ export class TaskDispatcher {
       try {
         expectedHeadSha = await this.getIntegrationHeadSha();
       } catch (err: any) {
+        if (this.isGracefulStopState) {
+          // A graceful stop landed while resolving the integration head: keep the worktree
+          // and settle the task cleanly out of "in_review" without merging or deleting it.
+          await this.settleGracefulStopPipeline(activeTracking, worktreeRes);
+          return;
+        }
         this.scheduler.failTask(
           task.id,
           `Failed to resolve integration head SHA: ${err?.message ?? String(err)}`
@@ -1498,6 +1545,12 @@ export class TaskDispatcher {
           toRef: `refs/heads/task/${task.id}`,
         });
       } catch (err: any) {
+        if (this.isGracefulStopState) {
+          // A graceful stop landed while computing the candidate diff: keep the worktree
+          // and settle the task cleanly out of "in_review" without merging or deleting it.
+          await this.settleGracefulStopPipeline(activeTracking, worktreeRes);
+          return;
+        }
         const reason = `Failed to compute candidate diff: ${err?.message ?? String(err)}`;
         if (task.attempts >= task.maxAttempts) {
           this.scheduler.failTask(task.id, reason);
@@ -1636,6 +1689,12 @@ export class TaskDispatcher {
         ) {
           // The reviewer refused a cancelled / stopped candidate: never retry or fail the
           // task - the control already recorded "abandoned" / "rejected" (or the run is stopping).
+          if (this.isGracefulStopState) {
+            // Keep the worker's worktree (with any uncommitted edits) and settle the task
+            // cleanly out of "in_review" rather than deleting it.
+            await this.settleGracefulStopPipeline(activeTracking, worktreeRes);
+            return;
+          }
           await this.settleCancelledPipeline(activeTracking, worktreeRes);
           return;
         }
@@ -1644,11 +1703,19 @@ export class TaskDispatcher {
 
       if (
         !submitResult.merged &&
-        (abortController.signal.aborted || this.isStoppedState)
+        (abortController.signal.aborted ||
+          this.isStoppedState ||
+          this.isGracefulStopState)
       ) {
         // The candidate was cancelled after review and onSubmit refused to
         // merge. Do NOT call retryTask / failTask: that would overwrite the
         // "abandoned" / "rejected" state the interrupt / lay-to-rest recorded.
+        if (this.isGracefulStopState) {
+          // A graceful stop refused the candidate: keep the worktree (with any
+          // uncommitted edits) and settle the task cleanly out of "in_review".
+          await this.settleGracefulStopPipeline(activeTracking, worktreeRes);
+          return;
+        }
         await this.settleCancelledPipeline(activeTracking, worktreeRes);
         return;
       }
