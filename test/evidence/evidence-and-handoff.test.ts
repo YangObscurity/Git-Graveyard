@@ -16,7 +16,9 @@ import {
 import { BuiltWithKiroEvidence } from "@/components/BuiltWithKiroEvidence";
 import {
   buildKiroHandoff,
+  deriveVerificationCommands,
   formatKiroHandoffText,
+  type KiroHandoffCertificate,
 } from "@/lib/artifacts/kiro-handoff";
 import { OpenInKiroHandoff } from "@/components/OpenInKiroHandoff";
 import { ReliquaryView } from "@/components/ReliquaryView";
@@ -329,5 +331,223 @@ describe("Task 26.4: ReliquaryView Open in Kiro handoff gating", () => {
     assert.ok(html.includes('data-testid="open-in-kiro-handoff"'));
     assert.ok(html.includes("https://github.com/octocat/project.git"));
     assert.ok(!html.includes('data-testid="open-in-kiro-unavailable"'));
+  });
+});
+
+describe("Open in Kiro handoff: verification commands follow the recorded certificate", () => {
+  const RESUME_TITLE = "Resume development locally with the Kiro CLI";
+
+  function resumeCommands(plan: ReturnType<typeof buildKiroHandoff>): string[] {
+    const step = plan.steps.find((s) => s.title === RESUME_TITLE);
+    assert.ok(step, "resume step must exist");
+    return step!.commands;
+  }
+
+  it("emits the recorded python install and test commands and omits the build", () => {
+    const certificate: KiroHandoffCertificate = {
+      primaryLanguage: "python",
+      packageManager: "pip",
+      install: { step: "install", command: "pip install -r requirements.txt", status: "passed" },
+      build: { step: "build", command: "not run", status: "not run" },
+      test: { step: "test", command: "pytest", status: "passed" },
+      rows: [
+        { step: "install", command: "pip install -r requirements.txt", status: "passed" },
+        { step: "build", command: "not run", status: "not run" },
+        { step: "test", command: "pytest", status: "passed" },
+      ],
+    };
+
+    const plan = buildKiroHandoff({
+      owner: "octocat",
+      repo: "legacy",
+      baseSha: "abc1234def",
+      runId: "run-py",
+      certificate,
+    });
+
+    const commands = resumeCommands(plan);
+    assert.ok(commands.includes("pip install -r requirements.txt"));
+    assert.ok(commands.includes("pytest"));
+    // The build was recorded as "not run", so no build command may appear.
+    assert.equal(commands.filter((c) => /build/i.test(c)).length, 0);
+    // No placeholder npm commands for a python run.
+    assert.ok(!commands.some((c) => c.includes("npm")));
+
+    const text = formatKiroHandoffText(plan);
+    assert.ok(!text.includes("npm"));
+
+    const step = plan.steps.find((s) => s.title === RESUME_TITLE);
+    assert.match(step!.detail, /recorded verification commands from the certificate/);
+  });
+
+  it("omits pytest and the build when no tests were found", () => {
+    const certificate: KiroHandoffCertificate = {
+      primaryLanguage: "python",
+      packageManager: "pip",
+      install: { step: "install", command: "pip install -r requirements.txt", status: "passed" },
+      build: { step: "build", command: "not run", status: "not run" },
+      test: { step: "test", command: "pytest", status: "No tests found", noTestsFound: true },
+    };
+
+    const commands = deriveVerificationCommands({
+      owner: "octocat",
+      repo: "legacy",
+      baseSha: "abc1234def",
+      runId: "run-py-notests",
+      certificate,
+    });
+
+    assert.deepEqual(commands, ["pip install -r requirements.txt"]);
+    assert.ok(!commands.includes("pytest"));
+    assert.equal(commands.filter((c) => /build/i.test(c)).length, 0);
+  });
+
+  it("emits all three exact node commands when they were recorded", () => {
+    const certificate: KiroHandoffCertificate = {
+      primaryLanguage: "node",
+      packageManager: "npm",
+      install: { step: "install", command: "npm ci", status: "passed" },
+      build: { step: "build", command: "npm run build", status: "passed" },
+      test: { step: "test", command: "npm test", status: "passed" },
+    };
+
+    const commands = deriveVerificationCommands({
+      owner: "octocat",
+      repo: "legacy",
+      baseSha: "abc1234def",
+      runId: "run-node",
+      certificate,
+    });
+
+    assert.deepEqual(commands, ["npm ci", "npm run build", "npm test"]);
+  });
+
+  it("does not inject unrecorded npm commands when no certificate is supplied", () => {
+    const plan = buildKiroHandoff({
+      owner: "octocat",
+      repo: "legacy",
+      baseSha: "abc1234def",
+      runId: "run-no-cert",
+    });
+
+    const commands = resumeCommands(plan);
+    assert.ok(!commands.includes("npm install"));
+    assert.ok(!commands.includes("npm run build"));
+    assert.ok(!commands.includes("npm test"));
+    // Only the CLI invocation and spec run remain.
+    assert.deepEqual(commands, ["kiro-cli", "/spec run resurrection"]);
+
+    const text = formatKiroHandoffText(plan);
+    assert.ok(!text.includes("npm install"));
+    assert.ok(!text.includes("npm run build"));
+    assert.ok(!text.includes("npm test"));
+  });
+
+  it("prefers the recorded retry command when the first install failed", () => {
+    const certificate: KiroHandoffCertificate = {
+      primaryLanguage: "python",
+      packageManager: "pip",
+      install: { step: "install", command: "pip install -r requirements.txt", status: "failed" },
+      retry: {
+        step: "retry",
+        command: "pip install --prefer-offline -r requirements.txt",
+        status: "passed",
+      },
+      build: { step: "build", command: "not run", status: "not run" },
+      test: { step: "test", command: "pytest", status: "passed" },
+    };
+
+    const commands = deriveVerificationCommands({
+      owner: "octocat",
+      repo: "legacy",
+      baseSha: "abc1234def",
+      runId: "run-retry",
+      certificate,
+    });
+
+    assert.deepEqual(commands, [
+      "pip install --prefer-offline -r requirements.txt",
+      "pytest",
+    ]);
+  });
+
+  it("returns the explicit verificationCommands verbatim (deduplicated) when supplied", () => {
+    const commands = deriveVerificationCommands({
+      owner: "octocat",
+      repo: "legacy",
+      baseSha: "abc1234def",
+      runId: "run-explicit",
+      verificationCommands: ["make test", "make test", "make lint"],
+    });
+    assert.deepEqual(commands, ["make test", "make lint"]);
+  });
+
+  it("returns no commands when neither a certificate nor verification commands are supplied", () => {
+    const commands = deriveVerificationCommands({
+      owner: "octocat",
+      repo: "legacy",
+      baseSha: "abc1234def",
+      runId: "run-empty",
+    });
+    assert.deepEqual(commands, []);
+  });
+
+  it("passes recorded python commands from events through ReliquaryView to the handoff", () => {
+    const html = renderToStaticMarkup(
+      React.createElement(ReliquaryView, {
+        runId: "run-py-events",
+        initialEvents: [
+          {
+            runId: "run-py-events",
+            seq: 1,
+            ts: 1731672000000,
+            kind: "exhume.certificate",
+            actor: "exhumer",
+            data: {
+              owner: "octocat",
+              repo: "legacy",
+              baseSha: "abc1234def",
+              primaryLanguage: "python",
+              packageManager: "pip",
+              refs: [],
+            },
+          },
+          {
+            runId: "run-py-events",
+            seq: 2,
+            ts: 1731672000001,
+            kind: "command.result",
+            actor: "exhumer",
+            data: {
+              step: "install",
+              commandLine: "pip install -r requirements.txt",
+              status: "passed",
+              refs: [],
+            },
+          },
+          {
+            runId: "run-py-events",
+            seq: 3,
+            ts: 1731672000002,
+            kind: "command.result",
+            actor: "exhumer",
+            data: { step: "build", commandLine: "not run", status: "not run", refs: [] },
+          },
+          {
+            runId: "run-py-events",
+            seq: 4,
+            ts: 1731672000003,
+            kind: "command.result",
+            actor: "exhumer",
+            data: { step: "test", commandLine: "pytest", status: "passed", refs: [] },
+          },
+        ],
+      })
+    );
+
+    assert.ok(html.includes('data-testid="open-in-kiro-handoff"'));
+    assert.ok(html.includes("pip install -r requirements.txt"));
+    assert.ok(html.includes("pytest"));
+    assert.ok(!html.includes("npm"));
   });
 });

@@ -22,9 +22,19 @@ export function OpenInKiroHandoff({
   baseSha,
   runId,
   targetSpecName,
+  certificate,
+  verificationCommands,
 }: OpenInKiroHandoffProps): React.ReactElement {
   const [copied, setCopied] = useState<boolean>(false);
-  const plan = buildKiroHandoff({ owner, repo, baseSha, runId, targetSpecName });
+  const plan = buildKiroHandoff({
+    owner,
+    repo,
+    baseSha,
+    runId,
+    targetSpecName,
+    certificate,
+    verificationCommands,
+  });
   const plainText = formatKiroHandoffText(plan);
 
   const handleCopy = (): void => {
