@@ -1,0 +1,329 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+
+import { RunStore } from "../../lib/runs/run-store";
+import { EventStore } from "../../lib/events/event-store";
+import {
+  STATUS_KEYWORDS,
+  EvidenceIndex,
+  buildEvidenceIndex,
+  checkReading,
+  extractMarkers,
+  runReportCheckWithRetry,
+  assignRunOutcomeWithInstallComparison,
+} from "../../lib/scribe/report-check";
+import {
+  ScribeService,
+  renderFindingsMarkdown,
+  deriveTaskStates,
+  isFinalCheckComplete,
+} from "../../lib/scribe/scribe-service";
+import { SCRIBE_NARRATIVE_FALLBACK_NOTICE } from "../../lib/lifecycle/report-step";
+
+function makeStores() {
+  const runStore = new RunStore(":memory:");
+  const eventStore = new EventStore(":memory:");
+  return { runStore, eventStore };
+}
+
+test("report-check: deterministic Findings rendering uses no model output", () => {
+  const { runStore, eventStore } = makeStores();
+  runStore.createRun({
+    runId: "run-findings",
+    url: "https://github.com/owner/repo",
+    sha: "abcdef0123456789abcdef0123456789abcdef01",
+    phase: "report",
+  });
+  eventStore.append({
+    runId: "run-findings",
+    kind: "task.state",
+    actor: "test",
+    data: { taskId: "task-1", state: "merged", refs: ["cmd:build"] },
+  });
+  eventStore.append({
+    runId: "run-findings",
+    kind: "command.result",
+    actor: "test",
+    data: { id: "build", exitCode: 0, refs: [] },
+  });
+
+  const run = runStore.getRun("run-findings")!;
+  const events = eventStore.getEvents("run-findings");
+  const first = renderFindingsMarkdown(run, events);
+  const second = renderFindingsMarkdown(run, events);
+
+  assert.equal(first, second);
+  assert.ok(first.startsWith("## Findings"));
+  assert.ok(first.includes("`task-1`: merged (ev:1)"));
+  assert.ok(first.includes("`cmd:build` (ev:1)"));
+  assert.deepEqual(deriveTaskStates(events), [
+    { id: "task-1", state: "merged", seq: 1 },
+  ]);
+});
+
+test("report-check: ScribeService rejects premature invocation before final_check completes", async () => {
+  const { runStore, eventStore } = makeStores();
+  runStore.createRun({
+    runId: "run-premature",
+    url: "https://github.com/owner/repo",
+    sha: "abcdef0123456789abcdef0123456789abcdef01",
+    phase: "legion",
+  });
+  const service = new ScribeService({ runStore, eventStore });
+
+  assert.equal(service.canRun("run-premature").ok, false);
+  await assert.rejects(
+    () => service.run({ runId: "run-premature" }),
+    (err) => (err as { reason?: string }).reason === "final_check_incomplete"
+  );
+
+  const run = runStore.getRun("run-premature")!;
+  assert.equal(isFinalCheckComplete(run, eventStore.getEvents("run-premature")), false);
+});
+
+test("report-check: extracts and resolves cmd:/file:/gh:/ev: markers", () => {
+  assert.deepEqual(extractMarkers("see cmd:build and ev:2"), ["cmd:build", "ev:2"]);
+  assert.ok((STATUS_KEYWORDS as readonly string[]).includes("not run"));
+  assert.ok((STATUS_KEYWORDS as readonly string[]).includes("resurrected"));
+
+  const index = buildEvidenceIndex({
+    commandResults: [{ id: "build" }],
+    files: ["src/app.ts"],
+    github: ["owner/repo#1"],
+    events: [
+      { runId: "r", seq: 2, ts: 0, kind: "command.result", actor: "a", data: { refs: [] } },
+    ],
+  });
+
+  assert.equal(index.resolve("cmd:build"), true);
+  assert.equal(index.resolve("file:src/app.ts:12"), true);
+  assert.equal(index.resolve("gh:owner/repo#1"), true);
+  assert.equal(index.resolve("ev:2"), true);
+  assert.equal(index.resolve("cmd:missing"), false);
+
+  const ok = checkReading(
+    "Built 3 files (file:src/app.ts). Merged into the fork (gh:owner/repo#1). Build passed (cmd:build) and recorded 2 events (ev:2).",
+    index
+  );
+  assert.equal(ok.passed, true);
+  assert.equal(ok.checkedCount >= 3, true);
+  assert.ok(ok.resolvedMarkers.includes("cmd:build"));
+  assert.ok(ok.resolvedMarkers.includes("ev:2"));
+});
+
+test("report-check: rejects unbacked numerals, status words and fabricated markers", () => {
+  const index = buildEvidenceIndex({ commandResults: [{ id: "build" }] });
+
+  const numeral = checkReading("There were 5 tests.", index);
+  assert.equal(numeral.passed, false);
+  assert.ok(numeral.unbackedClaims.some((c) => c.claim === "numeral"));
+
+  const status = checkReading("Build passed.", index);
+  assert.equal(status.passed, false);
+  assert.ok(status.unbackedClaims.some((c) => c.claim === "passed"));
+
+  const fake = checkReading("Merged 4 tasks (ev:999).", index);
+  assert.equal(fake.passed, false);
+  assert.ok(fake.unbackedClaims.some((c) => c.ref === "ev:999"));
+
+  const fakeCmd = checkReading("Build failed (cmd:nope).", index);
+  assert.equal(fakeCmd.passed, false);
+  assert.ok(fakeCmd.unbackedClaims.some((c) => c.ref === "cmd:nope"));
+});
+
+test("report-check: single retry then pass emits a report.checked event", async () => {
+  const { eventStore } = makeStores();
+  const index = buildEvidenceIndex({ commandResults: [{ id: "build" }] });
+  const retryCalls: number[] = [];
+
+  const result = await runReportCheckWithRetry({
+    reading: "Build passed.",
+    index,
+    retry: (unbackedClaims) => {
+      retryCalls.push(unbackedClaims.length);
+      return "Build passed (cmd:build).";
+    },
+    eventStore,
+    runId: "run-retry",
+  });
+
+  assert.equal(retryCalls.length, 1);
+  assert.equal(retryCalls[0], 1);
+  assert.equal(result.passed, true);
+  assert.equal(result.retried, true);
+  assert.equal(result.narrativeDropped, false);
+  assert.equal(result.reading, "Build passed (cmd:build).");
+
+  const events = eventStore.getEvents("run-retry", { kind: "report.checked" });
+  assert.equal(events.length, 1);
+  assert.equal(events[0].data.passed, true);
+  assert.equal(events[0].data.retried, true);
+  assert.equal(events[0].data.narrativeDropped, false);
+});
+
+test("report-check: drops the reading and substitutes the fallback on the second failure", async () => {
+  const { eventStore } = makeStores();
+  const index = buildEvidenceIndex({ commandResults: [{ id: "build" }] });
+  let calls = 0;
+
+  const result = await runReportCheckWithRetry({
+    reading: "Build passed.",
+    index,
+    retry: () => {
+      calls++;
+      return "Still failed.";
+    },
+    eventStore,
+    runId: "run-drop",
+  });
+
+  assert.equal(calls, 1);
+  assert.equal(result.narrativeDropped, true);
+  assert.equal(result.passed, false);
+  assert.equal(result.reading, SCRIBE_NARRATIVE_FALLBACK_NOTICE);
+  assert.equal(result.fallbackNotice, SCRIBE_NARRATIVE_FALLBACK_NOTICE);
+
+  const events = eventStore.getEvents("run-drop", { kind: "report.checked" });
+  assert.equal(events.length, 1);
+  assert.equal(events[0].data.passed, false);
+  assert.equal(events[0].data.narrativeDropped, true);
+  assert.equal(events[0].data.fallbackNotice, SCRIBE_NARRATIVE_FALLBACK_NOTICE);
+});
+
+test("report-check: a throwing retry is still invoked only once and drops the reading", async () => {
+  const { eventStore } = makeStores();
+  const index = new EvidenceIndex();
+  let calls = 0;
+  const result = await runReportCheckWithRetry({
+    reading: "Build failed.",
+    index,
+    retry: () => {
+      calls++;
+      throw new Error("retry exploded");
+    },
+    eventStore,
+    runId: "run-throw",
+  });
+  assert.equal(calls, 1);
+  assert.equal(result.narrativeDropped, true);
+});
+
+test("report-check: assigns the outcome with side-by-side baseline vs new install errors", () => {
+  const ok = assignRunOutcomeWithInstallComparison({
+    tasks: [{ id: "task-1", state: "merged" }],
+    finalCheck: { installPassed: true, buildPassed: true, testsPassed: true, hasTests: true },
+    baselineInstallError: "npm ERR! baseline install failed",
+    newInstallError: { command: "npm ci", exitCode: 1, error: "lockfile mismatch", ref: "cmd:install" },
+  });
+  assert.equal(ok.outcome, "resurrected");
+  assert.equal(ok.installComparison.hasInstallErrors, true);
+  assert.equal(ok.installComparison.rows.length, 2);
+  assert.equal(ok.installComparison.baseline?.context, "baseline");
+  assert.equal(ok.installComparison.new?.context, "new");
+  assert.equal(ok.installComparison.new?.exitCode, 1);
+  assert.equal(ok.installComparison.new?.ref, "cmd:install");
+
+  const failed = assignRunOutcomeWithInstallComparison({
+    tasks: [{ id: "task-1", state: "merged" }],
+    finalCheck: { installPassed: false },
+    newInstallError: { command: "npm ci", exitCode: 1, error: "still failing" },
+  });
+  assert.equal(failed.outcome, "not_resurrected");
+  assert.equal(failed.installComparison.hasInstallErrors, true);
+  assert.equal(failed.installComparison.new?.context, "new");
+
+  const noErrors = assignRunOutcomeWithInstallComparison({
+    tasks: [{ id: "task-1", state: "merged" }],
+    finalCheck: { installPassed: true, buildPassed: false, testsPassed: false, hasTests: true },
+  });
+  assert.equal(noErrors.outcome, "partial");
+  assert.equal(noErrors.installComparison.hasInstallErrors, false);
+});
+
+test("report-check: ScribeService renders Findings and verifies the reading end-to-end", async () => {
+  const { runStore, eventStore } = makeStores();
+  runStore.createRun({
+    runId: "run-svc",
+    url: "https://github.com/owner/repo",
+    sha: "abcdef0123456789abcdef0123456789abcdef01",
+    phase: "report",
+  });
+  eventStore.append({
+    runId: "run-svc",
+    kind: "task.state",
+    actor: "test",
+    data: { taskId: "task-1", state: "merged", refs: ["cmd:build"] },
+  });
+  eventStore.append({
+    runId: "run-svc",
+    kind: "final_check.result",
+    actor: "test",
+    data: { installPassed: true, buildPassed: true, testsPassed: true, hasTests: true, refs: [] },
+  });
+
+  const service = new ScribeService({ runStore, eventStore });
+  const result = await service.run({ runId: "run-svc" });
+
+  assert.ok(result.findingsMarkdown.includes("## Findings"));
+  assert.equal(result.narrativeDropped, false);
+  assert.equal(result.fallbackNotice, null);
+  assert.equal(result.reportCheck.passed, true);
+  assert.equal(result.outcome, "resurrected");
+  assert.equal(result.installComparison.hasInstallErrors, false);
+  assert.ok(result.scribeReading.includes("ev:2"));
+});
+
+test("report-check: ScribeService retries once then accepts the repaired reading", async () => {
+  const { runStore, eventStore } = makeStores();
+  runStore.createRun({
+    runId: "run-svc-retry",
+    url: "https://github.com/owner/repo",
+    sha: "abcdef0123456789abcdef0123456789abcdef01",
+    phase: "report",
+  });
+  eventStore.append({
+    runId: "run-svc-retry",
+    kind: "final_check.result",
+    actor: "test",
+    data: { installPassed: true, buildPassed: true, testsPassed: true, hasTests: true, refs: [] },
+  });
+
+  const readings = ["Build passed.", "Build passed (ev:1)."];
+  let index = 0;
+  const service = new ScribeService({
+    runStore,
+    eventStore,
+    scribeRunner: () => readings[index++] ?? null,
+  });
+  const result = await service.run({ runId: "run-svc-retry" });
+
+  assert.equal(result.narrativeDropped, false);
+  assert.equal(result.scribeReading, "Build passed (ev:1).");
+});
+
+test("report-check: ScribeService drops the reading when it fails twice", async () => {
+  const { runStore, eventStore } = makeStores();
+  runStore.createRun({
+    runId: "run-svc-drop",
+    url: "https://github.com/owner/repo",
+    sha: "abcdef0123456789abcdef0123456789abcdef01",
+    phase: "report",
+  });
+  eventStore.append({
+    runId: "run-svc-drop",
+    kind: "final_check.result",
+    actor: "test",
+    data: { installPassed: true, buildPassed: true, testsPassed: true, hasTests: true, refs: [] },
+  });
+
+  const service = new ScribeService({
+    runStore,
+    eventStore,
+    scribeRunner: () => "Build passed.",
+  });
+  const result = await service.run({ runId: "run-svc-drop" });
+
+  assert.equal(result.narrativeDropped, true);
+  assert.equal(result.scribeReading, SCRIBE_NARRATIVE_FALLBACK_NOTICE);
+  assert.equal(result.fallbackNotice, SCRIBE_NARRATIVE_FALLBACK_NOTICE);
+});
