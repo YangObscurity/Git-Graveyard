@@ -2669,6 +2669,194 @@ describe("ParallelScheduler merge lock, drift & rebase hardening (Task 20.4)", (
       fixture.cleanup();
     }
   });
+  it("rebases onto the resolved integration head even when the ref advances mid-review", async () => {
+    const fixture = createRepoFixture("icashe");
+    try {
+      const home = fixture.tmpDir;
+      const integrationBranch = `graveyard/${fixture.runId}`;
+      const integrationRef = `refs/heads/${integrationBranch}`;
+      const tasks = [
+        makePactTask("A", { filesInScope: ["src/a.ts"], line: 1 }),
+        makePactTask("B", { filesInScope: ["src/b.ts"], line: 2 }),
+      ];
+      const harness = makeMergeHarness(fixture);
+
+      // A must not produce its candidate until B's worktree base commit has been
+      // fixed, so B is cut from `fixture.baseSha` and rooted there.
+      let bDispatchedResolve: (() => void) | undefined;
+      const bDispatched = new Promise<void>((resolve) => {
+        bDispatchedResolve = resolve;
+      });
+      // B must not produce its candidate until A's candidate has been queued (and
+      // therefore reviewed and merged first), so B's review observes A's merged
+      // head as the integration head.
+      let aQueuedResolve: (() => void) | undefined;
+      const aQueued = new Promise<void>((resolve) => {
+        aQueuedResolve = resolve;
+      });
+      let aSha = "";
+      const runner: ParallelSchedulerRunner = async (context) => {
+        if (context.taskId === "A") {
+          await bDispatched;
+          aSha = commitWorktree(context.worktreeDir, context.taskId, home);
+          return { ok: true, candidateSha: aSha };
+        }
+        await aQueued;
+        const sha = commitWorktree(context.worktreeDir, context.taskId, home);
+        return { ok: true, candidateSha: sha };
+      };
+
+      // Capture the exact candidate snapshot handed to the Warden on B's FIRST
+      // review: the reviewed candidate rebased onto the integration head resolved
+      // BEFORE the concurrent ref advance. Re-queued reviews are not recorded, so
+      // this is the only aSha-bound review snapshot.
+      const bRecord: { candidateSha: string; candidateSha256?: string } = {
+        candidateSha: "",
+      };
+      const wardenReview: ParallelSchedulerWardenReview = async (candidate) => {
+        if (candidate.taskId === "B" && bRecord.candidateSha === "") {
+          bRecord.candidateSha = candidate.candidateSha;
+          bRecord.candidateSha256 = candidate.candidateSha256;
+        }
+        harness.reviewedShas.set(candidate.taskId, candidate.candidateSha);
+        return {
+          approved: true,
+          candidateSha256: candidate.candidateSha256,
+        };
+      };
+
+      const scheduler = makeScheduler(fixture, tasks, runner, {
+        parallelCap: 2,
+        maxConcurrentWarden: 1,
+        maxAttempts: 1,
+        wardenReview,
+        mergeCandidate: harness.mergeCandidate,
+        onDispatch: (context) => {
+          if (context.taskId === "B") {
+            bDispatchedResolve?.();
+          }
+        },
+        onCandidate: (candidate) => {
+          if (candidate.taskId === "A") {
+            aQueuedResolve?.();
+          }
+        },
+      });
+
+      // Intercept the git boundary so that, immediately AFTER B's integration head
+      // resolves to A's merged sha (`aSha`) and BEFORE the rebase runs, a
+      // concurrent merge advances `refs/heads/<integrationBranch>` to a newer
+      // commit (`cSha`). `reviewLoop` must still rebase onto the captured `aSha`.
+      let advanced = false;
+      let cSha = "";
+      const rebaseTargets: string[] = [];
+      const originalResolveGitRef = (scheduler as any).resolveGitRef.bind(
+        scheduler
+      );
+      (scheduler as any).resolveGitRef = async (
+        cwd: string,
+        ref: string
+      ): Promise<string | undefined> => {
+        const resolved = await originalResolveGitRef(cwd, ref);
+        if (!advanced && ref === integrationRef && resolved === aSha) {
+          advanced = true;
+          // A sibling merge lands on the integration branch right after the head
+          // was resolved, diverging from `aSha`.
+          cSha = commitBigFileToIntegration(fixture, "concurrent.txt", 64);
+        }
+        return resolved;
+      };
+      const originalGitCapture = (scheduler as any).gitCapture.bind(scheduler);
+      (scheduler as any).gitCapture = (
+        cwd: string,
+        args: readonly string[]
+      ): Promise<string> => {
+        if (args.includes("rebase") && args[args.length - 1] !== "--abort") {
+          rebaseTargets.push(args[args.length - 1]);
+        }
+        return originalGitCapture(cwd, args);
+      };
+
+      const summary = await scheduler.run();
+
+      // Guard the regression scenario: the concurrent advance actually fired.
+      assert.equal(advanced, true, "the concurrent ref advance must have fired");
+      assert.notEqual(cSha, "");
+      assert.notEqual(cSha, aSha);
+
+      // 1. `rebase` targeted the captured `aSha`, never the mutable ref name, so
+      // the rebased candidate's parent is `aSha` (not `cSha`).
+      assert.equal(
+        rebaseTargets[0],
+        aSha,
+        "rebase must target the captured integration head"
+      );
+      assert.equal(
+        rebaseTargets.includes(integrationRef),
+        false,
+        "rebase must never target the mutable integration ref"
+      );
+      assert.ok(bRecord.candidateSha, "B must have reached the Warden");
+      assert.equal(
+        runGit(["rev-parse", `${bRecord.candidateSha}^`], fixture.gitDir, home),
+        aSha,
+        "B's rebased parent must be the captured aSha, not cSha"
+      );
+
+      const runDiff = (base: string, head: string): string =>
+        childProcess
+          .execFileSync(
+            "git",
+            [
+              "diff",
+              "--binary",
+              "--no-color",
+              "--end-of-options",
+              `${base}..${head}`,
+            ],
+            {
+              cwd: fixture.gitDir,
+              encoding: "utf8",
+              env: gitEnv(home),
+              maxBuffer: 20 * 1024 * 1024,
+            }
+          )
+          .toString();
+
+      // 2. The reviewed hash binds to `aSha..candidateSha` and excludes cSha's
+      // concurrent change.
+      assert.equal(
+        bRecord.candidateSha256,
+        candidateSha256FromDiff(runDiff(aSha, bRecord.candidateSha))
+      );
+      assert.equal(
+        runDiff(aSha, bRecord.candidateSha).includes("concurrent.txt"),
+        false,
+        "the reviewed diff must not include the concurrent cSha change"
+      );
+
+      // 3. The ref moved before the final merge lock, so B detected the
+      // post-approval drift and re-queued; it resolved against the moved head
+      // without corrupting the `aSha`-bound evidence or burning an attempt.
+      assert.equal(summary.taskStates.A, "merged");
+      assert.equal(summary.taskStates.B, "merged");
+      assert.equal(summary.merged, 2);
+      assert.equal(scheduler.getScheduler().getTask("B")!.attempts, 1);
+      assert.equal(summary.retried, 0);
+      const bRecords = scheduler
+        .getReviewRecords()
+        .filter((record) => record.taskId === "B");
+      assert.equal(bRecords.length, 1);
+      assert.equal(bRecords[0].approved, true);
+      assert.equal(
+        runGit(["show", `${integrationBranch}:B.txt`], fixture.gitDir, home),
+        "B candidate"
+      );
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
 });
 
 

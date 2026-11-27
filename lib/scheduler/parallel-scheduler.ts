@@ -1421,7 +1421,7 @@ export class ParallelScheduler {
               "-c",
               "user.email=noreply@git-graveyard.local",
               "rebase",
-              integrationRef,
+              integrationHead,
             ]);
           } catch {
             rebaseOk = false;
