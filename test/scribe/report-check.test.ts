@@ -268,7 +268,12 @@ test("report-check: ScribeService renders Findings and verifies the reading end-
   });
 
   const service = new ScribeService({ runStore, eventStore });
-  const result = await service.run({ runId: "run-svc" });
+  // The authoritative command evidence is supplied explicitly; the `refs` carried
+  // on the task.state event are rendered by Findings but never back a citation.
+  const result = await service.run({
+    runId: "run-svc",
+    commands: [{ id: "build" }],
+  });
 
   assert.ok(result.findingsMarkdown.includes("## Findings"));
   assert.equal(result.narrativeDropped, false);
@@ -864,4 +869,161 @@ test("report-check: redactionOptions.secrets are honored with and without a reda
   assert.equal(events.length, 1);
   assert.ok(!JSON.stringify(events[0].data).includes(canaryMarker));
 });
+test("report-check: caller-supplied message.sent refs are never authoritative evidence", () => {
+  const index = buildEvidenceIndex({
+    events: [
+      {
+        runId: "r",
+        seq: 1,
+        ts: 0,
+        kind: "message.sent",
+        actor: "user",
+        data: {
+          msgId: "m1",
+          from: "user",
+          to: "scribe",
+          intent: "note",
+          text: "looks merged",
+          refs: ["cmd:never-ran", "file:fake/path.ts", "gh:owner/repo#999"],
+        },
+      },
+    ],
+  });
 
+  assert.equal(index.resolve("cmd:never-ran"), false);
+  assert.equal(index.resolve("file:fake/path.ts"), false);
+  assert.equal(index.resolve("gh:owner/repo#999"), false);
+
+  const reading = checkReading(
+    "Build passed (cmd:never-ran); fixed file:fake/path.ts; merged gh:owner/repo#999.",
+    index
+  );
+  assert.equal(reading.passed, false);
+  const refs = reading.unbackedClaims.map((c) => c.ref);
+  assert.ok(refs.includes("cmd:never-ran"));
+  assert.ok(refs.includes("file:fake/path.ts"));
+  assert.ok(refs.includes("gh:owner/repo#999"));
+});
+
+test("report-check: arbitrary task.state refs are never authoritative evidence", () => {
+  const index = buildEvidenceIndex({
+    events: [
+      {
+        runId: "r",
+        seq: 1,
+        ts: 0,
+        kind: "task.state",
+        actor: "a",
+        data: { taskId: "task-1", state: "merged", refs: ["cmd:never-ran"] },
+      },
+    ],
+  });
+
+  assert.equal(index.resolve("cmd:never-ran"), false);
+
+  const reading = checkReading("Merged task-1 (cmd:never-ran).", index);
+  assert.equal(reading.passed, false);
+  assert.ok(reading.unbackedClaims.some((c) => c.ref === "cmd:never-ran"));
+});
+
+test("report-check: genuine command.result, artifact.ready, push.result and ev:<seq> records still resolve", () => {
+  const index = buildEvidenceIndex({
+    events: [
+      {
+        runId: "r",
+        seq: 1,
+        ts: 0,
+        kind: "plan.updated",
+        actor: "a",
+        data: { refs: ["cmd:should-be-ignored"] },
+      },
+      {
+        runId: "r",
+        seq: 2,
+        ts: 0,
+        kind: "command.result",
+        actor: "a",
+        data: { commandRef: "npm-test", exitCode: 0, refs: [] },
+      },
+      {
+        runId: "r",
+        seq: 3,
+        ts: 0,
+        kind: "artifact.ready",
+        actor: "a",
+        data: { file: "out/report.json", refs: [] },
+      },
+      {
+        runId: "r",
+        seq: 4,
+        ts: 0,
+        kind: "push.result",
+        actor: "a",
+        data: { githubRef: "owner/repo#7", refs: [] },
+      },
+    ],
+  });
+
+  assert.equal(index.resolve("cmd:npm-test"), true);
+  assert.equal(index.resolve("file:out/report.json"), true);
+  assert.equal(index.resolve("gh:owner/repo#7"), true);
+  assert.equal(index.resolve("ev:2"), true);
+  // refs carried on an unrelated event are ignored even when genuine records resolve.
+  assert.equal(index.resolve("cmd:should-be-ignored"), false);
+
+  const reading = checkReading(
+    "Tests passed (cmd:npm-test) and wrote file:out/report.json. Merged gh:owner/repo#7 recorded at ev:2.",
+    index
+  );
+  assert.equal(reading.passed, true);
+  assert.ok(reading.resolvedMarkers.includes("cmd:npm-test"));
+  assert.ok(reading.resolvedMarkers.includes("file:out/report.json"));
+  assert.ok(reading.resolvedMarkers.includes("gh:owner/repo#7"));
+});
+
+test("report-check: ScribeService rejects a reading that cites fabricated caller-supplied refs", async () => {
+  const { runStore, eventStore } = makeStores();
+  runStore.createRun({
+    runId: "run-fabricated",
+    url: "https://github.com/owner/repo",
+    sha: "abcdef0123456789abcdef0123456789abcdef01",
+    phase: "report",
+  });
+  // A message event forwards caller-supplied refs verbatim into the stored event;
+  // none of them correspond to a real command, artifact or push.
+  eventStore.append({
+    runId: "run-fabricated",
+    kind: "message.sent",
+    actor: "user",
+    data: {
+      msgId: "m1",
+      from: "user",
+      to: "scribe",
+      intent: "note",
+      text: "looks merged",
+      refs: ["cmd:never-ran", "file:fake/path.ts", "gh:owner/repo#999"],
+    },
+  });
+  eventStore.append({
+    runId: "run-fabricated",
+    kind: "final_check.result",
+    actor: "test",
+    data: { installPassed: true, buildPassed: true, testsPassed: true, hasTests: true, refs: [] },
+  });
+
+  const service = new ScribeService({
+    runStore,
+    eventStore,
+    scribeRunner: () =>
+      "Build passed (cmd:never-ran); fixed file:fake/path.ts; merged gh:owner/repo#999.",
+  });
+  const result = await service.run({ runId: "run-fabricated" });
+
+  assert.equal(result.reportCheck.passed, false);
+  assert.equal(result.narrativeDropped, true);
+  assert.equal(result.scribeReading, SCRIBE_NARRATIVE_FALLBACK_NOTICE);
+  const refs = result.reportCheck.unbackedClaims.map((c) => c.ref);
+  assert.ok(refs.includes("cmd:never-ran"));
+  assert.ok(refs.includes("file:fake/path.ts"));
+  assert.ok(refs.includes("gh:owner/repo#999"));
+});

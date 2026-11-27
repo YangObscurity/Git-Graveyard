@@ -241,13 +241,12 @@ export function buildEvidenceIndex(input: EvidenceIndexInput = {}): EvidenceInde
       collected.eventSeqs.add(event.seq);
       collected.rawMarkers.add(`ev:${event.seq}`);
     }
+    // Caller-supplied `data.refs` are intentionally NOT indexed here. Message
+    // and task events forward arbitrary caller-supplied refs, so only the
+    // authoritative records below (command results, artifact paths, push refs,
+    // event sequence numbers and explicit index inputs) may back a citation.
     const data = event.data as Record<string, unknown> | undefined;
     if (data) {
-      if (Array.isArray(data.refs)) {
-        for (const ref of data.refs) {
-          addMarker(collected, String(ref));
-        }
-      }
       const id = data.id ?? data.commandId ?? data.commandRef;
       if (typeof id === "string" && event.kind === "command.result") {
         collected.commandIds.add(id);
