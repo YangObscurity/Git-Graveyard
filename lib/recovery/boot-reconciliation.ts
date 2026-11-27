@@ -170,7 +170,7 @@ export interface KiroCreditExhaustionInput {
 export interface KiroCreditExhaustionResult {
   readonly runId: string;
   readonly phase: "done";
-  readonly outcome: "budget_stopped";
+  readonly outcome: RunOutcome | null;
   readonly preservedMergedWork: boolean;
   readonly event: EventEnvelope | null;
 }
@@ -322,8 +322,14 @@ export class BootReconciliationService {
       return redactor.redactEventData(byOptions);
     } catch {
       // Fail closed: if the injected redactor throws, redact every string leaf
-      // rather than returning partially redacted data.
-      return redactAllStringLeaves(byOptions) as Record<string, unknown>;
+      // rather than returning partially redacted data. The run.clock pause action
+      // is a hardcoded internal control field, not untrusted payload, so it is
+      // preserved to keep the persisted clock event consistent with pausedRuns.
+      const fallback = redactAllStringLeaves(byOptions) as Record<string, unknown>;
+      if (byOptions.action === "pause") {
+        fallback.action = "pause";
+      }
+      return fallback;
     }
   }
 
@@ -804,6 +810,19 @@ export class BootReconciliationService {
     const merged = (run.metadata as Record<string, unknown> | null)
       ?.mergedTasksCount;
     const preservedMergedWork = typeof merged === "number" ? merged > 0 : true;
+
+    // Terminal guard: a run that already reached the done phase keeps its
+    // existing phase, outcome and endedAt untouched, and no budget.exceeded event
+    // is appended for a run that has already finished.
+    if (run.phase === "done") {
+      return {
+        runId: input.runId,
+        phase: "done",
+        outcome: run.outcome,
+        preservedMergedWork,
+        event: null,
+      };
+    }
 
     runStore.updateRun(input.runId, {
       phase: "done",

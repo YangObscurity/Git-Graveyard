@@ -44,7 +44,7 @@ export const EVIDENCE_MARKER_PREFIX_LIST: readonly string[] =
 
 // Marker token: prefix followed by a non-space, non-delimiter payload.
 export const EVIDENCE_MARKER_REGEX =
-  /\b(?:cmd|file|gh|ev):[^\s,;)\]}"']+/gi;
+  /\b(?:cmd|file|gh|ev):[^\s,;)\]}"'\`]+/gi;
 
 const NUMERAL_REGEX = /\d/;
 
@@ -534,6 +534,23 @@ function emitReportChecked(
 }
 
 /**
+ * Redacts the Scribe draft with the injected redactor before citation
+ * verification. Fails closed with the redaction mask when the redactor throws so
+ * a partially redacted reading is never verified or returned. When no redactor is
+ * injected the reading passes through unchanged.
+ */
+function redactReadingText(text: string, redactor?: Redactor): string {
+  if (!redactor || typeof redactor.redactText !== "function") {
+    return text;
+  }
+  try {
+    return redactor.redactText(text);
+  } catch {
+    return "[REDACTED]";
+  }
+}
+
+/**
  * Verifies the initial Scribe draft; on failure it invokes the retry callback once
  * with the exact unbacked claims. When the retry still fails the reading is dropped
  * and replaced with the fallback notice, and a redacted `report.checked` event is
@@ -545,7 +562,8 @@ export async function runReportCheckWithRetry(
   const actor = options.actor ?? "ScribeService";
   const index = options.index;
 
-  const first = checkReading(options.reading, index);
+  const firstReading = redactReadingText(options.reading, options.redactor);
+  const first = checkReading(firstReading, index);
 
   const emit = (
     result: ReportCheckResult,
@@ -584,10 +602,10 @@ export async function runReportCheckWithRetry(
   };
 
   if (first.passed) {
-    const event = emit(first, options.reading, false, false);
+    const event = emit(first, firstReading, false, false);
     return {
       passed: true,
-      reading: options.reading,
+      reading: firstReading,
       narrativeDropped: false,
       fallbackNotice: null,
       reportCheck: first,
@@ -604,13 +622,15 @@ export async function runReportCheckWithRetry(
   }
 
   let second: ReportCheckResult | null = null;
+  let secondReading: string | null = null;
   if (typeof retriedReading === "string" && retriedReading.trim().length > 0) {
-    second = checkReading(retriedReading, index);
+    secondReading = redactReadingText(retriedReading, options.redactor);
+    second = checkReading(secondReading, index);
     if (second.passed) {
-      const event = emit(second, retriedReading, false, true);
+      const event = emit(second, secondReading, false, true);
       return {
         passed: true,
-        reading: retriedReading,
+        reading: secondReading,
         narrativeDropped: false,
         fallbackNotice: null,
         reportCheck: second,
@@ -686,7 +706,9 @@ export interface AssignOutcomeInput extends ReportOutcomeEvaluationInput {
 /**
  * Redacts install error text with the injected redactor (when supplied) on top of
  * the built-in `redactText` engine so secret tokens and keys never reach the
- * `InstallErrorRow` rows returned in the install comparison.
+ * `InstallErrorRow` rows returned in the install comparison. Fails closed with
+ * the redaction mask when the injected redactor throws so unredacted text is
+ * never returned.
  */
 function redactInstallText(
   text: string,
@@ -700,7 +722,7 @@ function redactInstallText(
   try {
     return redactor.redactText(base);
   } catch {
-    return base;
+    return "[REDACTED]";
   }
 }
 
