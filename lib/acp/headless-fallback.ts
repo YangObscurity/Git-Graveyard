@@ -8,11 +8,17 @@
 // the exit-code mapping, the model check, approval resume and auto-denied asks.
 
 import { spawn } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
 import { StringDecoder } from "node:string_decoder";
 import {
   buildSkeletonEnv,
 } from "../supervisor/skeleton-env";
-import type { ChildProcessLike, SpawnFunction } from "../supervisor/types";
+import type {
+  ChildProcessLike,
+  SpawnFunction,
+  SpawnOptions,
+} from "../supervisor/types";
 import {
   DEFAULT_REDACTION_MASK,
   redactText,
@@ -37,6 +43,42 @@ import {
 } from "./stream-parser";
 
 const defaultSpawn = spawn as unknown as SpawnFunction;
+
+/**
+ * Resolves a sandbox username to its numeric uid/gid by reading `/etc/passwd`.
+ * POSIX only (win32 has no `/etc/passwd`), and returns `null` when the user is
+ * unknown or the file cannot be read, so the caller fails the turn closed rather
+ * than spawning without the requested sandbox identity.
+ */
+export function defaultResolveUserIds(
+  user: string
+): { uid: number; gid: number } | null {
+  if (process.platform === "win32") {
+    return null;
+  }
+  let content: string;
+  try {
+    content = fs.readFileSync("/etc/passwd", "utf-8");
+  } catch {
+    return null;
+  }
+  for (const line of content.split("\n")) {
+    if (line.length === 0 || line.startsWith("#")) {
+      continue;
+    }
+    const fields = line.split(":");
+    if (fields.length < 4 || fields[0] !== user) {
+      continue;
+    }
+    const uid = Number.parseInt(fields[2], 10);
+    const gid = Number.parseInt(fields[3], 10);
+    if (!Number.isInteger(uid) || !Number.isInteger(gid)) {
+      return null;
+    }
+    return { uid, gid };
+  }
+  return null;
+}
 
 /**
  * Activation gate (Probe P1 & P14): the Headless Fallback is enabled ONLY when
@@ -166,6 +208,13 @@ export interface HeadlessFallbackChannelOptions {
   pathEnv?: string;
   /** Sandbox user the spawned headless process runs as. */
   user?: string;
+  /**
+   * Resolves a sandbox username to numeric uid/gid for `defaultSpawn`. Defaults
+   * to reading `/etc/passwd` on POSIX. Returning `null` (or resolving to a uid
+   * the current process may not adopt) fails the turn closed with `spawn_failed`
+   * instead of spawning without the requested identity.
+   */
+  resolveUserIds?: (user: string) => { uid: number; gid: number } | null;
   command?: string;
   spawnFn?: SpawnFunction;
   /** Exact gateway MCP tool IDs passed through `--trust-tools`. */
@@ -353,6 +402,24 @@ export class HeadlessFallbackChannel {
   private redactionOptions(): RedactionOptions {
     const secrets = this.explicitSecretLiterals();
     return secrets.length > 0 ? { secrets } : {};
+  }
+
+  /**
+   * Clones an ask and redacts every string it carries (`askId`, `text`, the raw
+   * record including `raw.options`) with the channel's redaction options, so the
+   * `onAskAutoDeny` hook and any `ask.auto_denied` event built from it never leak
+   * an explicit non-env `kiroApiKey` (Requirement 17.12).
+   */
+  private redactAskForHook(ask: HeadlessAskRequest): HeadlessAskRequest {
+    const options = this.redactionOptions();
+    const raw = redactUnknownValue(ask.raw, options);
+    return {
+      askId: ask.askId === null ? null : redactText(ask.askId, options),
+      toolCallId:
+        ask.toolCallId === null ? null : redactText(ask.toolCallId, options),
+      text: ask.text === null ? null : redactText(ask.text, options),
+      raw: (raw ?? {}) as StreamJsonRecord,
+    };
   }
 
   private emptyResult(): HeadlessTurnResult {
@@ -886,14 +953,79 @@ export class HeadlessFallbackChannel {
     });
 
     return new Promise<TurnSpawnResult>((resolve) => {
+      // Only the built-in spawn can adopt a sandbox identity; a caller-injected
+      // spawnFn keeps receiving `user` verbatim so test/custom sandbox adapters
+      // and the existing `user` contract keep working (Requirement 16.2).
+      const usingDefaultSpawn = this.spawnFn === defaultSpawn;
+      const spawnOptions: SpawnOptions = {
+        cwd: this.cwd,
+        env,
+        stdio: ["ignore", "pipe", "pipe"],
+      };
+      if (usingDefaultSpawn && this.options.user) {
+        const requestedUser = this.options.user;
+        let currentUsername: string | null = null;
+        try {
+          currentUsername = os.userInfo().username;
+        } catch {
+          currentUsername = null;
+        }
+        if (currentUsername === requestedUser) {
+          // Already running as the requested user: spawn normally.
+        } else if (process.platform === "win32") {
+          // win32 cannot switch users; fail closed without spawning.
+          resolve({
+            exitCode: null,
+            records: [],
+            rawOutput: "",
+            spawnError: new Error(
+              `Cannot switch to sandbox user "${requestedUser}" on win32`
+            ),
+            signal: null,
+            logError: null,
+            autoDeniedAsks: [],
+            askDenyError: null,
+          });
+          return;
+        } else {
+          const resolved = (this.options.resolveUserIds ?? defaultResolveUserIds)(
+            requestedUser
+          );
+          const currentUid =
+            typeof process.getuid === "function" ? process.getuid() : null;
+          if (
+            resolved === null ||
+            (currentUid !== null &&
+              currentUid !== 0 &&
+              currentUid !== resolved.uid)
+          ) {
+            // Unresolvable user or lacking privilege: fail closed without
+            // spawning rather than running as the wrong identity.
+            resolve({
+              exitCode: null,
+              records: [],
+              rawOutput: "",
+              spawnError: new Error(
+                `Cannot switch to sandbox user "${requestedUser}": the requested uid/gid could not be adopted`
+              ),
+              signal: null,
+              logError: null,
+              autoDeniedAsks: [],
+              askDenyError: null,
+            });
+            return;
+          }
+          spawnOptions.uid = resolved.uid;
+          spawnOptions.gid = resolved.gid;
+        }
+      } else if (this.options.spawnFn !== undefined && this.options.user) {
+        // A custom/test spawnFn keeps receiving the user name as before.
+        spawnOptions.user = this.options.user;
+      }
+
       let proc: ChildProcessLike;
       try {
-        proc = this.spawnFn(this.command, args, {
-          cwd: this.cwd,
-          env,
-          stdio: ["ignore", "pipe", "pipe"],
-          ...(this.options.user ? { user: this.options.user } : {}),
-        });
+        proc = this.spawnFn(this.command, args, spawnOptions);
       } catch (err) {
         resolve({
           exitCode: null,
@@ -929,8 +1061,9 @@ export class HeadlessFallbackChannel {
         : null;
 
       // Fail closed the instant a required auto-deny hook
-      // rejects. The child process is signalled with SIGTERM and the turn never
-      // reports the ask as safely handled.
+      // rejects. The child process is signalled with SIGTERM, further records stop
+      // parsing, and the turn only settles once the child has actually exited
+      // (close/exit) so the caller never resolves before the process is gone.
       const settleAskDenyFailure = (err: Error): void => {
         if (settled) {
           return;
@@ -941,19 +1074,36 @@ export class HeadlessFallbackChannel {
         } catch {
           // Ignore a failed kill; the turn still fails closed.
         }
-        const logError = logger?.getLastError() ?? null;
-        logger?.close();
-        this.currentProcess = null;
-        resolve({
-          exitCode: proc.exitCode ?? null,
-          records,
-          rawOutput,
-          spawnError: null,
-          signal: null,
-          logError,
-          autoDeniedAsks,
-          askDenyError: err,
-        });
+        const finalize = (): void => {
+          const logError = logger?.getLastError() ?? null;
+          logger?.close();
+          this.currentProcess = null;
+          resolve({
+            exitCode: proc.exitCode ?? null,
+            records,
+            rawOutput,
+            spawnError: null,
+            signal: null,
+            logError,
+            autoDeniedAsks,
+            askDenyError: err,
+          });
+        };
+        // Already exited: settle immediately.
+        if (proc.exitCode !== null) {
+          finalize();
+          return;
+        }
+        let done = false;
+        const onCloseOrExit = (): void => {
+          if (done) {
+            return;
+          }
+          done = true;
+          finalize();
+        };
+        proc.once("close", onCloseOrExit);
+        proc.once("exit", onCloseOrExit);
       };
 
       const consumeLine = (line: string): void => {
@@ -978,10 +1128,14 @@ export class HeadlessFallbackChannel {
               break;
             }
             const hook = this.options.onAskAutoDeny;
+            // Requirement 17.12: redact the ask BEFORE it reaches the hook so any
+            // event the hook records (ask.auto_denied) can never carry an explicit
+            // credential embedded in the ask text, id, or raw options.
+            const redactedAsk = this.redactAskForHook(ask);
             let denial: Promise<void>;
             try {
               // `runTurn` refuses to spawn without the hook, so it is defined here.
-              denial = Promise.resolve(hook!(ask));
+              denial = Promise.resolve(hook!(redactedAsk));
             } catch (err) {
               denial = Promise.reject(err);
             }
@@ -990,7 +1144,7 @@ export class HeadlessFallbackChannel {
                 // Never report an ask whose turn already failed or settled while
                 // its denial was still in flight.
                 if (!settled) {
-                  autoDeniedAsks.push(ask);
+                  autoDeniedAsks.push(redactedAsk);
                 }
               },
               (err: unknown) => {
@@ -1246,12 +1400,48 @@ export type AskAutoDeniedEventData = {
 };
 
 /**
+ * Recursively redacts every string in an arbitrary value (array/nested object)
+ * with `redactText`, leaving non-string primitives untouched. Used so an
+ * `ask.auto_denied` payload can never carry an explicit credential embedded in
+ * the ask text or its `options` list (Requirement 17.12).
+ */
+function redactUnknownValue(
+  value: unknown,
+  redactionOptions?: RedactionOptions
+): unknown {
+  if (typeof value === "string") {
+    return redactText(value, redactionOptions);
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => redactUnknownValue(item, redactionOptions));
+  }
+  if (value !== null && typeof value === "object") {
+    if (
+      value instanceof Date ||
+      value instanceof RegExp ||
+      (typeof Buffer !== "undefined" && Buffer.isBuffer(value))
+    ) {
+      return value;
+    }
+    const result: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(value)) {
+      result[key] = redactUnknownValue(entry, redactionOptions);
+    }
+    return result;
+  }
+  return value;
+}
+
+/**
  * Builds the `ask.auto_denied` event data from a real `HeadlessAskRequest`.
  * The question text is the request's `text`; `options` is read defensively from
  * `ask.raw` (only when the raw record actually carries an `options` field).
+ * Every string is passed through the redactor before it is returned so an
+ * explicit credential in the ask text or options can never leak.
  */
 export function buildAskAutoDeniedEventData(
-  ask: HeadlessAskRequest
+  ask: HeadlessAskRequest,
+  redactionOptions?: RedactionOptions
 ): AskAutoDeniedEventData {
   let options: unknown = null;
   const raw = ask.raw as unknown;
@@ -1259,11 +1449,13 @@ export function buildAskAutoDeniedEventData(
     options = (raw as Record<string, unknown>).options ?? null;
   }
   const text = ask.text ?? null;
+  const redactedText = text === null ? null : redactText(text, redactionOptions);
   return {
-    askId: ask.askId,
-    question: text,
-    text,
-    options,
+    askId:
+      ask.askId === null ? null : redactText(ask.askId, redactionOptions),
+    question: redactedText,
+    text: redactedText,
+    options: redactUnknownValue(options, redactionOptions),
   };
 }
 

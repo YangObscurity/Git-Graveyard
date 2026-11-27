@@ -396,8 +396,11 @@ function hasAmbiguousUnicodeArguments(masked: string, openParenIndex: number): b
       if (braceDepth > 0) braceDepth -= 1;
     } else if (parenDepth === 0 && bracketDepth === 0 && braceDepth === 0) {
       if (ch === ",") return true;
-      // `*args` / `**kwargs` splat forwards an arbitrary Py2 arity.
-      if (ch === "*") return true;
+      // `*args` / `**kwargs` splat forwards an arbitrary Py2 arity. A genuine
+      // top-level splat only starts at the beginning of an argument, so a `*`
+      // with preceding non-whitespace text is multiplication/power; any earlier
+      // top-level comma already returned true above.
+      if (ch === "*") return args.slice(0, i).trim().length === 0;
       if (ch === "=") {
         const prev = args[i - 1];
         const next = args[i + 1];
