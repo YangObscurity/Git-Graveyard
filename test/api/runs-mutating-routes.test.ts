@@ -3406,5 +3406,457 @@ describe("mutating run routes against real objects", () => {
     assert.equal(orchestrator.getActiveRun(runId), undefined);
   });
 
+  it("abandons an in-review task on lay-to-rest during Warden review without merging", async () => {
+    const { runStore, eventStore } = makeStores();
+    const runId = "run-laytorest-in-review";
+    makeRun(runStore, runId);
+    const repo = createGitRepo(runId);
+    const host = makeRealHost({ runStore, eventStore });
+    const gitService = new GitService({ runsDir: repo.runsDir });
+
+    // A discarded task must never reach the integration branch.
+    let mergeCandidateCalls = 0;
+    (gitService as unknown as { mergeCandidate: unknown }).mergeCandidate =
+      async () => {
+        mergeCandidateCalls += 1;
+        throw new Error("mergeCandidate must never run for a discarded task");
+      };
+
+    const tasks = parsePact(
+      `- [ ] T1. Repair add()\n  - role: bonesetter\n  - files: index.js\n  - accept: npm test\n`
+    ).tasks;
+    const scheduler = new Scheduler({
+      pact: renderPact(tasks),
+      tasks,
+      runId,
+      approvedTaskIds: ["T1"],
+      pactApproved: true,
+      runParallelCap: 1,
+    });
+
+    const skeletonId = "skeleton-T1";
+    const holder: { dispatcher?: TaskDispatcher } = {};
+    let worktreeDir = "";
+    let stateAfterLayToRest = "";
+    let wardenCalls = 0;
+
+    const workerRunner = async (ctx: WorkerContext) => {
+      worktreeDir = ctx.worktreeDir;
+      fs.writeFileSync(
+        path.join(ctx.worktreeDir, "index.js"),
+        "module.exports = 2;\n",
+        "utf8"
+      );
+      childProcess.execFileSync("git", ["add", "index.js"], {
+        cwd: ctx.worktreeDir,
+      });
+      childProcess.execFileSync("git", ["commit", "-m", "Implement T1"], {
+        cwd: ctx.worktreeDir,
+      });
+      return { ok: true, taskId: ctx.taskId };
+    };
+
+    const wardenRunner = async (ctx: WardenReviewContext) => {
+      wardenCalls += 1;
+      // Lay the Skeleton to rest (discard) while its task is in_review.
+      assert.equal(
+        await holder.dispatcher!.layToRest(skeletonId, "discard"),
+        true
+      );
+      stateAfterLayToRest = scheduler.getTask("T1")?.state ?? "";
+      return buildVerdictRecord(ctx.candidateSha, {
+        diff: ctx.diff,
+        candidateSha256: ctx.candidateSha256,
+        tree: ctx.candidateTree,
+        install: { ok: true, ref: "cmd:install" },
+        build: { ok: true, ref: "cmd:build" },
+        accept: { ok: true, ref: "cmd:accept", exitCode: 0 },
+        tests: { ok: true, ref: "cmd:tests" },
+        noTestWeakening: true,
+      });
+    };
+
+    const dispatcher = new TaskDispatcher({
+      runId,
+      scheduler,
+      gitService,
+      host,
+      runDir: repo.runsDir,
+      gitDir: repo.gitDir,
+      baseSha: repo.baseSha,
+      workerRunner,
+      wardenRunner,
+      pollIntervalMs: 5,
+    });
+    holder.dispatcher = dispatcher;
+
+    const result = await dispatcher.step();
+
+    assert.equal(wardenCalls, 1);
+    // The lay-to-rest handler walked in_review -> rejected -> ready -> abandoned.
+    assert.equal(stateAfterLayToRest, "abandoned");
+    assert.equal(scheduler.getTask("T1")?.state, "abandoned");
+    // The post-review retry/fail path must never overwrite "abandoned".
+    assert.equal(mergeCandidateCalls, 0);
+    assert.equal(dispatcher.getLiveCount(), 0);
+    assert.equal(dispatcher.getActiveTask("T1"), undefined);
+    // A `discard` lay-to-rest deletes the worktree instead of preserving it.
+    assert.equal(fs.existsSync(worktreeDir), false);
+    assert.equal(
+      (dispatcher as unknown as { preservedWorktrees: Map<string, unknown> })
+        .preservedWorktrees.size,
+      0
+    );
+    // An abandoned task never emits `task.merged`.
+    assert.equal(eventStore.getEvents(runId, { kind: "task.merged" }).length, 0);
+    assert.notEqual(result.status, "failed");
+  });
+
+  it("serializes concurrent re-raises so only one pipeline restarts the task", async () => {
+    const { runStore, eventStore } = makeStores();
+    const runId = "run-reraise-concurrent";
+    makeRun(runStore, runId);
+    const repo = createGitRepo(runId);
+    const host = makeRealHost({ runStore, eventStore });
+    const gitService = new GitService({ runsDir: repo.runsDir });
+
+    const tasks = parsePact(
+      `- [ ] T1. Repair add()\n  - role: bonesetter\n  - files: index.js\n  - accept: npm test\n`
+    ).tasks;
+    const scheduler = new Scheduler({
+      pact: renderPact(tasks),
+      tasks,
+      runId,
+      approvedTaskIds: ["T1"],
+      pactApproved: true,
+      runParallelCap: 1,
+    });
+
+    let workerCalls = 0;
+    const firstTurn = { started: false, aborted: false };
+    const secondTurn = { entered: false };
+    let releaseSecond: () => void = () => {};
+    const secondGate = new Promise<void>((resolve) => {
+      releaseSecond = resolve;
+    });
+
+    const workerRunner = async (ctx: WorkerContext) => {
+      workerCalls += 1;
+      if (workerCalls === 1) {
+        firstTurn.started = true;
+        await new Promise<void>((resolve) => {
+          if (ctx.signal?.aborted) {
+            resolve();
+            return;
+          }
+          ctx.signal?.addEventListener("abort", () => resolve(), { once: true });
+        });
+        firstTurn.aborted = ctx.signal?.aborted === true;
+        throw new Error("interrupted by the concurrency regression test");
+      }
+      secondTurn.entered = true;
+      await secondGate;
+      fs.writeFileSync(
+        path.join(ctx.worktreeDir, "index.js"),
+        "module.exports = 2;\n",
+        "utf8"
+      );
+      childProcess.execFileSync("git", ["add", "index.js"], {
+        cwd: ctx.worktreeDir,
+      });
+      childProcess.execFileSync("git", ["commit", "-m", "Implement T1"], {
+        cwd: ctx.worktreeDir,
+      });
+      return { ok: true, taskId: ctx.taskId };
+    };
+
+    const wardenRunner = async (ctx: WardenReviewContext) =>
+      buildVerdictRecord(ctx.candidateSha, {
+        diff: ctx.diff,
+        candidateSha256: ctx.candidateSha256,
+        tree: ctx.candidateTree,
+        install: { ok: true, ref: "cmd:install" },
+        build: { ok: true, ref: "cmd:build" },
+        accept: { ok: true, ref: "cmd:accept", exitCode: 0 },
+        tests: { ok: true, ref: "cmd:tests" },
+        noTestWeakening: true,
+      });
+
+    const dispatcher = new TaskDispatcher({
+      runId,
+      scheduler,
+      gitService,
+      host,
+      runDir: repo.runsDir,
+      gitDir: repo.gitDir,
+      baseSha: repo.baseSha,
+      workerRunner,
+      wardenRunner,
+      pollIntervalMs: 5,
+    });
+
+    const skeletonId = "skeleton-T1";
+    const stepPromise = dispatcher.step();
+    await waitFor(() => firstTurn.started);
+    assert.equal(await dispatcher.interruptSkeleton(skeletonId), true);
+    await stepPromise;
+    assert.equal(firstTurn.aborted, true);
+    assert.equal(workerCalls, 1);
+    assert.equal(dispatcher.getLiveCount(), 0);
+
+    // Force the first re-raise to suspend so the two calls genuinely overlap:
+    // a stub supervisor whose raise() resolves on a later tick. The per-task
+    // claim (not only the fresh slot) then has to refuse the second call.
+    const known = [
+      ...(
+        dispatcher as unknown as {
+          knownSkeletonTasks: Map<string, Record<string, unknown>>;
+        }
+      ).knownSkeletonTasks.values(),
+    ].find((entry) => entry.taskId === "T1");
+    assert.ok(known, "the interrupted task must stay retrievable by id");
+    known!.supervisor = {
+      raise: () => new Promise<void>((resolve) => setTimeout(resolve, 10)),
+      cancel: async () => {},
+      steer: async () => {},
+      finish: async () => {},
+    };
+
+    const [first, second] = await Promise.all([
+      dispatcher.reraiseSkeleton(skeletonId),
+      dispatcher.reraiseSkeleton(skeletonId),
+    ]);
+    assert.equal(
+      [first, second].filter(Boolean).length,
+      1,
+      "exactly one concurrent re-raise wins"
+    );
+    assert.notEqual(first, second);
+
+    await waitFor(() => secondTurn.entered);
+    // Only the single claimed re-raise may have executed the worker again.
+    assert.equal(workerCalls, 2);
+
+    // A re-raise for an already-live (non-aborted) slot is refused.
+    assert.equal(await dispatcher.reraiseSkeleton(skeletonId), false);
+
+    releaseSecond();
+    await waitFor(
+      () =>
+        scheduler.getTask("T1")?.state === "merged" &&
+        dispatcher.getActiveTask("T1") === undefined
+    );
+    assert.equal(workerCalls, 2);
+    assert.equal(dispatcher.getLiveCount(), 0);
+  });
+
+  it("forwards addReviewFocus to the Warden runner context", async () => {
+    const { runStore, eventStore } = makeStores();
+    const runId = "run-focus-warden-runner";
+    makeRun(runStore, runId);
+    const repo = createGitRepo(runId);
+    const host = makeRealHost({ runStore, eventStore });
+    const gitService = new GitService({ runsDir: repo.runsDir });
+
+    const tasks = parsePact(
+      `- [ ] T1. Repair add()\n  - role: bonesetter\n  - files: index.js\n  - accept: npm test\n`
+    ).tasks;
+    const scheduler = new Scheduler({
+      pact: renderPact(tasks),
+      tasks,
+      runId,
+      approvedTaskIds: ["T1"],
+      pactApproved: true,
+      runParallelCap: 1,
+    });
+
+    const skeletonId = "skeleton-T1";
+    const holder: { dispatcher?: TaskDispatcher } = {};
+    let seenFocus: string[] | undefined;
+
+    const workerRunner = async (ctx: WorkerContext) => {
+      assert.equal(
+        await holder.dispatcher!.addReviewFocus(
+          skeletonId,
+          "verify rollback path"
+        ),
+        true
+      );
+      fs.writeFileSync(
+        path.join(ctx.worktreeDir, "index.js"),
+        "module.exports = 2;\n",
+        "utf8"
+      );
+      childProcess.execFileSync("git", ["add", "index.js"], {
+        cwd: ctx.worktreeDir,
+      });
+      childProcess.execFileSync("git", ["commit", "-m", "Implement T1"], {
+        cwd: ctx.worktreeDir,
+      });
+      return { ok: true, taskId: ctx.taskId };
+    };
+
+    const wardenRunner = async (ctx: WardenReviewContext) => {
+      seenFocus = ctx.reviewFocus;
+      return buildVerdictRecord(ctx.candidateSha, {
+        diff: ctx.diff,
+        candidateSha256: ctx.candidateSha256,
+        tree: ctx.candidateTree,
+        install: { ok: true, ref: "cmd:install" },
+        build: { ok: true, ref: "cmd:build" },
+        accept: { ok: true, ref: "cmd:accept", exitCode: 0 },
+        tests: { ok: true, ref: "cmd:tests" },
+        noTestWeakening: true,
+      });
+    };
+
+    const dispatcher = new TaskDispatcher({
+      runId,
+      scheduler,
+      gitService,
+      host,
+      runDir: repo.runsDir,
+      gitDir: repo.gitDir,
+      baseSha: repo.baseSha,
+      workerRunner,
+      wardenRunner,
+      pollIntervalMs: 5,
+    });
+    holder.dispatcher = dispatcher;
+
+    await dispatcher.step();
+    assert.deepEqual(seenFocus, ["verify rollback path"]);
+  });
+
+  it("forwards addReviewFocus to the injected warden reviewer candidate", async () => {
+    const { runStore, eventStore } = makeStores();
+    const runId = "run-focus-warden-reviewer";
+    makeRun(runStore, runId);
+    const repo = createGitRepo(runId);
+    const host = makeRealHost({ runStore, eventStore });
+    const gitService = new GitService({ runsDir: repo.runsDir });
+
+    const tasks = parsePact(
+      `- [ ] T1. Repair add()\n  - role: bonesetter\n  - files: index.js\n  - accept: npm test\n`
+    ).tasks;
+    const scheduler = new Scheduler({
+      pact: renderPact(tasks),
+      tasks,
+      runId,
+      approvedTaskIds: ["T1"],
+      pactApproved: true,
+      runParallelCap: 1,
+    });
+
+    const skeletonId = "skeleton-T1";
+    const holder: { dispatcher?: TaskDispatcher } = {};
+    let seenFocus: string[] | undefined;
+
+    const workerRunner = async (ctx: WorkerContext) => {
+      assert.equal(
+        await holder.dispatcher!.addReviewFocus(
+          skeletonId,
+          "verify rollback path"
+        ),
+        true
+      );
+      fs.writeFileSync(
+        path.join(ctx.worktreeDir, "index.js"),
+        "module.exports = 2;\n",
+        "utf8"
+      );
+      childProcess.execFileSync("git", ["add", "index.js"], {
+        cwd: ctx.worktreeDir,
+      });
+      childProcess.execFileSync("git", ["commit", "-m", "Implement T1"], {
+        cwd: ctx.worktreeDir,
+      });
+      return { ok: true, taskId: ctx.taskId };
+    };
+
+    // The injected `wardenReviewer` sees the candidate (2nd argument) with the
+    // recorded review focus attached.
+    const wardenReviewer = async (_run: unknown, candidate: any) => {
+      seenFocus = candidate.reviewFocus;
+      return buildVerdictRecord(candidate.candidateSha, {
+        diff: candidate.diff,
+        candidateSha256: candidate.candidateSha256,
+        tree: candidate.tree,
+        install: { ok: true, ref: "cmd:install" },
+        build: { ok: true, ref: "cmd:build" },
+        accept: { ok: true, ref: "cmd:accept", exitCode: 0 },
+        tests: { ok: true, ref: "cmd:tests" },
+        noTestWeakening: true,
+      });
+    };
+
+    const dispatcher = new TaskDispatcher({
+      runId,
+      scheduler,
+      gitService,
+      host,
+      runDir: repo.runsDir,
+      gitDir: repo.gitDir,
+      baseSha: repo.baseSha,
+      workerRunner,
+      wardenReviewer,
+      pollIntervalMs: 5,
+    });
+    holder.dispatcher = dispatcher;
+
+    await dispatcher.step();
+    assert.deepEqual(seenFocus, ["verify rollback path"]);
+  });
+
+  it("steers the default Warden supervisor with the recorded review focus", async () => {
+    const { runStore, eventStore } = makeStores();
+    const runId = "run-focus-default-warden";
+    makeRun(runStore, runId);
+    const runsDir = makeTempDir();
+    const host = makeRealHost({ runStore, eventStore });
+    const skeletonId = "skeleton-T1";
+    const { scheduler, dispatcher } = makeDispatcherWithActiveSkeleton(
+      runId,
+      { runStore, eventStore },
+      host,
+      runsDir,
+      skeletonId
+    );
+
+    const steered: string[] = [];
+    (host as unknown as { createSupervisor: unknown }).createSupervisor = () => ({
+      raise: async () => {},
+      steer: async (text: string) => {
+        steered.push(text);
+      },
+      finish: async () => {},
+    });
+
+    const task = scheduler.getTask("T1")!;
+    const candidate = {
+      diff: "diff --git a/index.js b/index.js\n",
+      candidateSha: "a".repeat(40),
+      candidateSha256: "b".repeat(64),
+      tree: "c".repeat(40),
+    };
+
+    await (
+      dispatcher as unknown as {
+        defaultWardenReview: (
+          t: unknown,
+          c: unknown,
+          a: string,
+          w: string,
+          f?: string[]
+        ) => Promise<unknown>;
+      }
+    ).defaultWardenReview(task, candidate, "npm test", path.join(runsDir, "wt"), [
+      "verify rollback path",
+    ]);
+
+    assert.equal(steered.length, 1);
+    assert.match(steered[0], /verify rollback path/);
+  });
+
 });
 

@@ -97,6 +97,8 @@ export interface WardenReviewContext {
   candidateTree?: string;
   expectedIntegrationHeadSha: string;
   acceptanceCommand: string;
+  /** Review focus recorded for this Skeleton's Warden review, if any. */
+  reviewFocus?: string[];
   supervisor?: SkeletonSupervisor;
   emitEvent: (event: EventInput) => EventEnvelope | void | Promise<void>;
   signal?: AbortSignal;
@@ -253,6 +255,12 @@ export class TaskDispatcher {
    * cannot exit while a restarted pipeline is still executing.
    */
   private readonly pipelinePromises: Map<string, Promise<void>> = new Map();
+  /**
+   * Task ids whose `reraiseSkeleton` is currently claimed. Claimed
+   * synchronously before any await, so two concurrent re-raises of the same
+   * Skeleton can never both restart its pipeline.
+   */
+  private readonly reraisingTasks: Set<string> = new Set();
   private readonly eventStore?: EventStore | any;
 
   private mergeLock: Promise<void> = Promise.resolve();
@@ -420,16 +428,16 @@ export class TaskDispatcher {
   }
 
   /**
-   * Moves an interrupted task cleanly out of `"running"` (to `"rejected"`, from
-   * which a `reraiseSkeleton` can re-queue it) without consuming an attempt.
-   * A task that is not currently running is left untouched.
+   * Moves an interrupted task cleanly out of `"running"` or `"in_review"` (to
+   * `"rejected"`, from which a `reraiseSkeleton` can re-queue it) without
+   * consuming an attempt. A task that is not currently live is left untouched.
    */
   private transitionTaskOutOfRunning(
     active: ActiveTaskTracking,
     reason: string
   ): void {
     const live = this.scheduler.getTask(active?.taskId);
-    if (!live || live.state !== "running") {
+    if (!live || (live.state !== "running" && live.state !== "in_review")) {
       return;
     }
     try {
@@ -441,8 +449,10 @@ export class TaskDispatcher {
 
   /**
    * Lays a tracked task to rest in the scheduler, abandoning it cleanly from a
-   * running or ready state. Other states (including terminal ones) are left as
-   * they are.
+   * running, ready, in-review or rejected state. `in_review` cannot reach
+   * `"abandoned"` directly, so it walks the legal path
+   * `in_review -> rejected -> ready -> abandoned`. Other states (including
+   * terminal ones) are left as they are.
    */
   private abandonTrackedTask(active: ActiveTaskTracking, reason: string): void {
     const live = this.scheduler.getTask(active?.taskId);
@@ -455,7 +465,52 @@ export class TaskDispatcher {
       } catch {
         // The slot release must still proceed even if the move is refused.
       }
+      return;
     }
+    if (live.state === "in_review") {
+      try {
+        this.scheduler.rejectTask(live.id, { reason, retry: false });
+        this.scheduler.retryTask(live.id);
+        this.scheduler.layToRest(live.id, reason);
+      } catch {
+        // The slot release must still proceed even if the move is refused.
+      }
+      return;
+    }
+    if (live.state === "rejected") {
+      try {
+        this.scheduler.retryTask(live.id);
+        this.scheduler.layToRest(live.id, reason);
+      } catch {
+        // The slot release must still proceed even if the move is refused.
+      }
+    }
+  }
+
+  /**
+   * Settles a pipeline that was cancelled while holding (or waiting for) the
+   * merge lock. The interrupt / lay-to-rest / stop handler has already moved
+   * the task out of `"running"` and released its slot, so this only cleans up
+   * (or keeps, for a re-raise) the worktree and makes sure the stale slot is
+   * gone. It must never call `retryTask` / `failTask`: that would overwrite the
+   * `"abandoned"` or `"rejected"` state the control recorded.
+   */
+  private async settleCancelledPipeline(
+    active: ActiveTaskTracking,
+    worktreeRes: TaskWorktreeResult
+  ): Promise<void> {
+    if (this.shouldPreserveWorktreeOnAbort(active)) {
+      // Keep the worktree (and the commits on its branch) so a later
+      // `reraiseSkeleton` resumes this work in place instead of recreating it.
+      active.preserveWorktree = true;
+      this.preservedWorktrees.set(active.taskId, worktreeRes);
+    } else {
+      // A `discard` lay-to-rest and a stop clean the worktree up as before.
+      active.preserveWorktree = false;
+      this.preservedWorktrees.delete(active.taskId);
+      await this.cleanupWorktree(worktreeRes.worktreeDir, active.taskId);
+    }
+    this.releaseActiveSkeletonSlot(active);
   }
 
   /**
@@ -519,68 +574,88 @@ export class TaskDispatcher {
     if (!active) {
       return false;
     }
-    if (active.supervisor && typeof active.supervisor.raise === "function") {
-      try {
-        await active.supervisor.raise();
-      } catch {
-        // A raise failure leaves the task tracked; the control is still
-        // considered delivered so the operator can retry.
-      }
-    }
-    // Re-queue the interrupted task: a rejected task returns to ready and a
-    // ready task is dispatched back to running.
-    const live = this.scheduler.getTask(active.taskId);
-    if (!live) {
+    // Synchronous claim before any await: two concurrent re-raises must never
+    // both restart the same task, and an already-live (non-aborted) slot must
+    // refuse a second re-raise.
+    if (this.reraisingTasks.has(active.taskId)) {
       return false;
     }
+    const currentSlot = this.activeTasks.get(active.taskId);
+    if (currentSlot && !currentSlot.abortController.signal.aborted) {
+      return false;
+    }
+    this.reraisingTasks.add(active.taskId);
     try {
-      if (live.state === "rejected") {
-        this.scheduler.retryTask(live.id);
+      if (active.supervisor && typeof active.supervisor.raise === "function") {
+        try {
+          await active.supervisor.raise();
+        } catch {
+          // A raise failure leaves the task tracked; the control is still
+          // considered delivered so the operator can retry.
+        }
       }
-      if (live.state === "ready") {
-        this.scheduler.dispatchTask(live.id);
+      // Re-queue the interrupted task: a rejected task returns to ready and a
+      // ready task is dispatched back to running. A task that is already
+      // running (or terminal) is refused so a second pipeline is never spawned.
+      const live = this.scheduler.getTask(active.taskId);
+      if (!live) {
+        return false;
       }
-    } catch {
-      // The state check below fails closed if the move was refused.
-    }
-    if (live.state !== "running" || this.isStoppedState || this.scheduler.isStopRequested) {
-      return false;
-    }
+      const stateBeforeReraise = live.state;
+      if (stateBeforeReraise !== "rejected" && stateBeforeReraise !== "ready") {
+        return false;
+      }
+      try {
+        if (live.state === "rejected") {
+          this.scheduler.retryTask(live.id);
+        }
+        if (live.state === "ready") {
+          this.scheduler.dispatchTask(live.id);
+        }
+      } catch {
+        // The state check below fails closed if the move was refused.
+      }
+      if (live.state !== "running" || this.isStoppedState || this.scheduler.isStopRequested) {
+        return false;
+      }
 
-    // Wait for any in-flight (cancelled) pipeline cleanup before restarting, so
-    // worktree handling cannot race the aborted run.
-    const inFlight = this.pipelinePromises.get(active.taskId);
-    if (inFlight) {
-      await inFlight.catch(() => {});
+      // Wait for any in-flight (cancelled) pipeline cleanup before restarting, so
+      // worktree handling cannot race the aborted run.
+      const inFlight = this.pipelinePromises.get(active.taskId);
+      if (inFlight) {
+        await inFlight.catch(() => {});
+      }
+      if (this.isStoppedState || this.scheduler.isStopRequested) {
+        return false;
+      }
+
+      // Never leave the stale aborted AbortController on the slot: a fresh
+      // controller plus a restarted pipeline is what makes the task live again.
+      // The same tracking object is reused so recorded `instructions`,
+      // `reviewFocus` and the Skeleton id survive the re-raise.
+      const abortController = new AbortController();
+      active.task = live;
+      active.abortController = abortController;
+      active.startedAt = Date.now();
+      this.activeTasks.set(active.taskId, active);
+      this.rememberSkeletonTask(active);
+      this.emitControlEvent(active, "reraise");
+
+      const preserved = this.preservedWorktrees.get(active.taskId);
+      void this.executeTaskPipeline(live, {
+        tracking: active,
+        preservedWorktree: preserved,
+      });
+
+      const slot = this.activeTasks.get(active.taskId);
+      return (
+        slot !== undefined &&
+        slot.abortController === abortController &&
+        !abortController.signal.aborted
+      );
+    } finally {
+      this.reraisingTasks.delete(active.taskId);
     }
-    if (this.isStoppedState || this.scheduler.isStopRequested) {
-      return false;
-    }
-
-    // Never leave the stale aborted AbortController on the slot: a fresh
-    // controller plus a restarted pipeline is what makes the task live again.
-    // The same tracking object is reused so recorded `instructions`,
-    // `reviewFocus` and the Skeleton id survive the re-raise.
-    const abortController = new AbortController();
-    active.task = live;
-    active.abortController = abortController;
-    active.startedAt = Date.now();
-    this.activeTasks.set(active.taskId, active);
-    this.rememberSkeletonTask(active);
-    this.emitControlEvent(active, "reraise");
-
-    const preserved = this.preservedWorktrees.get(active.taskId);
-    void this.executeTaskPipeline(live, {
-      tracking: active,
-      preservedWorktree: preserved,
-    });
-
-    const slot = this.activeTasks.get(active.taskId);
-    return (
-      slot !== undefined &&
-      slot.abortController === abortController &&
-      !abortController.signal.aborted
-    );
   }
 
   /**
@@ -1162,17 +1237,7 @@ export class TaskDispatcher {
         activeTracking,
         this.stopReason ?? "Skeleton interrupted"
       );
-      if (this.shouldPreserveWorktreeOnAbort(activeTracking)) {
-        // Keep the worktree (and the commits on its branch) so a later
-        // `reraiseSkeleton` resumes this work in place instead of recreating it.
-        activeTracking.preserveWorktree = true;
-        this.preservedWorktrees.set(task.id, worktreeRes);
-      } else {
-        activeTracking.preserveWorktree = false;
-        this.preservedWorktrees.delete(task.id);
-        await this.cleanupWorktree(worktreeRes.worktreeDir, task.id);
-      }
-      this.releaseActiveSkeletonSlot(activeTracking);
+      await this.settleCancelledPipeline(activeTracking, worktreeRes);
       return;
     }
 
@@ -1216,6 +1281,13 @@ export class TaskDispatcher {
     }
 
     await this.withMergeLock(async () => {
+      if (abortController.signal.aborted || this.isStoppedState) {
+        // A lay-to-rest / interrupt / stop landed while the task was waiting for
+        // the merge lock: never touch git and never merge.
+        await this.settleCancelledPipeline(activeTracking, worktreeRes);
+        return;
+      }
+
       let expectedHeadSha: string;
       try {
         expectedHeadSha = await this.getIntegrationHeadSha();
@@ -1259,6 +1331,13 @@ export class TaskDispatcher {
         candidate: any,
         acceptanceCommand: string
       ): Promise<WardenVerdictRecord> => {
+        // A cancellation must fail closed before the reviewer runs.
+        if (abortController.signal.aborted || this.isStoppedState) {
+          throw new Error("Task cancelled before Warden review");
+        }
+        const reviewFocus = activeTracking.reviewFocus?.length
+          ? [...activeTracking.reviewFocus]
+          : undefined;
         if (this.options.wardenRunner) {
           const wardenCtx: WardenReviewContext = {
             task,
@@ -1275,28 +1354,41 @@ export class TaskDispatcher {
             candidateTree: candidate.tree,
             expectedIntegrationHeadSha: expectedHeadSha,
             acceptanceCommand,
+            ...(reviewFocus ? { reviewFocus } : {}),
             emitEvent: (evt) => this.emitEvent(evt),
             signal: abortController.signal,
           };
           const rawResult = await this.options.wardenRunner(wardenCtx);
+          // A cancellation that landed during review must never proceed to merge.
+          if (abortController.signal.aborted || this.isStoppedState) {
+            throw new Error("Task cancelled during Warden review");
+          }
           return this.normalizeVerdictRecord(rawResult, candidate);
         }
 
         if (this.options.wardenReviewer) {
           const rawResult = await this.options.wardenReviewer(
             run,
-            candidate,
+            reviewFocus ? { ...candidate, reviewFocus } : candidate,
             acceptanceCommand
           );
+          if (abortController.signal.aborted || this.isStoppedState) {
+            throw new Error("Task cancelled during Warden review");
+          }
           return this.normalizeVerdictRecord(rawResult, candidate);
         }
 
-        return await this.defaultWardenReview(
+        const rawResult = await this.defaultWardenReview(
           task,
           candidate,
           acceptanceCommand,
-          worktreeRes.worktreeDir
+          worktreeRes.worktreeDir,
+          reviewFocus
         );
+        if (abortController.signal.aborted || this.isStoppedState) {
+          throw new Error("Task cancelled during Warden review");
+        }
+        return rawResult;
       };
 
       const allowList =
@@ -1328,9 +1420,32 @@ export class TaskDispatcher {
         wardenReviewer: wrappedWardenReviewer,
         scheduler: this.scheduler,
         eventStore: this.eventStore,
+        signal: abortController.signal,
       };
 
-      const submitResult = await onSubmit(submissionReport);
+      let submitResult: CandidateSubmissionResult;
+      try {
+        submitResult = await onSubmit(submissionReport);
+      } catch (err: any) {
+        if (abortController.signal.aborted || this.isStoppedState) {
+          // The reviewer refused a cancelled candidate: never retry or fail the
+          // task - the control already recorded "abandoned" / "rejected".
+          await this.settleCancelledPipeline(activeTracking, worktreeRes);
+          return;
+        }
+        throw err;
+      }
+
+      if (
+        !submitResult.merged &&
+        (abortController.signal.aborted || this.isStoppedState)
+      ) {
+        // The candidate was cancelled after review and onSubmit refused to
+        // merge. Do NOT call retryTask / failTask: that would overwrite the
+        // "abandoned" / "rejected" state the interrupt / lay-to-rest recorded.
+        await this.settleCancelledPipeline(activeTracking, worktreeRes);
+        return;
+      }
 
       if (submitResult.merged) {
         this.tasksMerged++;
@@ -1444,7 +1559,8 @@ export class TaskDispatcher {
     task: ScheduledTask,
     candidate: any,
     acceptanceCommand: string,
-    worktreeDir: string
+    worktreeDir: string,
+    reviewFocus?: string[]
   ): Promise<WardenVerdictRecord> {
     const cleanTaskId = task.id.replace(/[^A-Za-z0-9_.-]/g, "_");
     const skeletonId = `warden-${cleanTaskId}-${Date.now()}`;
@@ -1640,6 +1756,22 @@ export class TaskDispatcher {
             await supervisor.raise();
           } catch {
             // kiro-cli ACP might not be available in tests; proceed to evaluate checks
+          }
+        }
+        // Forward the recorded review focus to the Warden's live turn. Steering
+        // is best-effort: a supervisor without a live ACP (or without a `steer`
+        // method) must not break the deterministic review that follows.
+        if (
+          reviewFocus?.length &&
+          supervisor &&
+          typeof supervisor.steer === "function"
+        ) {
+          try {
+            await supervisor.steer(
+              `Focus the review on: ${reviewFocus.join("; ")}`
+            );
+          } catch {
+            // A failed steer leaves the review focus recorded but unforwarded.
           }
         }
       }

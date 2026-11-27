@@ -147,6 +147,12 @@ export interface CandidateSubmissionReport {
   currentHeadSha?: string;
   acceptanceCommand?: string;
   accept?: string;
+  /**
+   * When present, a cancelled task (interrupt / lay-to-rest / stop) fails the
+   * submission closed: the Warden reviewer is never invoked and the candidate
+   * is never merged once the signal is aborted.
+   */
+  signal?: AbortSignal;
   // Documented test doubles (Requirement B-1, B-2)
   wardenReviewer?: (
     run: any,
@@ -1177,6 +1183,22 @@ export async function onSubmit(
       taskObj?.accept ??
       "";
 
+    // A cancellation (interrupt / lay-to-rest / stop) must fail closed: never
+    // invoke the Warden reviewer for a task whose pipeline was cancelled.
+    if (report.signal?.aborted) {
+      const reason = "Task cancelled before review";
+      return {
+        ok: false,
+        merged: false,
+        state: "in_review",
+        reason,
+        reasons: [reason],
+        scopeResult,
+        redactorResult,
+        gateResult,
+      };
+    }
+
     const reviewer =
       report.wardenReviewer ??
       report.warden?.review ??
@@ -1587,6 +1609,23 @@ export async function onSubmit(
     // -------------------------------------------------------------------------
     // Step 9: Git-merge the candidate into the integration branch (B-3)
     // -------------------------------------------------------------------------
+    // A cancellation between review and merge must fail closed: never call
+    // mergeCandidate and never emit `task.merged` for a cancelled task.
+    if (report.signal?.aborted) {
+      const reason = "Task cancelled before merge";
+      return {
+        ok: false,
+        merged: false,
+        state: "in_review",
+        reason,
+        reasons: [reason],
+        scopeResult,
+        redactorResult,
+        gateResult,
+        verdict,
+      };
+    }
+
     let mergeResult: MergeCandidateResult;
     try {
       // mergeCandidate is module-private in GitService (verified merge proof);
