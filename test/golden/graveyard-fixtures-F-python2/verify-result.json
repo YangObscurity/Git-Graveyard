@@ -1,0 +1,17 @@
+{
+  "owner": "graveyard-fixtures",
+  "repo": "F-python2",
+  "sha": "c0837770710cb4d11e1544553c828cbe1dd30635349b1782f7bdb6a49fd9addc",
+  "gate": "syntax",
+  "ok": true,
+  "engineVersion": "7f5f8996aad628ab79d498f990bec4c9fbd89a9d9fc64431e3bf1b5ae0f733b8",
+  "signals": 9,
+  "patchSteps": 3,
+  "revertedSteps": 0,
+  "unknowns": 2,
+  "pythonLabels": {
+    "legacy/compat.py": "m1-partial",
+    "legacy/report.py": "m1-clean",
+    "setup.py": "m1-clean"
+  }
+}
