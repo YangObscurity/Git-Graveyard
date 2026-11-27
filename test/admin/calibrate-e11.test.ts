@@ -28,6 +28,7 @@ import {
   APPLY_REQUIRES_STORE_MESSAGE,
   DEFAULT_CALIBRATION_ACTOR,
   analyzeRecordedRunsForCalibration,
+  extractVerdictTaskId,
   formatCalibrationMarkdown,
   loadCompletedRunsFromEventStore,
   loadRecordedRunsFromDir,
@@ -1721,6 +1722,116 @@ describe("event pairing & ordering", () => {
       "zzz-run-early",
       "aaa-run-late",
     ]);
+  });
+});
+
+
+describe("calibrate-e11 — gateway verdict task-target normalization", () => {
+  function verdictRun(runId: string, verdicts: Array<Record<string, unknown>>): CalibrationSourceRun {
+    return mkRun(runId, [
+      { seq: 1, ts: 1_000_000, kind: "run.phase", data: { from: "queued", to: "exhume" } },
+      ...verdicts.map((data, index) => ({
+        seq: index + 2,
+        ts: 1_010_000 + index * 1_000,
+        kind: "verdict",
+        actor: "warden",
+        data,
+      })),
+      { seq: verdicts.length + 2, ts: 1_500_000, kind: "run.done", data: { outcome: "resurrected" } },
+    ]);
+  }
+
+  it("recovers task IDs from data.target for gateway verdicts without taskId", () => {
+    const run = verdictRun("gw-targets", [
+      { target: "T1", verdict: "reject" },
+      { target: "task:T2", verdict: "reject" },
+    ]);
+
+    const metric = analyzeRecordedRunsForCalibration([run]).wardenRejectionRoundsPerTask;
+    assert.equal(metric.status, "available");
+    // Two distinct tasks, one rejection each: not a single collapsed [2] sample.
+    assert.deepEqual([...metric.samples].sort((a, b) => a - b), [1, 1]);
+    assert.equal(metric.count, 2);
+    assert.equal(metric.max, 1);
+  });
+
+  it("excludes non-task gateway verdict targets from wardenRounds", () => {
+    const run = verdictRun("gw-non-task", [
+      { target: "final_check", verdict: "reject" },
+      { target: "run", verdict: "reject" },
+      { target: "0123456789abcdef0123456789abcdef01234567", verdict: "reject" },
+      { target: "T1", verdict: "reject" },
+    ]);
+
+    const metric = analyzeRecordedRunsForCalibration([run]).wardenRejectionRoundsPerTask;
+    assert.equal(metric.status, "available");
+    // Only the "T1" verdict is a task verdict; the run-level rejects are ignored.
+    assert.deepEqual(metric.samples, [1]);
+    assert.equal(metric.max, 1);
+  });
+
+  it("reports wardenRounds as not available when only non-task verdicts exist", () => {
+    const run = verdictRun("gw-only-non-task", [
+      { target: "final_check", verdict: "reject" },
+      { target: "run", verdict: "reject" },
+      { target: "0123456789abcdef0123456789abcdef01234567", verdict: "reject" },
+    ]);
+
+    const metric = analyzeRecordedRunsForCalibration([run]).wardenRejectionRoundsPerTask;
+    assert.equal(metric.status, "not available");
+    assert.equal(metric.max, null);
+    assert.deepEqual(metric.samples, []);
+  });
+
+  it("normalizes task: prefixes and rejects run-level target shapes", () => {
+    function verdictEvent(data: Record<string, unknown>, taskId?: string): EventEnvelope {
+      const envelope: EventEnvelope = {
+        runId: "r",
+        seq: 1,
+        ts: 0,
+        kind: "verdict",
+        actor: "warden",
+        data: { refs: [], ...data },
+      };
+      if (taskId !== undefined) {
+        envelope.taskId = taskId;
+      }
+      return envelope;
+    }
+
+    assert.equal(extractVerdictTaskId(verdictEvent({ target: "T1" })), "T1");
+    assert.equal(extractVerdictTaskId(verdictEvent({ target: "  T1  " })), "T1");
+    assert.equal(extractVerdictTaskId(verdictEvent({ target: "task:T2" })), "T2");
+    assert.equal(extractVerdictTaskId(verdictEvent({ target: "TASK: T3" })), "T3");
+    // An explicit taskId (envelope or data) wins over the target.
+    assert.equal(extractVerdictTaskId(verdictEvent({ target: "T1" }, "task:t9")), "t9");
+    assert.equal(extractVerdictTaskId(verdictEvent({ target: "T1", taskId: "t8" })), "t8");
+
+    // Run-level / non-task target shapes resolve to null.
+    for (const target of [
+      "final",
+      "final_check",
+      "run",
+      "integration",
+      "pact",
+      "report",
+      "gate",
+      "summary",
+      "run:abc",
+      "final:1",
+      "report:daily",
+      "pact:rev-2",
+      "branch:wave/1",
+      "FINAL_CHECK",
+      "0123456789abcdef0123456789abcdef01234567",
+    ]) {
+      assert.equal(extractVerdictTaskId(verdictEvent({ target })), null, `target ${target}`);
+    }
+
+    // No task ID anywhere, or an empty/blank one, resolves to null.
+    assert.equal(extractVerdictTaskId(verdictEvent({})), null);
+    assert.equal(extractVerdictTaskId(verdictEvent({}, "   ")), null);
+    assert.equal(extractVerdictTaskId(verdictEvent({ taskId: "" })), null);
   });
 });
 
