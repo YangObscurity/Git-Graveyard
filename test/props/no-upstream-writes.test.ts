@@ -123,6 +123,8 @@ describe("Property 15: No upstream writes (pushToFork)", () => {
         async (runId, sOwner, sRepo, fOwner, fRepo, phase) => {
           const sourceUrl = `https://github.com/${sOwner}/${sRepo}`;
           const forkUrl = `https://github.com/${fOwner}/${fRepo}`;
+          // Independent gate tests must use a real distinct fork target.
+          fc.pre(sourceUrl !== forkUrl);
           const service = new GitService({ ownerLogin: fOwner, sourceRepoUrl: sourceUrl });
           const common = {
             targetRepoUrl: forkUrl,
@@ -221,6 +223,8 @@ describe("Property 15: No upstream writes (pushToFork)", () => {
             reset();
             const sourceUrl = `https://github.com/${sOwner}/${sRepo}`;
             const forkUrl = `https://github.com/${fOwner}/${fRepo}`;
+            // Independent gate tests must use a real distinct fork target.
+            fc.pre(sourceUrl !== forkUrl);
             const service = new GitService({
               ownerLogin: fOwner,
               sourceRepoUrl: sourceUrl,
