@@ -1,0 +1,105 @@
+{
+  "signals": [
+    {
+      "ruleId": "M1",
+      "file": "legacy/compat.py",
+      "line": 6,
+      "column": 4,
+      "matched": "print",
+      "confidence": "high",
+      "manifestDir": "."
+    },
+    {
+      "ruleId": "M1",
+      "file": "legacy/compat.py",
+      "line": 7,
+      "column": 13,
+      "matched": "<>",
+      "confidence": "high",
+      "manifestDir": "."
+    },
+    {
+      "ruleId": "M1",
+      "file": "legacy/report.py",
+      "line": 8,
+      "column": 28,
+      "matched": ".iteritems(",
+      "confidence": "medium",
+      "manifestDir": "."
+    },
+    {
+      "ruleId": "M1",
+      "file": "legacy/report.py",
+      "line": 11,
+      "column": 8,
+      "matched": "print",
+      "confidence": "high",
+      "manifestDir": "."
+    },
+    {
+      "ruleId": "M1",
+      "file": "legacy/report.py",
+      "line": 13,
+      "column": 8,
+      "matched": "print",
+      "confidence": "high",
+      "manifestDir": "."
+    },
+    {
+      "ruleId": "M1",
+      "file": "legacy/report.py",
+      "line": 20,
+      "column": 4,
+      "matched": "except ValueError, err:",
+      "confidence": "high",
+      "manifestDir": "."
+    },
+    {
+      "ruleId": "M1",
+      "file": "legacy/report.py",
+      "line": 21,
+      "column": 8,
+      "matched": "print",
+      "confidence": "high",
+      "manifestDir": "."
+    },
+    {
+      "ruleId": "M6",
+      "file": "pyproject.toml",
+      "line": 1,
+      "column": 1,
+      "matched": "missing lock file",
+      "confidence": "high",
+      "manifestDir": "."
+    },
+    {
+      "ruleId": "M1",
+      "file": "setup.py",
+      "line": 5,
+      "column": 4,
+      "matched": "print",
+      "confidence": "high",
+      "manifestDir": "."
+    }
+  ],
+  "verdict": {
+    "status": "dead",
+    "deadReasons": [
+      "deprecation_signal"
+    ],
+    "reasons": [
+      "deprecation_signal"
+    ],
+    "lifespanYears": "unknown",
+    "yearsDead": 0,
+    "asOf": "2026-11-08T00:00:00.000Z"
+  },
+  "unknowns": [
+    {
+      "ruleId": "M1",
+      "reason": "py2_residue",
+      "file": "legacy/compat.py",
+      "line": 7
+    }
+  ]
+}
