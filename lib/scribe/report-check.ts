@@ -124,9 +124,6 @@ export class EvidenceIndex {
     if (trimmed.length === 0) {
       return false;
     }
-    if (this.rawMarkers.has(trimmed)) {
-      return true;
-    }
     const colon = trimmed.indexOf(":");
     if (colon <= 0) {
       return false;
@@ -355,8 +352,15 @@ export function checkReading(
 ): ReportCheckResult {
   if (!reading || typeof reading !== "string" || reading.trim().length === 0) {
     return {
-      passed: true,
-      unbackedClaims: [],
+      passed: false,
+      unbackedClaims: [
+        {
+          claim: "reading",
+          text: typeof reading === "string" ? reading : "",
+          reason:
+            "Empty or whitespace-only reading: the Scribe reading has no backed content",
+        },
+      ],
       checkedCount: 0,
       resolvedMarkers: [],
     };
@@ -423,6 +427,7 @@ export interface ReportCheckRetryOptions {
   readonly eventStore?: EventStore;
   readonly runId?: string;
   readonly actor?: string;
+  readonly redactor?: Redactor;
   readonly redactionOptions?: RedactionOptions;
 }
 
@@ -436,14 +441,55 @@ export interface ReportCheckRetryResult {
   readonly reportCheckedEvent: EventEnvelope | null;
 }
 
+function redactAllStringLeaves(
+  value: unknown,
+  seen: WeakSet<object> = new WeakSet()
+): unknown {
+  if (typeof value === "string") {
+    return "[REDACTED]";
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => redactAllStringLeaves(item, seen));
+  }
+  if (value !== null && typeof value === "object") {
+    if (seen.has(value)) {
+      return value;
+    }
+    seen.add(value);
+    const out: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      out[key] = redactAllStringLeaves(item, seen);
+    }
+    return out;
+  }
+  return value;
+}
+
+function redactReportCheckedData(
+  data: Record<string, unknown>,
+  redactor?: Redactor,
+  redactionOptions?: RedactionOptions
+): Record<string, unknown> {
+  const byOptions = redactEventData(data, redactionOptions);
+  if (!redactor || typeof redactor.redactEventData !== "function") {
+    return byOptions;
+  }
+  try {
+    return redactor.redactEventData(byOptions);
+  } catch {
+    return redactAllStringLeaves(byOptions) as Record<string, unknown>;
+  }
+}
+
 function emitReportChecked(
   eventStore: EventStore,
   runId: string,
   actor: string,
   data: Record<string, unknown>,
+  redactor?: Redactor,
   redactionOptions?: RedactionOptions
 ): EventEnvelope {
-  const redacted = redactEventData(data, redactionOptions);
+  const redacted = redactReportCheckedData(data, redactor, redactionOptions);
   return eventStore.append({
     runId,
     kind: "report.checked",
@@ -497,6 +543,7 @@ export async function runReportCheckWithRetry(
         readingLength: finalReading.length,
         refs: [],
       },
+      options.redactor,
       options.redactionOptions
     );
   };
@@ -641,7 +688,10 @@ function toInstallRow(
   const error = value.error ?? value.stderr ?? value.message ?? "";
   const row: InstallErrorRow = {
     context,
-    command: value.command ?? null,
+    command:
+      value.command !== undefined && value.command !== null
+        ? redactInstallText(String(value.command), redactor, redactionOptions)
+        : null,
     exitCode: typeof value.exitCode === "number" ? value.exitCode : null,
     error: redactInstallText(String(error), redactor, redactionOptions),
     ref: value.ref ?? null,

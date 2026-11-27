@@ -16,6 +16,35 @@ import {
 
 export const SECURITY_CONTAINMENT_EVENT_KIND = "security.containment";
 
+/**
+ * Fail-closed redaction helper: replaces every string leaf value with the
+ * redaction mask. Used when a caller-supplied redactor throws so no partial,
+ * unredacted data can ever be returned.
+ */
+function redactAllStringLeaves(
+  value: unknown,
+  seen: WeakSet<object> = new WeakSet()
+): unknown {
+  if (typeof value === "string") {
+    return "[REDACTED]";
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => redactAllStringLeaves(item, seen));
+  }
+  if (value !== null && typeof value === "object") {
+    if (seen.has(value)) {
+      return value;
+    }
+    seen.add(value);
+    const out: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      out[key] = redactAllStringLeaves(item, seen);
+    }
+    return out;
+  }
+  return value;
+}
+
 export type PrePromptBlockReason = "model_mismatch" | "gateway_missing";
 
 export interface PrePromptInvariantsInput {
@@ -203,7 +232,9 @@ export class FailureRecoveryHandler {
     try {
       return redactor.redactEventData(byOptions);
     } catch {
-      return byOptions;
+      // Fail closed: if the injected redactor throws, redact every string leaf
+      // rather than returning partially redacted data.
+      return redactAllStringLeaves(byOptions) as Record<string, unknown>;
     }
   }
 
@@ -386,7 +417,10 @@ export class FailureRecoveryHandler {
 
     const completed = new Set<string>();
     for (const [id, state] of states.entries()) {
-      if (state === "merged" || state === "skipped" || state === "abandoned" || state === "failed") {
+      // Only a merged task (or a task skipped under the rejection policy) may
+      // unblock its dependents. "failed" and "abandoned" dependencies stay
+      // blocked so downstream work is never dispatched on incomplete input.
+      if (state === "merged" || state === "skipped") {
         completed.add(id);
       }
     }
@@ -469,6 +503,8 @@ export class FailureRecoveryHandler {
     let requestedSteps = 0;
     let succeededSteps = 0;
 
+    let finalWorktreeDir: string | null = input.worktreeDir ?? null;
+
     const stopProcess = this.deps.stopProcess;
     if (typeof stopProcess === "function") {
       requestedSteps++;
@@ -489,8 +525,10 @@ export class FailureRecoveryHandler {
 
     if (input.worktreeDir) {
       requestedSteps++;
-      if (this.containWorktreeOnDisk(input.worktreeDir, input)) {
+      const contained = this.containWorktreeOnDisk(input.worktreeDir, input);
+      if (contained !== null) {
         succeededSteps++;
+        finalWorktreeDir = contained;
       }
     }
 
@@ -504,7 +542,7 @@ export class FailureRecoveryHandler {
       data: this.redact({
         reason: input.reason,
         detail: input.detail ?? null,
-        worktree: input.worktreeDir ?? null,
+        worktree: finalWorktreeDir,
         isolated,
         mergeBlocked: true,
         refs: [],
@@ -517,69 +555,124 @@ export class FailureRecoveryHandler {
       isolated,
       mergeBlocked: true,
       reason: input.reason,
-      worktreeDir: input.worktreeDir ?? null,
+      worktreeDir: finalWorktreeDir,
       event,
     };
   }
 
   /**
-   * Performs real, best-effort on-disk containment for a quarantined worktree:
-   * writes a lock marker, restricts the worktree and its files to read-only, and
-   * moves it under the configured quarantine root when one is set. Returns false
-   * whenever a requested containment step cannot be completed.
+   * Performs real on-disk containment for a quarantined worktree: writes a
+   * symlink-safe lock marker, restricts the worktree and its files to read-only,
+   * and moves it under the configured quarantine root when one is set. Returns the
+   * final worktree path on success, or null whenever a requested containment step
+   * cannot be completed.
    */
   private containWorktreeOnDisk(
     worktreeDir: string,
     input: QuarantineWorktreeInput
-  ): boolean {
+  ): string | null {
+    let realWorktree: string;
     try {
-      let stat: fs.Stats;
+      // lstat does not follow the final path component, so a symlinked worktree
+      // root is rejected outright instead of being followed.
+      const lstat = fs.lstatSync(worktreeDir);
+      if (lstat.isSymbolicLink() || !lstat.isDirectory()) {
+        return null;
+      }
+      realWorktree = fs.realpathSync(worktreeDir);
+    } catch {
+      return null;
+    }
+
+    const quarantineRoot = input.quarantineRoot ?? this.deps.quarantineRoot;
+    const hasQuarantineRoot =
+      typeof quarantineRoot === "string" && quarantineRoot.trim().length > 0;
+
+    let realQuarantineRoot: string | null = null;
+    if (hasQuarantineRoot) {
       try {
-        stat = fs.statSync(worktreeDir);
+        fs.mkdirSync(quarantineRoot as string, { recursive: true });
+        realQuarantineRoot = fs.realpathSync(quarantineRoot as string);
       } catch {
-        return false;
+        return null;
       }
-      if (!stat.isDirectory()) {
-        return false;
+      // Refuse to quarantine the quarantine base onto itself.
+      if (realWorktree === realQuarantineRoot) {
+        return null;
+      }
+    }
+
+    try {
+      // Open the marker with O_NOFOLLOW so it is created as a brand-new file and
+      // a pre-existing symlink at that path is never followed (O_EXCL fails the
+      // open instead of writing through the link).
+      const markerPath = path.join(worktreeDir, ".QUARANTINED");
+      const markerFlags =
+        fs.constants.O_CREAT |
+        fs.constants.O_EXCL |
+        fs.constants.O_WRONLY |
+        (fs.constants.O_NOFOLLOW ?? 0);
+      let fd: number | null = null;
+      try {
+        fd = fs.openSync(markerPath, markerFlags, 0o444);
+        fs.writeSync(
+          fd,
+          JSON.stringify(
+            {
+              runId: input.runId,
+              skeletonId: input.skeletonId ?? null,
+              reason: input.reason,
+              quarantinedAt: this.now(),
+            },
+            null,
+            2
+          )
+        );
+      } finally {
+        if (fd !== null) {
+          fs.closeSync(fd);
+        }
       }
 
-      fs.writeFileSync(
-        path.join(worktreeDir, ".QUARANTINED"),
-        JSON.stringify(
-          {
-            runId: input.runId,
-            skeletonId: input.skeletonId ?? null,
-            reason: input.reason,
-            quarantinedAt: this.now(),
-          },
-          null,
-          2
-        ),
-        { mode: 0o444 }
-      );
-
-      this.makeWorktreeReadOnly(worktreeDir);
-
-      const quarantineRoot = input.quarantineRoot ?? this.deps.quarantineRoot;
-      if (typeof quarantineRoot === "string" && quarantineRoot.trim().length > 0) {
-        fs.mkdirSync(quarantineRoot, { recursive: true });
+      // A chmod failure must propagate so read-only containment fails loudly.
+      // The move happens first because a read-only directory cannot be renamed.
+      let finalPath = worktreeDir;
+      if (hasQuarantineRoot) {
+        const root = quarantineRoot as string;
         const target = path.join(
-          quarantineRoot,
+          root,
           `${path.basename(worktreeDir)}-${this.now()}`
         );
         fs.renameSync(worktreeDir, target);
+        finalPath = target;
         this.quarantinedWorktrees.add(target);
       }
 
-      return true;
+      this.makeWorktreeReadOnly(finalPath);
+
+      // Validate realpath containment so the moved worktree can never resolve
+      // outside the configured quarantine base.
+      if (hasQuarantineRoot && realQuarantineRoot !== null) {
+        const realTarget = fs.realpathSync(finalPath);
+        if (
+          realTarget !== realQuarantineRoot &&
+          !realTarget.startsWith(realQuarantineRoot + path.sep)
+        ) {
+          return null;
+        }
+      }
+
+      return finalPath;
     } catch {
-      return false;
+      return null;
     }
   }
 
   /**
-   * Best-effort recursive read-only permissions: files become 0444 and directories
-   * become 0555 so the quarantined worktree can no longer be modified in place.
+   * Recursive read-only permissions: files become 0444 and directories become
+   * 0555 so the quarantined worktree can no longer be modified in place. Symlinks
+   * are skipped entirely so their targets are never followed or chmodded, and any
+   * chmod failure propagates to the caller.
    */
   private makeWorktreeReadOnly(root: string): void {
     const dirs: string[] = [];
@@ -587,31 +680,23 @@ export class FailureRecoveryHandler {
     while (stack.length > 0) {
       const current = stack.pop() as string;
       dirs.push(current);
-      let entries: fs.Dirent[] = [];
-      try {
-        entries = fs.readdirSync(current, { withFileTypes: true });
-      } catch {
-        entries = [];
-      }
+      const entries = fs.readdirSync(current, { withFileTypes: true });
       for (const entry of entries) {
         const full = path.join(current, entry.name);
+        // Never follow or chmod a symlink; skip it so the link target outside the
+        // worktree is left untouched.
+        if (entry.isSymbolicLink()) {
+          continue;
+        }
         if (entry.isDirectory()) {
           stack.push(full);
         } else {
-          try {
-            fs.chmodSync(full, 0o444);
-          } catch {
-            // best effort only
-          }
+          fs.chmodSync(full, 0o444);
         }
       }
     }
     for (const dir of dirs) {
-      try {
-        fs.chmodSync(dir, 0o555);
-      } catch {
-        // best effort only
-      }
+      fs.chmodSync(dir, 0o555);
     }
   }
 

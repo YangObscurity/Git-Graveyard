@@ -207,6 +207,9 @@ test("report-check: a throwing retry is still invoked only once and drops the re
   });
   assert.equal(calls, 1);
   assert.equal(result.narrativeDropped, true);
+  assert.equal(result.reading, SCRIBE_NARRATIVE_FALLBACK_NOTICE);
+  assert.equal(result.fallbackNotice, SCRIBE_NARRATIVE_FALLBACK_NOTICE);
+  assert.equal(result.passed, false);
 });
 
 test("report-check: assigns the outcome with side-by-side baseline vs new install errors", () => {
@@ -374,5 +377,137 @@ test("report-check: a caller-supplied redactor is honored for install error text
   assert.equal(result.installComparison.hasInstallErrors, true);
   assert.ok(!String(result.installComparison.new?.error).includes(customSecret));
   assert.ok(String(result.installComparison.new?.error).includes("[REDACTED]"));
+});
+
+test("report-check: raw unsupported markers never resolve against the evidence index", () => {
+  const index = buildEvidenceIndex({
+    commandResults: [{ id: "build", ref: "bogus:x" }],
+    markers: ["bogus:x", "weird:y"],
+  });
+
+  assert.equal(index.resolve("bogus:x"), false);
+  assert.equal(index.resolve("weird:y"), false);
+
+  const reading = checkReading("Merged 5 tasks (bogus:x).", index);
+  assert.equal(reading.passed, false);
+  assert.ok(reading.unbackedClaims.length > 0);
+  assert.ok(!reading.resolvedMarkers.includes("bogus:x"));
+});
+
+test("report-check: an empty Scribe runner reading fails and substitutes the fallback notice", async () => {
+  const { runStore, eventStore } = makeStores();
+  runStore.createRun({
+    runId: "run-empty",
+    url: "https://github.com/owner/repo",
+    sha: "abcdef0123456789abcdef0123456789abcdef01",
+    phase: "report",
+  });
+  eventStore.append({
+    runId: "run-empty",
+    kind: "final_check.result",
+    actor: "test",
+    data: { installPassed: true, buildPassed: true, testsPassed: true, hasTests: true, refs: [] },
+  });
+
+  const service = new ScribeService({
+    runStore,
+    eventStore,
+    scribeRunner: () => "",
+  });
+  const result = await service.run({ runId: "run-empty" });
+
+  assert.equal(result.narrativeDropped, true);
+  assert.equal(result.scribeReading, SCRIBE_NARRATIVE_FALLBACK_NOTICE);
+  assert.equal(result.fallbackNotice, SCRIBE_NARRATIVE_FALLBACK_NOTICE);
+  assert.equal(result.reportCheck.passed, false);
+
+  // A runner that throws must also be treated as a failed reading.
+  runStore.createRun({
+    runId: "run-throws-runner",
+    url: "https://github.com/owner/repo",
+    sha: "abcdef0123456789abcdef0123456789abcdef01",
+    phase: "report",
+  });
+  eventStore.append({
+    runId: "run-throws-runner",
+    kind: "final_check.result",
+    actor: "test",
+    data: { installPassed: true, buildPassed: true, testsPassed: true, hasTests: true, refs: [] },
+  });
+  const throwingService = new ScribeService({
+    runStore,
+    eventStore,
+    scribeRunner: () => {
+      throw new Error("runner exploded");
+    },
+  });
+  const thrown = await throwingService.run({ runId: "run-throws-runner" });
+  assert.equal(thrown.narrativeDropped, true);
+  assert.equal(thrown.scribeReading, SCRIBE_NARRATIVE_FALLBACK_NOTICE);
+  assert.equal(thrown.reportCheck.passed, false);
+});
+
+test("report-check: install error command text is redacted alongside the error", () => {
+  const ghToken = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+
+  const result = assignRunOutcomeWithInstallComparison({
+    tasks: [{ id: "task-1", state: "merged" }],
+    finalCheck: { installPassed: false },
+    newInstallError: {
+      command: `npm ci --token ${ghToken}`,
+      exitCode: 1,
+      error: "install failed",
+    },
+  });
+
+  const command = String(result.installComparison.new?.command ?? "");
+  assert.ok(!command.includes(ghToken));
+  assert.ok(command.includes("[REDACTED]"));
+});
+
+test("report-check: ScribeService applies the injected redactor to installComparison and report.checked", async () => {
+  const { runStore, eventStore } = makeStores();
+  runStore.createRun({
+    runId: "run-svc-redactor",
+    url: "https://github.com/owner/repo",
+    sha: "abcdef0123456789abcdef0123456789abcdef01",
+    phase: "report",
+  });
+  eventStore.append({
+    runId: "run-svc-redactor",
+    kind: "final_check.result",
+    actor: "test",
+    data: { installPassed: true, buildPassed: true, testsPassed: true, hasTests: true, refs: [] },
+  });
+
+  const redactor = new Redactor({ autoRegisterEnvSecrets: false });
+  const secret = "scribe-custom-secret-xyz-987654";
+  redactor.registerSecret(secret);
+
+  const service = new ScribeService({
+    runStore,
+    eventStore,
+    redactor,
+    scribeRunner: () => `Build failed with ${secret} (cmd:missing).`,
+  });
+  const result = await service.run({
+    runId: "run-svc-redactor",
+    newInstallError: {
+      command: `npm ci --secret ${secret}`,
+      exitCode: 1,
+      error: `install failed with ${secret}`,
+    },
+  });
+
+  assert.equal(result.installComparison.hasInstallErrors, true);
+  assert.ok(!String(result.installComparison.new?.error).includes(secret));
+  assert.ok(!String(result.installComparison.new?.command).includes(secret));
+  assert.ok(String(result.installComparison.new?.error).includes("[REDACTED]"));
+
+  const events = eventStore.getEvents("run-svc-redactor", { kind: "report.checked" });
+  assert.equal(events.length, 1);
+  const serialized = JSON.stringify(events[0].data);
+  assert.ok(!serialized.includes(secret));
+  assert.ok(serialized.includes("[REDACTED]"));
 });
 

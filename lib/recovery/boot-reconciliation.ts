@@ -68,7 +68,9 @@ export interface BootReconciliationResult {
   readonly errored: string[];
   readonly reapedPids: number[];
   readonly skippedPids: number[];
+  readonly failedPids: number[];
   readonly destroyedBoxes: string[];
+  readonly failedDestroys: string[];
   readonly unownedBoxes: string[];
   readonly workerRestarted: boolean;
   readonly pausedRuns: string[];
@@ -282,6 +284,9 @@ export class BootReconciliationService {
     if (!processOps) {
       return false;
     }
+    if (typeof processOps.kill !== "function") {
+      return false;
+    }
     const pid = pf?.pid;
     if (!Number.isInteger(pid) || pid <= 0) {
       return false;
@@ -378,14 +383,24 @@ export class BootReconciliationService {
 
     const reapedPids: number[] = [];
     const skippedPids: number[] = [];
+    const failedPids: number[] = [];
     for (const pf of pidFiles) {
       if (this.canReap(pf, processOps)) {
+        let signalled = false;
         try {
-          processOps?.kill?.(pf.pid, "SIGTERM");
+          const outcome = processOps?.kill?.(pf.pid, "SIGTERM");
+          signalled = outcome !== false;
         } catch {
-          // ignore signalling failures; the pidfile is still considered handled
+          signalled = false;
         }
-        reapedPids.push(pf.pid);
+        // Only record a pid as reaped once the kill actually succeeds; failures
+        // are tracked separately and never reported as reaped.
+        if (signalled) {
+          reapedPids.push(pf.pid);
+        } else {
+          skippedPids.push(pf.pid);
+          failedPids.push(pf.pid);
+        }
       } else {
         skippedPids.push(pf.pid);
       }
@@ -447,6 +462,7 @@ export class BootReconciliationService {
     }
 
     const destroyedBoxes: string[] = [];
+    const failedDestroys: string[] = [];
     const unownedBoxes: string[] = [];
     if (backend) {
       for (const box of boxes) {
@@ -465,12 +481,20 @@ export class BootReconciliationService {
           unownedBoxes.push(id);
           continue;
         }
+        let destroyed = false;
         try {
           await backend.destroy(id);
+          destroyed = true;
         } catch {
-          // ignore destroy failures; the box is still reported as orphaned
+          destroyed = false;
         }
-        destroyedBoxes.push(id);
+        // Only record a box as destroyed once the backend destroy succeeds;
+        // failures are tracked separately and never reported as destroyed.
+        if (destroyed) {
+          destroyedBoxes.push(id);
+        } else {
+          failedDestroys.push(id);
+        }
       }
     }
 
@@ -514,7 +538,9 @@ export class BootReconciliationService {
       errored,
       reapedPids,
       skippedPids,
+      failedPids,
       destroyedBoxes,
+      failedDestroys,
       unownedBoxes,
       workerRestarted,
       pausedRuns,
@@ -526,33 +552,53 @@ export class BootReconciliationService {
    * tags the command outcome with oomKilled or timedOut cleanly.
    */
   async handleBoxFailure(input: BoxFailureInput): Promise<BoxFailureResult> {
-    const attempts = input.priorRecreations ?? 0;
+    const prior = input.priorRecreations ?? 0;
     const flags: BoxFailureFlags = {
       oomKilled: input.kind === "oom",
       timedOut: input.kind === "ttl_expired",
     };
 
+    let attempts = prior;
     let recreated = false;
     let newSandboxId: string | null = null;
-    if (attempts < 1 && typeof input.recreateBox === "function") {
+    // A failed recreation must never rerun the command against the original,
+    // already-failed box.
+    let recreationFailed = false;
+    if (prior < 1 && typeof input.recreateBox === "function") {
+      // A recreation is performed or at least attempted, so advance the counter
+      // so callers persisting result.attempts enforce the 1-recreation cap.
+      attempts = prior + 1;
       try {
         const result = await input.recreateBox({
           runId: input.runId,
           sandboxId: input.sandboxId,
           kind: input.kind,
         });
-        if (result !== null && result !== undefined) {
+        const resolvedId =
+          result === null || result === undefined
+            ? null
+            : typeof result === "string"
+              ? result
+              : result.sandboxId ?? null;
+        if (
+          typeof resolvedId === "string" &&
+          resolvedId.trim().length > 0
+        ) {
           recreated = true;
-          newSandboxId = typeof result === "string" ? result : result.sandboxId ?? null;
+          newSandboxId = resolvedId;
+        } else {
+          // Empty or missing sandboxId is a failed recreation.
+          recreationFailed = true;
         }
       } catch {
         recreated = false;
+        recreationFailed = true;
       }
     }
 
     const spec = normalizeCommand(input.failedCommand);
     let commandOutcome: CommandOutcome = { ...flags };
-    if (typeof input.rerunCommand === "function") {
+    if (!recreationFailed && typeof input.rerunCommand === "function") {
       try {
         const outcome = await input.rerunCommand({
           runId: input.runId,
@@ -659,7 +705,7 @@ export class BootReconciliationService {
         data: this.redact({
           reason: "kiro_credit_exhausted",
           outcome: "budget_stopped",
-          preservedWork: true,
+          preservedWork: preservedMergedWork,
           refs: [],
         }),
       });

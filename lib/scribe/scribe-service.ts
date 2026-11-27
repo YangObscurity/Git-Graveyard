@@ -350,7 +350,8 @@ export class ScribeService {
 
     let draft = "";
     try {
-      draft = (await runner(baseContext)) ?? "";
+      const produced = await runner(baseContext);
+      draft = typeof produced === "string" ? produced : "";
     } catch {
       draft = "";
     }
@@ -363,6 +364,7 @@ export class ScribeService {
       eventStore: this.deps.eventStore,
       runId: input.runId,
       actor: input.actor ?? "ScribeService",
+      redactor: this.deps.redactor,
       redactionOptions: this.deps.redactionOptions,
     });
 
@@ -374,6 +376,8 @@ export class ScribeService {
       tasks: tasks.map((t) => ({ id: t.id, state: t.state })),
       baselineInstallError: input.baselineInstallError,
       newInstallError: input.newInstallError,
+      redactor: this.deps.redactor,
+      redactionOptions: this.deps.redactionOptions,
     });
 
     return {

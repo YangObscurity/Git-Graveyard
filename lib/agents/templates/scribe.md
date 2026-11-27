@@ -30,8 +30,7 @@ permissions:
         - "**/.env.*"
         - "**/*.pem"
         - "**/*.key"
-        - "**/id_rsa"
-        - "**/id_ed25519"
+        - "**/id_*"
       effect: deny
     - capability: fs_write
       match:
@@ -41,8 +40,7 @@ permissions:
         - "**/.env.*"
         - "**/*.pem"
         - "**/*.key"
-        - "**/id_rsa"
-        - "**/id_ed25519"
+        - "**/id_*"
       effect: deny
     - capability: fs_write
       match:

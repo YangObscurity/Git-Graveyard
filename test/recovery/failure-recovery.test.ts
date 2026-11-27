@@ -693,3 +693,320 @@ test("failure-recovery: handleProcessCrash records a terminal failed skeleton.st
   assert.equal(throwStates[1].data.state, "failed");
 });
 
+test("failure-recovery: handleBoxFailure advances attempts and rejects an empty recreation sandboxId", async () => {
+  const service = new BootReconciliationService();
+
+  let recreateCalls = 0;
+  const first = await service.handleBoxFailure({
+    runId: "run-cap",
+    sandboxId: "box-1",
+    kind: "exit",
+    recreateBox: () => {
+      recreateCalls++;
+      return { sandboxId: "box-2" };
+    },
+  });
+  assert.equal(recreateCalls, 1);
+  assert.equal(first.recreated, true);
+  assert.equal(first.attempts, 1);
+
+  // Persisting the advanced attempts enforces the 1-recreation cap.
+  recreateCalls = 0;
+  const second = await service.handleBoxFailure({
+    runId: "run-cap",
+    sandboxId: "box-1",
+    kind: "exit",
+    priorRecreations: first.attempts,
+    recreateBox: () => {
+      recreateCalls++;
+      return { sandboxId: "box-3" };
+    },
+  });
+  assert.equal(recreateCalls, 0);
+  assert.equal(second.recreated, false);
+  assert.equal(second.attempts, 1);
+
+  // Empty sandboxId is a failed recreation and the command must not rerun.
+  let rerunCalls = 0;
+  const empty = await service.handleBoxFailure({
+    runId: "run-cap",
+    sandboxId: "box-1",
+    kind: "exit",
+    recreateBox: () => ({ sandboxId: "" }),
+    rerunCommand: () => {
+      rerunCalls++;
+      return { exitCode: 0 };
+    },
+  });
+  assert.equal(empty.recreated, false);
+  assert.equal(empty.newSandboxId, null);
+  assert.equal(empty.attempts, 1);
+  assert.equal(rerunCalls, 0);
+
+  // Missing sandboxId is likewise a failed recreation.
+  let missingRerun = 0;
+  const missing = await service.handleBoxFailure({
+    runId: "run-cap",
+    sandboxId: "box-1",
+    kind: "exit",
+    recreateBox: () => ({}),
+    rerunCommand: () => {
+      missingRerun++;
+      return { exitCode: 0 };
+    },
+  });
+  assert.equal(missing.recreated, false);
+  assert.equal(missing.newSandboxId, null);
+  assert.equal(missing.attempts, 1);
+  assert.equal(missingRerun, 0);
+});
+
+test("failure-recovery: missing or throwing kill/destroy never records reaped pids or destroyed boxes", async () => {
+  const runStore = new RunStore(":memory:");
+  const eventStore = new EventStore(":memory:");
+  runStore.createRun({
+    runId: "run-x",
+    url: "https://github.com/owner/repo",
+    sha: "abc",
+    phase: "legion",
+    sandboxId: "box-live",
+  });
+
+  const service = new BootReconciliationService();
+
+  // processOps present but kill missing -> cannot reap, pid is skipped.
+  const noKill = await service.reconcileOnBoot({
+    runStore,
+    eventStore,
+    pidFiles: [{ pid: 501, command: "kiro-cli --acp", expectedOwner: "root" }],
+    processOps: {
+      isAlive: () => true,
+      readCommand: () => "kiro-cli --acp",
+      readOwner: () => "root",
+    },
+  });
+  assert.deepEqual(noKill.reapedPids, []);
+  assert.deepEqual(noKill.skippedPids, [501]);
+
+  // kill throws -> not reaped, tracked as a failure.
+  const throwingKill = await service.reconcileOnBoot({
+    runStore,
+    eventStore,
+    pidFiles: [{ pid: 502, command: "kiro-cli --acp", expectedOwner: "root" }],
+    processOps: {
+      isAlive: () => true,
+      readCommand: () => "kiro-cli --acp",
+      readOwner: () => "root",
+      kill: () => {
+        throw new Error("kill failed");
+      },
+    },
+  });
+  assert.deepEqual(throwingKill.reapedPids, []);
+  assert.ok(throwingKill.failedPids.includes(502));
+
+  // destroy throws -> not recorded as destroyed, tracked as a failure.
+  const destroyFailed = await service.reconcileOnBoot({
+    runStore,
+    eventStore,
+    backend: {
+      list: () => [
+        {
+          sandboxId: "box-orphan",
+          labels: { [SANDBOX_OWNERSHIP_LABEL]: DEFAULT_SANDBOX_MANAGED_BY },
+        },
+      ],
+      destroy: () => {
+        throw new Error("destroy failed");
+      },
+    },
+  });
+  assert.ok(!destroyFailed.destroyedBoxes.includes("box-orphan"));
+  assert.ok(destroyFailed.failedDestroys.includes("box-orphan"));
+});
+
+test("failure-recovery: Kiro credit exhaustion records preservedWork=false when no work was merged", () => {
+  const runStore = new RunStore(":memory:");
+  const eventStore = new EventStore(":memory:");
+  runStore.createRun({
+    runId: "run-budget-zero",
+    url: "https://github.com/owner/repo",
+    sha: "abc",
+    phase: "legion",
+    metadata: { mergedTasksCount: 0 },
+  });
+
+  const service = new BootReconciliationService({ runStore, eventStore });
+  const result = service.handleKiroCreditExhaustion({ runId: "run-budget-zero" });
+
+  assert.equal(result.preservedMergedWork, false);
+  const events = eventStore.getEvents("run-budget-zero", { kind: "budget.exceeded" });
+  assert.equal(events.length, 1);
+  assert.equal(events[0].data.preservedWork, false);
+});
+
+test("failure-recovery: quarantineWorktree never follows or chmods a symlink inside the worktree", () => {
+  const eventStore = new EventStore(":memory:");
+  const handler = new FailureRecoveryHandler({ eventStore });
+
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "gg-quarantine-symlink-"));
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "gg-outside-"));
+  const outsideFile = path.join(outside, "keep-writable.txt");
+  fs.writeFileSync(outsideFile, "untouched");
+  fs.chmodSync(outsideFile, 0o644);
+  const beforeMode = fs.statSync(outsideFile).mode;
+
+  const linkPath = path.join(tmp, "escape");
+  fs.symlinkSync(outsideFile, linkPath);
+
+  try {
+    const result = handler.quarantineWorktree({
+      runId: "run-symlink",
+      worktreeDir: tmp,
+      reason: "symlink_escape",
+    });
+
+    assert.equal(result.isolated, true);
+    // The symlink target outside the worktree is neither followed nor chmodded.
+    assert.equal(fs.statSync(outsideFile).mode, beforeMode);
+    assert.equal(fs.readFileSync(outsideFile, "utf-8"), "untouched");
+    // The symlink entry itself is skipped, staying a symlink.
+    assert.equal(fs.lstatSync(linkPath).isSymbolicLink(), true);
+  } finally {
+    const restore = (target: string, mode: number) => {
+      try {
+        fs.chmodSync(target, mode);
+      } catch {
+        // ignore
+      }
+    };
+    restore(tmp, 0o755);
+    restore(path.join(tmp, ".QUARANTINED"), 0o644);
+    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test("failure-recovery: quarantineWorktree records the moved quarantine path accurately", () => {
+  const eventStore = new EventStore(":memory:");
+  const handler = new FailureRecoveryHandler({ eventStore });
+
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "gg-move-src-"));
+  const quarantineRoot = fs.mkdtempSync(path.join(os.tmpdir(), "gg-move-root-"));
+  fs.writeFileSync(path.join(tmp, "file.txt"), "secret");
+
+  const makeWritableAndRemove = (root: string) => {
+    const walk = (dir: string) => {
+      try {
+        fs.chmodSync(dir, 0o755);
+      } catch {
+        // ignore
+      }
+      let entries: fs.Dirent[] = [];
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const entry of entries) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          walk(full);
+        } else {
+          try {
+            fs.chmodSync(full, 0o644);
+          } catch {
+            // ignore
+          }
+        }
+      }
+    };
+    if (fs.existsSync(root)) {
+      walk(root);
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  };
+
+  try {
+    const result = handler.quarantineWorktree({
+      runId: "run-move",
+      skeletonId: "sk-move",
+      worktreeDir: tmp,
+      reason: "secret_detected",
+      quarantineRoot,
+    });
+
+    assert.equal(result.isolated, true);
+    assert.equal(typeof result.worktreeDir, "string");
+    const finalPath = result.worktreeDir as string;
+    assert.notEqual(finalPath, tmp);
+    assert.ok(finalPath.startsWith(quarantineRoot));
+    assert.equal(fs.existsSync(finalPath), true);
+    assert.equal(fs.existsSync(path.join(finalPath, ".QUARANTINED")), true);
+    assert.equal(handler.isWorktreeQuarantined(finalPath), true);
+
+    const events = eventStore.getEvents("run-move", {
+      kind: SECURITY_CONTAINMENT_EVENT_KIND,
+    });
+    assert.equal(events.length, 1);
+    assert.equal(events[0].data.worktree, finalPath);
+  } finally {
+    makeWritableAndRemove(tmp);
+    makeWritableAndRemove(quarantineRoot);
+  }
+});
+
+test("failure-recovery: failed and abandoned dependencies stay blocked in handleMaxWardenRejections", () => {
+  const eventStore = new EventStore(":memory:");
+  const handler = new FailureRecoveryHandler({ eventStore });
+
+  const result = handler.handleMaxWardenRejections({
+    runId: "run-deps",
+    taskId: "task-9",
+    rejectionRounds: 0,
+    maxRounds: 3,
+    pactTasks: [
+      { id: "task-failed", state: "failed" },
+      { id: "task-abandoned", state: "abandoned" },
+      { id: "task-merged", state: "merged" },
+      { id: "task-2", state: "pending", blockedBy: ["task-failed"] },
+      { id: "task-3", state: "pending", blockedBy: ["task-abandoned"] },
+      { id: "task-4", state: "pending", blockedBy: ["task-merged"] },
+    ],
+  });
+
+  assert.ok(!result.dispatched.includes("task-2"));
+  assert.ok(!result.dispatched.includes("task-3"));
+  assert.ok(result.remaining.includes("task-2"));
+  assert.ok(result.remaining.includes("task-3"));
+  assert.ok(result.dispatched.includes("task-4"));
+});
+
+test("failure-recovery: a throwing custom redactor fails closed and redacts every string leaf", () => {
+  const eventStore = new EventStore(":memory:");
+  const throwingRedactor = {
+    redactEventData: () => {
+      throw new Error("redactor exploded");
+    },
+  } as unknown as Redactor;
+
+  const handler = new FailureRecoveryHandler({
+    eventStore,
+    redactor: throwingRedactor,
+  });
+  handler.handleBrokerWatchdogTimeout({
+    runId: "run-redact-fail",
+    skeletonId: "sk-redact-fail",
+    requestId: "super-secret-request-id",
+    timeoutMs: 1000,
+    watchdogLimitMs: 1000,
+  });
+
+  const anomalies = eventStore.getEvents("run-redact-fail", {
+    kind: "permission.anomaly",
+  });
+  assert.equal(anomalies.length, 1);
+  assert.equal(anomalies[0].data.requestId, "[REDACTED]");
+  assert.equal(anomalies[0].data.reason, "[REDACTED]");
+  assert.equal(anomalies[0].data.timeoutMs, 1000);
+});
