@@ -26,6 +26,7 @@ import {
   ReliquaryArtifactDownloads,
   type ReliquaryArtifactItem,
 } from "./ReliquaryArtifactDownloads";
+import { OpenInKiroHandoff } from "./OpenInKiroHandoff";
 
 export interface ReliquaryPushInfo {
   enabled: boolean;
@@ -909,31 +910,12 @@ export function ReliquaryView({
       </section>
 
       {/* 6. Open in Kiro handoff instructions (Requirement 38.9) */}
-      <section
-        className="crypt-panel p-5 font-mono text-xs space-y-3"
-        data-testid="open-in-kiro-handoff"
-      >
-        <h3 className="text-sm font-semibold text-bone">
-          Open in Kiro Handoff Instructions
-        </h3>
-        <ol className="list-decimal list-inside space-y-2 text-ash">
-          <li>
-            Clone the source repository and check out at the pinned base sha.
-          </li>
-          <li>
-            Execute <code className="crypt-well text-emerald-300 px-1.5 py-0.5">git apply -p1 all.patch</code>.
-          </li>
-          <li>
-            Copy <code className="crypt-well text-emerald-300 px-1.5 py-0.5">spec/</code> to{" "}
-            <code className="crypt-well text-emerald-300 px-1.5 py-0.5">
-              .kiro/specs/resurrection/{owner}-{repo}/
-            </code>.
-          </li>
-          <li>
-            Run <code className="crypt-well text-emerald-300 px-1.5 py-0.5">/spec run &lt;name&gt;</code> in Kiro CLI or open the spec in the Kiro IDE.
-          </li>
-        </ol>
-      </section>
+      <OpenInKiroHandoff
+        owner={owner}
+        repo={repo}
+        baseSha={baseSha}
+        runId={runId}
+      />
 
       <CryptOrnament kind="divider" />
 
