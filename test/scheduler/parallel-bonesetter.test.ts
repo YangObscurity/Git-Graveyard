@@ -33,6 +33,8 @@ import {
   CLAUDE_SONNET_5_5_MODEL_ID,
 } from "../../lib/agents/model-allowlist";
 import { GitService } from "../../lib/git/git-service";
+import { EventStore } from "../../lib/events/event-store";
+import { candidateSha256FromDiff } from "../../lib/merge/candidate-hash";
 import type { PactTask } from "../../lib/pact/pact-parser";
 // Import via the module barrel to assert the Task 20.3 re-export from index.ts.
 import { ParallelScheduler } from "../../lib/scheduler";
@@ -41,14 +43,30 @@ import type {
   ParallelSchedulerRunner,
   ParallelSchedulerCandidate,
   ParallelSchedulerOptions,
+  ParallelSchedulerWardenReview,
   ParallelSlotContext,
   ParallelWardenDecision,
 } from "../../lib/scheduler/parallel-scheduler";
+import type { TaskMergeEvidence } from "../../lib/scheduler/types";
 import { mapHeadlessExitCode, parseStreamJsonLine } from "../../lib/acp/stream-parser";
 import { HeadlessFallbackChannel } from "../../lib/acp/headless-fallback";
 import type { ChildProcessLike, SpawnFunction } from "../../lib/supervisor/types";
 
-const BONESETTER_ALLOWED_ROOT_FILENAMES = BONESETTER_WRITABLE_FILENAMES;
+// Independent literal copy of the ten allowed root manifest/lockfile names. The
+// test compares the production allowlist against this list (not itself) so a
+// silent change to either side is caught.
+const EXPECTED_BONESETTER_ROOT_FILENAMES = [
+  "package.json",
+  "package-lock.json",
+  "npm-shrinkwrap.json",
+  "yarn.lock",
+  "pnpm-lock.yaml",
+  "poetry.lock",
+  "pipfile",
+  "pipfile.lock",
+  "pyproject.toml",
+  "requirements.txt",
+];
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -349,8 +367,12 @@ function makeControlledRunner(home: string): ControlledRunner {
 
 describe("Bonesetter worktree write boundary (Task 20.4)", () => {
   it("permits writes only on the ten root manifest/lockfile names", () => {
-    assert.equal(BONESETTER_ALLOWED_ROOT_FILENAMES.size, 10);
-    for (const name of BONESETTER_ALLOWED_ROOT_FILENAMES) {
+    assert.equal(EXPECTED_BONESETTER_ROOT_FILENAMES.length, 10);
+    assert.deepEqual(
+      [...BONESETTER_WRITABLE_FILENAMES].sort(),
+      [...EXPECTED_BONESETTER_ROOT_FILENAMES].map((n) => n.toLowerCase()).sort()
+    );
+    for (const name of EXPECTED_BONESETTER_ROOT_FILENAMES) {
       assert.equal(isBonesetterWritablePath(name), true, `${name} must be writable`);
     }
     // Root-only: a nested manifest is never writable.
@@ -703,7 +725,8 @@ function makeScheduler(
 
 async function drainRun<T>(
   runPromise: Promise<T>,
-  controller: ControlledRunner
+  controller: ControlledRunner,
+  timeoutMs = 15000
 ): Promise<T> {
   let done = false;
   const tracked = runPromise.then(
@@ -716,11 +739,141 @@ async function drainRun<T>(
       throw err;
     }
   );
+  const deadline = Date.now() + timeoutMs;
   while (!done) {
+    if (Date.now() > deadline) {
+      throw new Error(
+        `drainRun timed out after ${timeoutMs}ms: ParallelScheduler.run() did not settle`
+      );
+    }
     controller.releaseAll();
     await new Promise<void>((resolve) => setTimeout(resolve, 5));
   }
   return tracked;
+}
+
+/** A Warden review that approves every candidate with its own hash. */
+function makeApprovingWarden(): ParallelSchedulerWardenReview {
+  return async (candidate: ParallelSchedulerCandidate) => ({
+    approved: true,
+    candidateSha256: candidate.candidateSha256,
+  });
+}
+
+interface MergeHarness {
+  gitService: GitService;
+  store: EventStore;
+  mergeCandidate: NonNullable<ParallelSchedulerOptions["mergeCandidate"]>;
+}
+
+/**
+ * Builds a `mergeCandidate` executor that performs a real verified git merge and
+ * returns the evidence the composed Scheduler requires. When a candidate branch
+ * is no longer a descendant of the advanced integration head, it synthesizes a
+ * child commit carrying the candidate tree so the merge still fast-forwards.
+ */
+function makeMergeHarness(fixture: RepoFixture): MergeHarness {
+  const gitService = new GitService({ runsDir: fixture.runDir });
+  const store = new EventStore();
+  const home = fixture.tmpDir;
+  const integrationRef = `graveyard/${fixture.runId}`;
+
+  const mergeCandidate: MergeHarness["mergeCandidate"] = async (candidate) => {
+    const head = runGit(["rev-parse", integrationRef], fixture.gitDir, home);
+    let candidateSha = candidate.candidateSha;
+    let descendant = false;
+    try {
+      runGit(["merge-base", "--is-ancestor", head, candidateSha], fixture.gitDir, home);
+      descendant = true;
+    } catch {
+      descendant = false;
+    }
+    if (!descendant) {
+      const tree = runGit(["rev-parse", `${candidateSha}^{tree}`], fixture.gitDir, home);
+      candidateSha = runGit(
+        [
+          "-c", "user.name=Test Runner",
+          "-c", "user.email=runner@example.test",
+          "commit-tree", tree, "-p", head, "-m", `merge ${candidate.taskId}`,
+        ],
+        fixture.gitDir,
+        home
+      );
+    }
+    const tree = runGit(["rev-parse", `${candidateSha}^{tree}`], fixture.gitDir, home);
+    const rawDiff = childProcess
+      .execFileSync(
+        "git",
+        ["diff", "--binary", "--no-color", "--end-of-options", `${head}..${candidateSha}`],
+        { cwd: fixture.gitDir, encoding: "utf8", env: gitEnv(home) }
+      )
+      .toString();
+    const candidateSha256 = candidateSha256FromDiff(rawDiff);
+    store.append({
+      runId: fixture.runId,
+      kind: "verdict",
+      actor: "warden",
+      taskId: candidate.taskId,
+      data: { taskId: candidate.taskId, verdict: "approve", candidateSha256, tree },
+    });
+    store.append({
+      runId: fixture.runId,
+      kind: "gate.result",
+      actor: "gate",
+      taskId: candidate.taskId,
+      data: { taskId: candidate.taskId, ok: true, tree },
+    });
+    const verdict = {
+      verdict: "approve",
+      status: "approve",
+      candidateSha,
+      candidateSha256,
+      tree,
+      reasons: [{ text: "All checks passed", refs: ["cmd:true"] }],
+      checks: {
+        install: { ok: true },
+        build: { ok: true },
+        accept: { ok: true },
+        tests: { ok: true },
+        noTestWeakening: { ok: true },
+      },
+    };
+    const gateResult = { ok: true, tree };
+    const mergeResult = await (gitService as any).mergeCandidate({
+      runId: fixture.runId,
+      candidateSha,
+      expectedIntegrationHeadSha: head,
+      candidateSha256,
+      verdict,
+      verdictCandidateSha256: candidateSha256,
+      gateResult,
+      gitDir: fixture.gitDir,
+      runDir: fixture.runDir,
+    });
+    if (!mergeResult || !mergeResult.ok || !mergeResult.merged) {
+      return { ok: false, reason: mergeResult?.reason ?? "merge_failed" };
+    }
+    const evidence = {
+      verdict,
+      gateResult,
+      candidateSha,
+      candidateSha256,
+      tree,
+      gateTree: tree,
+      verdictTree: tree,
+      expectedHeadSha: head,
+      currentHeadSha: head,
+      integrationHeadSha: head,
+      diff: rawDiff,
+      taskId: candidate.taskId,
+      runId: fixture.runId,
+      eventSource: store,
+      gitMerge: mergeResult,
+    } as unknown as TaskMergeEvidence;
+    return { ok: true, evidence };
+  };
+
+  return { gitService, store, mergeCandidate };
 }
 
 describe("ParallelScheduler concurrency & dispatch (Task 20.4)", () => {
@@ -731,11 +884,13 @@ describe("ParallelScheduler concurrency & dispatch (Task 20.4)", () => {
         makePactTask(id, { filesInScope: [`src/${id}.ts`], line: index + 1 })
       );
       const controller = makeControlledRunner(fixture.tmpDir);
+      const harness = makeMergeHarness(fixture);
       const scheduler = makeScheduler(fixture, tasks, controller.runner, {
         parallelCap: 2,
         globalCap: 3,
         runningMax: 4,
-        wardenReview: async () => ({ approved: true }),
+        wardenReview: makeApprovingWarden(),
+        mergeCandidate: harness.mergeCandidate,
       });
       // min over the SPECIFIED bounds only; default 1 when none is specified.
       assert.equal(
@@ -765,6 +920,7 @@ describe("ParallelScheduler concurrency & dispatch (Task 20.4)", () => {
       assert.equal(controller.maxRunning, 2);
       assert.equal(summary.dispatched, 6);
       assert.equal(summary.candidatesProduced, 6);
+      assert.equal(summary.merged, 6);
     } finally {
       fixture.cleanup();
     }
@@ -779,9 +935,11 @@ describe("ParallelScheduler concurrency & dispatch (Task 20.4)", () => {
         makePactTask("t3", { filesInScope: ["src/t3.ts"], line: 3 }),
       ];
       const controller = makeControlledRunner(fixture.tmpDir);
+      const harness = makeMergeHarness(fixture);
       const scheduler = makeScheduler(fixture, tasks, controller.runner, {
         parallelCap: 2,
-        wardenReview: async () => ({ approved: true }),
+        wardenReview: makeApprovingWarden(),
+        mergeCandidate: harness.mergeCandidate,
       });
 
       const runPromise = scheduler.run();
@@ -860,25 +1018,29 @@ describe("ParallelScheduler concurrency & dispatch (Task 20.4)", () => {
         makePactTask("C", { filesInScope: ["src/c.ts"], line: 3 }),
       ];
       const controller = makeControlledRunner(fixture.tmpDir);
+      const harness = makeMergeHarness(fixture);
       const scheduler = makeScheduler(fixture, tasks, controller.runner, {
         parallelCap: 3,
-        wardenReview: async () => ({ approved: true }),
+        wardenReview: makeApprovingWarden(),
+        mergeCandidate: harness.mergeCandidate,
       });
 
       const runPromise = scheduler.run();
       await waitFor(() => controller.pending().length >= 2);
 
-      // A and C run; B is skipped because A owns src/shared.ts.
+      // A and C run; B is skipped because A owns src/shared.ts while it runs.
       assert.deepEqual(scheduler.getDispatchSequence(), ["A", "C"]);
       assert.equal(scheduler.getStatus().activeSlots, 2);
       assert.equal(controller.contexts.has("B"), false);
 
       const summary = await drainRun(runPromise, controller);
-      assert.equal(summary.taskStates.A, "in_review");
-      assert.equal(summary.taskStates.C, "in_review");
-      // B never runs while an in-review owner still claims src/shared.ts.
-      assert.equal(summary.taskStates.B, "ready");
-      assert.equal(scheduler.getDispatchSequence().includes("B"), false);
+      // Once A merges and releases its claim, B may finally be dispatched (never
+      // concurrently with A) and merges as well.
+      assert.deepEqual(scheduler.getDispatchSequence(), ["A", "C", "B"]);
+      assert.equal(summary.taskStates.A, "merged");
+      assert.equal(summary.taskStates.C, "merged");
+      assert.equal(summary.taskStates.B, "merged");
+      assert.equal(summary.merged, 3);
     } finally {
       fixture.cleanup();
     }
@@ -896,7 +1058,8 @@ describe("ParallelScheduler serialized Warden review (Task 20.4)", () => {
         makePactTask("C", { filesInScope: ["src/c.ts"], line: 3 }),
       ];
       const controller = makeControlledRunner(fixture.tmpDir);
-      let releaseReview: (() => void) | null = null;
+      const harness = makeMergeHarness(fixture);
+      const reviewGate: { release?: () => void } = {};
       const reviewOrder: string[] = [];
       const wardenReview = async (
         candidate: ParallelSchedulerCandidate
@@ -904,14 +1067,15 @@ describe("ParallelScheduler serialized Warden review (Task 20.4)", () => {
         reviewOrder.push(candidate.taskId);
         if (candidate.taskId === "A") {
           await new Promise<void>((resolve) => {
-            releaseReview = resolve;
+            reviewGate.release = resolve;
           });
         }
-        return { approved: true };
+        return { approved: true, candidateSha256: candidate.candidateSha256 };
       };
       const scheduler = makeScheduler(fixture, tasks, controller.runner, {
         parallelCap: 2,
         wardenReview,
+        mergeCandidate: harness.mergeCandidate,
       });
       assert.equal(scheduler.maxConcurrentWarden, 1);
 
@@ -922,7 +1086,7 @@ describe("ParallelScheduler serialized Warden review (Task 20.4)", () => {
 
       // A finishes and enters the review queue, where it is held.
       controller.release("A");
-      await waitFor(() => releaseReview !== null);
+      await waitFor(() => reviewGate.release !== undefined);
       assert.equal(scheduler.getStatus().activeReviews, 1);
       assert.ok(controller.committed.has("A"), "A committed its candidate");
 
@@ -933,14 +1097,23 @@ describe("ParallelScheduler serialized Warden review (Task 20.4)", () => {
       assert.ok(controller.pending().includes("B"));
       await waitFor(() => controller.pending().includes("C"));
 
+      // B finishes and is queued behind A. Because the Warden is strictly
+      // serialized, B must still be waiting while A is held.
+      controller.release("B");
+      await waitFor(() => scheduler.getStatus().pendingReviews >= 1);
+      assert.equal(scheduler.getStatus().activeReviews, 1);
+      assert.equal(reviewOrder.length, 1);
+      assert.equal(reviewOrder[0], "A");
+
       // Release the held review, then let the rest drain.
-      releaseReview!();
+      reviewGate.release?.();
       const summary = await drainRun(runPromise, controller);
       assert.equal(summary.maxObservedWardenConcurrency, 1);
       assert.equal(scheduler.getMaxObservedWardenConcurrency(), 1);
       assert.equal(reviewOrder.length, 3);
       assert.equal(reviewOrder[0], "A");
       assert.equal(summary.approved, 3);
+      assert.equal(summary.merged, 3);
     } finally {
       fixture.cleanup();
     }
@@ -950,13 +1123,16 @@ describe("ParallelScheduler serialized Warden review (Task 20.4)", () => {
     const fixture = createRepoFixture("retry");
     try {
       const controller = makeControlledRunner(fixture.tmpDir);
+      const harness = makeMergeHarness(fixture);
       let reviews = 0;
       const retries: Array<[string, number, string]> = [];
-      const wardenReview = async (): Promise<ParallelWardenDecision> => {
+      const wardenReview = async (
+        candidate: ParallelSchedulerCandidate
+      ): Promise<ParallelWardenDecision> => {
         reviews += 1;
         return reviews === 1
           ? { approved: false, reason: "changes requested" }
-          : { approved: true };
+          : { approved: true, candidateSha256: candidate.candidateSha256 };
       };
       const scheduler = makeScheduler(
         fixture,
@@ -965,6 +1141,7 @@ describe("ParallelScheduler serialized Warden review (Task 20.4)", () => {
         {
           parallelCap: 1,
           wardenReview,
+          mergeCandidate: harness.mergeCandidate,
           onRetry: (taskId, attempt, reason) => {
             retries.push([taskId, attempt, reason]);
           },
@@ -983,7 +1160,7 @@ describe("ParallelScheduler serialized Warden review (Task 20.4)", () => {
       assert.equal(retries.length, 1);
       assert.equal(retries[0][0], "A");
       assert.equal(retries[0][2], "changes requested");
-      assert.equal(summary.taskStates.A, "in_review");
+      assert.equal(summary.taskStates.A, "merged");
     } finally {
       fixture.cleanup();
     }
@@ -1076,9 +1253,11 @@ describe("ParallelScheduler pause & resume (Task 20.4)", () => {
         makePactTask("C", { filesInScope: ["src/c.ts"], line: 3 }),
       ];
       const controller = makeControlledRunner(fixture.tmpDir);
+      const harness = makeMergeHarness(fixture);
       const scheduler = makeScheduler(fixture, tasks, controller.runner, {
         parallelCap: 2,
-        wardenReview: async () => ({ approved: true }),
+        wardenReview: makeApprovingWarden(),
+        mergeCandidate: harness.mergeCandidate,
       });
 
       const runPromise = scheduler.run();
@@ -1120,7 +1299,7 @@ describe("ParallelScheduler pause & resume (Task 20.4)", () => {
 
       assert.equal(summary.dispatched, 3);
       assert.deepEqual(scheduler.getDispatchSequence(), ["A", "B", "C"]);
-      assert.equal(summary.taskStates.C, "in_review");
+      assert.equal(summary.taskStates.C, "merged");
     } finally {
       fixture.cleanup();
     }
@@ -1143,13 +1322,14 @@ describe("ParallelScheduler defers worktree cleanup until after Warden review (T
           dir: candidate.worktreeDir,
           existed: fs.existsSync(candidate.worktreeDir),
         });
-        return { approved: true };
+        return { approved: true, candidateSha256: candidate.candidateSha256 };
       };
+      const harness = makeMergeHarness(fixture);
       const scheduler = makeScheduler(
         fixture,
         [makePactTask("A", { filesInScope: ["src/a.ts"], line: 1 })],
         controller.runner,
-        { parallelCap: 1, wardenReview }
+        { parallelCap: 1, wardenReview, mergeCandidate: harness.mergeCandidate }
       );
 
       const summary = await drainRun(scheduler.run(), controller);
@@ -1284,11 +1464,12 @@ describe("ParallelScheduler verifies warden candidateSha256 (Task 20.4)", () => 
   it("accepts an approval whose candidateSha256 matches case-insensitively", async () => {
     const fixture = createRepoFixture("shamatch");
     try {
-      const runner: ParallelSchedulerRunner = async () => ({
-        ok: true,
-        candidateSha: "1".repeat(40),
-        candidateSha256: "AbCdEf0123456789",
-      });
+      const controller = makeControlledRunner(fixture.tmpDir);
+      const harness = makeMergeHarness(fixture);
+      const runner: ParallelSchedulerRunner = async (ctx) => {
+        const res = await controller.runner(ctx);
+        return res.ok ? { ...res, candidateSha256: "AbCdEf0123456789" } : res;
+      };
       const scheduler = new ParallelScheduler({
         runId: fixture.runId,
         runsDir: fixture.runDir,
@@ -1303,11 +1484,176 @@ describe("ParallelScheduler verifies warden candidateSha256 (Task 20.4)", () => 
           approved: true,
           candidateSha256: "abcdef0123456789",
         }),
+        mergeCandidate: harness.mergeCandidate,
       });
 
-      const summary = await scheduler.run();
+      const summary = await drainRun(scheduler.run(), controller);
       assert.equal(summary.approved, 1);
-      assert.equal(summary.taskStates.A, "in_review");
+      assert.equal(summary.merged, 1);
+      assert.equal(summary.taskStates.A, "merged");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+});
+
+describe("ParallelScheduler verified merge & unblocking (Task 20.4)", () => {
+  it("unblocks a dependent task (T2 depends on T1) to ready -> running -> merged after T1 merges", async () => {
+    const fixture = createRepoFixture("dependent");
+    try {
+      const tasks = [
+        makePactTask("T1", { filesInScope: ["src/t1.ts"], line: 1 }),
+        makePactTask("T2", {
+          filesInScope: ["src/t2.ts"],
+          line: 2,
+          dependencies: ["T1"],
+        }),
+      ];
+      const controller = makeControlledRunner(fixture.tmpDir);
+      const harness = makeMergeHarness(fixture);
+      const dispatchStates: string[] = [];
+      const scheduler = makeScheduler(fixture, tasks, controller.runner, {
+        parallelCap: 2,
+        wardenReview: makeApprovingWarden(),
+        mergeCandidate: harness.mergeCandidate,
+        onDispatch: (context) => {
+          dispatchStates.push(
+            scheduler.getScheduler().getTask(context.taskId)!.state
+          );
+        },
+      });
+
+      const summary = await drainRun(scheduler.run(), controller);
+
+      // T1 merges first; only then is the dependent T2 ready and dispatched.
+      assert.deepEqual(scheduler.getDispatchSequence(), ["T1", "T2"]);
+      assert.deepEqual(dispatchStates, ["running", "running"]);
+      assert.equal(summary.taskStates.T1, "merged");
+      assert.equal(summary.taskStates.T2, "merged");
+      assert.equal(summary.merged, 2);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("rejects a Warden approval that omits candidateSha256 (fail-closed)", async () => {
+    const fixture = createRepoFixture("shamissing");
+    try {
+      const controller = makeControlledRunner(fixture.tmpDir);
+      const scheduler = makeScheduler(
+        fixture,
+        [makePactTask("A", { filesInScope: ["src/a.ts"], line: 1 })],
+        controller.runner,
+        {
+          parallelCap: 1,
+          maxAttempts: 1,
+          wardenReview: async () => ({ approved: true }),
+        }
+      );
+
+      const summary = await drainRun(scheduler.run(), controller);
+
+      assert.equal(summary.approved, 0);
+      assert.equal(summary.merged, 0);
+      const records = scheduler.getReviewRecords();
+      assert.equal(records.length, 1);
+      assert.equal(records[0].approved, false);
+      assert.equal(records[0].reason, "candidateSha256_missing");
+      assert.equal(summary.taskStates.A, "failed");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("abort during resolveHeadSha() never enqueues a candidate, hangs settle(), or leaks the worktree", async () => {
+    const fixture = createRepoFixture("aborthead");
+    try {
+      const controller = makeControlledRunner(fixture.tmpDir);
+      const worktreeDirs: string[] = [];
+      const runner: ParallelSchedulerRunner = async (context) => {
+        worktreeDirs.push(context.worktreeDir);
+        return { ok: true };
+      };
+      const scheduler = makeScheduler(
+        fixture,
+        [makePactTask("A", { filesInScope: ["src/a.ts"], line: 1 })],
+        runner,
+        { parallelCap: 1, maxAttempts: 1 }
+      );
+
+      // Park the worker inside resolveHeadSha() until we abort.
+      let releaseHead: ((sha: string) => void) | undefined;
+      (scheduler as any).resolveHeadSha = () =>
+        new Promise<string>((resolve) => {
+          releaseHead = resolve;
+        });
+
+      const runPromise = scheduler.run();
+      await waitFor(() => releaseHead !== undefined);
+      assert.equal(worktreeDirs.length, 1);
+      assert.ok(fs.existsSync(worktreeDirs[0]));
+
+      scheduler.abort("stop");
+      releaseHead!("0".repeat(40));
+
+      // A 5s deadline inside drainRun fails fast if settle() hangs.
+      const summary = await drainRun(runPromise, controller, 5000);
+
+      assert.equal(summary.aborted, true);
+      assert.equal(summary.candidatesProduced, 0);
+      assert.equal(scheduler.getReviewQueue().length, 0);
+      assert.equal(summary.taskStates.A, "abandoned");
+      assert.equal(
+        fs.existsSync(worktreeDirs[0]),
+        false,
+        "aborted worktree must be torn down"
+      );
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("throwing onReview / onCleanup callbacks never lose slots or block rejection retries", async () => {
+    const fixture = createRepoFixture("throwsafe");
+    try {
+      const controller = makeControlledRunner(fixture.tmpDir);
+      const harness = makeMergeHarness(fixture);
+      let reviews = 0;
+      const scheduler = makeScheduler(
+        fixture,
+        [makePactTask("A", { filesInScope: ["src/a.ts"], line: 1 })],
+        controller.runner,
+        {
+          parallelCap: 2,
+          wardenReview: async (candidate) => {
+            reviews += 1;
+            return reviews === 1
+              ? { approved: false, reason: "changes requested" }
+              : { approved: true, candidateSha256: candidate.candidateSha256 };
+          },
+          mergeCandidate: harness.mergeCandidate,
+          onReview: () => {
+            throw new Error("onReview boom");
+          },
+          onCleanup: () => {
+            throw new Error("onCleanup boom");
+          },
+        }
+      );
+
+      const summary = await drainRun(scheduler.run(), controller);
+
+      // The first rejection still retried despite the throwing onReview observer.
+      assert.equal(reviews, 2);
+      assert.equal(summary.retried, 1);
+      assert.equal(summary.merged, 1);
+      assert.equal(summary.taskStates.A, "merged");
+      // No slot leaked: every slot is available again at the end of the run.
+      assert.equal(scheduler.getStatus().activeSlots, 0);
+      assert.equal(
+        scheduler.getStatus().availableSlots,
+        scheduler.getEffectiveCap()
+      );
     } finally {
       fixture.cleanup();
     }

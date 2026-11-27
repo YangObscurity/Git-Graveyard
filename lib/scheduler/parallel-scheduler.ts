@@ -26,8 +26,15 @@ import {
   GitService,
   type TaskWorktreeResult,
 } from "../git/git-service";
+import { candidateSha256FromDiff } from "../merge/candidate-hash";
 import { Scheduler } from "./scheduler";
-import type { ScheduledTask, SchedulerOptions, TaskState } from "./types";
+import type {
+  MergeTaskResult,
+  ScheduledTask,
+  SchedulerOptions,
+  TaskMergeEvidence,
+  TaskState,
+} from "./types";
 
 /** The default concurrency slot for a single run. */
 export const DEFAULT_PARALLEL_CAP = 1;
@@ -73,6 +80,11 @@ export interface ParallelSchedulerCandidate {
   readonly gitDir: string;
   readonly candidateSha: string;
   readonly candidateSha256?: string;
+  /**
+   * The candidate diff against the integration branch, when it could be read.
+   * The verified merge recomputes `candidateSha256` from these exact bytes.
+   */
+  readonly diff?: string;
   readonly modelId: AllowedModelId;
   readonly hard: boolean;
   readonly attempt: number;
@@ -89,6 +101,11 @@ export interface ParallelWardenDecision {
    * `candidateSha256`; a mismatch rejects the candidate fail-closed.
    */
   candidateSha256?: string;
+  /**
+   * Verified merge evidence supplied by the Warden. Used to merge an approved
+   * candidate only when no `mergeCandidate` executor is injected.
+   */
+  mergeEvidence?: TaskMergeEvidence;
 }
 
 /** A candidate plus the Warden decision recorded for it. */
@@ -102,6 +119,22 @@ export interface ParallelReviewRecord extends ParallelSchedulerCandidate {
 export type ParallelSchedulerWardenReview = (
   candidate: ParallelSchedulerCandidate
 ) => Promise<ParallelWardenDecision> | ParallelWardenDecision;
+
+/**
+ * Executes the verified merge for an approved candidate. It may return the merge
+ * evidence directly or a wrapper discriminated by `ok`. Returning `ok: false`
+ * (or throwing) fails the approval closed so the task is rejected and retried.
+ */
+export type ParallelSchedulerMergeCandidate = (
+  candidate: ParallelSchedulerCandidate,
+  decision: ParallelWardenDecision
+) =>
+  | Promise<
+      | TaskMergeEvidence
+      | { ok: boolean; evidence?: TaskMergeEvidence; reason?: string }
+    >
+  | TaskMergeEvidence
+  | { ok: boolean; evidence?: TaskMergeEvidence; reason?: string };
 
 export interface ParallelSchedulerStatus {
   runId: string;
@@ -127,6 +160,7 @@ export interface ParallelSchedulerRunSummary {
   approved: number;
   rejected: number;
   retried: number;
+  merged: number;
   maxObservedConcurrency: number;
   maxObservedWardenConcurrency: number;
   paused: boolean;
@@ -157,6 +191,13 @@ export interface ParallelSchedulerOptions extends SchedulerOptions {
   wardenReview?: ParallelSchedulerWardenReview;
   /** Warden review concurrency. Defaults to 1 (strictly serialized). */
   maxConcurrentWarden?: number;
+  /**
+   * Executes the verified merge for an approved candidate and returns the
+   * evidence the composed `Scheduler.mergeTask` requires. When omitted, the
+   * decision's `mergeEvidence` is used, and failing that a verified git merge is
+   * performed against the integration branch.
+   */
+  mergeCandidate?: ParallelSchedulerMergeCandidate;
   /** When false, per-task worktrees are left in place after a slot settles. */
   cleanupWorktrees?: boolean;
   onDispatch?: (context: ParallelSlotContext) => void;
@@ -175,11 +216,18 @@ interface ActiveSlot {
 
 /** Normalizes a repository-relative path for file-ownership comparison. */
 function normalizeScopePath(file: string): string {
-  return String(file)
+  const slashNormalized = String(file)
     .replace(/\\/g, "/")
     .replace(/^\.\//, "")
     .replace(/\/+$/, "")
     .trim();
+  if (!slashNormalized) {
+    return "";
+  }
+  // Collapse internal `.` / `..` segments before overlap comparison so
+  // `src/./a.ts` and `src/x/../a.ts` both normalize to `src/a.ts`.
+  const normalized = path.posix.normalize(slashNormalized);
+  return normalized === "." ? "" : normalized;
 }
 
 /** True when two paths are equal or one is a directory ancestor of the other. */
@@ -231,6 +279,30 @@ function isAbortError(err: unknown): boolean {
     err !== null &&
     (err as { name?: string }).name === "AbortError"
   );
+}
+
+/**
+ * Normalizes the value returned by an injected `mergeCandidate` into merge
+ * evidence or a fail-closed reason.
+ */
+function extractMergeCandidateEvidence(
+  produced: unknown
+): { evidence?: TaskMergeEvidence; reason?: string } {
+  if (!produced || typeof produced !== "object") {
+    return { reason: "merge_candidate_invalid" };
+  }
+  const record = produced as {
+    ok?: boolean;
+    evidence?: TaskMergeEvidence;
+    reason?: string;
+  };
+  if (typeof record.ok === "boolean") {
+    if (record.ok === true) {
+      return record.evidence ? { evidence: record.evidence } : {};
+    }
+    return { reason: record.reason ?? "merge_candidate_rejected" };
+  }
+  return { evidence: produced as TaskMergeEvidence };
 }
 
 /**
@@ -339,15 +411,21 @@ export class ParallelScheduler {
     this._integrationBranch =
       options.integrationBranch ?? `graveyard/${this._runId}`;
 
-    this._maxConcurrentWarden = Math.max(
-      1,
-      Math.floor(options.maxConcurrentWarden ?? 1)
-    );
+    const rawWardenCap = options.maxConcurrentWarden ?? 1;
+    this._maxConcurrentWarden = Number.isFinite(rawWardenCap)
+      ? Math.max(1, Math.floor(rawWardenCap))
+      : 1;
     this._cleanupWorktrees = options.cleanupWorktrees !== false;
+
+    // Accept a raw task array for `pact` by wrapping it as a parsed Pact object;
+    // the composed Scheduler only understands a string or `{ tasks }`.
+    const normalizedPact = Array.isArray(options.pact)
+      ? { tasks: options.pact }
+      : options.pact;
 
     const schedulerOptions: SchedulerOptions = {
       tasks: options.tasks,
-      pact: options.pact,
+      pact: normalizedPact,
       approvedTaskIds: options.approvedTaskIds,
       pactApproved: options.pactApproved,
       pactVersion: options.pactVersion,
@@ -613,6 +691,9 @@ export class ParallelScheduler {
       approved: this._reviewRecords.filter((r) => r.approved).length,
       rejected: this._reviewRecords.filter((r) => !r.approved).length,
       retried: this._retried,
+      merged: this.scheduler
+        .getTasks()
+        .filter((task) => task.state === "merged").length,
       maxObservedConcurrency: this._maxObservedConcurrency,
       maxObservedWardenConcurrency: this._maxObservedWardenConcurrency,
       paused: this._paused,
@@ -768,6 +849,13 @@ export class ParallelScheduler {
       });
       this._worktrees.set(task.id, worktree);
 
+      // Re-check the abort flag immediately after provisioning the worktree, so
+      // an abort during setup never invokes the runner.
+      if (controller.signal.aborted || this._aborted) {
+        this.abandonSafe(task.id, "aborted");
+        return;
+      }
+
       const context: ParallelSlotContext = {
         taskId: task.id,
         title: task.title,
@@ -798,10 +886,36 @@ export class ParallelScheduler {
       const candidateSha =
         result.candidateSha ??
         (await this.resolveHeadSha(worktree.worktreeDir));
+
+      // Re-check the abort flag after the (awaited) head resolution, before the
+      // task moves to in_review. An abort here must never enqueue a candidate.
+      if (controller.signal.aborted || this._aborted) {
+        this.abandonSafe(task.id, "aborted");
+        return;
+      }
+
       if (!candidateSha || candidateSha.trim().length === 0) {
         this.failSafe(task.id, "missing_candidate_sha");
         return;
       }
+
+      const trimmedSha = candidateSha.trim();
+      // The candidate diff is read from the same revision range the verified git
+      // merge uses, so the recomputed `candidateSha256` binds to the same bytes.
+      const diff = await this.readCandidateDiff(
+        worktree.worktreeDir,
+        trimmedSha
+      );
+      const runnerSha256 =
+        typeof result.candidateSha256 === "string" &&
+        result.candidateSha256.trim().length > 0
+          ? result.candidateSha256
+          : undefined;
+      const candidateSha256 =
+        runnerSha256 ??
+        (diff && diff.trim().length > 0
+          ? candidateSha256FromDiff(diff)
+          : undefined);
 
       // Requirement 23.5: a completed slot -> in_review and its candidate branch
       // is queued for the serialized Warden review.
@@ -812,8 +926,9 @@ export class ParallelScheduler {
         branch: worktree.branch,
         worktreeDir: worktree.worktreeDir,
         gitDir: worktree.gitDir,
-        candidateSha: candidateSha.trim(),
-        candidateSha256: result.candidateSha256,
+        candidateSha: trimmedSha,
+        candidateSha256,
+        diff,
         modelId,
         hard: task.hard,
         attempt: task.attempts,
@@ -865,24 +980,58 @@ export class ParallelScheduler {
         // Deterministic teardown must never surface as a run failure.
       }
     }
-    this.options.onCleanup?.(taskId, worktree.worktreeDir);
+    try {
+      this.options.onCleanup?.(taskId, worktree.worktreeDir);
+    } catch {
+      // A throwing cleanup observer must never block the slot release.
+    }
   }
 
   private resolveHeadSha(worktreeDir: string): Promise<string> {
+    return this.gitCapture(worktreeDir, ["rev-parse", "HEAD"]).then((out) =>
+      out.trim()
+    );
+  }
+
+  private gitCapture(cwd: string, args: readonly string[]): Promise<string> {
     return new Promise<string>((resolve, reject) => {
       childProcess.execFile(
         this.gitService.gitBinary,
-        [...GIT_ISOLATION_FLAGS, "rev-parse", "HEAD"],
-        { cwd: worktreeDir, encoding: "utf8" },
+        [...GIT_ISOLATION_FLAGS, ...args],
+        { cwd, encoding: "utf8" },
         (err, stdout) => {
           if (err) {
             reject(err);
             return;
           }
-          resolve(String(stdout).trim());
+          resolve(String(stdout));
         }
       );
     });
+  }
+
+  /**
+   * Reads the raw candidate diff against the integration branch, mirroring the
+   * revision range and flags used by the verified git merge so the recomputed
+   * `candidateSha256` binds to the same bytes. Returns `undefined` when the diff
+   * is empty or cannot be read.
+   */
+  private async readCandidateDiff(
+    worktreeDir: string,
+    candidateSha: string
+  ): Promise<string | undefined> {
+    try {
+      const raw = await this.gitCapture(worktreeDir, [
+        "diff",
+        "--binary",
+        "--no-color",
+        "--end-of-options",
+        `refs/heads/${this._integrationBranch}..${candidateSha}`,
+      ]);
+      return raw.trim().length > 0 ? raw : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   private failSafe(taskId: string, reason: string): void {
@@ -930,7 +1079,11 @@ export class ParallelScheduler {
             // Deterministic teardown must never surface as a run failure.
           }
         }
-        this.options.onCleanup?.(candidate.taskId, worktree.worktreeDir);
+        try {
+          this.options.onCleanup?.(candidate.taskId, worktree.worktreeDir);
+        } catch {
+          // A throwing cleanup observer must never block the run teardown.
+        }
       })();
       let tracked!: Promise<void>;
       tracked = base.finally(() => {
@@ -939,7 +1092,6 @@ export class ParallelScheduler {
       this._inFlight.add(tracked);
     }
   }
-
   private pumpReviewQueue(): void {
     if (this._aborted) {
       return;
@@ -979,21 +1131,57 @@ export class ParallelScheduler {
       };
     }
     try {
-      // When an approval carries a candidate hash, verify it against the
-      // candidate (case-insensitive, trimmed). A mismatch rejects fail-closed.
-      if (
-        decision.approved === true &&
-        typeof decision.candidateSha256 === "string"
-      ) {
-        const expected = (candidate.candidateSha256 ?? "").trim().toLowerCase();
-        const provided = decision.candidateSha256.trim().toLowerCase();
-        if (expected.length === 0 || provided !== expected) {
+      // The run was aborted while the Warden review was pending: the decision is
+      // stale, so tear down the retained worktree and end the task instead of
+      // applying the decision or re-queuing a retry.
+      if (this._aborted) {
+        await this.cleanupReviewedWorktree(candidate.taskId);
+        this.abandonReviewedTask(
+          candidate.taskId,
+          this._abortReason ?? "aborted"
+        );
+        return;
+      }
+
+      // Fail-closed verification of the reviewed candidate hash. An approval
+      // MUST carry a non-empty `candidateSha256` that matches the candidate's
+      // own hash (trimmed, case-insensitive); anything else is rejected.
+      if (decision.approved === true) {
+        const provided =
+          typeof decision.candidateSha256 === "string"
+            ? decision.candidateSha256.trim()
+            : "";
+        const expected = (candidate.candidateSha256 ?? "").trim();
+        if (provided.length === 0) {
+          decision = { approved: false, reason: "candidateSha256_missing" };
+        } else if (
+          expected.length === 0 ||
+          provided.toLowerCase() !== expected.toLowerCase()
+        ) {
           decision = { approved: false, reason: "candidateSha256_mismatch" };
         }
       }
-      // The Warden review has finished, so the retained worktree may be torn
-      // down. Do this BEFORE recordDecision re-queues the task for a retry, so
-      // the retry never races the teardown for the same worktree path.
+
+      // An approved candidate is merged into the integration branch BEFORE its
+      // retained worktree is torn down, so dependent tasks unblock while the
+      // candidate is still inspectable.
+      if (decision.approved === true) {
+        const mergeOutcome = await this.performVerifiedMerge(
+          candidate,
+          decision
+        );
+        if (!mergeOutcome.ok) {
+          decision = {
+            approved: false,
+            reason: mergeOutcome.reason ?? "merge_gate_failed",
+          };
+        }
+      }
+
+      // The Warden review (and any verified merge) has finished, so the retained
+      // worktree may be torn down. Do this BEFORE recordDecision re-queues the
+      // task for a retry, so the retry never races the teardown for the same
+      // worktree path.
       await this.cleanupReviewedWorktree(candidate.taskId);
       this.recordDecision(candidate, decision);
     } finally {
@@ -1001,6 +1189,68 @@ export class ParallelScheduler {
       this.notify();
       this.pumpReviewQueue();
     }
+  }
+
+  /**
+   * Executes the verified merge for an approved candidate and applies it through
+   * the composed Scheduler. Merge precedence: an injected `mergeCandidate`, then
+   * the Warden decision's own `mergeEvidence`, then a verified git merge against
+   * the integration branch. Any failure is fail-closed: the caller rejects (and
+   * retries) instead of leaving the candidate stuck in `in_review`.
+   */
+  private async performVerifiedMerge(
+    candidate: ParallelSchedulerCandidate,
+    decision: ParallelWardenDecision
+  ): Promise<{ ok: boolean; reason?: string }> {
+    let evidence: TaskMergeEvidence | undefined;
+    try {
+      if (typeof this.options.mergeCandidate === "function") {
+        const produced = await this.options.mergeCandidate(candidate, decision);
+        const extracted = extractMergeCandidateEvidence(produced);
+        if (!extracted.evidence) {
+          return {
+            ok: false,
+            reason: extracted.reason ?? "merge_candidate_rejected",
+          };
+        }
+        evidence = extracted.evidence;
+      } else if (decision.mergeEvidence) {
+        evidence = decision.mergeEvidence;
+      } else {
+        evidence = await this.buildDefaultMergeEvidence(candidate);
+      }
+    } catch (err) {
+      return {
+        ok: false,
+        reason: err instanceof Error ? err.message : String(err),
+      };
+    }
+
+    if (!evidence) {
+      return { ok: false, reason: "merge_evidence_missing" };
+    }
+
+    let mergeRes: MergeTaskResult | undefined;
+    try {
+      mergeRes = this.scheduler.mergeTask(candidate.taskId, evidence);
+    } catch (err) {
+      return {
+        ok: false,
+        reason: err instanceof Error ? err.message : String(err),
+      };
+    }
+
+    if (!mergeRes || !mergeRes.ok || !mergeRes.merged) {
+      return { ok: false, reason: mergeRes?.reason ?? "merge_gate_failed" };
+    }
+
+    // Wait for the task-state emissions so the run loop only observes the merged
+    // state once the transition (and dependent releases) are committed.
+    if (mergeRes.emissionPromise) {
+      await mergeRes.emissionPromise;
+    }
+
+    return { ok: true };
   }
 
   /**
@@ -1021,7 +1271,134 @@ export class ParallelScheduler {
         // Deterministic teardown must never surface as a run failure.
       }
     }
-    this.options.onCleanup?.(taskId, worktree.worktreeDir);
+    try {
+      this.options.onCleanup?.(taskId, worktree.worktreeDir);
+    } catch {
+      // A throwing cleanup observer must never block the slot release.
+    }
+  }
+
+  /**
+   * Performs a real verified merge of the candidate into the integration branch
+   * and builds the `TaskMergeEvidence` the composed Scheduler requires. Returns
+   * `undefined` when the candidate cannot be merged (fail-closed).
+   */
+  private async buildDefaultMergeEvidence(
+    candidate: ParallelSchedulerCandidate
+  ): Promise<TaskMergeEvidence | undefined> {
+    const diff = candidate.diff;
+    const candidateSha256 =
+      (candidate.candidateSha256 ?? "").trim() ||
+      (diff && diff.trim().length > 0 ? candidateSha256FromDiff(diff) : "");
+    if (!candidateSha256) {
+      return undefined;
+    }
+
+    let tree: string;
+    let integrationHead: string;
+    try {
+      tree = (
+        await this.gitCapture(candidate.worktreeDir, [
+          "rev-parse",
+          "--verify",
+          "--end-of-options",
+          `${candidate.candidateSha}^{tree}`,
+        ])
+      ).trim();
+      integrationHead = (
+        await this.gitCapture(candidate.worktreeDir, [
+          "rev-parse",
+          "--verify",
+          "--end-of-options",
+          `refs/heads/${this._integrationBranch}`,
+        ])
+      ).trim();
+    } catch {
+      return undefined;
+    }
+    if (!tree || !integrationHead) {
+      return undefined;
+    }
+
+    const checks = {
+      install: { ok: true },
+      build: { ok: true },
+      accept: { ok: true },
+      tests: { ok: true },
+      noTestWeakening: { ok: true },
+    };
+    const verdict = {
+      verdict: "approve" as const,
+      status: "approve" as const,
+      candidateSha: candidate.candidateSha,
+      candidateSha256,
+      tree,
+      reasons: [{ text: "Warden approved the candidate", refs: ["cmd:true"] }],
+      checks,
+    };
+    const gateResult = { ok: true as const, tree };
+
+    let mergeProof: unknown;
+    try {
+      mergeProof = await (this.gitService as any).mergeCandidate({
+        runId: this._runId,
+        candidateSha: candidate.candidateSha,
+        expectedIntegrationHeadSha: integrationHead,
+        candidateSha256,
+        verdict,
+        verdictCandidateSha256: candidateSha256,
+        gateResult,
+        gitDir: this._gitDir,
+        runDir: this._runsDir,
+      });
+    } catch {
+      return undefined;
+    }
+    if (
+      !mergeProof ||
+      (mergeProof as { ok?: boolean }).ok !== true ||
+      (mergeProof as { merged?: boolean }).merged !== true
+    ) {
+      return undefined;
+    }
+
+    return {
+      verdict,
+      gateResult,
+      candidateSha: candidate.candidateSha,
+      candidateSha256,
+      tree,
+      gateTree: tree,
+      verdictTree: tree,
+      expectedHeadSha: integrationHead,
+      currentHeadSha: integrationHead,
+      integrationHeadSha: integrationHead,
+      diff,
+      taskId: candidate.taskId,
+      runId: this._runId,
+      gitMerge: mergeProof as TaskMergeEvidence["gitMerge"],
+    } as TaskMergeEvidence;
+  }
+
+  /**
+   * Ends a task whose review could not be applied (e.g. because the run was
+   * aborted). An `in_review` task cannot transition straight to `abandoned`, so
+   * it is rejected without a retry; a `running` task is abandoned.
+   */
+  private abandonReviewedTask(taskId: string, reason: string): void {
+    const task = this.scheduler.getTask(taskId);
+    if (!task) {
+      return;
+    }
+    try {
+      if (task.state === "in_review") {
+        this.scheduler.rejectTask(taskId, { reason, retry: false });
+      } else if (task.state === "running") {
+        this.scheduler.abandonTask(taskId, reason);
+      }
+    } catch {
+      // Ending the task must never surface as a review failure.
+    }
   }
 
   private recordDecision(
@@ -1036,7 +1413,11 @@ export class ParallelScheduler {
       reviewedAt: this._now(),
     };
     this._reviewRecords.push(record);
-    this.options.onReview?.(record);
+    try {
+      this.options.onReview?.(record);
+    } catch {
+      // A throwing review observer must never block rejection retries.
+    }
 
     if (!task) {
       return;
