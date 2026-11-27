@@ -11,6 +11,10 @@ import {
   ASK_DEFAULTS,
 } from "../../lib/hitl/ask-manager";
 import { ApprovalManager } from "../../lib/gateway/approval-manager";
+import {
+  removeQuotes,
+  tokenizeSimpleCommand,
+} from "../../lib/gateway/command-policy";
 
 function createManager(options?: { now?: () => number; approvalWaitMs?: number }) {
   const store = new EventStore(":memory:");
@@ -627,3 +631,64 @@ test("AskManager: requestApproval derives commandText canonically from argv when
   manager.resolveApproval(card.approvalId, "Approve once");
   assert.equal(approvalManager.consumeGrant("sk-canon", ["npm", "ci"], "/w"), true);
 });
+
+test("AskManager: requestApproval formats argv into a boundary-preserving commandText", () => {
+  const approvalManager = new ApprovalManager({ defaultWaitMs: 60_000 });
+  const store = new EventStore(":memory:");
+  const manager = new AskManager({ eventStore: store, approvalManager });
+
+  const argv = ["printf", "%s", "a b", ""];
+  const card = manager.requestApproval({
+    runId: "run-argv-boundary",
+    argv,
+    cwd: "/w",
+    riskClass: "safe",
+    skeletonId: "sk-boundary",
+  });
+
+  // The displayed command must preserve argument boundaries rather than
+  // collapsing argv into "printf %s a b ".
+  assert.notEqual(card.commandText, "printf %s a b ");
+  assert.equal(card.commandText, `printf %s 'a b' ""`);
+
+  // The formatted command round-trips back to the exact argv.
+  assert.deepEqual(
+    tokenizeSimpleCommand(card.commandText).map((w) => removeQuotes(w)),
+    argv
+  );
+
+  manager.resolveApproval(card.approvalId, "Approve once");
+  assert.equal(
+    approvalManager.consumeGrant("sk-boundary", ["printf", "%s", "a b", ""], "/w"),
+    true
+  );
+});
+
+test("AskManager: argv quoting round-trips embedded quotes, metacharacters and empty tokens", () => {
+  const approvalManager = new ApprovalManager({ defaultWaitMs: 60_000 });
+  const store = new EventStore(":memory:");
+  const manager = new AskManager({ eventStore: store, approvalManager });
+
+  const argv = ["sh", "-c", "echo 'hi there' \"$HOME\"", "a\\b", "", "-"];
+  const card = manager.requestApproval({
+    runId: "run-argv-roundtrip",
+    argv,
+    cwd: "/w",
+    riskClass: "safe",
+    skeletonId: "sk-roundtrip",
+  });
+
+  assert.deepEqual(
+    tokenizeSimpleCommand(card.commandText).map((w) => removeQuotes(w)),
+    argv
+  );
+
+  manager.resolveApproval(card.approvalId, "Approve once");
+  assert.equal(approvalManager.consumeGrant("sk-roundtrip", [...argv], "/w"), true);
+
+  const requested = store.getEvents("run-argv-roundtrip", {
+    kind: "approval.requested",
+  });
+  assert.equal(requested.length, 1);
+});
+
