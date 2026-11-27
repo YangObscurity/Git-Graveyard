@@ -8,6 +8,7 @@ import {
   resolveRunStore,
 } from "@/lib/runtime/store-context";
 import { redactEvent } from "@/lib/security/redactor";
+import type { EventStore } from "@/lib/events/event-store";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -34,6 +35,51 @@ function isSafePathSegment(value: unknown): value is string {
 
 interface AskResolver {
   answerAsk: (askId: string, answer: unknown) => unknown;
+  getAsk?: (askId: string) => { runId?: unknown } | undefined;
+}
+
+type AskOwnership = "ok" | "mismatch" | "unknown";
+
+/**
+ * Verifies that an ask belongs to the run in the URL before anything is
+ * answered. Ownership is proven either by the AskManager's own record or by a
+ * matching `ask.raised` event in this run's event log; anything else fails
+ * closed. An ask bound to a different run is reported as a mismatch.
+ */
+function verifyAskOwnership(
+  askManager: AskResolver | null,
+  eventStore: EventStore,
+  runId: string,
+  askId: string
+): AskOwnership {
+  if (askManager && typeof askManager.getAsk === "function") {
+    try {
+      const ask = askManager.getAsk(askId);
+      if (ask && typeof ask === "object") {
+        const owner = (ask as { runId?: unknown }).runId;
+        if (typeof owner === "string") {
+          return owner === runId ? "ok" : "mismatch";
+        }
+      }
+    } catch {
+      // Fall through to the event log.
+    }
+  }
+
+  try {
+    const raised = eventStore.getEvents(runId, { kind: "ask.raised" });
+    const owned = raised.some((event) => {
+      const data = event.data as Record<string, unknown> | undefined;
+      return data?.askId === askId;
+    });
+    if (owned) {
+      return "ok";
+    }
+  } catch {
+    // Unreadable event log means ownership cannot be verified.
+  }
+
+  return "unknown";
 }
 
 /**
@@ -143,8 +189,27 @@ export async function POST(
 
   let handled = false;
   const orchestrator = resolveActiveOrchestrator(request, context);
-
   const askManager = resolveAskManager(request, context, orchestrator);
+
+  // Ownership: an ask raised by one run may only be answered through that run.
+  const ownership = verifyAskOwnership(askManager, eventStore, runId, askId);
+  if (ownership === "mismatch") {
+    return Response.json(
+      { ok: false, error: "Ask does not belong to this run", code: "ASK_RUN_MISMATCH" },
+      { status: 403 }
+    );
+  }
+  if (ownership === "unknown") {
+    return Response.json(
+      {
+        ok: false,
+        error: "Ask ownership could not be verified for this run",
+        code: "ASK_NOT_FOUND",
+      },
+      { status: 404 }
+    );
+  }
+
   if (askManager) {
     try {
       if (await askManager.answerAsk(askId, body.answer)) {
@@ -153,7 +218,9 @@ export async function POST(
     } catch {}
   }
 
-  if (orchestrator && typeof orchestrator.answerAsk === "function") {
+  // Dispatch to the orchestrator only when the AskManager did not already
+  // handle the answer, so a single POST never answers an ask twice.
+  if (!handled && orchestrator && typeof orchestrator.answerAsk === "function") {
     try {
       if (await orchestrator.answerAsk(runId, askId, body.answer)) {
         handled = true;

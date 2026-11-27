@@ -138,21 +138,63 @@ export async function POST(
   if (!resolved) {
     try {
       const host = getRuntimeHost();
+      const approvalManager = host?.gateway?.approvalManager;
       if (
-        host?.gateway?.approvalManager &&
-        typeof host.gateway.approvalManager.resolveApproval === "function"
+        approvalManager &&
+        typeof approvalManager.resolveApproval === "function"
       ) {
-        await host.gateway.approvalManager.resolveApproval(
-          approvalId,
-          resolution
-        );
-        resolved = true;
+        // Scope the fallback to this run: when the manager exposes its record,
+        // reject an approval bound to a different run before resolving.
+        const getApproval = (
+          approvalManager as unknown as {
+            getApproval?: (id: string) => { runId?: unknown } | undefined;
+          }
+        ).getApproval;
+        if (typeof getApproval === "function") {
+          const existing = getApproval.call(approvalManager, approvalId);
+          if (
+            existing &&
+            typeof existing.runId === "string" &&
+            existing.runId !== runId
+          ) {
+            return Response.json(
+              {
+                ok: false,
+                error: "Approval does not belong to this run",
+                code: "APPROVAL_RUN_MISMATCH",
+              },
+              { status: 403 }
+            );
+          }
+        }
+
+        const res = await approvalManager.resolveApproval(approvalId, {
+          ...resolution,
+          runId,
+        });
+        if (res !== null && res !== undefined) {
+          resolved = true;
+        }
       }
-    } catch {}
+    } catch (err) {
+      // The manager's own run binding is authoritative: a mismatch is
+      // fail-closed rather than silently recorded against this run.
+      if (err instanceof Error && /runId mismatch/i.test(err.message)) {
+        return Response.json(
+          {
+            ok: false,
+            error: "Approval does not belong to this run",
+            code: "APPROVAL_RUN_MISMATCH",
+          },
+          { status: 403 }
+        );
+      }
+    }
   }
 
-  // Persist an approved command pattern when one is supplied.
-  if (body.decision === "approve_pattern") {
+  // Persist an approved command pattern only when the approval actually
+  // resolved; a failed resolution must never widen what the run may execute.
+  if (resolved && body.decision === "approve_pattern") {
     const patternValue = (body.pattern ?? body.scope)?.trim();
     if (patternValue && typeof runStore.addApprovedPattern === "function") {
       try {

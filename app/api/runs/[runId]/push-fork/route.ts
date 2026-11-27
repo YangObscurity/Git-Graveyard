@@ -3,15 +3,15 @@ import {
   authorizeMutatingRunRequest,
   extractCallerCredentials,
 } from "@/lib/pact/pact-mutation";
-import { GitService } from "@/lib/git/git-service";
+import { GitService, hasEmbeddedCredentials } from "@/lib/git/git-service";
 import {
   isSafeRunId,
   resolveActiveOrchestrator,
   resolveEventStore,
   resolveRunStore,
 } from "@/lib/runtime/store-context";
-import { redactEvent, redactText } from "@/lib/security/redactor";
-import type { EventStore } from "@/lib/events/event-store";
+import { redactEvent } from "@/lib/security/redactor";
+import type { EventEnvelope, EventStore } from "@/lib/events/event-store";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -75,20 +75,175 @@ function statusForPushError(code: unknown): number {
   }
 }
 
-function normalizeRepoUrl(raw: string): string | null {
-  const match = raw
-    .trim()
-    .match(/^[a-zA-Z]+:\/\/github\.com\/([^/]+)\/([^/?#]+?)(?:\.git)?$/);
-  if (!match) return null;
-  return `${match[1].toLowerCase()}/${match[2].toLowerCase()}`;
+/**
+ * Canonicalizes GitHub HTTPS, SSH and `ssh://` URL spellings (case-insensitively)
+ * to `owner/repo`, so two spellings of the same repository compare equal. Any
+ * URL that is not a GitHub repository or that carries embedded credentials
+ * returns `null`.
+ */
+function canonicalRepoSlug(raw: string): string | null {
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+
+  const patterns: RegExp[] = [
+    /^https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?\/?$/i,
+    /^git@github\.com:([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?\/?$/i,
+    /^ssh:\/\/git@github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?\/?$/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = trimmed.match(pattern);
+    if (!match) continue;
+    const owner = match[1];
+    const repo = match[2];
+    if (!owner || !repo) return null;
+    if (owner === "." || owner === ".." || repo === "." || repo === "..") {
+      return null;
+    }
+    return `${owner.toLowerCase()}/${repo.toLowerCase()}`;
+  }
+  return null;
 }
 
 /** True when the push target is the same repository as the source. */
 function targetsSourceRepo(targetFork: string, sourceUrl: string): boolean {
-  if (targetFork.trim() === sourceUrl.trim()) return true;
-  const target = normalizeRepoUrl(targetFork);
-  const source = normalizeRepoUrl(sourceUrl);
-  return Boolean(target && source && target === source);
+  const target = canonicalRepoSlug(targetFork);
+  const source = canonicalRepoSlug(sourceUrl);
+  if (target && source) {
+    return target === source;
+  }
+  return targetFork.trim() === sourceUrl.trim();
+}
+
+/**
+ * Defense-in-depth: the fork target must be exactly
+ * `https://github.com/<owner>/<repo>` with an optional `.git` suffix, carrying
+ * no embedded credentials and no HTTP / file / SSH / alternate-host endpoint.
+ * This runs before any git operation touches the network.
+ */
+function isValidForkTarget(raw: string): boolean {
+  if (typeof raw !== "string") return false;
+  const trimmed = raw.trim();
+  if (!trimmed) return false;
+  if (hasEmbeddedCredentials(trimmed)) return false;
+  if (!/^https:\/\//.test(trimmed)) return false;
+
+  const match = trimmed.match(
+    /^https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?$/
+  );
+  if (!match) return false;
+
+  const owner = match[1];
+  const repo = match[2];
+  if (owner === "." || owner === ".." || repo === "." || repo === "..") {
+    return false;
+  }
+  return true;
+}
+
+interface PendingPushAsk {
+  askId: string;
+  targetFork: string;
+  branch: string | null;
+}
+
+interface PendingPushAskFailure {
+  status: number;
+  error: string;
+  code: string;
+}
+
+/**
+ * Finds the pending (unanswered) `push_confirm` ask that a run actually raised,
+ * reading only that run's own event log. When `requestedAskId` is supplied it
+ * must name that exact ask; otherwise the most recent unanswered `push_confirm`
+ * ask wins. A missing or already-consumed ask is a hard failure so a confirmed
+ * push can never be invented or replayed.
+ */
+function findPendingPushConfirmAsk(
+  eventStore: EventStore,
+  runId: string,
+  requestedAskId?: string
+): PendingPushAsk | PendingPushAskFailure {
+  let events: EventEnvelope[];
+  try {
+    events = eventStore.getEvents(runId);
+  } catch {
+    return {
+      status: 500,
+      error: "Could not read the run event log",
+      code: "EVENT_LOG_UNAVAILABLE",
+    };
+  }
+
+  const raised = new Map<string, { targetFork?: string; branch?: string }>();
+  const order: string[] = [];
+  const answered = new Set<string>();
+
+  for (const event of events) {
+    const data = event.data as Record<string, unknown> | undefined;
+    if (!data) continue;
+    const askId = typeof data.askId === "string" ? data.askId : undefined;
+    if (!askId) continue;
+
+    if (event.kind === "ask.raised" && data.kind === "push_confirm") {
+      raised.set(askId, {
+        targetFork: typeof data.targetFork === "string" ? data.targetFork : undefined,
+        branch: typeof data.branch === "string" ? data.branch : undefined,
+      });
+      order.push(askId);
+    } else if (event.kind === "ask.answered") {
+      answered.add(askId);
+    }
+  }
+
+  const toResult = (
+    askId: string
+  ): PendingPushAsk | PendingPushAskFailure => {
+    const record = raised.get(askId);
+    if (!record?.targetFork) {
+      return {
+        status: 409,
+        error: "The raised push confirmation has no target fork",
+        code: "PUSH_ASK_INVALID",
+      };
+    }
+    return { askId, targetFork: record.targetFork, branch: record.branch ?? null };
+  };
+
+  if (requestedAskId) {
+    if (!raised.has(requestedAskId)) {
+      return {
+        status: 409,
+        error: "No matching push confirmation was raised for this run",
+        code: "PUSH_ASK_NOT_FOUND",
+      };
+    }
+    if (answered.has(requestedAskId)) {
+      return {
+        status: 409,
+        error: "That push confirmation was already answered",
+        code: "PUSH_ASK_ALREADY_ANSWERED",
+      };
+    }
+    return toResult(requestedAskId);
+  }
+
+  for (let i = order.length - 1; i >= 0; i -= 1) {
+    const askId = order[i];
+    if (answered.has(askId)) continue;
+    const result = toResult(askId);
+    if (!("status" in result)) {
+      return result;
+    }
+  }
+
+  return {
+    status: 409,
+    error: "No pending push confirmation was found for this run",
+    code: "PUSH_ASK_MISSING",
+  };
 }
 
 export async function POST(
@@ -231,12 +386,47 @@ export async function POST(
     );
   }
 
-  // Step 2: confirmed push.
-  const targetFork = body.targetFork ?? run.pushTargetFork ?? null;
-  if (!targetFork) {
+  // Step 2: confirmed push. The confirmation is bound to the pending
+  // `push_confirm` ask this run actually raised: the caller can neither invent
+  // one, retarget it, nor replay a consumed one.
+  const pendingAsk = findPendingPushConfirmAsk(eventStore, runId, body.askId);
+  if ("status" in pendingAsk) {
     return Response.json(
-      { ok: false, error: "A target fork is required before pushing" },
-      { status: 400 }
+      { ok: false, error: pendingAsk.error, code: pendingAsk.code },
+      { status: pendingAsk.status }
+    );
+  }
+
+  const targetFork = pendingAsk.targetFork;
+  const pushedBranch = pendingAsk.branch ?? branch;
+
+  // A caller-supplied target must spell the same repository as the raised ask.
+  if (body.targetFork !== undefined) {
+    const provided = canonicalRepoSlug(body.targetFork);
+    const raisedTarget = canonicalRepoSlug(targetFork);
+    if (!provided || !raisedTarget || provided !== raisedTarget) {
+      return Response.json(
+        {
+          ok: false,
+          error: "The confirmation target does not match the raised push ask",
+          code: "PUSH_TARGET_MISMATCH",
+        },
+        { status: 409 }
+      );
+    }
+  }
+
+  // Defense-in-depth allowlist: the raised target must be a plain
+  // https://github.com/<owner>/<repo> URL before any git operation runs.
+  if (!isValidForkTarget(targetFork)) {
+    return Response.json(
+      {
+        ok: false,
+        error:
+          "The fork target must be an https://github.com/<owner>/<repo> repository",
+        code: "INVALID_FORK_TARGET",
+      },
+      { status: 403 }
     );
   }
 
@@ -261,11 +451,11 @@ export async function POST(
       kind: "ask.answered",
       actor: "user",
       data: {
-        askId: body.askId,
+        askId: pendingAsk.askId,
         kind: "push_confirm",
         answer: "Push",
         targetFork,
-        branch,
+        branch: pushedBranch,
       },
     }) as never
   );
@@ -284,7 +474,7 @@ export async function POST(
     const result = (await gitService.pushToFork(runId, {
       targetRepoUrl: targetFork,
       sourceRepoUrl: sourceUrl,
-      branchName: branch,
+      branchName: pushedBranch,
       runPhase: "done",
       invitePushFlag: true,
       pushConfirm: true,
@@ -296,7 +486,7 @@ export async function POST(
         ok: true,
         runId,
         targetFork,
-        branch: result?.branch ?? branch,
+        branch: result?.branch ?? pushedBranch,
         commitSha: result?.commitSha ?? null,
         sourceUntouched: true,
       },
@@ -304,13 +494,8 @@ export async function POST(
     );
   } catch (err) {
     const code = (err as { code?: unknown })?.code;
-    const message = err instanceof Error ? err.message : String(err);
     return Response.json(
-      {
-        ok: false,
-        error: redactText(message),
-        code: typeof code === "string" ? code : undefined,
-      },
+      { ok: false, error: "Unable to complete the fork push" },
       { status: statusForPushError(code) }
     );
   }

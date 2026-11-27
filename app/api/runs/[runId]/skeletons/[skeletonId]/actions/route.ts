@@ -75,17 +75,21 @@ const EVENT_KIND: Record<CanonicalAction, string> = {
   add_review_focus: "warden.focus_added",
 };
 
-/** Calls the first method that exists on `target`, returning whether one ran. */
-function callFirst(
+/**
+ * Awaits the first method that exists on `target`, returning whether one ran.
+ * A dispatched call that throws or rejects propagates to the caller so the
+ * route can answer with an error instead of recording a false success.
+ */
+async function callFirst(
   target: unknown,
   names: readonly string[],
   ...args: unknown[]
-): boolean {
+): Promise<boolean> {
   if (!target || typeof target !== "object") return false;
   for (const name of names) {
     const fn = (target as Record<string, unknown>)[name];
     if (typeof fn === "function") {
-      (fn as (...a: unknown[]) => unknown).apply(target, args);
+      await (fn as (...a: unknown[]) => unknown).apply(target, args);
       return true;
     }
   }
@@ -93,34 +97,34 @@ function callFirst(
 }
 
 /** Forwards the action to the active dispatcher/warden when one is attached. */
-function forwardToDispatcher(
+async function forwardToDispatcher(
   handle: { dispatcher?: unknown; warden?: unknown } | undefined,
   action: CanonicalAction,
   skeletonId: string,
   body: z.infer<typeof skeletonActionSchema>
-): void {
+): Promise<void> {
   if (!handle) return;
   const dispatcher = handle.dispatcher;
   switch (action) {
     case "interrupt":
-      callFirst(dispatcher, ["interruptSkeleton"], skeletonId) ||
-        callFirst(dispatcher, ["pause"]);
+      (await callFirst(dispatcher, ["interruptSkeleton"], skeletonId)) ||
+        (await callFirst(dispatcher, ["pause"]));
       break;
     case "reraise":
-      callFirst(dispatcher, ["resume"]) ||
-        callFirst(dispatcher, ["reraiseSkeleton"], skeletonId);
+      (await callFirst(dispatcher, ["resume"])) ||
+        (await callFirst(dispatcher, ["reraiseSkeleton"], skeletonId));
       break;
     case "lay_to_rest":
-      callFirst(dispatcher, ["layToRest"], skeletonId, body.choice);
+      await callFirst(dispatcher, ["layToRest"], skeletonId, body.choice);
       break;
     case "send_instruction":
-      callFirst(dispatcher, ["sendInstruction"], skeletonId, body.instruction) ||
-        callFirst(dispatcher, ["instruct"], skeletonId, body.instruction);
+      (await callFirst(dispatcher, ["sendInstruction"], skeletonId, body.instruction)) ||
+        (await callFirst(dispatcher, ["instruct"], skeletonId, body.instruction));
       break;
     case "add_review_focus":
-      callFirst(handle.warden, ["addReviewFocus"], skeletonId, body.focus) ||
-        callFirst(handle.warden, ["addFocus"], skeletonId, body.focus) ||
-        callFirst(dispatcher, ["addReviewFocus"], skeletonId, body.focus);
+      (await callFirst(handle.warden, ["addReviewFocus"], skeletonId, body.focus)) ||
+        (await callFirst(handle.warden, ["addFocus"], skeletonId, body.focus)) ||
+        (await callFirst(dispatcher, ["addReviewFocus"], skeletonId, body.focus));
       break;
   }
 }
@@ -214,8 +218,15 @@ export async function POST(
   const orchestrator = resolveActiveOrchestrator(request, context);
   const handle = orchestrator?.getActiveRun?.(runId);
   try {
-    forwardToDispatcher(handle, action, skeletonId, body);
-  } catch {}
+    await forwardToDispatcher(handle, action, skeletonId, body);
+  } catch {
+    // A dispatcher that throws or rejects is surfaced as a failure; the run
+    // must not record a success audit event for an action that never landed.
+    return Response.json(
+      { ok: false, error: "Failed to dispatch the skeleton action" },
+      { status: 502 }
+    );
+  }
 
   const eventKind = EVENT_KIND[action];
   const eventData: Record<string, unknown> = {

@@ -70,6 +70,29 @@ async function readJson(res: Response): Promise<Record<string, any>> {
   return (await res.json()) as Record<string, any>;
 }
 
+/**
+ * Raises the pending `push_confirm` ask for a run the way the two-step route
+ * expects, returning the ask id the confirmation must echo back.
+ */
+async function raisePushConfirmAsk(
+  runId: string,
+  body: Record<string, unknown> = {},
+  headers: Record<string, string> = {}
+): Promise<string> {
+  const res = await pushFork(
+    jsonRequest(
+      `http://test/api/runs/${runId}/push-fork`,
+      { confirmed: false, ...body },
+      headers
+    ),
+    runParams(runId)
+  );
+  assert.equal(res.status, 202, "the unconfirmed step should raise an ask");
+  const data = await readJson(res);
+  assert.equal(typeof data.askId, "string");
+  return data.askId as string;
+}
+
 describe("mutating run API routes", () => {
   let savedEnv: NodeJS.ProcessEnv;
 
@@ -347,10 +370,14 @@ describe("mutating run API routes", () => {
       assert.equal(events[0].data.decision, "approve_once");
     });
 
-    it("persists an approved pattern for approve_pattern", async () => {
+    it("persists an approved pattern for approve_pattern once it resolves", async () => {
       const { runStore } = makeStores();
       const runId = "run-appr-pattern";
       makeRun(runStore, runId);
+
+      (globalThis as Record<string, unknown>).__runOrchestrator = {
+        resolveApproval: async () => ({ ok: true }),
+      };
 
       const res = await resolveApproval(
         jsonRequest(`http://test/api/runs/${runId}/approvals/appr-2`, {
@@ -360,10 +387,34 @@ describe("mutating run API routes", () => {
         { params: Promise.resolve({ runId, approvalId: "appr-2" }) }
       );
       assert.equal(res.status, 200);
+      const data = await readJson(res);
+      assert.equal(data.resolved, true);
 
       const patterns = runStore.getApprovedPatterns(runId);
       assert.equal(patterns.length, 1);
       assert.equal(patterns[0].pattern, "npm test -- --watch=false");
+    });
+
+    it("does not persist an approved pattern when the approval does not resolve", async () => {
+      const { runStore } = makeStores();
+      const runId = "run-appr-pattern-unresolved";
+      makeRun(runStore, runId);
+
+      (globalThis as Record<string, unknown>).__runOrchestrator = {
+        resolveApproval: async () => null,
+      };
+
+      const res = await resolveApproval(
+        jsonRequest(`http://test/api/runs/${runId}/approvals/appr-unresolved`, {
+          decision: "approve_pattern",
+          pattern: "rm -rf /",
+        }),
+        { params: Promise.resolve({ runId, approvalId: "appr-unresolved" }) }
+      );
+      assert.equal(res.status, 200);
+      const data = await readJson(res);
+      assert.equal(data.resolved, false);
+      assert.equal(runStore.getApprovedPatterns(runId).length, 0);
     });
 
     it("rejects an unsafe approvalId with 400", async () => {
@@ -413,6 +464,13 @@ describe("mutating run API routes", () => {
       const runId = "run-ask-ok";
       makeRun(runStore, runId);
 
+      eventStore.append({
+        runId,
+        kind: "ask.raised",
+        actor: "necromancer",
+        data: { askId: "ask-1", kind: "push_confirm" },
+      });
+
       let answered: { id: string; answer: unknown } | null = null;
       (globalThis as Record<string, unknown>).__runOrchestrator = {
         answerAsk: async (_runId: string, askId: string, answer: unknown) => {
@@ -436,6 +494,75 @@ describe("mutating run API routes", () => {
       const events = eventStore.getEvents(runId, { kind: "ask.answered" });
       assert.equal(events.length, 1);
       assert.equal(events[0].data.answer, "yes");
+    });
+
+    it("fails closed (403/404) for an askId raised by a different run", async () => {
+      const { runStore, eventStore } = makeStores();
+      const runA = "run-ask-owner-a";
+      const runB = "run-ask-owner-b";
+      makeRun(runStore, runA);
+      makeRun(runStore, runB);
+
+      eventStore.append({
+        runId: runA,
+        kind: "ask.raised",
+        actor: "necromancer",
+        data: { askId: "ask-cross", kind: "push_confirm" },
+      });
+
+      let answered = false;
+      (globalThis as Record<string, unknown>).__runOrchestrator = {
+        answerAsk: async () => {
+          answered = true;
+          return true;
+        },
+      };
+
+      const res = await answerAsk(
+        jsonRequest(`http://test/api/runs/${runB}/asks/ask-cross`, { answer: "yes" }),
+        { params: Promise.resolve({ runId: runB, askId: "ask-cross" }) }
+      );
+      assert.ok(
+        res.status === 403 || res.status === 404,
+        `cross-run askId should fail closed, got ${res.status}`
+      );
+      assert.equal(answered, false);
+      assert.equal(
+        eventStore.getEvents(runB, { kind: "ask.answered" }).length,
+        0
+      );
+    });
+
+    it("only dispatches to the orchestrator when the AskManager has not handled the ask", async () => {
+      const { runStore } = makeStores();
+      const runId = "run-ask-single-dispatch";
+      makeRun(runStore, runId);
+
+      let askManagerAnswers = 0;
+      let orchestratorAnswers = 0;
+      (globalThis as Record<string, unknown>).__runOrchestrator = {
+        askManager: {
+          getAsk: (askId: string) => ({ askId, runId }),
+          answerAsk: async () => {
+            askManagerAnswers += 1;
+            return true;
+          },
+        },
+        answerAsk: async () => {
+          orchestratorAnswers += 1;
+          return true;
+        },
+      };
+
+      const res = await answerAsk(
+        jsonRequest(`http://test/api/runs/${runId}/asks/ask-dup`, { answer: "yes" }),
+        { params: Promise.resolve({ runId, askId: "ask-dup" }) }
+      );
+      assert.equal(res.status, 200);
+      const data = await readJson(res);
+      assert.equal(data.handled, true);
+      assert.equal(askManagerAnswers, 1);
+      assert.equal(orchestratorAnswers, 0);
     });
 
     it("rejects a missing answer with 400", async () => {
@@ -612,6 +739,37 @@ describe("mutating run API routes", () => {
 
       assert.deepEqual(forwarded, ["interrupt:skel-4", "rest:skel-4"]);
     });
+
+    it("returns a non-2xx and no success audit event when the dispatcher rejects", async () => {
+      const { runStore, eventStore } = makeStores();
+      const runId = "run-skel-dispatch-fails";
+      makeRun(runStore, runId);
+
+      (globalThis as Record<string, unknown>).__runOrchestrator = {
+        getActiveRun: (id: string) =>
+          id === runId
+            ? {
+                dispatcher: {
+                  interruptSkeleton: async () => {
+                    throw new Error("dispatcher offline");
+                  },
+                },
+              }
+            : undefined,
+      };
+
+      const res = await skeletonAction(
+        jsonRequest(`http://test/api/runs/${runId}/skeletons/skel-5/actions`, {
+          action: "interrupt",
+        }),
+        { params: Promise.resolve({ runId, skeletonId: "skel-5" }) }
+      );
+      assert.ok(res.status >= 400, `expected a non-2xx status, got ${res.status}`);
+      assert.equal(
+        eventStore.getEvents(runId, { kind: "skeleton.interrupted" }).length,
+        0
+      );
+    });
   });
 
 
@@ -683,7 +841,7 @@ describe("mutating run API routes", () => {
     });
 
     it("still pauses a run when the owner presents the invite code", async () => {
-      const { runStore } = makeStores();
+      const { runStore, eventStore } = makeStores();
       const runId = "run-ctrl-pause";
       makeRun(runStore, runId, {
         phase: "legion",
@@ -699,6 +857,11 @@ describe("mutating run API routes", () => {
         runParams(runId)
       );
       assert.equal(res.status, 200);
+
+      const clock = eventStore.getEvents(runId, { kind: "run.clock" });
+      assert.equal(clock.length, 1);
+      assert.equal(clock[0].data.action, "pause");
+      assert.equal(clock[0].data.reason, "hold on");
     });
   });
 
@@ -798,10 +961,16 @@ describe("mutating run API routes", () => {
         inviteCodeHash: OWNER_INVITE_HASH,
       });
 
+      const askId = await raisePushConfirmAsk(
+        runId,
+        {},
+        { "x-invite-code": OWNER_INVITE }
+      );
+
       const calls: Array<Record<string, unknown>> = [];
       const req = jsonRequest(
         `http://test/api/runs/${runId}/push-fork`,
-        { confirmed: true },
+        { confirmed: true, askId },
         { "x-invite-code": OWNER_INVITE }
       );
       (req as unknown as Record<string, unknown>).gitService = {
@@ -828,6 +997,7 @@ describe("mutating run API routes", () => {
 
       const answered = eventStore.getEvents(runId, { kind: "ask.answered" });
       assert.equal(answered.length, 1);
+      assert.equal(answered[0].data.askId, askId);
       assert.equal(answered[0].data.kind, "push_confirm");
       assert.equal(answered[0].data.answer, "Push");
     });
@@ -835,16 +1005,30 @@ describe("mutating run API routes", () => {
     it("refuses to push to the source repository (403)", async () => {
       const { runStore } = makeStores();
       const runId = "run-push-source";
-      makeRun(runStore, runId, { phase: "done", pushFlag: true });
+      makeRun(runStore, runId, {
+        phase: "done",
+        pushFlag: true,
+        pushTargetFork: SOURCE,
+      });
 
-      const res = await pushFork(
-        jsonRequest(`http://test/api/runs/${runId}/push-fork`, {
-          confirmed: true,
-          targetFork: SOURCE,
-        }),
-        runParams(runId)
-      );
+      const askId = await raisePushConfirmAsk(runId);
+
+      let pushed = false;
+      const req = jsonRequest(`http://test/api/runs/${runId}/push-fork`, {
+        confirmed: true,
+        askId,
+        targetFork: SOURCE,
+      });
+      (req as unknown as Record<string, unknown>).gitService = {
+        pushToFork: async () => {
+          pushed = true;
+          return {};
+        },
+      };
+
+      const res = await pushFork(req, runParams(runId));
       assert.equal(res.status, 403);
+      assert.equal(pushed, false);
     });
 
     it("surfaces a sanitized 403 when the git service refuses the push", async () => {
@@ -856,8 +1040,11 @@ describe("mutating run API routes", () => {
         pushTargetFork: FORK,
       });
 
+      const askId = await raisePushConfirmAsk(runId);
+
       const req = jsonRequest(`http://test/api/runs/${runId}/push-fork`, {
         confirmed: true,
+        askId,
       });
       (req as unknown as Record<string, unknown>).gitService = {
         pushToFork: async () => {
@@ -871,6 +1058,165 @@ describe("mutating run API routes", () => {
       assert.equal(res.status, 403);
       const data = await readJson(res);
       assert.equal(data.ok, false);
+      const serialized = JSON.stringify(data);
+      assert.ok(!serialized.includes("push refused"), "must not leak the raw error message");
+      assert.ok(!serialized.includes("SOURCE_WRITE_FORBIDDEN"), "must not leak the raw error code");
+    });
+
+    it("rejects a confirmed push when no push_confirm ask is pending (409)", async () => {
+      const { runStore } = makeStores();
+      const runId = "run-push-no-ask";
+      makeRun(runStore, runId, {
+        phase: "done",
+        pushFlag: true,
+        pushTargetFork: FORK,
+      });
+
+      let pushed = false;
+      const req = jsonRequest(`http://test/api/runs/${runId}/push-fork`, {
+        confirmed: true,
+      });
+      (req as unknown as Record<string, unknown>).gitService = {
+        pushToFork: async () => {
+          pushed = true;
+          return {};
+        },
+      };
+
+      const res = await pushFork(req, runParams(runId));
+      assert.equal(res.status, 409);
+      assert.equal(pushed, false);
+    });
+
+    it("rejects a target-swap confirmation that differs from the raised ask (409)", async () => {
+      const { runStore } = makeStores();
+      const runId = "run-push-swap";
+      makeRun(runStore, runId, {
+        phase: "done",
+        pushFlag: true,
+        pushTargetFork: FORK,
+      });
+
+      const askId = await raisePushConfirmAsk(runId);
+
+      let pushed = false;
+      const req = jsonRequest(`http://test/api/runs/${runId}/push-fork`, {
+        confirmed: true,
+        askId,
+        targetFork: "https://github.com/attacker-user/other-repo",
+      });
+      (req as unknown as Record<string, unknown>).gitService = {
+        pushToFork: async () => {
+          pushed = true;
+          return {};
+        },
+      };
+
+      const res = await pushFork(req, runParams(runId));
+      assert.equal(res.status, 409);
+      assert.equal(pushed, false);
+    });
+
+    it("rejects replaying a consumed push_confirm ask (409)", async () => {
+      const { runStore } = makeStores();
+      const runId = "run-push-replay";
+      makeRun(runStore, runId, {
+        phase: "done",
+        pushFlag: true,
+        pushTargetFork: FORK,
+      });
+
+      const askId = await raisePushConfirmAsk(runId);
+
+      const first = jsonRequest(`http://test/api/runs/${runId}/push-fork`, {
+        confirmed: true,
+        askId,
+      });
+      (first as unknown as Record<string, unknown>).gitService = {
+        pushToFork: async () => ({
+          ok: true,
+          commitSha: "abc123",
+          branch: `graveyard/${runId}`,
+        }),
+      };
+      const firstRes = await pushFork(first, runParams(runId));
+      assert.equal(firstRes.status, 200);
+
+      let secondPushed = false;
+      const second = jsonRequest(`http://test/api/runs/${runId}/push-fork`, {
+        confirmed: true,
+        askId,
+      });
+      (second as unknown as Record<string, unknown>).gitService = {
+        pushToFork: async () => {
+          secondPushed = true;
+          return {};
+        },
+      };
+      const secondRes = await pushFork(second, runParams(runId));
+      assert.equal(secondRes.status, 409);
+      assert.equal(secondPushed, false);
+    });
+
+    it("blocks an SSH-form source repository variant (403)", async () => {
+      const { runStore } = makeStores();
+      const runId = "run-push-ssh-source";
+      makeRun(runStore, runId, {
+        url: "git@github.com:source-owner/source-repo.git",
+        phase: "done",
+        pushFlag: true,
+        pushTargetFork: SOURCE,
+      });
+
+      const askId = await raisePushConfirmAsk(runId);
+
+      let pushed = false;
+      const req = jsonRequest(`http://test/api/runs/${runId}/push-fork`, {
+        confirmed: true,
+        askId,
+      });
+      (req as unknown as Record<string, unknown>).gitService = {
+        pushToFork: async () => {
+          pushed = true;
+          return {};
+        },
+      };
+
+      const res = await pushFork(req, runParams(runId));
+      assert.equal(res.status, 403);
+      assert.equal(pushed, false);
+    });
+
+    it("rejects a non-https://github.com target fork before calling GitService", async () => {
+      const { runStore } = makeStores();
+      const runId = "run-push-bad-target";
+      makeRun(runStore, runId, {
+        phase: "done",
+        pushFlag: true,
+      });
+
+      const askId = await raisePushConfirmAsk(runId, {
+        targetFork: "git@github.com:owner-user/source-repo-fork.git",
+      });
+
+      let pushed = false;
+      const req = jsonRequest(`http://test/api/runs/${runId}/push-fork`, {
+        confirmed: true,
+        askId,
+      });
+      (req as unknown as Record<string, unknown>).gitService = {
+        pushToFork: async () => {
+          pushed = true;
+          return {};
+        },
+      };
+
+      const res = await pushFork(req, runParams(runId));
+      assert.ok(
+        res.status === 400 || res.status === 403,
+        `expected 400/403, got ${res.status}`
+      );
+      assert.equal(pushed, false);
     });
   });
 
@@ -937,6 +1283,7 @@ describe("mutating run API routes", () => {
     it("postAskAnswerById targets the per-ask route", async () => {
       await postAskAnswerById("run-x", "ask-1", "yes", "code-123");
       assert.equal(calls[0].url, "/api/runs/run-x/asks/ask-1");
+      assert.equal(headersOf(calls[0])["x-invite-code"], "code-123");
       assert.deepEqual(JSON.parse(String(calls[0].init.body)), { answer: "yes" });
     });
 
@@ -949,6 +1296,7 @@ describe("mutating run API routes", () => {
         "code-123"
       );
       assert.equal(calls[0].url, "/api/runs/run-x/skeletons/skel-1/actions");
+      assert.equal(headersOf(calls[0])["x-invite-code"], "code-123");
       assert.deepEqual(JSON.parse(String(calls[0].init.body)), {
         action: "send-instruction",
         instruction: "go",
@@ -966,6 +1314,7 @@ describe("mutating run API routes", () => {
       await postControl("run-x", "pause", "failed", "code-123");
       assert.equal(calls[0].url, "/api/runs/run-x/control");
       assert.equal(headersOf(calls[0])["x-invite-code"], "code-123");
+      assert.deepEqual(JSON.parse(String(calls[0].init.body)), { action: "pause" });
     });
   });
 });
