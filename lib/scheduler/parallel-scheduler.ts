@@ -283,6 +283,31 @@ function isAbortError(err: unknown): boolean {
 }
 
 /**
+ * Raised when a candidate diff cannot be captured because it overflows the git
+ * capture buffer. The worker treats it as an explicit failure rather than
+ * queuing a candidate without a `candidateSha256`.
+ */
+class CandidateDiffTooLargeError extends Error {
+  readonly code = "candidate_diff_too_large";
+  constructor() {
+    super("candidate_diff_too_large");
+    this.name = "CandidateDiffTooLargeError";
+  }
+}
+
+/** True for our own overflow error or Node's raw max-buffer overflow error. */
+function isCandidateDiffTooLarge(err: unknown): boolean {
+  if (typeof err !== "object" || err === null) {
+    return false;
+  }
+  const code = (err as { code?: unknown }).code;
+  return (
+    code === "candidate_diff_too_large" ||
+    code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"
+  );
+}
+
+/**
  * Normalizes the value returned by an injected `mergeCandidate` into merge
  * evidence or a fail-closed reason.
  */
@@ -306,11 +331,14 @@ function extractMergeCandidateEvidence(
   return { evidence: produced as TaskMergeEvidence };
 }
 /**
- * True when injected merge evidence is bound to the exact approved candidate:
- * the evidence sha and sha256 must be non-empty and match the candidate's, and
- * any `gitMerge.candidateSha` / `gitMerge.candidateSha256` must match as well
- * (a sha256 comparison is trimmed and case-insensitive). Used to fail a merge
- * closed BEFORE `Scheduler.mergeTask` can move any git refs.
+ * True when injected merge evidence is bound to the exact approved candidate.
+ * EVERY present candidate sha (top-level `candidateSha`, `verdict.candidateSha`,
+ * `gitMerge.candidateSha`) AND every present `candidateSha256` (top-level,
+ * `verdict.candidateSha256`, `gitMerge.candidateSha256`) must be non-empty and
+ * agree with the candidate's own sha / sha256 (a sha256 comparison is trimmed
+ * and case-insensitive). Any internal discrepancy (e.g. a nested
+ * `verdict.candidateSha` naming a different commit) fails the match. Used to
+ * fail a merge closed BEFORE `Scheduler.mergeTask` can move any git refs.
  */
 function mergeEvidenceMatchesCandidate(
   evidence: TaskMergeEvidence,
@@ -327,43 +355,41 @@ function mergeEvidenceMatchesCandidate(
   const candidateSha = (candidate.candidateSha ?? "").trim();
   const candidateSha256 = (candidate.candidateSha256 ?? "").trim().toLowerCase();
 
-  const evidenceSha =
-    record.candidateSha ??
-    (verdict ? verdict.candidateSha : undefined) ??
-    (gitMerge ? gitMerge.candidateSha : undefined);
-  if (
-    typeof evidenceSha !== "string" ||
-    evidenceSha.trim().length === 0 ||
-    evidenceSha.trim() !== candidateSha
-  ) {
+  // Validate EVERY present candidate sha against the candidate's own sha.
+  const presentShas: unknown[] = [
+    record.candidateSha,
+    verdict ? verdict.candidateSha : undefined,
+    gitMerge ? gitMerge.candidateSha : undefined,
+  ].filter((value): boolean => value !== undefined && value !== null);
+
+  if (presentShas.length === 0 || candidateSha.length === 0) {
     return false;
   }
-
-  const evidenceSha256 =
-    record.candidateSha256 ??
-    (verdict ? verdict.candidateSha256 : undefined) ??
-    (gitMerge ? gitMerge.candidateSha256 : undefined);
-  if (
-    typeof evidenceSha256 !== "string" ||
-    evidenceSha256.trim().length === 0 ||
-    candidateSha256.length === 0 ||
-    evidenceSha256.trim().toLowerCase() !== candidateSha256
-  ) {
-    return false;
-  }
-
-  if (gitMerge) {
+  for (const value of presentShas) {
     if (
-      gitMerge.candidateSha !== undefined &&
-      (typeof gitMerge.candidateSha !== "string" ||
-        gitMerge.candidateSha.trim() !== candidateSha)
+      typeof value !== "string" ||
+      value.trim().length === 0 ||
+      value.trim() !== candidateSha
     ) {
       return false;
     }
+  }
+
+  // Validate EVERY present candidate sha256 against the candidate's own hash.
+  const presentSha256: unknown[] = [
+    record.candidateSha256,
+    verdict ? verdict.candidateSha256 : undefined,
+    gitMerge ? gitMerge.candidateSha256 : undefined,
+  ].filter((value): boolean => value !== undefined && value !== null);
+
+  if (presentSha256.length === 0 || candidateSha256.length === 0) {
+    return false;
+  }
+  for (const value of presentSha256) {
     if (
-      gitMerge.candidateSha256 !== undefined &&
-      (typeof gitMerge.candidateSha256 !== "string" ||
-        gitMerge.candidateSha256.trim().toLowerCase() !== candidateSha256)
+      typeof value !== "string" ||
+      value.trim().length === 0 ||
+      value.trim().toLowerCase() !== candidateSha256
     ) {
       return false;
     }
@@ -969,10 +995,18 @@ export class ParallelScheduler {
       const trimmedSha = candidateSha.trim();
       // The candidate diff is read from the same revision range the verified git
       // merge uses, so the recomputed `candidateSha256` binds to the same bytes.
-      const diff = await this.readCandidateDiff(
-        worktree.worktreeDir,
-        trimmedSha
-      );
+      // A diff that overflows the capture buffer fails the task explicitly rather
+      // than queuing a candidate without a `candidateSha256`.
+      let diff: string | undefined;
+      try {
+        diff = await this.readCandidateDiff(worktree.worktreeDir, trimmedSha);
+      } catch (diffErr) {
+        if (isCandidateDiffTooLarge(diffErr)) {
+          this.failSafe(task.id, "candidate_diff_too_large");
+          return;
+        }
+        throw diffErr;
+      }
 
       // Re-check the abort flag after the (awaited) diff read, before the task
       // moves to in_review: an abort during diff reading must never enqueue a
@@ -1069,12 +1103,57 @@ export class ParallelScheduler {
     );
   }
 
+  /** Resolves a ref to its sha, or `undefined` when it does not exist. */
+  private async resolveGitRef(
+    cwd: string,
+    ref: string
+  ): Promise<string | undefined> {
+    try {
+      const out = await this.gitCapture(cwd, [
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        ref,
+      ]);
+      const trimmed = out.trim();
+      return trimmed.length > 0 ? trimmed : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** True when `ref` exists in the repository containing `cwd`. */
+  private async gitRefExists(cwd: string, ref: string): Promise<boolean> {
+    return (await this.resolveGitRef(cwd, ref)) !== undefined;
+  }
+
+  /** True when `ancestorRef` is an ancestor of `descendantRef`. */
+  private async isAncestor(
+    cwd: string,
+    ancestorRef: string,
+    descendantRef: string
+  ): Promise<boolean> {
+    try {
+      await this.gitCapture(cwd, [
+        "merge-base",
+        "--is-ancestor",
+        ancestorRef,
+        descendantRef,
+      ]);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   private gitCapture(cwd: string, args: readonly string[]): Promise<string> {
     return new Promise<string>((resolve, reject) => {
       childProcess.execFile(
         this.gitService.gitBinary,
         [...GIT_ISOLATION_FLAGS, ...args],
-        { cwd, encoding: "utf8" },
+        // Match `lib/git/git-service.ts` (20 MiB) so large candidate diffs are
+        // captured in full instead of overflowing at Node's 1 MiB default.
+        { cwd, encoding: "utf8", maxBuffer: 20 * 1024 * 1024 },
         (err, stdout) => {
           if (err) {
             reject(err);
@@ -1090,24 +1169,33 @@ export class ParallelScheduler {
    * Reads the raw candidate diff against the integration branch, mirroring the
    * revision range and flags used by the verified git merge so the recomputed
    * `candidateSha256` binds to the same bytes. Returns `undefined` when the diff
-   * is empty or cannot be read.
+   * is empty or cannot be read (e.g. an unknown revision in a mocked unit test).
+   *
+   * A diff that overflows the 20 MiB capture buffer throws
+   * `CandidateDiffTooLargeError` instead of being swallowed as "no diff", so the
+   * caller fails the candidate rather than queuing one without a
+   * `candidateSha256`.
    */
   private async readCandidateDiff(
     worktreeDir: string,
     candidateSha: string
   ): Promise<string | undefined> {
+    let raw: string;
     try {
-      const raw = await this.gitCapture(worktreeDir, [
+      raw = await this.gitCapture(worktreeDir, [
         "diff",
         "--binary",
         "--no-color",
         "--end-of-options",
         `refs/heads/${this._integrationBranch}..${candidateSha}`,
       ]);
-      return raw.trim().length > 0 ? raw : undefined;
-    } catch {
+    } catch (err) {
+      if (isCandidateDiffTooLarge(err)) {
+        throw new CandidateDiffTooLargeError();
+      }
       return undefined;
     }
+    return raw.trim().length > 0 ? raw : undefined;
   }
 
   private failSafe(taskId: string, reason: string): void {
@@ -1200,19 +1288,130 @@ export class ParallelScheduler {
   private async reviewLoop(
     candidate: ParallelSchedulerCandidate
   ): Promise<void> {
-    let decision: ParallelWardenDecision;
     try {
-      decision = (await this.wardenReview(candidate)) ?? {
-        approved: false,
-        reason: "no_decision",
-      };
-    } catch (err) {
-      decision = {
-        approved: false,
-        reason: err instanceof Error ? err.message : String(err),
-      };
-    }
-    try {
+      // -------------------------------------------------------------------
+      // Honest pre-review rebase onto the integration head.
+      //
+      // Another parallel task may have merged onto `integrationBranch` while
+      // this candidate was produced or queued, so the candidate is rebased to
+      // the CURRENT integration head BEFORE the Warden reviews it. That way the
+      // exact commit the Warden approves is the one that merges.
+      // -------------------------------------------------------------------
+      let effectiveCandidate: ParallelSchedulerCandidate = candidate;
+      const integrationRef = `refs/heads/${this._integrationBranch}`;
+      // Only rebase when the integration ref actually exists: purely mocked
+      // non-git unit tests have no such ref and are skipped cleanly.
+      if (await this.gitRefExists(candidate.worktreeDir, integrationRef)) {
+        const alreadyDescendant = await this.isAncestor(
+          candidate.worktreeDir,
+          integrationRef,
+          candidate.candidateSha
+        );
+        if (!alreadyDescendant) {
+          let rebaseOk = true;
+          try {
+            await this.gitCapture(candidate.worktreeDir, [
+              "-c",
+              "user.name=GitGraveyard",
+              "-c",
+              "user.email=noreply@git-graveyard.local",
+              "rebase",
+              integrationRef,
+            ]);
+          } catch {
+            rebaseOk = false;
+            try {
+              await this.gitCapture(candidate.worktreeDir, [
+                "rebase",
+                "--abort",
+              ]);
+            } catch {
+              // Best-effort abort: never mask the original rebase conflict.
+            }
+          }
+
+          if (!rebaseOk) {
+            await this.cleanupReviewedWorktree(candidate.taskId);
+            this.recordDecision(candidate, {
+              approved: false,
+              reason: "rebase_conflict",
+            });
+            return;
+          }
+
+          // Re-check the abort flag after the (awaited) rebase, before the
+          // Warden is invoked: an abort here must never run the review.
+          if (this._aborted) {
+            await this.cleanupReviewedWorktree(candidate.taskId);
+            this.abandonReviewedTask(
+              candidate.taskId,
+              this._abortReason ?? "aborted"
+            );
+            return;
+          }
+
+          // The rebase rewrote the candidate commit, so recompute the sha, the
+          // diff and the sha256 that bind the reviewed snapshot to the exact
+          // bytes the verified merge will consume.
+          const newSha = await this.resolveHeadSha(candidate.worktreeDir);
+          let newDiff: string | undefined;
+          try {
+            newDiff = await this.readCandidateDiff(
+              candidate.worktreeDir,
+              newSha
+            );
+          } catch {
+            await this.cleanupReviewedWorktree(candidate.taskId);
+            this.recordDecision(candidate, {
+              approved: false,
+              reason: "candidate_diff_too_large",
+            });
+            return;
+          }
+          const newSha256 =
+            newDiff && newDiff.trim().length > 0
+              ? candidateSha256FromDiff(newDiff)
+              : candidate.candidateSha256;
+          effectiveCandidate = {
+            ...candidate,
+            candidateSha: newSha,
+            candidateSha256: newSha256,
+            diff: newDiff,
+          };
+        }
+      }
+
+      // Re-check the abort flag after the rebase, before invoking the Warden.
+      if (this._aborted) {
+        await this.cleanupReviewedWorktree(candidate.taskId);
+        this.abandonReviewedTask(
+          candidate.taskId,
+          this._abortReason ?? "aborted"
+        );
+        return;
+      }
+
+      // Deep-freeze the reviewed snapshot so neither the Warden nor the verified
+      // merge can EVER mutate `candidateSha` / `candidateSha256`.
+      const reviewedCandidate: ParallelSchedulerCandidate = Object.freeze({
+        ...effectiveCandidate,
+        filesInScope: Object.freeze([
+          ...effectiveCandidate.filesInScope,
+        ]) as string[],
+      });
+
+      let decision: ParallelWardenDecision;
+      try {
+        decision = (await this.wardenReview(reviewedCandidate)) ?? {
+          approved: false,
+          reason: "no_decision",
+        };
+      } catch (err) {
+        decision = {
+          approved: false,
+          reason: err instanceof Error ? err.message : String(err),
+        };
+      }
       // The run was aborted while the Warden review was pending: the decision is
       // stale, so tear down the retained worktree and end the task instead of
       // applying the decision or re-queuing a retry.
@@ -1233,7 +1432,7 @@ export class ParallelScheduler {
           typeof decision.candidateSha256 === "string"
             ? decision.candidateSha256.trim()
             : "";
-        const expected = (candidate.candidateSha256 ?? "").trim();
+        const expected = (reviewedCandidate.candidateSha256 ?? "").trim();
         if (provided.length === 0) {
           decision = { approved: false, reason: "candidateSha256_missing" };
         } else if (
@@ -1249,7 +1448,7 @@ export class ParallelScheduler {
       // candidate is still inspectable.
       if (decision.approved === true) {
         const mergeOutcome = await this.performVerifiedMerge(
-          candidate,
+          reviewedCandidate,
           decision
         );
         if (!mergeOutcome.ok) {
@@ -1265,7 +1464,21 @@ export class ParallelScheduler {
       // task for a retry, so the retry never races the teardown for the same
       // worktree path.
       await this.cleanupReviewedWorktree(candidate.taskId);
-      this.recordDecision(candidate, decision);
+
+      // An abort during the worktree teardown must never let recordDecision()
+      // re-queue a rejected task to `ready`.
+      if (
+        this._aborted &&
+        this.scheduler.getTask(candidate.taskId)?.state !== "merged"
+      ) {
+        this.abandonReviewedTask(
+          candidate.taskId,
+          this._abortReason ?? "aborted"
+        );
+        return;
+      }
+
+      this.recordDecision(reviewedCandidate, decision);
     } finally {
       this._wardenActive -= 1;
       this.notify();
@@ -1285,12 +1498,43 @@ export class ParallelScheduler {
     candidate: ParallelSchedulerCandidate,
     decision: ParallelWardenDecision
   ): Promise<{ ok: boolean; reason?: string }> {
+    const integrationRef = `refs/heads/${this._integrationBranch}`;
+    // Capture the integration head BEFORE the merge executor runs so a merge
+    // that moved the ref but then failed (mismatched evidence, a rejected merge
+    // gate, or an emission compensation) can be rolled back, keeping git refs
+    // and scheduler state consistent. Best-effort: absent in mocked unit tests.
+    const preMergeHead = await this.resolveGitRef(
+      candidate.worktreeDir,
+      integrationRef
+    );
+    const rollbackIfMoved = async (): Promise<void> => {
+      if (!preMergeHead) {
+        return;
+      }
+      try {
+        const current = await this.resolveGitRef(
+          candidate.worktreeDir,
+          integrationRef
+        );
+        if (current && current !== preMergeHead) {
+          await this.gitCapture(candidate.worktreeDir, [
+            "update-ref",
+            integrationRef,
+            preMergeHead,
+          ]);
+        }
+      } catch {
+        // Best-effort rollback: never mask the original merge failure.
+      }
+    };
+
     let evidence: TaskMergeEvidence | undefined;
     if (typeof this.options.mergeCandidate === "function") {
       let produced: unknown;
       try {
         produced = await this.options.mergeCandidate(candidate, decision);
       } catch (err) {
+        await rollbackIfMoved();
         return {
           ok: false,
           reason: err instanceof Error ? err.message : String(err),
@@ -1298,7 +1542,13 @@ export class ParallelScheduler {
       }
       const extracted = extractMergeCandidateEvidence(produced);
       if (!extracted.evidence) {
-        return { ok: false, reason: "merge_evidence_missing" };
+        await rollbackIfMoved();
+        // Never drop the executor's own refusal reason (e.g.
+        // "integration_head_changed").
+        return {
+          ok: false,
+          reason: extracted.reason ?? "merge_evidence_missing",
+        };
       }
       evidence = extracted.evidence;
     } else if (decision.mergeEvidence) {
@@ -1306,12 +1556,14 @@ export class ParallelScheduler {
     }
 
     if (!evidence) {
+      await rollbackIfMoved();
       return { ok: false, reason: "merge_evidence_missing" };
     }
 
     // Bind the supplied evidence strictly to this approved candidate: a merge
     // whose evidence names a different sha or sha256 must never move git refs.
     if (!mergeEvidenceMatchesCandidate(evidence, candidate)) {
+      await rollbackIfMoved();
       return { ok: false, reason: "merge_evidence_candidate_mismatch" };
     }
 
@@ -1319,6 +1571,7 @@ export class ParallelScheduler {
     try {
       mergeRes = this.scheduler.mergeTask(candidate.taskId, evidence);
     } catch (err) {
+      await rollbackIfMoved();
       return {
         ok: false,
         reason: err instanceof Error ? err.message : String(err),
@@ -1326,6 +1579,7 @@ export class ParallelScheduler {
     }
 
     if (!mergeRes || !mergeRes.ok || !mergeRes.merged) {
+      await rollbackIfMoved();
       return { ok: false, reason: mergeRes?.reason ?? "merge_gate_failed" };
     }
 
@@ -1342,6 +1596,7 @@ export class ParallelScheduler {
       }
     }
     if (this.scheduler.getTask(candidate.taskId)?.state !== "merged") {
+      await rollbackIfMoved();
       return { ok: false, reason: "merge_emission_failed" };
     }
 

@@ -1896,7 +1896,9 @@ test("pushToFork: emitEvent receives redacted push events without duplicated fie
     process.exit(0);
   }
   if (args.includes("push")) {
-    process.stdout.write("Everything up-to-date");
+    const token = process.env.GIT_WRITE_TOKEN || "";
+    process.stdout.write("Everything up-to-date " + token);
+    process.stderr.write("write token: " + token);
     process.exit(0);
   }
   process.exit(0);
@@ -1959,6 +1961,23 @@ test("pushToFork: emitEvent receives redacted push events without duplicated fie
       "stdout",
       "targetRepoUrl",
     ]);
+
+    // The fake git echoes the write token on stdout and stderr, so these
+    // assertions fail immediately if redaction regresses.
+    assert.equal(
+      String(result.data.stdout).includes(secretToken),
+      false,
+      "push.result stdout must not contain the write token"
+    );
+    assert.equal(
+      String(result.data.stderr).includes(secretToken),
+      false,
+      "push.result stderr must not contain the write token"
+    );
+    assert.ok(
+      String(result.data.stdout).includes("[REDACTED]"),
+      "push.result stdout must show the write token was redacted"
+    );
 
     // The redacting emitter must never surface the write token.
     assert.equal(JSON.stringify(emitted).includes(secretToken), false);

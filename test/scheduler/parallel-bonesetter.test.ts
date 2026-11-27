@@ -752,92 +752,93 @@ async function drainRun<T>(
   return tracked;
 }
 
-/** A Warden review that approves every candidate with its own hash. */
-function makeApprovingWarden(): ParallelSchedulerWardenReview {
-  return async (candidate: ParallelSchedulerCandidate) => ({
-    approved: true,
-    candidateSha256: candidate.candidateSha256,
-  });
+/**
+ * A Warden review that approves every candidate with its own hash. When a
+ * harness is supplied the reviewed sha is recorded so the harness's
+ * `mergeCandidate` can assert the exact approved commit is what merged.
+ */
+function makeApprovingWarden(
+  harness?: MergeHarness
+): ParallelSchedulerWardenReview {
+  return async (candidate: ParallelSchedulerCandidate) => {
+    harness?.reviewedShas.set(candidate.taskId, candidate.candidateSha);
+    return {
+      approved: true,
+      candidateSha256: candidate.candidateSha256,
+    };
+  };
 }
 
 interface MergeHarness {
   gitService: GitService;
   store: EventStore;
   mergeCandidate: NonNullable<ParallelSchedulerOptions["mergeCandidate"]>;
+  /** Candidate shas recorded by the Warden review, keyed by task id. */
+  reviewedShas: Map<string, string>;
+  wardenReview: ParallelSchedulerWardenReview;
 }
 
 /**
  * Builds a `mergeCandidate` executor that performs a real verified git merge and
- * returns the evidence the composed Scheduler requires. When a candidate branch
- * is no longer a descendant of the advanced integration head, it synthesizes a
- * child commit carrying the candidate tree so the merge still fast-forwards.
+ * returns the evidence the composed Scheduler requires. The scheduler rebases an
+ * approved candidate onto the integration head BEFORE `wardenReview`, so the
+ * candidate sha is already a descendant of the integration head here. This
+ * executor asserts that invariant (and that the reviewed sha is the merged sha)
+ * instead of replaying or mutating the candidate.
  */
 function makeMergeHarness(fixture: RepoFixture): MergeHarness {
   const gitService = new GitService({ runsDir: fixture.runDir });
   const store = new EventStore();
   const home = fixture.tmpDir;
   const integrationRef = `graveyard/${fixture.runId}`;
+  const reviewedShas = new Map<string, string>();
 
   const mergeCandidate: MergeHarness["mergeCandidate"] = async (candidate) => {
+    // The snapshot handed to the merge is the SAME deep-frozen snapshot the
+    // Warden reviewed, so it can neither be mutated nor differ from review.
+    const reviewedSha = reviewedShas.get(candidate.taskId);
+    assert.ok(
+      reviewedSha,
+      `${candidate.taskId} must be reviewed before it is merged`
+    );
+    assert.equal(
+      reviewedSha,
+      candidate.candidateSha,
+      "reviewedSha must equal mergedSha (the approved commit is what merges)"
+    );
+    assert.ok(
+      Object.isFrozen(candidate),
+      "candidate snapshot passed to mergeCandidate must be frozen"
+    );
+
     const head = runGit(["rev-parse", integrationRef], fixture.gitDir, home);
-    let candidateSha = candidate.candidateSha;
-    let descendant = false;
-    try {
-      runGit(["merge-base", "--is-ancestor", head, candidateSha], fixture.gitDir, home);
-      descendant = true;
-    } catch {
-      descendant = false;
-    }
-    if (!descendant) {
-      // Tree-preserving replay of the candidate's changes onto the advanced
-      // integration head: cherry-pick the candidate commit in a temporary
-      // worktree so the files merged by earlier tasks (e.g. A.txt) survive
-      // alongside this candidate's files (e.g. B.txt). A `git commit-tree` with
-      // the candidate's own tree would overwrite them with its stale base tree.
-      const replayDir = fs.mkdtempSync(
-        path.join(fixture.tmpDir, `merge-${candidate.taskId}-`)
-      );
-      fs.rmSync(replayDir, { recursive: true, force: true });
-      runGit(["worktree", "add", "--detach", replayDir, head], fixture.gitDir, home);
-      try {
+    // The scheduler rebased the candidate onto the integration head BEFORE the
+    // Warden reviewed it, so the candidate is already a descendant here.
+    assert.doesNotThrow(
+      () =>
         runGit(
-          [
-            "-c",
-            "user.name=Test Runner",
-            "-c",
-            "user.email=runner@example.test",
-            "cherry-pick",
-            candidateSha,
-          ],
-          replayDir,
+          ["merge-base", "--is-ancestor", head, candidate.candidateSha],
+          fixture.gitDir,
           home
-        );
-        candidateSha = runGit(["rev-parse", "HEAD"], replayDir, home);
-      } finally {
-        try {
-          runGit(["worktree", "remove", "--force", replayDir], fixture.gitDir, home);
-        } catch {
-          // Ignore teardown failures; the fixture cleanup removes the temp dir.
-        }
-        fs.rmSync(replayDir, { recursive: true, force: true });
-      }
-      // Rebind the (test) candidate to the replayed commit so the verified merge
-      // evidence is bound to the sha this candidate is actually merged from.
-      (candidate as { candidateSha: string }).candidateSha = candidateSha;
-    }
+        ),
+      "candidateSha must already be a descendant of the integration head"
+    );
+
+    const candidateSha = candidate.candidateSha;
     const tree = runGit(["rev-parse", `${candidateSha}^{tree}`], fixture.gitDir, home);
     const rawDiff = childProcess
       .execFileSync(
         "git",
         ["diff", "--binary", "--no-color", "--end-of-options", `${head}..${candidateSha}`],
-        { cwd: fixture.gitDir, encoding: "utf8", env: gitEnv(home) }
+        {
+          cwd: fixture.gitDir,
+          encoding: "utf8",
+          env: gitEnv(home),
+          maxBuffer: 20 * 1024 * 1024,
+        }
       )
       .toString();
     const candidateSha256 = candidateSha256FromDiff(rawDiff);
-    // Bind the (test) candidate to the exact sha/bytes the verified merge
-    // consumes so the ParallelScheduler's evidence/candidate match check passes.
-    (candidate as { candidateSha: string }).candidateSha = candidateSha;
-    (candidate as { candidateSha256?: string }).candidateSha256 = candidateSha256;
     store.append({
       runId: fixture.runId,
       kind: "verdict",
@@ -902,7 +903,16 @@ function makeMergeHarness(fixture: RepoFixture): MergeHarness {
     return { ok: true, evidence };
   };
 
-  return { gitService, store, mergeCandidate };
+  const harness: MergeHarness = {
+    gitService,
+    store,
+    mergeCandidate,
+    reviewedShas,
+    // Replaced immediately below; makeApprovingWarden records into `reviewedShas`.
+    wardenReview: async () => ({ approved: false, reason: "uninitialized" }),
+  };
+  harness.wardenReview = makeApprovingWarden(harness);
+  return harness;
 }
 
 describe("ParallelScheduler concurrency & dispatch (Task 20.4)", () => {
@@ -918,7 +928,7 @@ describe("ParallelScheduler concurrency & dispatch (Task 20.4)", () => {
         parallelCap: 2,
         globalCap: 3,
         runningMax: 4,
-        wardenReview: makeApprovingWarden(),
+        wardenReview: harness.wardenReview,
         mergeCandidate: harness.mergeCandidate,
       });
       // min over the SPECIFIED bounds only; default 1 when none is specified.
@@ -967,7 +977,7 @@ describe("ParallelScheduler concurrency & dispatch (Task 20.4)", () => {
       const harness = makeMergeHarness(fixture);
       const scheduler = makeScheduler(fixture, tasks, controller.runner, {
         parallelCap: 2,
-        wardenReview: makeApprovingWarden(),
+        wardenReview: harness.wardenReview,
         mergeCandidate: harness.mergeCandidate,
       });
 
@@ -1050,7 +1060,7 @@ describe("ParallelScheduler concurrency & dispatch (Task 20.4)", () => {
       const harness = makeMergeHarness(fixture);
       const scheduler = makeScheduler(fixture, tasks, controller.runner, {
         parallelCap: 3,
-        wardenReview: makeApprovingWarden(),
+        wardenReview: harness.wardenReview,
         mergeCandidate: harness.mergeCandidate,
       });
 
@@ -1099,6 +1109,7 @@ describe("ParallelScheduler serialized Warden review (Task 20.4)", () => {
             reviewGate.release = resolve;
           });
         }
+        harness.reviewedShas.set(candidate.taskId, candidate.candidateSha);
         return { approved: true, candidateSha256: candidate.candidateSha256 };
       };
       const scheduler = makeScheduler(fixture, tasks, controller.runner, {
@@ -1113,9 +1124,12 @@ describe("ParallelScheduler serialized Warden review (Task 20.4)", () => {
       assert.deepEqual(scheduler.getDispatchSequence().slice(0, 2), ["A", "B"]);
       assert.ok(controller.committed.has("A") === false);
 
-      // A finishes and enters the review queue, where it is held.
+      // A finishes and enters the review queue, where it is held. Waiting until
+      // A's `wardenReview` has actually entered guarantees B waits behind A.
       controller.release("A");
-      await waitFor(() => reviewGate.release !== undefined);
+      await waitFor(
+        () => reviewGate.release !== undefined && reviewOrder.length === 1
+      );
       assert.equal(scheduler.getStatus().activeReviews, 1);
       assert.ok(controller.committed.has("A"), "A committed its candidate");
 
@@ -1159,9 +1173,11 @@ describe("ParallelScheduler serialized Warden review (Task 20.4)", () => {
         candidate: ParallelSchedulerCandidate
       ): Promise<ParallelWardenDecision> => {
         reviews += 1;
-        return reviews === 1
-          ? { approved: false, reason: "changes requested" }
-          : { approved: true, candidateSha256: candidate.candidateSha256 };
+        if (reviews === 1) {
+          return { approved: false, reason: "changes requested" };
+        }
+        harness.reviewedShas.set(candidate.taskId, candidate.candidateSha);
+        return { approved: true, candidateSha256: candidate.candidateSha256 };
       };
       const scheduler = makeScheduler(
         fixture,
@@ -1296,12 +1312,14 @@ describe("ParallelScheduler stop & abort (Task 20.4)", () => {
 
       const runPromise = scheduler.run();
       await waitFor(() => controller.pending().length >= 2);
+      // Enter A's review first so B deterministically waits in the serialized
+      // review queue behind A.
       controller.release("A");
+      await waitFor(() => reviewGate.release !== undefined);
       controller.release("B");
 
       // A's review is held, so B's candidate waits on the serialized queue while
       // its task sits in `in_review`.
-      await waitFor(() => reviewGate.release !== undefined);
       await waitFor(() =>
         scheduler.getReviewQueue().some((candidate) => candidate.taskId === "B")
       );
@@ -1339,7 +1357,7 @@ describe("ParallelScheduler pause & resume (Task 20.4)", () => {
       const harness = makeMergeHarness(fixture);
       const scheduler = makeScheduler(fixture, tasks, controller.runner, {
         parallelCap: 2,
-        wardenReview: makeApprovingWarden(),
+        wardenReview: harness.wardenReview,
         mergeCandidate: harness.mergeCandidate,
       });
 
@@ -1395,6 +1413,7 @@ describe("ParallelScheduler defers worktree cleanup until after Warden review (T
     const fixture = createRepoFixture("wardenclean");
     try {
       const controller = makeControlledRunner(fixture.tmpDir);
+      const harness = makeMergeHarness(fixture);
       const observed: Array<{ taskId: string; dir: string; existed: boolean }> =
         [];
       const wardenReview = async (
@@ -1405,9 +1424,9 @@ describe("ParallelScheduler defers worktree cleanup until after Warden review (T
           dir: candidate.worktreeDir,
           existed: fs.existsSync(candidate.worktreeDir),
         });
+        harness.reviewedShas.set(candidate.taskId, candidate.candidateSha);
         return { approved: true, candidateSha256: candidate.candidateSha256 };
       };
-      const harness = makeMergeHarness(fixture);
       const scheduler = makeScheduler(
         fixture,
         [makePactTask("A", { filesInScope: ["src/a.ts"], line: 1 })],
@@ -1560,10 +1579,13 @@ describe("ParallelScheduler verifies warden candidateSha256 (Task 20.4)", () => 
         maxAttempts: 1,
         runner: controller.runner,
         // The approval carries the real candidate hash in a different case.
-        wardenReview: async (candidate) => ({
-          approved: true,
-          candidateSha256: (candidate.candidateSha256 ?? "").toUpperCase(),
-        }),
+        wardenReview: async (candidate) => {
+          harness.reviewedShas.set(candidate.taskId, candidate.candidateSha);
+          return {
+            approved: true,
+            candidateSha256: (candidate.candidateSha256 ?? "").toUpperCase(),
+          };
+        },
         mergeCandidate: harness.mergeCandidate,
       });
 
@@ -1635,19 +1657,33 @@ describe("ParallelScheduler fail-closed merge evidence (Task 20.4)", () => {
       );
       const mergeCandidate: NonNullable<
         ParallelSchedulerOptions["mergeCandidate"]
-      > = async (candidate) => ({
-        ok: true,
-        evidence: {
-          candidateSha: "0".repeat(40),
-          candidateSha256: candidate.candidateSha256,
-          verdict: {
-            candidateSha: candidate.candidateSha,
+      > = async (candidate) => {
+        // A real verified merge advances the integration ref before the executor
+        // returns. Returning mismatched evidence AFTER the ref moved must roll it
+        // back so git refs and scheduler state never diverge.
+        runGit(
+          [
+            "update-ref",
+            `refs/heads/${integrationRef}`,
+            candidate.candidateSha,
+          ],
+          fixture.gitDir,
+          fixture.tmpDir
+        );
+        return {
+          ok: true,
+          evidence: {
+            candidateSha: "0".repeat(40),
             candidateSha256: candidate.candidateSha256,
-          },
-          gateResult: { ok: true, tree: "a".repeat(40) },
-          diff: candidate.diff ?? "diff",
-        } as unknown as TaskMergeEvidence,
-      });
+            verdict: {
+              candidateSha: candidate.candidateSha,
+              candidateSha256: candidate.candidateSha256,
+            },
+            gateResult: { ok: true, tree: "a".repeat(40) },
+            diff: candidate.diff ?? "diff",
+          } as unknown as TaskMergeEvidence,
+        };
+      };
       const scheduler = makeScheduler(
         fixture,
         [makePactTask("A", { filesInScope: ["src/a.ts"], line: 1 })],
@@ -1672,7 +1708,11 @@ describe("ParallelScheduler fail-closed merge evidence (Task 20.4)", () => {
         fixture.gitDir,
         fixture.tmpDir
       );
-      assert.equal(after, before, "mismatched evidence must not move git refs");
+      assert.equal(
+        after,
+        before,
+        "a moved integration ref must be rolled back to `before`"
+      );
     } finally {
       fixture.cleanup();
     }
@@ -1752,7 +1792,7 @@ describe("ParallelScheduler verified merge & unblocking (Task 20.4)", () => {
       const dispatchStates: string[] = [];
       const scheduler = makeScheduler(fixture, tasks, controller.runner, {
         parallelCap: 2,
-        wardenReview: makeApprovingWarden(),
+        wardenReview: harness.wardenReview,
         mergeCandidate: harness.mergeCandidate,
         onDispatch: (context) => {
           dispatchStates.push(
@@ -1785,7 +1825,7 @@ describe("ParallelScheduler verified merge & unblocking (Task 20.4)", () => {
       const harness = makeMergeHarness(fixture);
       const scheduler = makeScheduler(fixture, tasks, controller.runner, {
         parallelCap: 2,
-        wardenReview: makeApprovingWarden(),
+        wardenReview: harness.wardenReview,
         mergeCandidate: harness.mergeCandidate,
       });
 
@@ -1956,9 +1996,11 @@ describe("ParallelScheduler verified merge & unblocking (Task 20.4)", () => {
           parallelCap: 2,
           wardenReview: async (candidate) => {
             reviews += 1;
-            return reviews === 1
-              ? { approved: false, reason: "changes requested" }
-              : { approved: true, candidateSha256: candidate.candidateSha256 };
+            if (reviews === 1) {
+              return { approved: false, reason: "changes requested" };
+            }
+            harness.reviewedShas.set(candidate.taskId, candidate.candidateSha);
+            return { approved: true, candidateSha256: candidate.candidateSha256 };
           },
           mergeCandidate: harness.mergeCandidate,
           onReview: () => {
@@ -1988,4 +2030,185 @@ describe("ParallelScheduler verified merge & unblocking (Task 20.4)", () => {
     }
   });
 });
+
+describe("ParallelScheduler merge reason propagation, large diffs & nested mismatch (Task 20.4)", () => {
+  it("propagates a merge executor's refusal reason to reviewRecords and onRetry", async () => {
+    const fixture = createRepoFixture("headchanged");
+    try {
+      const controller = makeControlledRunner(fixture.tmpDir);
+      const retries: Array<[string, number, string]> = [];
+      const mergeCandidate: NonNullable<
+        ParallelSchedulerOptions["mergeCandidate"]
+      > = async () => ({ ok: false, reason: "integration_head_changed" });
+      const scheduler = makeScheduler(
+        fixture,
+        [makePactTask("A", { filesInScope: ["src/a.ts"], line: 1 })],
+        controller.runner,
+        {
+          parallelCap: 1,
+          maxAttempts: 2,
+          wardenReview: makeApprovingWarden(),
+          mergeCandidate,
+          onRetry: (taskId, attempt, reason) => {
+            retries.push([taskId, attempt, reason]);
+          },
+        }
+      );
+
+      const summary = await drainRun(scheduler.run(), controller);
+
+      const records = scheduler.getReviewRecords();
+      assert.ok(records.length >= 1);
+      assert.equal(records[0].approved, false);
+      assert.equal(
+        records[0].reason,
+        "integration_head_changed",
+        "the executor's refusal reason must not be dropped"
+      );
+      assert.equal(retries.length, 1);
+      assert.equal(retries[0][0], "A");
+      assert.equal(retries[0][2], "integration_head_changed");
+      assert.equal(summary.merged, 0);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("merges a candidate whose diff exceeds 1.2 MiB (20 MiB capture buffer)", async () => {
+    const fixture = createRepoFixture("bigdiff");
+    try {
+      const harness = makeMergeHarness(fixture);
+      const home = fixture.tmpDir;
+      const bigContent = "x".repeat(1.5 * 1024 * 1024);
+      const runner: ParallelSchedulerRunner = async (context) => {
+        fs.writeFileSync(
+          path.join(context.worktreeDir, "big.txt"),
+          `${bigContent}\n`,
+          "utf8"
+        );
+        runGit(["add", "-A"], context.worktreeDir, home);
+        runGit(
+          [
+            "-c",
+            "user.name=Test Runner",
+            "-c",
+            "user.email=runner@example.test",
+            "commit",
+            "-m",
+            "big candidate",
+          ],
+          context.worktreeDir,
+          home
+        );
+        const sha = runGit(["rev-parse", "HEAD"], context.worktreeDir, home);
+        return { ok: true, candidateSha: sha };
+      };
+      const scheduler = makeScheduler(
+        fixture,
+        [makePactTask("A", { filesInScope: ["src/a.ts"], line: 1 })],
+        runner,
+        {
+          parallelCap: 1,
+          wardenReview: harness.wardenReview,
+          mergeCandidate: harness.mergeCandidate,
+        }
+      );
+
+      const summary = await scheduler.run();
+
+      assert.equal(summary.approved, 1);
+      assert.equal(summary.merged, 1);
+      assert.equal(summary.taskStates.A, "merged");
+      const records = scheduler.getReviewRecords();
+      assert.equal(records.length, 1);
+      assert.equal((records[0].candidateSha256 ?? "").length, 64);
+      // The final integration commit carries the big file in full.
+      const integrationRef = `graveyard/${fixture.runId}`;
+      const size = Number(
+        runGit(
+          ["cat-file", "-s", `${integrationRef}:big.txt`],
+          fixture.gitDir,
+          home
+        )
+      );
+      assert.ok(size > 1.2 * 1024 * 1024, `big.txt size was ${size}`);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("rejects a nested verdict.candidateSha mismatch and rolls back a moved integration ref", async () => {
+    const fixture = createRepoFixture("nestedmismatch");
+    try {
+      const controller = makeControlledRunner(fixture.tmpDir);
+      const integrationRef = `graveyard/${fixture.runId}`;
+      const before = runGit(
+        ["rev-parse", integrationRef],
+        fixture.gitDir,
+        fixture.tmpDir
+      );
+      const mergeCandidate: NonNullable<
+        ParallelSchedulerOptions["mergeCandidate"]
+      > = async (candidate) => {
+        // Advance the integration ref as a real merge would, then return evidence
+        // whose NESTED verdict names a different commit: the internal discrepancy
+        // must be rejected and the moved ref rolled back.
+        runGit(
+          [
+            "update-ref",
+            `refs/heads/${integrationRef}`,
+            candidate.candidateSha,
+          ],
+          fixture.gitDir,
+          fixture.tmpDir
+        );
+        return {
+          ok: true,
+          evidence: {
+            candidateSha: candidate.candidateSha,
+            candidateSha256: candidate.candidateSha256,
+            verdict: {
+              candidateSha: "1".repeat(40),
+              candidateSha256: candidate.candidateSha256,
+            },
+            gateResult: { ok: true, tree: "a".repeat(40) },
+            diff: candidate.diff ?? "diff",
+          } as unknown as TaskMergeEvidence,
+        };
+      };
+      const scheduler = makeScheduler(
+        fixture,
+        [makePactTask("A", { filesInScope: ["src/a.ts"], line: 1 })],
+        controller.runner,
+        {
+          parallelCap: 1,
+          maxAttempts: 1,
+          wardenReview: makeApprovingWarden(),
+          mergeCandidate,
+        }
+      );
+
+      const summary = await drainRun(scheduler.run(), controller);
+
+      assert.equal(summary.merged, 0);
+      const records = scheduler.getReviewRecords();
+      assert.equal(records.length, 1);
+      assert.equal(records[0].approved, false);
+      assert.equal(records[0].reason, "merge_evidence_candidate_mismatch");
+      const after = runGit(
+        ["rev-parse", integrationRef],
+        fixture.gitDir,
+        fixture.tmpDir
+      );
+      assert.equal(
+        after,
+        before,
+        "a moved integration ref must be rolled back to `before`"
+      );
+    } finally {
+      fixture.cleanup();
+    }
+  });
+});
+
 
