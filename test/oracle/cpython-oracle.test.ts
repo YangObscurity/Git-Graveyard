@@ -51,6 +51,14 @@ function pythonAvailable(): boolean {
 
 const hasPython = pythonAvailable();
 
+/**
+ * `it` options so that a missing CPython is reported as an explicit skip rather
+ * than a silent pass that hides an untested oracle.
+ */
+const skipWhenNoPython: { skip?: boolean | string } = hasPython
+  ? {}
+  : { skip: "python3 interpreter unavailable" };
+
 function runOracle(args: string[], stdin?: string, parseJson = true): OracleRun {
   const res = spawnSync(PYTHON, [oracleScript, ...args], {
     input: stdin,
@@ -104,16 +112,14 @@ describe("CPython oracle (Requirements 9.3, 10.7)", () => {
     if (hasPython) await initPythonParser();
   });
 
-  it("ships a scripts/test-oracle.py that passes its own --self-test", () => {
-    if (!hasPython) return;
+  it("ships a scripts/test-oracle.py that passes its own --self-test", skipWhenNoPython, () => {
     assert.ok(fs.existsSync(oracleScript), "scripts/test-oracle.py must exist");
     const run = runOracle(["--self-test"], undefined, false);
     assert.equal(run.status, 0, run.stderr || run.stdout);
     assert.match(run.stdout, /self-test ok/);
   });
 
-  it("reports featureVersion 3.13 on a CPython that supports it", () => {
-    if (!hasPython) return;
+  it("reports featureVersion 3.13 on a CPython that supports it", skipWhenNoPython, () => {
     const run = runOracleOnSource("def f(x):\n    return x\n", "clean.py");
     assert.equal(run.records.length, 1);
     const record = run.records[0];
@@ -128,8 +134,7 @@ describe("CPython oracle (Requirements 9.3, 10.7)", () => {
     }
   });
 
-  it("accepts every Python file labelled m1-clean after the M1 rewrite pass", () => {
-    if (!hasPython) return;
+  it("accepts every Python file labelled m1-clean after the M1 rewrite pass", skipWhenNoPython, () => {
     const fixtureDir = pythonFixtureDir();
     const files = listPythonFiles(fixtureDir);
     assert.ok(files.length > 0, "the F-python2 fixture must ship Python files");
@@ -164,8 +169,7 @@ describe("CPython oracle (Requirements 9.3, 10.7)", () => {
     }
   });
 
-  it("fails unmigrated Python 2 syntax with explicit SyntaxError details", () => {
-    if (!hasPython) return;
+  it("fails unmigrated Python 2 syntax with explicit SyntaxError details", skipWhenNoPython, () => {
     const cases: Array<{ name: string; source: string }> = [
       { name: "print-statement.py", source: 'print "hi"\n' },
       { name: "except-comma.py", source: "try:\n    pass\nexcept E, e:\n    pass\n" },
@@ -192,8 +196,7 @@ describe("CPython oracle (Requirements 9.3, 10.7)", () => {
     }
   });
 
-  it("checks --file and --dir inputs and aggregates the JSON records", () => {
-    if (!hasPython) return;
+  it("checks --file and --dir inputs and aggregates the JSON records", skipWhenNoPython, () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "oracle-"));
     try {
       const cleanPath = path.join(tmpDir, "clean.py");
@@ -218,8 +221,42 @@ describe("CPython oracle (Requirements 9.3, 10.7)", () => {
     }
   });
 
-  it("rejects a malformed --feature-version with a usage error", () => {
-    if (!hasPython) return;
+  it("fails an invalid UTF-8 file instead of silently replacing the bytes", skipWhenNoPython, () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "oracle-utf8-"));
+    try {
+      const badPath = path.join(tmpDir, "invalid-utf8.py");
+      // `x = "\xff"` reads fine when invalid bytes are replaced with U+FFFD,
+      // but must fail when the raw bytes are parsed as strict UTF-8.
+      fs.writeFileSync(
+        badPath,
+        Buffer.from([0x78, 0x20, 0x3d, 0x20, 0x22, 0xff, 0x22, 0x0a])
+      );
+      const run = runOracle(["--file", badPath, "--json", "--feature-version", FEATURE_VERSION]);
+      assert.equal(run.records.length, 1);
+      const record = run.records[0];
+      assert.equal(record.ok, false, "invalid UTF-8 must fail the oracle");
+      assert.ok(record.errors.length >= 1, "the failure must carry an explicit error");
+      assert.match(record.errors[0].message, /decode|invalid|utf-8/i);
+      assert.equal(run.status, 1, "an invalid UTF-8 file exits with code 1");
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("exits with code 2 when a file target cannot be read", skipWhenNoPython, () => {
+    const missing = path.join(
+      os.tmpdir(),
+      `oracle-missing-${process.pid}-${Date.now()}.py`
+    );
+    assert.equal(fs.existsSync(missing), false, "the probe path must not exist");
+    const run = runOracle(["--file", missing, "--json"]);
+    assert.equal(run.records.length, 1);
+    assert.equal(run.records[0].ok, false);
+    assert.match(run.records[0].errors[0].message, /unreadable/);
+    assert.equal(run.status, 2, "an unreadable file target exits with code 2");
+  });
+
+  it("rejects a malformed --feature-version with a usage error", skipWhenNoPython, () => {
     const run = runOracle(
       ["--stdin", "--filename", "f.py", "--json", "--feature-version", "not-a-version"],
       "pass\n"

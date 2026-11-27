@@ -1,0 +1,58 @@
+Index: legacy/compat.py
+===================================================================
+--- legacy/compat.py
++++ legacy/compat.py
+@@ -3,7 +3,7 @@
+ 
+ 
+ def dump(value, stream=None):
+-    print >>stream, "value:", value
++    print("value:", value, file=stream)
+     if value <> None:
+         return value
+     return None
+
+Index: legacy/report.py
+===================================================================
+--- legacy/report.py
++++ legacy/report.py
+@@ -5,20 +5,20 @@
+ 
+ def summarize(items):
+     total = 0
+-    for name, value in items.iteritems():
++    for name, value in items.items():
+         total += value
+     if total > 0:
+-        print "total:", total
++        print("total:", total)
+     else:
+-        print "no items"
++        print("no items")
+     return total
+ 
+ 
+ def main():
+     try:
+         summarize({"a": 1, "b": 2})
+-    except ValueError, err:
+-        print >>sys.stderr, "failed:", err
++    except ValueError as err:
++        print("failed:", err, file=sys.stderr)
+ 
+ 
+ if __name__ == "__main__":
+
+Index: setup.py
+===================================================================
+--- setup.py
++++ setup.py
+@@ -2,7 +2,7 @@
+ from distutils.core import setup
+ 
+ if __name__ == "__main__":
+-    print "building f-python2"
++    print("building f-python2")
+ 
+ setup(
+     name="f-python2",

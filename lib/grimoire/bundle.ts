@@ -201,6 +201,16 @@ export function patchStepKey(ruleId: string, file: string): string {
   return `${ruleId}:${file}`;
 }
 
+/**
+ * Internal deduplication key for a `(ruleId, file|target)` pair. A NUL
+ * separator cannot appear in a rule id or a normalized path, so a path that
+ * contains a `:` never collides with a different pair. The exported
+ * `patchStepKey` keeps its `"${ruleId}:${file}"` contract for callers.
+ */
+function dedupeKey(ruleId: string, file: string): string {
+  return `${ruleId}\u0000${file}`;
+}
+
 export function normalizeBundlePath(file: string): string {
   return file.replace(/\\/g, "/").replace(/^\.\/+/, "").replace(/\/+$/, "");
 }
@@ -233,8 +243,9 @@ export function normalizePatchSteps(
     if (!isBundleRuleId(ruleId) || file.length === 0) continue;
     if (!isPatchWorthyStep(step)) continue;
     const key = patchStepKey(ruleId, file);
-    if (seen.has(key)) continue;
-    seen.add(key);
+    const dedupe = dedupeKey(ruleId, file);
+    if (seen.has(dedupe)) continue;
+    seen.add(dedupe);
     normalized.push({
       key,
       ruleId,
@@ -311,12 +322,14 @@ export function deriveManualTasks(input: BundleInput): BundleManualTaskInput[] {
 export function collectManualTasks(input: BundleInput): BundleManualTaskInput[] {
   const merged = new Map<string, BundleManualTaskInput>();
   for (const task of deriveManualTasks(input)) {
-    merged.set(patchStepKey(task.ruleId, task.target), task);
+    const target = normalizeBundlePath(task.target) || ".";
+    merged.set(dedupeKey(task.ruleId, target), { ...task, target });
   }
   for (const task of input.manualTasks ?? []) {
     const ruleId = String(task.ruleId).toUpperCase();
     if (!isBundleRuleId(ruleId)) continue;
-    merged.set(patchStepKey(ruleId, task.target), { ...task, ruleId });
+    const target = normalizeBundlePath(task.target) || ".";
+    merged.set(dedupeKey(ruleId, target), { ...task, ruleId, target });
   }
   return Array.from(merged.values()).sort((a, b) => {
     if (a.ruleId !== b.ruleId) return a.ruleId < b.ruleId ? -1 : 1;
@@ -426,10 +439,14 @@ export function renderRequirements(
     );
   }
   if (input.m2Fired) {
+    // Mirror the effective `engines.node`: a stricter valid constraint from the
+    // manifest (for example `>=24`) is preserved instead of being pinned to 22.
+    const nodeValue =
+      runtime && runtime.kind === "node" && runtime.value ? runtime.value : ">=22";
     runtimeLines.push(
       bullet(
         "M2",
-        "WHEN the repository is resurrected, the target Node runtime SHALL be `>=22` (rule M2, Requirement 7.9)."
+        `WHEN the repository is resurrected, the target Node runtime SHALL be \`${nodeValue}\` (rule M2, Requirement 7.9).`
       )
     );
   } else if (runtime && runtime.kind === "node" && runtime.value) {
@@ -593,12 +610,17 @@ export function resolvedStatusCounts(
     blocked: 0,
   };
   const provided = input.taskStatusCounts;
+  if (provided) {
+    // An explicit `taskStatusCounts` is authoritative: statuses it omits are
+    // reported as 0 and never mixed with the derived counts.
+    return BUNDLE_TASK_STATUSES.map((status) => ({
+      status,
+      count: typeof provided[status] === "number" ? (provided[status] as number) : 0,
+    }));
+  }
   return BUNDLE_TASK_STATUSES.map((status) => ({
     status,
-    count:
-      provided && typeof provided[status] === "number"
-        ? (provided[status] as number)
-        : derived[status],
+    count: derived[status],
   }));
 }
 
@@ -877,6 +899,22 @@ export function parseBundleTasks(tasks: string): ParsedBundleTasks {
   return { patch, manual };
 }
 
+/**
+ * Extracts the backtick-wrapped paths from a mapping Files cell. Splitting on
+ * bare commas would break a path that itself contains a comma, so the paths are
+ * read out of their backtick delimiters instead.
+ */
+function extractBacktickPaths(cell: string): string[] {
+  const paths: string[] = [];
+  const re = /`([^`]+)`/g;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(cell)) !== null) {
+    const path = match[1].trim();
+    if (path.length > 0) paths.push(path);
+  }
+  return paths;
+}
+
 /** Extracts the mapping rows from a rendered `design.md` (Requirement 6.2, P5). */
 export function extractMappingRows(design: string): BundleMappingRow[] {
   const rows: BundleMappingRow[] = [];
@@ -902,13 +940,7 @@ export function extractMappingRows(design: string): BundleMappingRow[] {
       fired: match[2].trim() === "yes",
       finding: match[3].trim(),
       target: match[4].trim(),
-      files:
-        filesRaw === "-" || filesRaw === ""
-          ? []
-          : filesRaw
-              .split(",")
-              .map((part) => part.trim().replace(/^`/, "").replace(/`$/, ""))
-              .filter((part) => part.length > 0),
+      files: extractBacktickPaths(filesRaw),
     });
   }
   return rows;
