@@ -388,16 +388,24 @@ export function ExhumeView({
               {!inviteCode.trim() && (
                 <div
                   data-testid="no-code-replay-offer"
-                  className="text-xs text-ash"
+                  className="text-xs text-ash space-y-1"
                 >
-                  No invite code?{" "}
-                  <a
-                    href={routes.history()}
-                    className="underline text-parchment hover:text-emerald-300 transition-colors"
-                  >
-                    Watch the Replay of a recorded run in History
-                  </a>
-                  .
+                  <p data-testid="no-code-exhume-reason" className="text-amber-200/90">
+                    The Exhume button is disabled because a live run needs an
+                    invite code. The autopsy above and recorded runs are still
+                    available.
+                  </p>
+                  <p>
+                    No invite code?{" "}
+                    <a
+                      href="/replay"
+                      data-testid="no-code-replay-link"
+                      className="underline text-parchment hover:text-emerald-300 transition-colors"
+                    >
+                      Watch the Replay of a recorded run
+                    </a>
+                    .
+                  </p>
                 </div>
               )}
             </div>

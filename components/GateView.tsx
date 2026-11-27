@@ -12,6 +12,78 @@ import { RecentRuns } from "./RecentRuns";
 import { CryptOrnament } from "./ui/CryptOrnament";
 import { StatusPill } from "./ui/StatusPill";
 
+/**
+ * Formats a GitHub rate-limit reset value (ISO timestamp or epoch seconds or
+ * milliseconds) as a local `hh:mm` clock string. Returns the input unchanged
+ * when it cannot be parsed so nothing is invented.
+ */
+export function formatGithubResetTime(resetAt?: string | number | null): string {
+  if (resetAt === null || resetAt === undefined || resetAt === "") {
+    return "a later time";
+  }
+  let date: Date;
+  if (typeof resetAt === "number") {
+    // Epoch seconds vs milliseconds.
+    const ms = resetAt < 1e12 ? resetAt * 1000 : resetAt;
+    date = new Date(ms);
+  } else {
+    const asNumber = Number(resetAt);
+    if (!Number.isNaN(asNumber) && resetAt.trim() !== "") {
+      const ms = asNumber < 1e12 ? asNumber * 1000 : asNumber;
+      date = new Date(ms);
+    } else {
+      date = new Date(resetAt);
+    }
+  }
+  if (Number.isNaN(date.getTime())) {
+    return String(resetAt);
+  }
+  const hh = String(date.getHours()).padStart(2, "0");
+  const mm = String(date.getMinutes()).padStart(2, "0");
+  return `${hh}:${mm}`;
+}
+
+/**
+ * Plain-English message for a refused invite code. Each refusal reason gets its
+ * own sentence so the visitor knows exactly what to do next. Falls back to the
+ * server-provided message for codes we do not recognise.
+ */
+export function describeInviteCodeError(
+  code: string | undefined,
+  fallback: string
+): string {
+  const normalized = (code ?? "").toUpperCase();
+  if (
+    normalized === "INVALID_INVITE_CODE" ||
+    normalized === "INVALID_CODE" ||
+    normalized === "WRONG"
+  ) {
+    return "That invite code is not valid. Check the code and try again.";
+  }
+  if (
+    normalized === "EXPIRED_INVITE_CODE" ||
+    normalized === "EXPIRED_CODE" ||
+    normalized === "EXPIRED"
+  ) {
+    return "That invite code has expired. Ask the owner for a new code.";
+  }
+  if (
+    normalized === "REVOKED_INVITE_CODE" ||
+    normalized === "REVOKED_CODE" ||
+    normalized === "REVOKED"
+  ) {
+    return "That invite code has been revoked by the owner. Ask the owner for a new code.";
+  }
+  if (
+    normalized === "RUN_LIMIT_REACHED" ||
+    normalized === "EXHAUSTED_CODE" ||
+    normalized === "USED_UP"
+  ) {
+    return "That invite code has no remaining runs. Ask the owner for a new code.";
+  }
+  return fallback;
+}
+
 export function GateView() {
   let router: ReturnType<typeof useRouter> | null = null;
   try {
@@ -152,7 +224,20 @@ export function GateView() {
     setSubmitting(false);
 
     if (!result.ok) {
-      setFormError(result.message);
+      // Requirement 34.7: each refusal has its own message. Invite-code
+      // refusals get a distinct sentence per reason; a GitHub rate limit shows
+      // the formatted reset time.
+      if (result.code === "RATE_LIMITED") {
+        const match = result.message.match(/Reset time:\s*(.+?)\.\s*Try again/);
+        const rawReset = match ? match[1] : undefined;
+        setFormError(
+          `GitHub rate limit exceeded. It resets at ${formatGithubResetTime(
+            rawReset
+          )}. Try again after it resets.`
+        );
+        return;
+      }
+      setFormError(describeInviteCodeError(result.code, result.message));
       return;
     }
 
