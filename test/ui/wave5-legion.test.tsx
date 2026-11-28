@@ -134,34 +134,67 @@ describe("Task 24.1 SSE reconnect: banner text and Last-Event-ID tracking", () =
 });
 
 describe("Task 24.1 recovery: Recovering then resumed or restarted", () => {
-  it("marks the run recovering on a worker restart and clears on recovery complete", () => {
+  it("marks the run recovering on a worker restart and clears on the next Skeleton activity", () => {
     seq = 0;
     const base = buildRunView([
       ev("run.phase", { phase: "legion" }),
       ev("skeleton.raised", { role: "bonesetter" }, { skeletonId: "sk-1" }),
     ]);
-    const recovering = applyRunEvents(base, [ev("system.worker_restart", {})]);
+    const recovering = applyRunEvents(base, [ev("system.worker_restart", { restarted: true })]);
     assert.equal(recovering.recovering, true);
-    const done = applyRunEvents(recovering, [ev("system.recovery_complete", {})]);
+    const stillRecovering = applyRunEvents(recovering, [
+      ev("skeleton.state", { state: "recovering" }, { skeletonId: "sk-1" }),
+    ]);
+    assert.equal(stillRecovering.recovering, true);
+    const done = applyRunEvents(stillRecovering, [
+      ev("skeleton.tool_call", { tool: "shell" }, { skeletonId: "sk-1" }),
+    ]);
     assert.equal(done.recovering, false);
   });
 
-  it("records a resumed outcome and labels it", () => {
+  it("does not react to recovery event kinds the backend never emits", () => {
+    seq = 0;
+    const recovering = buildRunView([
+      ev("run.phase", { phase: "legion" }),
+      ev("skeleton.raised", { role: "bonesetter" }, { skeletonId: "sk-1" }),
+      ev("system.worker_restart", { restarted: true }),
+      ev("system.recovery_complete", {}),
+    ]);
+    assert.equal(recovering.recovering, true);
+  });
+
+  it("derives a resumed outcome when a recovering Skeleton becomes active again", () => {
     seq = 0;
     const view = applyRunEvents(
-      buildRunView([ev("skeleton.raised", { role: "bonesetter" }, { skeletonId: "sk-1" })]),
-      [ev("skeleton.recovered", { outcome: "resumed" }, { skeletonId: "sk-1" })]
+      buildRunView([
+        ev("skeleton.raised", { role: "bonesetter" }, { skeletonId: "sk-1" }),
+        ev("skeleton.state", { state: "recovering", reason: "crash" }, { skeletonId: "sk-1" }),
+      ]),
+      [ev("skeleton.state", { state: "running" }, { skeletonId: "sk-1" })]
     );
     assert.equal(view.skeletons[0].recoveryOutcome, "resumed");
     assert.equal(view.skeletons[0].state, "running");
     assert.equal(recoveryOutcomeLabel("resumed"), "Resumed the same session");
   });
 
-  it("records a restarted outcome and labels it", () => {
+  it("does not claim recovery when a recovering Skeleton fails", () => {
+    seq = 0;
+    const view = buildRunView([
+      ev("skeleton.raised", { role: "bonesetter" }, { skeletonId: "sk-1" }),
+      ev("skeleton.state", { state: "recovering" }, { skeletonId: "sk-1" }),
+      ev("skeleton.state", { state: "failed", terminal: true }, { skeletonId: "sk-1" }),
+    ]);
+    assert.equal(view.skeletons[0].recoveryOutcome ?? null, null);
+  });
+
+  it("derives a restarted outcome when a fresh session is raised for a recovering Skeleton", () => {
     seq = 0;
     const view = applyRunEvents(
-      buildRunView([ev("skeleton.raised", { role: "bonesetter" }, { skeletonId: "sk-1" })]),
-      [ev("skeleton.recovered", { outcome: "restarted" }, { skeletonId: "sk-1" })]
+      buildRunView([
+        ev("skeleton.raised", { role: "bonesetter" }, { skeletonId: "sk-1" }),
+        ev("skeleton.state", { state: "recovering" }, { skeletonId: "sk-1" }),
+      ]),
+      [ev("skeleton.raised", { role: "bonesetter" }, { skeletonId: "sk-1" })]
     );
     assert.equal(view.skeletons[0].recoveryOutcome, "restarted");
     assert.equal(recoveryOutcomeLabel("restarted"), "Restarted from its last commit");

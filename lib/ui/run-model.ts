@@ -496,13 +496,6 @@ function applyOne(draft: Draft, event: RunEvent) {
       break;
     }
 
-    case "system.recovery_complete":
-    case "necromancer.recovery_complete": {
-      // The Necromancer finished reattaching every Skeleton after a restart.
-      draft.recovering = false;
-      break;
-    }
-
     case "command.started": {
       const command = commandLineOf(data);
       if (!command) break;
@@ -883,15 +876,31 @@ function applyOne(draft: Draft, event: RunEvent) {
     touchSkeleton(draft, skeletonId, event, data);
   } else if (skeletonId && kind.startsWith("skeleton.")) {
     const skeleton = touchSkeleton(draft, skeletonId, event, data);
+    // The backend records a crash respawn only as skeleton.state "recovering"
+    // (FailureRecoveryHandler); there is no dedicated "recovered" event. The
+    // outcome is therefore derived from what the Skeleton does next.
+    const wasRecovering = skeleton.state === "recovering";
 
     if (kind === "skeleton.raised") {
       skeleton.role = str(data.role) ?? str(data.agent) ?? skeleton.role;
       skeleton.state = "running";
       const worktree = str(data.worktreeRoot) ?? str(data.worktree);
       if (worktree) skeleton.worktree = worktree;
+      if (wasRecovering) {
+        // A fresh session was raised for a recovering Skeleton: it starts again
+        // from the last commit in its kept worktree.
+        markRecovered(skeleton, "restarted");
+      }
     } else if (kind === "skeleton.state") {
-      skeleton.state = str(data.state) ?? str(data.status) ?? skeleton.state;
+      const next = str(data.state) ?? str(data.status) ?? skeleton.state;
+      skeleton.state = next;
+      if (wasRecovering && isActiveSkeletonState(next)) {
+        // The recovering session became active again without a new raise:
+        // the same session was reattached.
+        markRecovered(skeleton, "resumed");
+      }
     } else if (kind === "skeleton.tool_call") {
+      if (wasRecovering) markRecovered(skeleton, "resumed");
       const tool = str(data.tool) ?? str(data.name) ?? str(data.toolName) ?? "tool";
       skeleton.currentToolCall = {
         tool,
@@ -922,29 +931,36 @@ function applyOne(draft: Draft, event: RunEvent) {
           -MAX_SKELETON_LOG_LINES
         );
       }
-    } else if (kind === "skeleton.recovered") {
-      // A crashed Skeleton was respawned by the Necromancer. The recorded
-      // outcome says whether the same session was reattached or it restarted
-      // from its last commit.
-      const outcome = str(data.outcome) ?? str(data.recoveryOutcome);
-      const resumed =
-        data.resumed === true || outcome === "resumed" || outcome === "reattached";
-      const restarted =
-        data.restarted === true ||
-        data.fromCommit === true ||
-        outcome === "restarted" ||
-        outcome === "from_commit";
-      skeleton.recoveryOutcome = resumed ? "resumed" : restarted ? "restarted" : null;
-      skeleton.state = "running";
-      skeleton.currentToolCall = null;
-      const note = resumed
-        ? "Resumed the same session"
-        : restarted
-        ? "Restarted from its last commit"
-        : "Skeleton recovered";
-      skeleton.logs = [...skeleton.logs, note].slice(-MAX_SKELETON_LOG_LINES);
+    }
+
+    // A run-level restart recovery ends once the Necromancer is driving a
+    // Skeleton again. The backend emits no "recovery complete" event, so the
+    // first recorded Skeleton activity after system.worker_restart clears it.
+    if (
+      draft.recovering &&
+      (kind === "skeleton.raised" ||
+        kind === "skeleton.tool_call" ||
+        kind === "skeleton.log" ||
+        (kind === "skeleton.state" && skeleton.state !== "recovering"))
+    ) {
+      draft.recovering = false;
     }
   }
+}
+
+const RESUMED_SKELETON_STATES = new Set(["starting", "running", "working", "auditing"]);
+
+function isActiveSkeletonState(state: string | null | undefined): boolean {
+  return typeof state === "string" && RESUMED_SKELETON_STATES.has(state);
+}
+
+function markRecovered(
+  skeleton: { recoveryOutcome?: "resumed" | "restarted" | null; logs: string[] },
+  outcome: "resumed" | "restarted"
+): void {
+  skeleton.recoveryOutcome = outcome;
+  const note = recoveryOutcomeLabel(outcome);
+  if (note) skeleton.logs = [...skeleton.logs, note].slice(-MAX_SKELETON_LOG_LINES);
 }
 
 function isRunEvent(value: unknown): value is RunEvent {
