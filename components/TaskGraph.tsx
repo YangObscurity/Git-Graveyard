@@ -1,6 +1,7 @@
 "use client";
 
 import React from "react";
+import { useRovingTabIndex } from "@/lib/a11y/roving-tabindex";
 
 /** One task in the synchronized graph/table views. */
 export interface TaskNode {
@@ -115,15 +116,40 @@ function stateToneClass(state: string): string {
   return "border-white/15 border-t-neutral-500";
 }
 
+export function taskStateIndicator(state: string): string {
+  const s = state.toLowerCase();
+  if (s === "merged" || s === "completed" || s === "done") return "[✓]";
+  if (s === "failed" || s === "error" || s === "abandoned") return "[✕]";
+  if (s === "running" || s === "in_progress" || s === "in_review") return "[▶]";
+  return "[·]";
+}
+
+export function taskVerdictIndicator(verdict?: string | null): string {
+  const v = (verdict ?? "").toLowerCase();
+  if (v === "approve" || v === "approved" || v === "pass") return "✓";
+  if (v === "reject" || v === "rejected" || v === "fail" || v === "failed") return "✕";
+  return "…";
+}
+
 /**
- * Interactive directed acyclic task graph. Nodes are real buttons (keyboard
- * focusable, Enter/Space selects) and edges are drawn from each dependency to
- * the task that depends on it. The same TaskNode[] feeds TaskTable, so the two
- * views stay in lockstep.
+ * Interactive directed acyclic task graph. Nodes are real buttons managed as a
+ * roving-tabindex group (Tab enters/exits cleanly; Arrow keys, Home, and End
+ * traverse nodes) and edges are drawn from each dependency to the task that
+ * depends on it. The same TaskNode[] feeds TaskTable, so the two views stay in
+ * lockstep.
  */
 export function TaskGraph({ tasks, selectedTaskId, onSelectTask }: TaskGraphProps) {
   const { positioned, width, height } = layout(tasks);
   const posById = new Map(positioned.map((p) => [p.node.taskId, p]));
+  const orderedIds = positioned.map((p) => p.node.taskId);
+  const { registerItemRef, getItemProps } = useRovingTabIndex<HTMLButtonElement>(
+    orderedIds,
+    {
+      selectedId: selectedTaskId ?? null,
+      orientation: "both",
+      wrap: true,
+    }
+  );
 
   if (tasks.length === 0) {
     return (
@@ -172,13 +198,20 @@ export function TaskGraph({ tasks, selectedTaskId, onSelectTask }: TaskGraphProp
           )}
         </svg>
 
-        {positioned.map((p) => {
+        {positioned.map((p, index) => {
           const t = p.node;
           const selected = selectedTaskId === t.taskId;
+          const rovingProps = getItemProps(t.taskId, index);
+          const stateIcon = taskStateIndicator(t.state);
+          const verdictIcon = taskVerdictIndicator(t.verdict);
           return (
             <button
               key={t.taskId}
+              ref={registerItemRef(t.taskId)}
               type="button"
+              tabIndex={rovingProps.tabIndex}
+              onFocus={rovingProps.onFocus}
+              onKeyDown={rovingProps.onKeyDown}
               data-testid={`task-graph-node-${t.taskId}`}
               data-task-id={t.taskId}
               aria-pressed={selected}
@@ -195,10 +228,12 @@ export function TaskGraph({ tasks, selectedTaskId, onSelectTask }: TaskGraphProp
             >
               <span className="font-semibold text-bone truncate w-full">{t.taskId}</span>
               <span className="text-[10px] text-ash truncate w-full">
+                <span aria-hidden="true">{stateIcon} </span>
                 {t.state}
                 {typeof t.attempt === "number" ? ` · attempt ${t.attempt}` : ""}
               </span>
               <span className={`text-[10px] px-1.5 rounded border ${verdictToneClass(t.verdict)}`}>
+                <span aria-hidden="true">{verdictIcon} </span>
                 Warden: {t.verdict || "pending"}
               </span>
             </button>

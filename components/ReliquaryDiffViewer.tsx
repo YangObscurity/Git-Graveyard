@@ -259,6 +259,16 @@ export function ReliquaryDiffViewer({
             defaultLanguage="diff"
             theme="vs-dark"
             value={fullRawText}
+            loading={
+              <pre
+                tabIndex={0}
+                aria-label="Unified code diff fallback"
+                data-testid="pre-diff-loading-fallback"
+                className="crypt-well m-3 p-4 max-h-[500px] overflow-auto text-xs font-mono leading-relaxed whitespace-pre text-parchment"
+              >
+                {fullRawText}
+              </pre>
+            }
             options={{
               readOnly: true,
               minimap: { enabled: false },
@@ -293,25 +303,30 @@ export function ReliquaryDiffViewer({
                     className="px-2 py-0.5 rounded bg-amber-950/45 border border-[var(--arcane-amber-border)] text-amber-300 font-semibold text-[11px]"
                     data-testid={`hunk-tag-${idx}`}
                   >
+                    <span aria-hidden="true">[#] </span>
                     {tagLabel}
                   </div>
                 </div>
 
                 {hunk.header && (
-                  <div className="text-xs text-violet-300 font-semibold pt-1">
+                  <div className="text-xs text-parchment font-semibold pt-1 border-l-2 border-violet-500/50 pl-2">
                     {hunk.header}
                   </div>
                 )}
 
-                <pre className="text-xs font-mono leading-relaxed whitespace-pre overflow-x-auto pt-1">
+                <pre
+                  tabIndex={0}
+                  aria-label={`Code diff for ${hunk.file || "all.patch"}`}
+                  className="text-xs font-mono leading-relaxed whitespace-pre overflow-x-auto pt-1"
+                >
                   {(hunk.lines ?? (hunk.rawText ? hunk.rawText.split("\n") : [])).map((line, lIdx) => {
-                    let lineClass = "text-parchment/85 px-1.5";
+                    let lineClass = "text-parchment px-1.5";
                     if (line.startsWith("+") && !line.startsWith("+++")) {
                       lineClass = "text-emerald-300 bg-emerald-950/35 border-l-2 border-emerald-500/50 px-1.5";
                     } else if (line.startsWith("-") && !line.startsWith("---")) {
                       lineClass = "text-rose-300 bg-rose-950/35 border-l-2 border-rose-500/50 px-1.5";
                     } else if (line.startsWith("@@")) {
-                      lineClass = "text-violet-300 bg-violet-950/25 border-l-2 border-violet-500/50 px-1.5";
+                      lineClass = "text-bone bg-violet-950/25 border-l-2 border-violet-500/50 px-1.5";
                     }
                     return (
                       <div key={lIdx} className={lineClass}>

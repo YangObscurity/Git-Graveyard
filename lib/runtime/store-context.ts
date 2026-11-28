@@ -11,7 +11,12 @@ import {
   seedRecordedRunsIntoStores,
 } from "../runs/recorded-runs-loader";
 import { getDefaultRunStore, RunStore, type RunRecord } from "../runs/run-store";
-import { getDefaultSettingsStore, SettingsStore } from "../admin/settings-store";
+import {
+  E11_DEFAULT_SETTINGS,
+  getDefaultSettingsStore,
+  REQUIRED_SETTING_KEYS,
+  SettingsStore,
+} from "../admin/settings-store";
 
 interface InjectedStoreCarrier {
   runStore?: RunStore;
@@ -188,7 +193,17 @@ export function isSettingsStoreConfigured(request?: Request, context?: unknown):
   }
 
   const g = globalThis as unknown as GlobalStoreSlots;
-  if (g.__settingsStore || g.__sharedSettingsStore) {
+  if (g.__settingsStore) {
+    return true;
+  }
+  // The shared store is created lazily by `getDefaultSettingsStore` the first time any route reads
+  // settings (for example the Admin session check) and seeds the E11 starting defaults on init. The
+  // same store also holds internal state such as admin session revocations, kill-switch flags and
+  // the promotion audit record. None of that is configuration: the store only counts once an
+  // operational setting (a Required_Setting or an E11 setting) has been written, which leaves an
+  // audit entry (seeding does not). Otherwise opening /admin once would silently turn on the
+  // Required_Settings gate for the rest of the process.
+  if (g.__sharedSettingsStore && hasWrittenSetting(g.__sharedSettingsStore)) {
     return true;
   }
 
@@ -198,6 +213,20 @@ export function isSettingsStoreConfigured(request?: Request, context?: unknown):
   }
 
   return process.env.NODE_ENV === "production";
+}
+
+const OPERATIONAL_SETTING_KEYS: ReadonlySet<string> = new Set([
+  ...REQUIRED_SETTING_KEYS,
+  ...Object.keys(E11_DEFAULT_SETTINGS),
+]);
+
+function hasWrittenSetting(store: SettingsStore): boolean {
+  try {
+    return store.getAuditLog().some((entry) => OPERATIONAL_SETTING_KEYS.has(entry.key));
+  } catch {
+    // An unreadable store is treated as configured so the Required_Settings gate fails closed.
+    return true;
+  }
 }
 
 export function resolveEventTap(request?: Request, context?: unknown): EventTap {
