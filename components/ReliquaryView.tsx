@@ -1026,7 +1026,10 @@ export function ReliquaryView({
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs font-mono">
                   <div className="crypt-well space-y-1.5 p-3.5">
                     <div className="font-semibold text-emerald-400">What works:</div>
-                    <ul className="list-disc list-inside space-y-1 text-parchment">
+                    <ul
+                      className="list-disc list-inside space-y-1 text-parchment"
+                      data-testid="partial-works-list"
+                    >
                       {worksList.length === 0 && <li>not recorded</li>}
                       {worksList.map((item, idx) => (
                         <li key={idx}>{item}</li>
@@ -1035,7 +1038,10 @@ export function ReliquaryView({
                   </div>
                   <div className="crypt-well space-y-1.5 p-3.5">
                     <div className="font-semibold text-rose-400">What does not:</div>
-                    <ul className="list-disc list-inside space-y-1 text-parchment">
+                    <ul
+                      className="list-disc list-inside space-y-1 text-parchment"
+                      data-testid="partial-does-not-work-list"
+                    >
                       {doesNotWorkList.length === 0 && <li>not recorded</li>}
                       {doesNotWorkList.map((item, idx) => (
                         <li key={idx}>{item}</li>
@@ -1121,6 +1127,20 @@ export function ReliquaryView({
         <h3 className="text-xs font-semibold text-bone uppercase tracking-[0.16em]">
           02 · Diff Browser
         </h3>
+        {noTasksMerged && (
+          <div
+            data-testid="reliquary-no-tasks-merged"
+            className="crypt-panel border-l-2 border-l-amber-400/80 p-3.5 text-xs font-mono text-amber-200 space-y-1"
+          >
+            <div className="font-semibold text-bone">
+              No task merged during this run. There is no diff.
+            </div>
+            <div className="text-ash">
+              Only the Death Certificate and the run report are offered. The diff
+              download and the diff viewer are not available.
+            </div>
+          </div>
+        )}
         <ReliquaryDiffViewer
           diff={diff}
           hunks={hunks}

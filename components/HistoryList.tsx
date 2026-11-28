@@ -27,11 +27,109 @@ export interface HistoryRunItem {
   startedAt?: number | null;
   endedAt?: number | null;
   date?: string;
+  /** Roles that took part in the run, when the record carries them. */
+  rolesUsed?: string[] | null;
+  /** Engine version that produced the run, when the record carries it. */
+  engineVersion?: string | null;
+  /** How the run was recorded (for example "live"). */
+  mode?: string | null;
+  /** Build status before the run, when the record carries it. */
+  beforeBuildStatus?: string | null;
+  /** Build status after the run, when the record carries it. */
+  afterBuildStatus?: string | null;
+}
+
+export interface HistoryRunMetadataView {
+  roles: string[];
+  engineVersion: string | null;
+  mode: string | null;
+  beforeBuild: string | null;
+  afterBuild: string | null;
+}
+
+function firstString(...values: unknown[]): string | null {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim().length > 0) {
+      return value.trim();
+    }
+  }
+  return null;
+}
+
+function stringList(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const out: string[] = [];
+  for (const entry of value) {
+    if (typeof entry === "string" && entry.trim().length > 0) {
+      out.push(entry.trim());
+    }
+  }
+  return out;
+}
+
+/**
+ * Derives the extra per-row facts (roles, engine version, recorded-on mode and
+ * before/after build status) from the run record. Only values the record
+ * actually carries are returned; anything absent stays null or "not recorded".
+ */
+export function describeRunMetadata(run: HistoryRunItem): HistoryRunMetadataView {
+  const meta =
+    run.metadata && typeof run.metadata === "object" && !Array.isArray(run.metadata)
+      ? (run.metadata as Record<string, unknown>)
+      : {};
+
+  const roles = (() => {
+    const direct = stringList(run.rolesUsed);
+    if (direct.length > 0) return direct;
+    const fromMeta = stringList(meta.rolesUsed ?? meta.roles);
+    if (fromMeta.length > 0) return fromMeta;
+    const skeletons = meta.skeletons;
+    if (Array.isArray(skeletons)) {
+      const fromSkeletons: string[] = [];
+      for (const entry of skeletons) {
+        if (entry && typeof entry === "object") {
+          const role = (entry as Record<string, unknown>).role;
+          if (typeof role === "string" && role.trim().length > 0) {
+            fromSkeletons.push(role.trim());
+          }
+        }
+      }
+      if (fromSkeletons.length > 0) return fromSkeletons;
+    }
+    return [] as string[];
+  })();
+
+  const engineVersion = firstString(
+    run.engineVersion,
+    meta.engineVersion,
+    meta.engine,
+    meta.engineSha
+  );
+
+  const rawMode = firstString(run.mode, meta.mode, meta.recordedOn, meta.recordedMode);
+  const mode = rawMode ? rawMode.toLowerCase() : null;
+
+  const beforeBuild = firstString(
+    run.beforeBuildStatus,
+    meta.beforeBuildStatus,
+    meta.beforeBuild,
+    meta.buildBefore
+  );
+  const afterBuild = firstString(
+    run.afterBuildStatus,
+    meta.afterBuildStatus,
+    meta.afterBuild,
+    meta.buildAfter
+  );
+
+  return { roles, engineVersion, mode, beforeBuild, afterBuild };
 }
 
 export interface HistoryListProps {
   initialRuns?: HistoryRunItem[];
   limit?: number;
+  /** Explicit error message (tests and SSR); when omitted the list fetches. */
+  initialError?: string | null;
 }
 
 export function formatOutcome(outcome?: string | null, isRemoved?: boolean): string {
@@ -101,10 +199,10 @@ function getOutcomeTone(
 
 type OutcomeFilter = "all" | "resurrected" | "partial" | "other";
 
-export function HistoryList({ initialRuns, limit }: HistoryListProps) {
+export function HistoryList({ initialRuns, limit, initialError }: HistoryListProps) {
   const [runs, setRuns] = useState<HistoryRunItem[]>(initialRuns ?? []);
   const [loading, setLoading] = useState<boolean>(initialRuns === undefined);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(initialError ?? null);
   const [searchQuery, setSearchQuery] = useState<string>("");
   const [outcomeFilter, setOutcomeFilter] = useState<OutcomeFilter>("all");
 
@@ -296,11 +394,26 @@ export function HistoryList({ initialRuns, limit }: HistoryListProps) {
             const outcomeTone = getOutcomeTone(run.outcome, isRemoved);
             const shortSha = run.sha ? run.sha.slice(0, 7) : null;
             const durationDisplay = formatDuration(run.startedAt, run.endedAt);
+            const meta = describeRunMetadata(run);
+            const modeLabel =
+              meta.mode === "live"
+                ? "Recorded live run"
+                : meta.mode
+                ? `Recorded ${meta.mode} run`
+                : "Mode not recorded";
+            const buildLabel =
+              meta.beforeBuild || meta.afterBuild
+                ? `before ${meta.beforeBuild ?? "not recorded"} -> after ${
+                    meta.afterBuild ?? "not recorded"
+                  }`
+                : "not recorded";
 
             return (
               <article
                 key={run.runId}
                 data-testid={`history-run-${run.runId}`}
+                data-ui-element="history-list-row"
+                data-ui-state={isRemoved ? "hidden" : "populated"}
                 className="crypt-panel p-4 hover:border-emerald-500/35 hover:bg-slab-hover transition-all flex flex-col lg:flex-row lg:items-center justify-between gap-4"
               >
                 <div className="space-y-2 min-w-0">
@@ -344,6 +457,30 @@ export function HistoryList({ initialRuns, limit }: HistoryListProps) {
                     ) : null}
                     <span className="text-[11px] text-dust">
                       id:{run.runId}
+                    </span>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2 text-[11px] text-ash">
+                    <span
+                      data-testid="history-run-mode"
+                      className="crypt-well px-2 py-0.5 text-[10px] uppercase tracking-wider text-parchment border border-white/15"
+                    >
+                      {modeLabel}
+                    </span>
+                    <span data-testid="history-run-roles" className="text-dust">
+                      Roles:{" "}
+                      <span className="text-parchment">
+                        {meta.roles.length > 0 ? meta.roles.join(", ") : "not recorded"}
+                      </span>
+                    </span>
+                    <span data-testid="history-run-build-status" className="text-dust">
+                      Build: <span className="text-parchment">{buildLabel}</span>
+                    </span>
+                    <span data-testid="history-run-engine" className="text-dust">
+                      Engine:{" "}
+                      <span className="text-parchment">
+                        {meta.engineVersion ?? "not recorded"}
+                      </span>
                     </span>
                   </div>
                 </div>

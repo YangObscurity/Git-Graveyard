@@ -4,6 +4,8 @@ import React, { useEffect, useState } from "react";
 import { CryptOrnament } from "./ui/CryptOrnament";
 import { StatusPill } from "./ui/StatusPill";
 import { CommandRow, type CommandRowItem } from "./CommandRow";
+import { LayToRestModal } from "./LayToRestModal";
+import { recoveryOutcomeLabel } from "@/lib/ui/run-model";
 
 export interface SkeletonData {
   skeletonId: string;
@@ -34,11 +36,14 @@ export interface SkeletonData {
   } | null;
   silentSeconds?: number;
   isSilent?: boolean;
+  recoveryOutcome?: "resumed" | "restarted" | null;
 }
 
 export interface LegionSkeletonCardProps {
   skeleton: SkeletonData;
   runDone?: boolean;
+  /** Run-level flag: the Necromancer is recovering after a restart. */
+  recovering?: boolean;
   onSendInstruction?: (skeletonId: string, instruction?: string) => void;
   onInterrupt?: (skeletonId: string) => void;
   onReraise?: (skeletonId: string) => void;
@@ -80,9 +85,39 @@ function resolveUiState(state: string): CanonicalSkeletonUiState {
   return "working";
 }
 
+/**
+ * The message shown when an interrupt confirmation can no longer be trusted
+ * because the command it was opened for has already finished.
+ */
+export const INTERRUPT_STALE_MESSAGE =
+  "The command finished before the interrupt was sent.";
+
+export interface InterruptConfirmBinding {
+  /** Tool call id captured when the confirmation opened, or null if none. */
+  toolCallId: string | null;
+}
+
+/**
+ * Decides whether an open interrupt confirmation still refers to the command
+ * the operator meant to stop. It is stale when the run has ended, the Skeleton
+ * has no running tool call, or the current tool call id differs from the one
+ * captured when the confirmation opened.
+ */
+export function interruptConfirmStillValid(
+  binding: InterruptConfirmBinding | null,
+  currentToolCallId: string | null | undefined,
+  runDone: boolean
+): boolean {
+  if (runDone) return false;
+  if (binding === null) return false;
+  if (currentToolCallId === null || currentToolCallId === undefined) return false;
+  return binding.toolCallId === currentToolCallId;
+}
+
 export function LegionSkeletonCard({
   skeleton,
   runDone = false,
+  recovering = false,
   onSendInstruction,
   onInterrupt,
   onReraise,
@@ -90,6 +125,11 @@ export function LegionSkeletonCard({
   onAddReviewFocus,
 }: LegionSkeletonCardProps) {
   const [showLayToRestConfirm, setShowLayToRestConfirm] = useState(false);
+  const [showInterruptConfirm, setShowInterruptConfirm] = useState(false);
+  // The tool call id captured when the interrupt confirmation was opened, so a
+  // confirmation can never be applied to a different command than the one shown.
+  const [interruptConfirmBinding, setInterruptConfirmBinding] =
+    useState<InterruptConfirmBinding | null>(null);
   // The user writes the instruction or review focus; nothing is sent without text.
   const [composerOpen, setComposerOpen] = useState(false);
   const [composerText, setComposerText] = useState("");
@@ -107,7 +147,17 @@ export function LegionSkeletonCard({
   const isRejected = state === "rejected";
   const isFailed = state === "failed" || state === "error";
   const isStopped = state === "stopped";
-  const isRecovering = state === "recovering";
+  // Recovering covers both an explicit "recovering" state and a run-level
+  // restart recovery while this Skeleton is still active.
+  const isRecovering =
+    state === "recovering" ||
+    (recovering &&
+      !isCompleted &&
+      !isFailed &&
+      !isRejected &&
+      !isStopped &&
+      !isLaidToRest);
+  const recoveryLabel = recoveryOutcomeLabel(skeleton.recoveryOutcome);
 
   const uiState = resolveUiState(state);
 
@@ -177,6 +227,18 @@ export function LegionSkeletonCard({
     }, 1000);
     return () => clearInterval(timer);
   }, [activeToolStartedAt]);
+
+  // Close the interrupt confirmation automatically when it no longer refers to
+  // the command the operator meant to stop: the run ended, the Skeleton has no
+  // running tool call, or the tool call id changed since the confirmation opened.
+  useEffect(() => {
+    if (!showInterruptConfirm) return;
+    const currentToolCallId = skeleton.currentToolCall?.toolCallId ?? null;
+    if (!interruptConfirmStillValid(interruptConfirmBinding, currentToolCallId, runDone)) {
+      setShowInterruptConfirm(false);
+      setInterruptConfirmBinding(null);
+    }
+  }, [showInterruptConfirm, interruptConfirmBinding, skeleton.currentToolCall, runDone]);
 
   const toolRunningSeconds =
     activeToolStartedAt !== null && clientNowMs !== null
@@ -288,6 +350,12 @@ export function LegionSkeletonCard({
             label={`${stateIcon} ${skeleton.state || "unknown"}`}
             uiState={uiState}
           />
+          {isRecovering && (
+            <StatusPill tone="violet" pulse label="Recovering" uiState="recovering" />
+          )}
+          {recoveryLabel && (
+            <StatusPill tone="violet" label={recoveryLabel} uiState="recovered" />
+          )}
         </div>
       </div>
 
@@ -437,6 +505,28 @@ export function LegionSkeletonCard({
         </div>
       )}
 
+      {/* Interrupt Confirmation: warn that the running output will be lost */}
+      {showInterruptConfirm && !showLayToRestConfirm && (
+        <SkeletonInterruptConfirm
+          skeletonId={skeleton.skeletonId}
+          onConfirm={() => {
+            const currentToolCallId = skeleton.currentToolCall?.toolCallId ?? null;
+            if (!interruptConfirmStillValid(interruptConfirmBinding, currentToolCallId, runDone)) {
+              setShowInterruptConfirm(false);
+              setInterruptConfirmBinding(null);
+              return;
+            }
+            setShowInterruptConfirm(false);
+            setInterruptConfirmBinding(null);
+            onInterrupt?.(skeleton.skeletonId);
+          }}
+          onCancel={() => {
+            setShowInterruptConfirm(false);
+            setInterruptConfirmBinding(null);
+          }}
+        />
+      )}
+
       {/* Instruction / review-focus composer (Requirement 37.11) */}
       {composerOpen && !showLayToRestConfirm && (
         <form
@@ -497,40 +587,19 @@ export function LegionSkeletonCard({
 
       {/* Lay to Rest Confirmation (Requirement 37.13) */}
       {showLayToRestConfirm ? (
-        <div className="crypt-well border-rose-500/45 bg-rose-950/30 p-3.5 space-y-2.5">
-          <p className="text-xs text-rose-200">
-            Lay this Skeleton to rest? Its task will become abandoned. Choose what to do with its work:
-          </p>
-          <div className="flex flex-wrap gap-2">
-            <button
-              type="button"
-              onClick={() => {
-                setShowLayToRestConfirm(false);
-                onLayToRest?.(skeleton.skeletonId, "keep");
-              }}
-              className="crypt-btn-ghost px-3 py-1.5 text-xs rounded"
-            >
-              Keep its commits
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                setShowLayToRestConfirm(false);
-                onLayToRest?.(skeleton.skeletonId, "discard");
-              }}
-              className="crypt-btn-danger px-3 py-1.5 text-xs rounded"
-            >
-              Discard its work
-            </button>
-            <button
-              type="button"
-              onClick={() => setShowLayToRestConfirm(false)}
-              className="crypt-btn-ghost px-3 py-1.5 text-xs rounded text-ash"
-            >
-              Cancel
-            </button>
-          </div>
-        </div>
+        <LayToRestModal
+          skeletonId={skeleton.skeletonId}
+          role={role}
+          onKeep={() => {
+            setShowLayToRestConfirm(false);
+            onLayToRest?.(skeleton.skeletonId, "keep");
+          }}
+          onDiscard={() => {
+            setShowLayToRestConfirm(false);
+            onLayToRest?.(skeleton.skeletonId, "discard");
+          }}
+          onCancel={() => setShowLayToRestConfirm(false)}
+        />
       ) : (
         /* Action Buttons (Requirement 37.11) */
         <div className="flex flex-wrap gap-2 pt-2 border-t border-white/[0.08]">
@@ -570,7 +639,12 @@ export function LegionSkeletonCard({
 
           <button
             type="button"
-            onClick={() => onInterrupt?.(skeleton.skeletonId)}
+            onClick={() => {
+              setInterruptConfirmBinding({
+                toolCallId: skeleton.currentToolCall?.toolCallId ?? null,
+              });
+              setShowInterruptConfirm(true);
+            }}
             disabled={interruptDisabled}
             title={interruptDisabledReason}
             onFocus={() => {
@@ -618,6 +692,52 @@ export function LegionSkeletonCard({
         </div>
       )}
     </article>
+  );
+}
+
+export interface SkeletonInterruptConfirmProps {
+  skeletonId: string;
+  onConfirm: () => void;
+  onCancel: () => void;
+}
+
+/**
+ * Confirmation shown before interrupting a running Skeleton. It states plainly
+ * that the running command's output so far will be lost, so the user can decide
+ * with full information.
+ */
+export function SkeletonInterruptConfirm({
+  skeletonId,
+  onConfirm,
+  onCancel,
+}: SkeletonInterruptConfirmProps) {
+  return (
+    <div
+      data-testid={`skeleton-interrupt-confirm-${skeletonId}`}
+      className="crypt-well border-amber-500/45 bg-amber-950/30 p-3.5 space-y-2.5"
+    >
+      <p className="text-xs text-amber-200">
+        Interrupt now? The command this Skeleton is running will be stopped and its
+        output so far will be lost. This cannot be undone.
+      </p>
+      <div className="flex flex-wrap gap-2">
+        <button
+          type="button"
+          data-testid={`skeleton-interrupt-now-${skeletonId}`}
+          onClick={onConfirm}
+          className="crypt-btn-danger px-3 py-1.5 text-xs rounded"
+        >
+          Interrupt now
+        </button>
+        <button
+          type="button"
+          onClick={onCancel}
+          className="crypt-btn-ghost px-3 py-1.5 text-xs rounded text-ash"
+        >
+          Cancel
+        </button>
+      </div>
+    </div>
   );
 }
 

@@ -27,6 +27,12 @@ export interface RunStream {
   /** Plain-words load failure, or null. */
   loadError: string | null;
   /**
+   * Highest event sequence applied so far. Sent back to the server as the
+   * `Last-Event-ID` (via the `lastEventId` query param) so a reconnect resumes
+   * cleanly after this seq without replaying or dropping events.
+   */
+  lastEventSeq: number;
+  /**
    * Read events newer than the last applied seq. Called after a user action so
    * its recorded event shows even while the stream is reconnecting. Does
    * nothing before the component has mounted.
@@ -107,6 +113,10 @@ export function useRunStream(
 
       if (typeof EventSource === "undefined") return;
       try {
+        // Resume after the last applied seq so the server replays nothing the
+        // client already has. On a later drop the browser re-requests this URL
+        // and attaches the native Last-Event-ID header, which the server uses to
+        // resume from the newest applied event.
         source = new EventSource(eventStreamUrl(runId, resumeFrom));
       } catch {
         setReconnecting(true);
@@ -124,7 +134,8 @@ export function useRunStream(
         }
       };
       source.onerror = () => {
-        // EventSource retries on its own and sends Last-Event-ID.
+        // EventSource retries on its own and re-sends Last-Event-ID (the id of
+        // the last event it delivered), so the server resumes without replay.
         if (!cancelled) setReconnecting(true);
       };
     }
@@ -170,5 +181,5 @@ export function useRunStream(
     };
   }, [runId]);
 
-  return { view, loading, reconnecting, loadError, refresh };
+  return { view, loading, reconnecting, loadError, lastEventSeq: view.lastSeq, refresh };
 }

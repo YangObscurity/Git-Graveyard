@@ -13,6 +13,8 @@ export interface ReplayPlayerProps {
   from?: number;
   to?: number;
   autoPlay?: boolean;
+  /** Explicit error message (tests and SSR); when omitted the player fetches. */
+  initialError?: string | null;
 }
 
 export interface ReplayTimelineEvent {
@@ -129,10 +131,11 @@ export function ReplayPlayer({
   from,
   to,
   autoPlay = false,
+  initialError,
 }: ReplayPlayerProps) {
   const [events, setEvents] = useState<EventEnvelope[]>(initialEvents ?? []);
   const [loading, setLoading] = useState<boolean>(initialEvents === undefined);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(initialError ?? null);
 
   const timeline = useMemo(() => {
     const startSeq = typeof from === "number" ? from : 1;
@@ -631,11 +634,13 @@ export function ReplayPlayer({
     );
   }
 
-  // Find the last event index among actual events to label stopped point if killed
+  // Find the highest stored seq so the stopped-point label lands on the last
+  // stored event even when the array is not in seq order.
   let lastActualEventSeq: number | null = null;
-  for (let i = events.length - 1; i >= 0; i--) {
-    lastActualEventSeq = events[i].seq;
-    break;
+  for (const ev of events) {
+    if (lastActualEventSeq === null || ev.seq > lastActualEventSeq) {
+      lastActualEventSeq = ev.seq;
+    }
   }
 
   // Render timeline items
@@ -718,7 +723,7 @@ export function ReplayPlayer({
                       data-testid="shortened-wait-label"
                       className="px-2 py-0.5 rounded text-[11px] bg-amber-950/40 text-amber-300 border border-[var(--arcane-amber-border)]"
                     >
-                      Shortened wait
+                      Shortened wait (time between events was compressed)
                     </span>
                   ) : null}
                 </div>

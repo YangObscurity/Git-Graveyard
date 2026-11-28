@@ -264,7 +264,32 @@ export function CryptNav({ currentPath, runId, runPhase }: CryptNavProps = {}) {
         {/* Right Cluster: Utility Links */}
         <div className="flex items-center gap-2 text-xs font-mono">
           <Link
-            href="/history"
+            href={routes.builtWithKiro()}
+            data-nav-link="built-with-kiro"
+            className={`px-2.5 py-1 rounded border transition-colors ${
+              pathname.startsWith("/built-with-kiro")
+                ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-300"
+                : "border-white/10 bg-white/[0.03] text-neutral-300 hover:text-bone hover:border-white/20"
+            }`}
+          >
+            Built with Kiro
+          </Link>
+
+          <Link
+            href={routes.admin()}
+            data-nav-link="admin"
+            className={`px-2.5 py-1 rounded border transition-colors ${
+              pathname.startsWith("/admin")
+                ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-300"
+                : "border-white/10 bg-white/[0.03] text-neutral-300 hover:text-bone hover:border-white/20"
+            }`}
+          >
+            Admin
+          </Link>
+
+          <Link
+            href={routes.history()}
+            data-nav-link="history"
             className={`px-2.5 py-1 rounded border transition-colors ${
               activeStage === "history"
                 ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-300"

@@ -753,19 +753,19 @@ Implementation plan for the resurrection engine (design Revision 4). It follows 
     - Test boot reconciliation and box recovery in test/recovery/failure-recovery.test.ts verifying pidfile process cleanup, container recreation, and rate limit handling
     - _Requirements: 26.6, 26.7, 26.8, 41.5, 41.7, 41.17, 41.20, 41.21, 41.24_
 
-- [ ] 24. [Teammate — Pure Frontend / UI States] UI completion: remaining states on the slice screens, task graph, Built with Kiro page and Admin page
-  - [ ] 24.1 Add the Legion attention, reconnect and recovery states
+- [x] 24. [Teammate — Pure Frontend / UI States] UI completion: remaining states on the slice screens, task graph, Built with Kiro page and Admin page
+  - [x] 24.1 Add the Legion attention, reconnect and recovery states
     - Extend components/LegionDashboard.tsx and components/RunHeader.tsx from 15.4: while an item needs the user, show the inbox badge, fill the "You" slot and put the state in the browser tab title.
     - While the SSE connection is down, show "Reconnecting... showing events up to #<seq>" and resume from Last-Event-ID.
     - While the Necromancer recovers after a restart, show the recovering state on the affected cards; when a crashed Skeleton is respawned, show "Recovering" followed by "Resumed the same session" or "Restarted from its last commit".
     - _Requirements: 37.4, 37.5, 37.6, 41.6_
-  - [ ] 24.2 Add the Skeleton card controls, the silent state and the run-end states
+  - [x] 24.2 Add the Skeleton card controls, the silent state and the run-end states
     - Extend components/SkeletonCard.tsx from 15.4 with Send instruction, Interrupt, Re-raise and Lay to rest on every Builder card, and Add review focus instead of Send instruction on the Warden card; a disabled button that receives focus states why it is disabled.
     - When the user chooses "Interrupt now" delivery, warn that the running command's output will be lost; when the user chooses Lay to rest, open components/LayToRestModal.tsx with the choices "Keep its commits" and "Discard its work".
     - Show "Silent for mm:ss" on a card whose Skeleton produced no tool call and no log line for the silent-Skeleton limit.
     - On a run-level error, show a plain message with links to the kept evidence; when some tasks merged and others failed or were abandoned, show the partial state.
     - _Requirements: 27.4, 37.8, 37.9, 37.11, 37.12, 37.13, 37.17_
-  - [ ] 24.3 Implement synchronized task graph visualization and accessible task table
+  - [x] 24.3 Implement synchronized task graph visualization and accessible task table
     - Write components/TaskGraph.tsx rendering an interactive directed acyclic task graph showing task dependencies, states, attempt numbers, and Warden verdicts
     - Write components/TaskTable.tsx providing a synchronized keyboard-navigable table view carrying identical task state, dependency, and attempt data
     - Implement accessible toggle between graph and table view, preserving selection and state synchronization across live run updates
@@ -791,18 +791,18 @@ Implementation plan for the resurrection engine (design Revision 4). It follows 
     - While the Planner revises the Pact, lock edits and show the diff between versions in components/PactDiff.tsx when the revision arrives; while the run is parked, offer "Resume" and state that resuming clones the repository again.
     - Extend components/BudgetSettings.tsx: when probe P5 shows no credit field in turn_completion, state "Credits are not reported by the CLI; the cap is minutes and tool calls".
     - _Requirements: 36.2, 36.3, 36.5, 36.6, 36.9, 36.10, 36.12_
-  - [ ] 24.8 Add the Reliquary partial, empty, missing, hidden, push and report-check states
+  - [x] 24.8 Add the Reliquary partial, empty, missing, hidden, push and report-check states
     - Extend components/ReliquaryView.tsx from 15.5: for outcome partial, list what works and what does not from the before and after table.
     - When no task merged, state that there is no diff and offer only the Death_Certificate and the report; when an artifact is missing, show "This file could not be built. The event log is still available."; when the Admin has hidden the run, show "Removed by the owner".
     - Where the Invite_Code's push flag is on, show the push target Fork and the branch graveyard/<runId> and state that the Source_Repository is not touched.
     - When the Scribe's run report fails the Report_Check, drop the unverified reading and state that the model reading failed verification.
     - _Requirements: 38.3, 38.11, 38.12, 38.13, 38.14, 38.15_
-  - [ ] 24.9 Add the remaining History and Replay states
+  - [x] 24.9 Add the remaining History and Replay states
     - Extend components/HistoryList.tsx from 15.6: a loading state, an error state with a plain message on a load error, the empty state "No recorded runs have been published yet", and "Removed by the owner" for hidden runs.
     - Show on every History row the repository, short base sha, date, outcome, wall time, roles used, before and after build status, recorded-on mode, engine version and the label "Recorded live run".
     - Extend components/ReplayPlayer.tsx: show replay time and original time and label every shortened wait; show "Redacted by the owner" at each admin.redaction point; at the last event, show the ended state and offer the Reliquary; for a killed run, label the last stored event as the point where the run was stopped; show an error state when the event log cannot be read.
     - _Requirements: 33.8, 33.9, 33.10, 39.1, 39.2, 39.3, 39.4, 39.5, 39.6, 39.14_
-  - [ ] 24.10 Implement the Built with Kiro page and the Admin page states
+  - [x] 24.10 Implement the Built with Kiro page and the Admin page states
     - Write app/built-with-kiro/page.tsx and components/BuiltWithKiroView.tsx displaying evidence loaded from kiro-evidence.json and GET /api/history?fields=kiro, with "None found" in any section whose source file is missing.
     - Write app/admin/page.tsx and components/AdminDashboard.tsx: only the sign-in state while no Admin is signed in, the empty state when no Invite_Code exists, and publish, redact and hide for finished runs; a run reaches the History_Page only through the Admin's publish action, which is enabled only after the Admin has reviewed the run and applied any redaction; hide marks the run "Removed by the owner".
     - Write components/KillSwitchModal.tsx with the three kill levels (pause new runs; stop gracefully, where running Skeletons end at their next tool boundary and worktrees are kept; hard kill), each behind a typed confirmation that states how many runs the level affects.
@@ -842,7 +842,7 @@ Implementation plan for the resurrection engine (design Revision 4). It follows 
     - Execute automated axe-core accessibility audit using npm run test:e2e asserting zero violations of impact serious or critical across all states
     - _Requirements: 46.1_
 
-- [ ] 26. [Teammate — Pure Code, Build Script & UI Component] Built with Kiro evidence builder and Open in Kiro handoff
+- [x] 26. [Teammate — Pure Code, Build Script & UI Component] Built with Kiro evidence builder and Open in Kiro handoff
   - [x] 26.1 Implement build-time Kiro evidence builder script
     - Write scripts/evidence/build-evidence.ts and package.json script evidence:build generating kiro-evidence.json adhering to the verified build evidence schema
     - Scan repository and index only verified existing files: specs (.kiro/specs/**), steering files with their inclusion mode (.kiro/steering/**), hooks with their triggers (.kiro/hooks/*.json), role agent templates (lib/agents/templates/**), and spec-to-task-to-commit links derived from git log
@@ -852,7 +852,7 @@ Implementation plan for the resurrection engine (design Revision 4). It follows 
     - Write test/ci/evidence-integrity.test.ts verifying that every file path listed in kiro-evidence.json exists in the repository
     - Fail CI execution if kiro-evidence.json contains non-existent paths, stale commit links, or invalid schema formatting
     - _Requirements: 48.6_
-  - [ ] 26.3 Implement Built with Kiro evidence runtime data loader and page integration
+  - [x] 26.3 Implement Built with Kiro evidence runtime data loader and page integration
     - Write lib/evidence/evidence-service.ts loading kiro-evidence.json and fetching GET /api/history?fields=kiro to feed app/built-with-kiro/page.tsx
     - Render build-time evidence in components/BuiltWithKiroEvidence.tsx showing specs, steering files, hooks, and committed role agent templates with configured tool permissions from lib/agents/templates/
     - Extract from the three most recent published runs each Skeleton's role, agent name, model ID, kiro-cli version, session ID, and timestamp from run.started and skeleton.raised events
@@ -868,25 +868,25 @@ Implementation plan for the resurrection engine (design Revision 4). It follows 
 - [ ] 27. [Teammate — Offline Verification (test:props, test:golden, test:e2e)] Checkpoint - Full judge journey verified across all v1 screens, honest metrics, and Kiro evidence. Run npm run test:props, npm run test:golden, and npm run test:e2e, ask the user if questions arise.
 
 - [ ] 28. [Owner — Docker Cloud Sandbox & Host Daemon; Teammate — Pure Sync Validator Logic (28.2)] DockerCloudSandboxBackend (topology P-B) and always-on host configuration
-  - [ ] 28.1 Implement DockerCloudSandboxBackend core under Topology P-B
+  - [x] 28.1 Implement DockerCloudSandboxBackend core under Topology P-B
     - Write lib/execution/docker-cloud-sandbox-backend.ts conforming to ExecutionBackend interface selected when EXECUTION_BACKEND=docker-cloud-sandbox in lib/execution/backend-factory.ts
     - Enforce Topology P-B where kiro-cli runs on the production host and Necromancer operates outside every cloud sandbox, enforcing Topology P-B whenever probe P10 or P11 lacks a recorded pass
     - Accept commands strictly as argv arrays rejecting shell command strings and user ID 0
     - If probe P16 shows that the production SDK does not separate stderr, report separateStderr: false and log output as a single merged stream
     - _Requirements: 43.1, 43.2, 43.7, 43.12, 43.13, 43.19, 43.20_
-  - [ ] 28.2 Implement Topology P-B workspace file synchronization and security sanitization
+  - [x] 28.2 Implement Topology P-B workspace file synchronization and security sanitization
     - Write lib/execution/sandbox-sync.ts maintaining the host worktree as authoritative source of truth for model edits using syncIn and syncOut
     - Implement security validation in lib/execution/sync-validator.ts rejecting absolute paths, .. segments, paths under .git/ or .kiro/, symlinks, and files exceeding the size limit during syncOut
     - Exclude build outputs including node_modules and dist during syncOut while including sources, manifests, and lock files
     - Reject Box specs carrying secret values, non-empty secrets or ports fields, or env vars matching secret denylist, configure default deny networking with hostname allowlist, and support Box re-attachment via get and label listing on restart with idempotency keys and sequenced output streaming
     - _Requirements: 43.3, 43.4, 43.5, 43.6, 43.8, 43.9, 43.14, 43.15, 43.16_
-  - [ ] 28.3 Implement production cloud sandbox lifecycle, quotas, and host configuration
+  - [x] 28.3 Implement production cloud sandbox lifecycle, quotas, and host configuration
     - Write lib/execution/cloud-lifecycle.ts enforcing default lifetime TTL of 1 hour with a renewable hard cap of 24 hours for cloud sandboxes
     - Limit admitted production concurrency to at most 5 concurrent runs based on the 10-sandbox account quota
     - Prohibit creation of snapshots for any sandbox, and pull artifacts and logs from sandboxes upon run completion before destroying sandboxes
     - Write lib/execution/host-config.ts establishing always-on host configuration, environment variable validation, and daemon supervision outside cloud sandboxes
     - _Requirements: 43.17, 43.18, 43.21, 43.22_
-  - [ ] 28.4 Write integration test suite for DockerCloudSandboxBackend
+  - [x] 28.4 Write integration test suite for DockerCloudSandboxBackend
     - Test DockerCloudSandboxBackend operations in test/execution/docker-cloud-sandbox.test.ts: Topology P-B host kiro-cli execution, separateStderr reporting based on probe P16, and host worktree authority
     - Test syncOut security sanitization rejecting absolute paths, directory traversal, .git/ or .kiro/ writes, symlinks, and oversized files
     - Test exclusion of build outputs (node_modules, dist), sandbox snapshot rejection, TTL expiration enforcement, and 5-run concurrency quota limits

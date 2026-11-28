@@ -231,15 +231,22 @@ export async function fetchRecentKiroRuns(
   }
 }
 
-/** Load build evidence and merge the three most recent published runs. */
+/** Load build evidence and merge the three most recent published runs.
+ *
+ * When `preloadedRecentRuns` is supplied (for example by a server-rendered page
+ * that already listed the runs in-process), they are used as-is and no fetch is
+ * performed; otherwise the runs are fetched from `GET /api/history?fields=kiro`.
+ */
 export async function loadEvidenceBundle(
   repoRoot?: string,
   fetchImpl?: typeof fetch,
-  baseUrl?: string
+  baseUrl?: string,
+  preloadedRecentRuns?: PublishedRunEvidence[]
 ): Promise<EvidenceBundle> {
-  const [build, recentRuns] = await Promise.all([
-    loadBuildEvidence(repoRoot),
-    fetchRecentKiroRuns(3, fetchImpl, baseUrl),
-  ]);
+  const build = await loadBuildEvidence(repoRoot);
+  const recentRuns =
+    preloadedRecentRuns !== undefined
+      ? preloadedRecentRuns
+      : await fetchRecentKiroRuns(3, fetchImpl, baseUrl);
   return { build, recentRuns };
 }
