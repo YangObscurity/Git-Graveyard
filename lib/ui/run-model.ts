@@ -88,6 +88,12 @@ export interface RunSkeleton {
   worktree: string;
   candidateSha256?: string | null;
   verdict?: string | null;
+  /**
+   * Recorded recovery outcome after a crash/respawn: "resumed" when the same
+   * session was reattached, "restarted" when the Skeleton began again from its
+   * last commit. Null until a recovery event reports one.
+   */
+  recoveryOutcome?: "resumed" | "restarted" | null;
   lastEvent: {
     seq?: number;
     kind?: string;
@@ -127,6 +133,10 @@ export interface RunTask {
   state: string;
   attempt?: number;
   summary?: string;
+  /** Task IDs this task depends on, when the run recorded them. */
+  dependencies?: string[];
+  /** Warden verdict for the task: "approve" | "reject" | a pending marker. */
+  verdict?: string | null;
 }
 
 export interface RunChannelEntry {
@@ -399,6 +409,7 @@ function touchSkeleton(
       elapsedSeconds: 0,
       credits: null,
       worktree: str(data.worktreeRoot) ?? str(data.worktree) ?? skeletonId,
+      recoveryOutcome: null,
       lastEvent: null,
     };
     draft.skeletons.push(skeleton);
@@ -610,6 +621,10 @@ function applyOne(draft: Draft, event: RunEvent) {
         state: str(data.state) ?? str(data.status) ?? "pending",
         ...(num(event.attempt) !== undefined ? { attempt: num(event.attempt) } : {}),
         ...(str(data.summary) ? { summary: str(data.summary) } : {}),
+        ...(strList(data.dependencies) ? { dependencies: strList(data.dependencies) } : {}),
+        ...(str(data.verdict) ?? str(data.wardenVerdict)
+          ? { verdict: str(data.verdict) ?? str(data.wardenVerdict) ?? null }
+          : {}),
       });
       break;
     }
@@ -861,15 +876,31 @@ function applyOne(draft: Draft, event: RunEvent) {
     touchSkeleton(draft, skeletonId, event, data);
   } else if (skeletonId && kind.startsWith("skeleton.")) {
     const skeleton = touchSkeleton(draft, skeletonId, event, data);
+    // The backend records a crash respawn only as skeleton.state "recovering"
+    // (FailureRecoveryHandler); there is no dedicated "recovered" event. The
+    // outcome is therefore derived from what the Skeleton does next.
+    const wasRecovering = skeleton.state === "recovering";
 
     if (kind === "skeleton.raised") {
       skeleton.role = str(data.role) ?? str(data.agent) ?? skeleton.role;
       skeleton.state = "running";
       const worktree = str(data.worktreeRoot) ?? str(data.worktree);
       if (worktree) skeleton.worktree = worktree;
+      if (wasRecovering) {
+        // A fresh session was raised for a recovering Skeleton: it starts again
+        // from the last commit in its kept worktree.
+        markRecovered(skeleton, "restarted");
+      }
     } else if (kind === "skeleton.state") {
-      skeleton.state = str(data.state) ?? str(data.status) ?? skeleton.state;
+      const next = str(data.state) ?? str(data.status) ?? skeleton.state;
+      skeleton.state = next;
+      if (wasRecovering && isActiveSkeletonState(next)) {
+        // The recovering session became active again without a new raise:
+        // the same session was reattached.
+        markRecovered(skeleton, "resumed");
+      }
     } else if (kind === "skeleton.tool_call") {
+      if (wasRecovering) markRecovered(skeleton, "resumed");
       const tool = str(data.tool) ?? str(data.name) ?? str(data.toolName) ?? "tool";
       skeleton.currentToolCall = {
         tool,
@@ -901,7 +932,35 @@ function applyOne(draft: Draft, event: RunEvent) {
         );
       }
     }
+
+    // A run-level restart recovery ends once the Necromancer is driving a
+    // Skeleton again. The backend emits no "recovery complete" event, so the
+    // first recorded Skeleton activity after system.worker_restart clears it.
+    if (
+      draft.recovering &&
+      (kind === "skeleton.raised" ||
+        kind === "skeleton.tool_call" ||
+        kind === "skeleton.log" ||
+        (kind === "skeleton.state" && skeleton.state !== "recovering"))
+    ) {
+      draft.recovering = false;
+    }
   }
+}
+
+const RESUMED_SKELETON_STATES = new Set(["starting", "running", "working", "auditing"]);
+
+function isActiveSkeletonState(state: string | null | undefined): boolean {
+  return typeof state === "string" && RESUMED_SKELETON_STATES.has(state);
+}
+
+function markRecovered(
+  skeleton: { recoveryOutcome?: "resumed" | "restarted" | null; logs: string[] },
+  outcome: "resumed" | "restarted"
+): void {
+  skeleton.recoveryOutcome = outcome;
+  const note = recoveryOutcomeLabel(outcome);
+  if (note) skeleton.logs = [...skeleton.logs, note].slice(-MAX_SKELETON_LOG_LINES);
 }
 
 function isRunEvent(value: unknown): value is RunEvent {
@@ -963,4 +1022,36 @@ export function elapsedSeconds(view: RunView, now: number): number {
 
 export function mergedTaskCount(view: RunView): number {
   return view.tasks.filter((t) => t.state === "merged").length;
+}
+
+/**
+ * Banner shown while the live stream is reconnecting. It names the last event
+ * sequence the client has applied so the user knows nothing newer is on screen.
+ */
+export function reconnectBannerText(lastSeq: number): string {
+  const safe = Number.isFinite(lastSeq) && lastSeq > 0 ? Math.floor(lastSeq) : 0;
+  return `Reconnecting... showing events up to #${safe}`;
+}
+
+/**
+ * Value the client sends to resume the stream after `lastSeq` (as the
+ * `Last-Event-ID` header / `lastEventId` query param). Null before any event
+ * has been received, so the server sends the whole log from the start.
+ */
+export function lastEventIdParam(lastSeq: number): string | null {
+  return Number.isFinite(lastSeq) && lastSeq > 0 ? String(Math.floor(lastSeq)) : null;
+}
+
+/** Plain-English label for a recorded Skeleton recovery outcome. */
+export function recoveryOutcomeLabel(
+  outcome: "resumed" | "restarted" | null | undefined
+): string | null {
+  if (outcome === "resumed") return "Resumed the same session";
+  if (outcome === "restarted") return "Restarted from its last commit";
+  return null;
+}
+
+/** How many items (approvals + open questions) are waiting on the user. */
+export function needsUserCount(view: RunView): number {
+  return pendingApprovals(view).length + openAsks(view).length;
 }
