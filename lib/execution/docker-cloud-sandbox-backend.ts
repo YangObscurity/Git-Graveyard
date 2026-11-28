@@ -362,7 +362,7 @@ export class DockerCloudSandboxBackend implements ExecutionBackend {
    * cloud sandbox; when P10/P11 lack a recorded pass, any attempt to launch
    * kiro-cli or Necromancer is rejected.
    */
-  private enforceTopologyPTrong(argv: string[]): void {
+  private enforceTopologyPB(argv: string[]): void {
     const joined = argv.join(" ");
     const mentionsKiro = /\bkiro-cli\b/.test(joined) || argv.some((a) => a === "kiro-cli");
     const mentionsNecromancer = /necromancer/i.test(joined);
@@ -520,7 +520,7 @@ async get(id: string): Promise<DockerCloudSandbox | undefined> {
     validateExecRequest(req);
     assertArgvArray(req.argv);
     this.rejectRootUser(req);
-    this.enforceTopologyPTrong(req.argv);
+    this.enforceTopologyPB(req.argv);
     const key = req.idempotencyKey;
     if (key && this.execIdempotency.has(key)) {
       return this.execIdempotency.get(key)!;
