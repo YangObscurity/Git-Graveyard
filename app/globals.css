@@ -131,7 +131,7 @@ html {
 }
 
 body {
-  background: var(--bg-abyss);
+  background-color: var(--bg-abyss);
   color: var(--fg-parchment);
   font-family: var(--font-body);
   line-height: 1.5;
