@@ -1,6 +1,6 @@
 {
   "schemaVersion": "v1",
-  "generatedFromSha": "57d30f0",
+  "generatedFromSha": "e05fb38",
   "specs": [
     {
       "path": ".kiro/specs/resurrection-engine/.config.kiro",
@@ -461,6 +461,12 @@
   ],
   "commitLinks": [
     {
+      "sha": "e05fb381243379d42f6057291c68b02dcdb07f36",
+      "shortSha": "e05fb38",
+      "subject": "fix(wave-5): re-attach only a sandbox that carries the requested idempotency key",
+      "refs": "HEAD -> wave/5"
+    },
+    {
       "sha": "cf2e28b5107bb1797bf4a347523099e0d5565e21",
       "shortSha": "cf2e28b",
       "subject": "docs(wave-5): mark tasks 24, 26 and 28.1-28.4 complete",
@@ -602,12 +608,6 @@
       "sha": "0fe4bfe38578e739639cc720f69ab2ec07b6c61c",
       "shortSha": "0fe4bfe",
       "subject": "feat(scribe,recovery): add ScribeService, ReportCheck verification, failure recovery, and boot reconciliation",
-      "refs": ""
-    },
-    {
-      "sha": "1b07abb185324011111718b8e3c3c69cac594b74",
-      "shortSha": "1b07abb",
-      "subject": "feat(admission,admin): add invite codes, FIFO queue, BudgetGovernor, admin auth, and kill switch",
       "refs": ""
     }
   ]
