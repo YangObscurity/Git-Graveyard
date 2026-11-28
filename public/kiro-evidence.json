@@ -1,6 +1,6 @@
 {
   "schemaVersion": "v1",
-  "generatedFromSha": "f54ee4d",
+  "generatedFromSha": "96fef12",
   "specs": [
     {
       "path": ".kiro/specs/resurrection-engine/.config.kiro",
@@ -461,10 +461,16 @@
   ],
   "commitLinks": [
     {
+      "sha": "96fef12363a3222ee1f329c28c92ac5b1977613b",
+      "shortSha": "96fef12",
+      "subject": "fix(wave-5): count overlapping destroys and never hand out a sandbox being destroyed",
+      "refs": "HEAD -> wave/5"
+    },
+    {
       "sha": "f54ee4d9b3190cbc65063ac283e7ffda610285cd",
       "shortSha": "f54ee4d",
       "subject": "fix(wave-5): refuse a created sandbox whose destroy is still in flight",
-      "refs": "HEAD -> wave/5"
+      "refs": ""
     },
     {
       "sha": "11fb4bccdf9272092157dd3c6fdfa8fa39066994",
@@ -602,12 +608,6 @@
       "sha": "b64467e6d6512382d8351813bcf286642e9ea2f5",
       "shortSha": "b64467e",
       "subject": "fix(wave-3): preserve own __proto__ keys in queue clone and isolate post-send lookup",
-      "refs": ""
-    },
-    {
-      "sha": "0a4f16588376f1416f8185c1111ccc28e2e08bde",
-      "shortSha": "0a4f165",
-      "subject": "fix(wave-3): resolve review findings and secret-scan test fixture",
       "refs": ""
     }
   ]
