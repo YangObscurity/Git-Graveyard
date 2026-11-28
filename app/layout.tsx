@@ -1,6 +1,8 @@
 import type { Metadata } from "next";
 import "./globals.css";
 import "../styles/accessibility.css";
+import "../styles/motion.css";
+import { fontVariableClasses } from "./fonts";
 import { CryptNav } from "@/components/ui/CryptNav";
 import { UiDebugBootstrap } from "@/components/ui/UiDebugBootstrap";
 import { SkipLink } from "@/components/a11y/SkipLink";
@@ -20,8 +22,8 @@ export default function RootLayout({
   children: React.ReactNode;
 }) {
   return (
-    <html lang="en" className="dark">
-      <body className="crypt-bg-atmosphere text-bone antialiased min-h-screen font-mono selection:bg-emerald-500/30 selection:text-emerald-200 flex flex-col">
+    <html lang="en" className={`dark ${fontVariableClasses}`}>
+      <body className="crypt-bg-atmosphere text-bone antialiased min-h-screen font-body selection:bg-emerald-500/30 selection:text-emerald-200 flex flex-col">
         <AriaAnnouncerProvider>
           <SkipLink />
           <CryptNav />

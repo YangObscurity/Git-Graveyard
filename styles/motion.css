@@ -1,0 +1,404 @@
+/* =====================================================================
+   Motion catalogue — animates only transform, opacity and filter.
+   Static end states live in plain styles so reduced-motion keeps every
+   signal intact.
+   ===================================================================== */
+
+/* ---------- Named keyframes (transform / opacity / filter only) ---- */
+@keyframes fog-drift-a {
+  from { transform: translate3d(-4%, 1%, 0); }
+  to   { transform: translate3d(5%, -2%, 0); }
+}
+
+@keyframes fog-drift-b {
+  from { transform: translate3d(4%, -1%, 0) scale(1.05); }
+  to   { transform: translate3d(-6%, 2%, 0) scale(1); }
+}
+
+@keyframes candle-flicker {
+  0%, 100% { transform: scale(1, 1) rotate(0deg); opacity: 1; }
+  17%      { transform: scale(0.94, 1.08) rotate(-2deg); opacity: 0.94; }
+  33%      { transform: scale(1.03, 0.95) rotate(1.5deg); opacity: 1; }
+  52%      { transform: scale(0.97, 1.05) rotate(-1deg); opacity: 0.9; }
+  71%      { transform: scale(1.02, 0.97) rotate(2deg); opacity: 1; }
+  86%      { transform: scale(0.96, 1.04) rotate(-1.5deg); opacity: 0.95; }
+}
+
+@keyframes halo-breathe {
+  0%, 100% { opacity: 0.55; transform: scale(1); }
+  50%      { opacity: 0.9; transform: scale(1.12); }
+}
+
+@keyframes flame-ignite {
+  from { transform: scale(0.2); opacity: 0; }
+  to   { transform: scale(1); opacity: 1; }
+}
+
+@keyframes node-glow {
+  0%, 100% { opacity: 0.35; transform: scale(1); }
+  50%      { opacity: 0.95; transform: scale(1.03); }
+}
+
+@keyframes reveal-rise {
+  from { opacity: 0; transform: translateY(18px); }
+  to   { opacity: 1; transform: none; }
+}
+
+@keyframes skel-raise {
+  from { opacity: 0; transform: translateY(16px); filter: brightness(1.7); }
+  to   { opacity: 1; transform: none; filter: none; }
+}
+
+@keyframes rim-flash {
+  0%   { opacity: 0; }
+  30%  { opacity: 1; }
+  100% { opacity: 0; }
+}
+
+@keyframes skel-rest {
+  from { filter: none; }
+  to   { filter: grayscale(1) brightness(0.86); }
+}
+
+@keyframes lid-close {
+  from { transform: scaleX(0); }
+  to   { transform: scaleX(1); }
+}
+
+@keyframes unseal-l {
+  from { transform: none; opacity: 1; }
+  to   { transform: translateX(-5px) rotate(-16deg); opacity: 0.55; }
+}
+
+@keyframes unseal-r {
+  from { transform: none; opacity: 1; }
+  to   { transform: translateX(5px) rotate(16deg); opacity: 0.55; }
+}
+
+@keyframes reseal-l {
+  from { transform: translateX(-5px) rotate(-16deg); opacity: 0.55; }
+  to   { transform: none; opacity: 1; }
+}
+
+@keyframes reseal-r {
+  from { transform: translateX(5px) rotate(16deg); opacity: 0.55; }
+  to   { transform: none; opacity: 1; }
+}
+
+@keyframes stamp-press {
+  0%   { opacity: 0; transform: scale(1.22); }
+  60%  { opacity: 1; transform: scale(0.97); }
+  100% { opacity: 1; transform: scale(1); }
+}
+
+@keyframes alarm-ring {
+  0%   { opacity: 0; }
+  20%  { opacity: 1; }
+  45%  { opacity: 0.3; }
+  70%  { opacity: 1; }
+  100% { opacity: 0.7; }
+}
+
+@keyframes row-cursor {
+  from { opacity: 0.2; }
+  to   { opacity: 1; }
+}
+
+@keyframes vt-out {
+  to {
+    opacity: 0;
+    transform: translateX(var(--vt-shift, -24px));
+    filter: blur(2px);
+  }
+}
+
+@keyframes vt-in {
+  from {
+    opacity: 0;
+    transform: translateX(var(--vt-shift-in, 24px));
+    filter: blur(2px);
+  }
+}
+
+/* ---------- Static end states -------------------------------------- */
+.crypt-node {
+  position: relative;
+}
+
+.crypt-node::after {
+  content: "";
+  position: absolute;
+  inset: -4px;
+  border-radius: 9px;
+  pointer-events: none;
+  border: 2px solid transparent;
+  opacity: 0;
+}
+
+.crypt-node[data-state="running"]::after {
+  border-color: var(--necromancy-emerald);
+  box-shadow: var(--glow-emerald);
+  opacity: 0.85;
+}
+
+.crypt-node[data-state="in_review"]::after {
+  border-color: var(--arcane-amber);
+  opacity: 0.8;
+}
+
+.crypt-skel {
+  position: relative;
+  overflow: hidden;
+}
+
+.crypt-skel::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  height: 3px;
+  background: var(--fg-ash);
+  transform: scaleX(0);
+  transform-origin: left center;
+  pointer-events: none;
+}
+
+.crypt-skel.is-rested {
+  filter: grayscale(1) brightness(0.86);
+}
+
+.crypt-skel.is-rested::before {
+  transform: scaleX(1);
+}
+
+.crypt-skel.is-complete::before {
+  transform: scaleX(1);
+  background: var(--necromancy-emerald);
+}
+
+.crypt-skel__rim {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  box-shadow: inset 0 0 0 1px var(--necromancy-emerald), var(--glow-emerald);
+  opacity: 0;
+}
+
+.crypt-stamp {
+  display: inline-flex;
+}
+
+.crypt-alarm {
+  position: relative;
+}
+
+.crypt-alarm::after {
+  content: "";
+  position: absolute;
+  inset: -3px;
+  border-radius: 8px;
+  border: 2px solid var(--crimson-seal);
+  box-shadow: var(--glow-crimson);
+  pointer-events: none;
+  opacity: 0;
+}
+
+.crypt-alarm.is-ringing::after {
+  opacity: 0.7;
+}
+
+.is-cursor {
+  position: relative;
+}
+
+.is-cursor::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: rgba(255, 179, 71, 0.1);
+  box-shadow: inset 3px 0 0 var(--candle-flame);
+  pointer-events: none;
+}
+
+.crypt-reveal {
+  opacity: 1;
+  transform: none;
+}
+
+/* ---------- Active motion (gated by both OS & app toggle) ---------- */
+@media (prefers-reduced-motion: no-preference) {
+  /* Fog drift */
+  html:not([data-ui-reduced-motion="true"]) .crypt-fog::before {
+    animation: fog-drift-a 46s var(--ease-standard) infinite alternate;
+  }
+
+  html:not([data-ui-reduced-motion="true"]) .crypt-fog::after {
+    animation: fog-drift-b 67s var(--ease-standard) infinite alternate;
+  }
+
+  /* Candle flicker & ignition */
+  html:not([data-ui-reduced-motion="true"]) [data-state="now"] .crypt-candle .flame,
+  html:not([data-ui-reduced-motion="true"]) [data-state="now"] .crypt-candle .flame-core,
+  html:not([data-ui-reduced-motion="true"]) .crypt-candle.is-flicker .flame,
+  html:not([data-ui-reduced-motion="true"]) .crypt-candle.is-flicker .flame-core {
+    animation: candle-flicker 2.9s ease-in-out infinite;
+  }
+
+  html:not([data-ui-reduced-motion="true"]) [data-state="now"] .crypt-candle .halo,
+  html:not([data-ui-reduced-motion="true"]) .crypt-candle.is-flicker .halo {
+    animation: halo-breathe 2.9s ease-in-out infinite;
+  }
+
+  html:not([data-ui-reduced-motion="true"]) .crypt-candle.is-igniting .flame,
+  html:not([data-ui-reduced-motion="true"]) .crypt-candle.is-igniting .flame-core {
+    animation: flame-ignite var(--dur-slow) var(--ease-out) both;
+  }
+
+  /* Task graph glow */
+  html:not([data-ui-reduced-motion="true"]) .crypt-node[data-state="running"]::after {
+    animation: node-glow 2.4s ease-in-out infinite;
+  }
+
+  /* Skeleton raise and lay to rest */
+  html:not([data-ui-reduced-motion="true"]) .crypt-skel.is-raising {
+    animation: skel-raise var(--dur-slow) var(--ease-out) both;
+  }
+
+  html:not([data-ui-reduced-motion="true"]) .crypt-skel.is-raising .crypt-skel__rim {
+    animation: rim-flash var(--dur-ritual) var(--ease-standard) both;
+  }
+
+  html:not([data-ui-reduced-motion="true"]) .crypt-skel.is-resting {
+    animation: skel-rest 600ms var(--ease-standard) both;
+  }
+
+  html:not([data-ui-reduced-motion="true"]) .crypt-skel.is-resting::before,
+  html:not([data-ui-reduced-motion="true"]) .crypt-skel.is-closing::before {
+    animation: lid-close 520ms var(--ease-out) 80ms both;
+  }
+
+  /* Seal break & reseal */
+  html:not([data-ui-reduced-motion="true"]) .crypt-seal.is-unsealing .half-l {
+    animation: unseal-l 450ms var(--ease-out) both;
+  }
+
+  html:not([data-ui-reduced-motion="true"]) .crypt-seal.is-unsealing .half-r {
+    animation: unseal-r 450ms var(--ease-out) both;
+  }
+
+  html:not([data-ui-reduced-motion="true"]) .crypt-seal.is-sealing .half-l {
+    animation: reseal-l 380ms var(--ease-in) both;
+  }
+
+  html:not([data-ui-reduced-motion="true"]) .crypt-seal.is-sealing .half-r {
+    animation: reseal-r 380ms var(--ease-in) both;
+  }
+
+  /* Error & outcome stamp, kill alarm, replay row cursor */
+  html:not([data-ui-reduced-motion="true"]) .crypt-stamp.is-pressing {
+    animation: stamp-press 320ms var(--ease-stamp) both;
+  }
+
+  html:not([data-ui-reduced-motion="true"]) .crypt-alarm.is-ringing::after {
+    animation: alarm-ring 900ms linear both;
+  }
+
+  html:not([data-ui-reduced-motion="true"]) .is-cursor::before {
+    animation: row-cursor 220ms var(--ease-out) both;
+  }
+
+  /* Button hover overlay opacity transition */
+  html:not([data-ui-reduced-motion="true"]) .crypt-btn-primary::after,
+  html:not([data-ui-reduced-motion="true"]) .crypt-btn-ghost::after,
+  html:not([data-ui-reduced-motion="true"]) .crypt-btn-danger::after {
+    transition: opacity var(--dur-quick) var(--ease-standard);
+  }
+
+  /* View transitions between stages (nav stays fixed) */
+  html:not([data-ui-reduced-motion="true"])::view-transition-old(.ritual-forward),
+  html:not([data-ui-reduced-motion="true"])::view-transition-old(root) {
+    animation: vt-out 160ms var(--ease-in) both;
+  }
+
+  html:not([data-ui-reduced-motion="true"])::view-transition-new(.ritual-forward),
+  html:not([data-ui-reduced-motion="true"])::view-transition-new(root) {
+    animation: vt-in 260ms var(--ease-out) 120ms both;
+  }
+
+  html:not([data-ui-reduced-motion="true"])::view-transition-old(.ritual-back) {
+    --vt-shift: 24px;
+    animation: vt-out 160ms var(--ease-in) both;
+  }
+
+  html:not([data-ui-reduced-motion="true"])::view-transition-new(.ritual-back) {
+    --vt-shift-in: -24px;
+    animation: vt-in 260ms var(--ease-out) 120ms both;
+  }
+}
+
+/* Scroll reveal only where view() timeline is supported */
+@supports (animation-timeline: view()) {
+  @media (prefers-reduced-motion: no-preference) {
+    html:not([data-ui-reduced-motion="true"]) .crypt-reveal {
+      animation: reveal-rise linear both;
+      animation-timeline: view();
+      animation-range: entry 0% cover 22%;
+    }
+  }
+}
+
+/* View transition structure */
+::view-transition {
+  pointer-events: none;
+}
+
+::view-transition-group(crypt-nav) {
+  animation: none;
+  z-index: 100;
+}
+
+::view-transition-old(crypt-nav) {
+  display: none;
+}
+
+::view-transition-new(crypt-nav) {
+  animation: none;
+}
+
+html.vt-back {
+  --vt-shift: 24px;
+  --vt-shift-in: -24px;
+}
+
+/* ---------- Reduced-motion brakes (OS & app toggle) --------------- */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    transition-duration: 0.01ms !important;
+  }
+
+  ::view-transition-old(*),
+  ::view-transition-new(*),
+  ::view-transition-group(*) {
+    animation-duration: 0s !important;
+    animation-delay: 0s !important;
+  }
+}
+
+html[data-ui-reduced-motion="true"] *,
+html[data-ui-reduced-motion="true"] *::before,
+html[data-ui-reduced-motion="true"] *::after {
+  animation: none !important;
+  transition-duration: 0.01ms !important;
+}
+
+html[data-ui-reduced-motion="true"]::view-transition-old(*),
+html[data-ui-reduced-motion="true"]::view-transition-new(*),
+html[data-ui-reduced-motion="true"]::view-transition-group(*) {
+  animation-duration: 0s !important;
+  animation-delay: 0s !important;
+}

@@ -1,4 +1,5 @@
 import React from "react";
+import { StateGlyph, type StateFamily } from "./StateGlyph";
 
 export interface StatusPillProps {
   tone: "emerald" | "amber" | "crimson" | "violet" | "neutral";
@@ -10,38 +11,48 @@ export interface StatusPillProps {
   className?: string;
 }
 
+const TONE_TO_FAMILY: Record<StatusPillProps["tone"], StateFamily> = {
+  emerald: "risen",
+  amber: "wait",
+  crimson: "fail",
+  violet: "kiro",
+  neutral: "idle",
+};
+
 const TONE_CLASSES: Record<
   StatusPillProps["tone"],
   { pill: string; dot: string }
 > = {
   emerald: {
-    pill: "bg-emerald-950/50 text-emerald-300 border-[var(--necromancy-emerald-border)] shadow-[0_0_14px_-6px_rgba(16,185,129,0.5)]",
-    dot: "bg-emerald-400",
+    pill: "crypt-tag crypt-tag--risen",
+    dot: "bg-[var(--state-risen-fg)]",
   },
   amber: {
-    pill: "bg-amber-950/50 text-amber-300 border-[var(--arcane-amber-border)] shadow-[0_0_14px_-6px_rgba(245,158,11,0.45)]",
-    dot: "bg-amber-400",
+    pill: "crypt-tag crypt-tag--wait",
+    dot: "bg-[var(--state-wait-fg)]",
   },
   crimson: {
-    pill: "bg-rose-950/50 text-rose-300 border-[var(--crimson-seal-border)] shadow-[0_0_14px_-6px_rgba(244,63,94,0.45)]",
-    dot: "bg-rose-400",
+    pill: "crypt-tag crypt-tag--fail",
+    dot: "bg-[var(--state-fail-fg)]",
   },
   violet: {
-    pill: "bg-violet-950/50 text-violet-300 border-[var(--spectral-violet-border)] shadow-[0_0_14px_-6px_rgba(167,139,250,0.45)]",
-    dot: "bg-violet-400",
+    pill: "crypt-kiro",
+    dot: "bg-[var(--spectral-violet)]",
   },
   neutral: {
-    pill: "bg-neutral-900/80 text-neutral-300 border-[var(--border-engraved)]",
-    dot: "bg-neutral-400",
+    pill: "crypt-tag crypt-tag--idle",
+    dot: "bg-[var(--state-idle-fg)]",
   },
 };
 
 function toSlug(value: string): string {
-  return value
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "") || "unknown";
+  return (
+    value
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "") || "unknown"
+  );
 }
 
 export function StatusPill({
@@ -54,6 +65,7 @@ export function StatusPill({
   className = "",
 }: StatusPillProps) {
   const styles = TONE_CLASSES[tone];
+  const family = TONE_TO_FAMILY[tone];
   const resolvedState = uiState ?? toSlug(label);
 
   return (
@@ -62,7 +74,8 @@ export function StatusPill({
       data-ui-element="status-pill"
       data-ui-state={resolvedState}
       data-ui-variant={tone}
-      className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full border text-[11px] uppercase tracking-wider font-mono font-medium whitespace-nowrap ${styles.pill} ${className}`.trim()}
+      data-state-family={family}
+      className={`${styles.pill} ${className}`.trim()}
     >
       {pulse && (
         <span
@@ -70,7 +83,9 @@ export function StatusPill({
           className={`w-1.5 h-1.5 rounded-full shrink-0 crypt-pulse-emerald ${styles.dot}`}
         />
       )}
-      {icon && <span className="inline-flex items-center shrink-0">{icon}</span>}
+      <span aria-hidden="true" className="inline-flex items-center shrink-0">
+        {icon ?? <StateGlyph family={family} />}
+      </span>
       <span>{label}</span>
     </span>
   );

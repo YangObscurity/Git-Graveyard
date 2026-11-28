@@ -3,54 +3,106 @@
 :root {
   color-scheme: dark;
 
-  /* Core Surfaces — Obsidian Basalt Hierarchy */
-  --bg-abyss: #060709;          /* Page backdrop */
-  --bg-crypt: #0b0d11;          /* Primary container / slab */
-  --bg-slab: #10131a;           /* Card / elevated panel */
-  --bg-slab-hover: #151922;     /* Interactive row / card hover */
-  --bg-recessed: #050608;       /* Code blocks, logs, inputs, terminal wells */
-  --bg-glass: rgba(11, 13, 17, 0.84); /* Sticky nav & HUD backdrop */
+  /* Core Surfaces — Cool stone for machine output, warm vellum for documents */
+  --bg-abyss: #0a0a0c;          /* Page backdrop */
+  --bg-crypt: #0e0f13;          /* Section ground */
+  --bg-slab: #13141a;           /* Card / elevated panel */
+  --bg-slab-hover: #1a1b22;     /* Interactive row / card hover */
+  --bg-recessed: #060608;       /* Code blocks, logs, inputs, terminal wells */
+  --bg-sheet: #16140f;          /* Warm vellum documents: Death Certificate, Pact, report */
+  --bg-glass: rgba(10, 10, 12, 0.9); /* Sticky nav & HUD backdrop */
 
   /* Foregrounds — Bone Ivory & Ash */
-  --fg-bone: #f5f5f4;           /* Primary headings & high-emphasis values */
-  --fg-parchment: #d6d3d1;      /* Primary body copy */
-  --fg-ash: #9ca3af;            /* Secondary metadata & labels */
-  --fg-dust: #6b7280;           /* Muted timestamps, SHA prefixes, hints */
+  --fg-bone: #f1ece2;           /* Primary headings & high-emphasis values */
+  --fg-parchment: #d9d2c5;      /* Primary body copy */
+  --fg-ash: #aea89e;            /* Secondary metadata & labels */
+  --fg-dust: #9a948a;           /* Muted timestamps, SHA prefixes, hints */
 
   /* Borders & Hairlines */
-  --border-hairline: rgba(245, 245, 244, 0.09);
-  --border-engraved: rgba(245, 245, 244, 0.16);
+  --border-hairline: rgba(241, 236, 226, 0.1);
+  --border-engraved: rgba(241, 236, 226, 0.2);
+  --border-control: #77726a;
   --border-focus: rgba(52, 211, 153, 0.55);
+  --focus-ring: #f1ece2;
 
-  /* Semantic Necromantic Accents */
+  /* Semantic Necromantic Accents (fills, borders, icons only) */
   --necromancy-emerald: #10b981;
   --necromancy-emerald-bright: #34d399;
-  --necromancy-emerald-dim: rgba(16, 185, 129, 0.12);
-  --necromancy-emerald-border: rgba(16, 185, 129, 0.35);
+  --necromancy-emerald-dim: rgba(16, 185, 129, 0.14);
+  --necromancy-emerald-border: rgba(16, 185, 129, 0.5);
 
   --arcane-amber: #f59e0b;
   --arcane-amber-bright: #fbbf24;
-  --arcane-amber-dim: rgba(245, 158, 11, 0.12);
-  --arcane-amber-border: rgba(245, 158, 11, 0.35);
+  --arcane-amber-dim: rgba(245, 158, 11, 0.14);
+  --arcane-amber-border: rgba(245, 158, 11, 0.5);
 
   --crimson-seal: #f43f5e;
   --crimson-seal-bright: #fb7185;
-  --crimson-seal-dim: rgba(244, 63, 94, 0.12);
-  --crimson-seal-border: rgba(244, 63, 94, 0.35);
+  --crimson-seal-dim: rgba(244, 63, 94, 0.14);
+  --crimson-seal-border: rgba(244, 63, 94, 0.55);
 
+  /* Kiro marker: borders and icons only, never text colour */
   --spectral-violet: #a78bfa;
-  --spectral-violet-dim: rgba(167, 139, 250, 0.12);
-  --spectral-violet-border: rgba(167, 139, 250, 0.35);
+  --spectral-violet-dim: rgba(167, 139, 250, 0.08);
+  --spectral-violet-border: rgba(167, 139, 250, 0.6);
+
+  /* Candle tokens */
+  --candle-flame: #ffb347;
+  --candle-core: #fff1c9;
+  --candle-wax: #e9e1d0;
+
+  /* State text tokens (icon + text always; colour is the third signal) */
+  --state-risen-fg: #5fe3ad;
+  --state-wait-fg: #fcc65e;
+  --state-fail-fg: #ff94a3;
+  --state-idle-fg: var(--fg-ash);
+
+  /* Typography Stacks & Scale */
+  --font-ritual: var(--font-ritual-face, "Grenze Gotisch", "UnifrakturMaguntia", Georgia, serif);
+  --font-body: var(--font-body-face, "Atkinson Hyperlegible Next", "Atkinson Hyperlegible", "Segoe UI", system-ui, sans-serif);
+  --font-mono-stack: var(--font-mono-face, "Atkinson Hyperlegible Mono", ui-monospace, "Cascadia Code", "JetBrains Mono", Consolas, Menlo, monospace);
+  --font-display-stack: var(--font-ritual);
+  --text-caption: 0.75rem;   /* 12 */
+  --text-ui: 0.875rem;       /* 14 */
+  --text-body: 1rem;         /* 16 */
+  --text-lead: 1.125rem;     /* 18 */
+  --text-h3: 1.3125rem;      /* 21 */
+  --text-h2: 1.5rem;         /* 24 */
+  --text-h1: 2.25rem;        /* 36 */
+  --text-display: 3.5rem;    /* 56 */
+
+  /* Spacing & Material Radii */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-12: 48px;
+  --space-16: 64px;
+  --radius-tag: 3px;
+  --radius-sheet: 2px;
+  --radius-well: 4px;
+  --radius-slab: 6px;
+  --radius-control: 6px;
 
   /* Elevation & Spectral Glows */
-  --shadow-slab: 0 1px 0 0 rgba(255, 255, 255, 0.04) inset, 0 12px 32px -12px rgba(0, 0, 0, 0.75);
-  --glow-emerald: 0 0 24px -4px rgba(16, 185, 129, 0.28);
-  --glow-amber: 0 0 24px -4px rgba(245, 158, 11, 0.24);
-  --glow-crimson: 0 0 24px -4px rgba(244, 63, 94, 0.26);
+  --shadow-slab: inset 0 1px 0 rgba(241, 236, 226, 0.05), 0 18px 40px -20px rgba(0, 0, 0, 0.9);
+  --shadow-sheet: inset 0 1px 0 rgba(255, 214, 150, 0.07), 0 24px 48px -24px rgba(0, 0, 0, 0.95);
+  --glow-emerald: 0 0 28px -6px rgba(16, 185, 129, 0.5);
+  --glow-amber: 0 0 26px -6px rgba(245, 158, 11, 0.5);
+  --glow-crimson: 0 0 28px -8px rgba(244, 63, 94, 0.55);
+  --glow-candle: 0 0 18px 2px rgba(255, 170, 60, 0.45);
 
-  /* Typography Stacks */
-  --font-mono-stack: ui-monospace, "JetBrains Mono", "Cascadia Code", "Fira Code", Menlo, Monaco, Consolas, monospace;
-  --font-display-stack: Georgia, "Times New Roman", ui-serif, serif;
+  /* Motion Durations & Easing */
+  --dur-quick: 150ms;
+  --dur-base: 240ms;
+  --dur-slow: 420ms;
+  --dur-ritual: 700ms;
+  --ease-out: cubic-bezier(0.2, 0.7, 0.2, 1);
+  --ease-in: cubic-bezier(0.5, 0, 0.75, 0);
+  --ease-standard: cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-stamp: cubic-bezier(0.2, 0.9, 0.3, 1.25);
 }
 
 @theme inline {
@@ -59,17 +111,52 @@
   --color-slab: var(--bg-slab);
   --color-slab-hover: var(--bg-slab-hover);
   --color-recessed: var(--bg-recessed);
+  --color-sheet: var(--bg-sheet);
   --color-bone: var(--fg-bone);
   --color-parchment: var(--fg-parchment);
   --color-ash: var(--fg-ash);
   --color-dust: var(--fg-dust);
+  --color-state-risen: var(--state-risen-fg);
+  --color-state-wait: var(--state-wait-fg);
+  --color-state-fail: var(--state-fail-fg);
+  --font-body: var(--font-body-face, "Atkinson Hyperlegible Next", "Atkinson Hyperlegible", "Segoe UI", system-ui, sans-serif);
+  --font-ritual: var(--font-ritual-face, "Grenze Gotisch", "UnifrakturMaguntia", Georgia, serif);
+  --font-mono: var(--font-mono-face, "Atkinson Hyperlegible Mono", ui-monospace, "Cascadia Code", "JetBrains Mono", Consolas, Menlo, monospace);
   --font-serif-ritual: var(--font-display-stack);
 }
 
-/* Global thin dark scrollbars */
+/* Global base & thin dark scrollbars */
+html {
+  background: var(--bg-abyss);
+}
+
+body {
+  background-color: var(--bg-abyss);
+  color: var(--fg-parchment);
+  font-family: var(--font-body);
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+code,
+kbd,
+pre,
+.t-mono {
+  font-family: var(--font-mono-stack);
+}
+
+/* Gothic ritual face applies only to h1 and explicit ritual display classes */
+:is(h2, h3, h4, h5, h6).font-serif-ritual {
+  font-family: var(--font-body);
+}
+
+h1.font-serif-ritual {
+  font-family: var(--font-ritual);
+}
+
 * {
   scrollbar-width: thin;
-  scrollbar-color: #262b38 #060709;
+  scrollbar-color: #2b2c35 var(--bg-abyss);
 }
 
 *::-webkit-scrollbar {
@@ -78,184 +165,940 @@
 }
 
 *::-webkit-scrollbar-track {
-  background: #060709;
+  background: var(--bg-abyss);
 }
 
 *::-webkit-scrollbar-thumb {
-  background: #262b38;
+  background: #2b2c35;
   border-radius: 9999px;
 }
 
 *::-webkit-scrollbar-thumb:hover {
-  background: #374151;
+  background: #3d3f4c;
 }
 
-/* Cryptic Gothic Terminal Surface & Atmosphere Utilities */
-.crypt-bg-atmosphere {
-  background-color: var(--bg-abyss);
-  background-image:
-    radial-gradient(ellipse 80% 45% at 50% -10%, rgba(16, 185, 129, 0.08), transparent 70%),
-    radial-gradient(rgba(245, 245, 244, 0.035) 1px, transparent 1px);
-  background-size: 100% 100%, 24px 24px;
-  background-position: 0 0, 0 0;
-  background-attachment: fixed, scroll;
-}
-
-.crypt-panel {
-  background: linear-gradient(180deg, rgba(16, 19, 26, 0.95) 0%, rgba(11, 13, 17, 0.98) 100%);
-  border: 1px solid var(--border-hairline);
-  box-shadow: var(--shadow-slab);
-  border-radius: 0.5rem;
-  position: relative;
-}
-
-.crypt-panel-engraved {
-  background: linear-gradient(180deg, rgba(16, 19, 26, 0.95) 0%, rgba(11, 13, 17, 0.98) 100%);
-  border: 1px solid var(--border-engraved);
-  box-shadow: var(--shadow-slab);
-  border-radius: 0.5rem;
-  position: relative;
-}
-
-.crypt-panel-engraved::before {
-  content: "";
-  position: absolute;
-  inset: -1px;
-  pointer-events: none;
-  border-radius: inherit;
-  background-image:
-    linear-gradient(to right, rgba(245, 245, 244, 0.35), rgba(245, 245, 244, 0.35)),
-    linear-gradient(to bottom, rgba(245, 245, 244, 0.35), rgba(245, 245, 244, 0.35)),
-    linear-gradient(to left, rgba(245, 245, 244, 0.35), rgba(245, 245, 244, 0.35)),
-    linear-gradient(to bottom, rgba(245, 245, 244, 0.35), rgba(245, 245, 244, 0.35)),
-    linear-gradient(to right, rgba(245, 245, 244, 0.35), rgba(245, 245, 244, 0.35)),
-    linear-gradient(to top, rgba(245, 245, 244, 0.35), rgba(245, 245, 244, 0.35)),
-    linear-gradient(to left, rgba(245, 245, 244, 0.35), rgba(245, 245, 244, 0.35)),
-    linear-gradient(to top, rgba(245, 245, 244, 0.35), rgba(245, 245, 244, 0.35));
-  background-size:
-    8px 1px, 1px 8px,
-    8px 1px, 1px 8px,
-    8px 1px, 1px 8px,
-    8px 1px, 1px 8px;
-  background-position:
-    top left, top left,
-    top right, top right,
-    bottom left, bottom left,
-    bottom right, bottom right;
-  background-repeat: no-repeat;
-}
-
-.crypt-well {
-  background: var(--bg-recessed);
-  border: 1px solid var(--border-hairline);
-  box-shadow: inset 0 2px 6px rgba(0, 0, 0, 0.6);
-  border-radius: 0.375rem;
-}
-
-.crypt-btn-primary {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 0.5rem;
-  background-color: rgba(16, 185, 129, 0.9);
-  color: #060709;
+/* Typography helpers */
+.t-ritual {
+  font-family: var(--font-ritual);
   font-weight: 600;
-  border: 1px solid rgba(110, 231, 183, 0.4);
-  box-shadow: 0 0 20px -4px rgba(16, 185, 129, 0.45);
-  transition: all 150ms cubic-bezier(0.4, 0, 0.2, 1);
-  cursor: pointer;
+  font-size: var(--text-h1);
+  line-height: 1.1;
+  color: var(--fg-bone);
+  letter-spacing: 0.005em;
+  margin: 0;
 }
 
-.crypt-btn-primary:hover:not(:disabled) {
-  background-color: #34d399;
+.t-display {
+  font-family: var(--font-ritual);
+  font-weight: 600;
+  font-size: clamp(2.5rem, 5vw, var(--text-display));
+  line-height: 1.02;
+  color: var(--fg-bone);
+  margin: 0;
 }
 
-.crypt-btn-primary:focus-visible {
-  outline: 2px solid #34d399;
-  outline-offset: 2px;
+.t-h2 {
+  font-size: var(--text-h2);
+  font-weight: 700;
+  line-height: 1.25;
+  color: var(--fg-bone);
+  margin: 0;
 }
 
-.crypt-btn-primary:disabled {
-  opacity: 0.5;
-  box-shadow: none;
-  cursor: not-allowed;
+.t-h3 {
+  font-size: var(--text-h3);
+  font-weight: 700;
+  line-height: 1.3;
+  color: var(--fg-bone);
+  margin: 0;
 }
 
-.crypt-btn-ghost {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 0.5rem;
-  background-color: rgba(23, 23, 23, 0.8);
-  color: #e5e5e5;
-  border: 1px solid rgba(64, 64, 64, 0.8);
-  transition: color 150ms cubic-bezier(0.4, 0, 0.2, 1),
-    background-color 150ms cubic-bezier(0.4, 0, 0.2, 1),
-    border-color 150ms cubic-bezier(0.4, 0, 0.2, 1);
-  cursor: pointer;
+.t-h4 {
+  font-size: var(--text-body);
+  font-weight: 700;
+  line-height: 1.4;
+  color: var(--fg-bone);
+  margin: 0;
 }
 
-.crypt-btn-ghost:hover:not(:disabled) {
-  background-color: rgba(38, 38, 38, 0.9);
-  border-color: rgba(115, 115, 115, 0.8);
+.t-lead {
+  font-size: var(--text-lead);
+  line-height: 1.5;
+  color: var(--fg-parchment);
+  margin: 0;
+  max-width: 62ch;
 }
 
-.crypt-btn-ghost:focus-visible {
-  outline: 2px solid rgba(245, 245, 244, 0.45);
-  outline-offset: 2px;
+.t-body {
+  font-size: var(--text-body);
+  color: var(--fg-parchment);
+  max-width: 72ch;
 }
 
-.crypt-btn-ghost:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
+.t-ui {
+  font-size: var(--text-ui);
+  line-height: 1.45;
 }
 
-.crypt-btn-danger {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 0.5rem;
-  background-color: rgba(76, 5, 25, 0.7);
-  color: #fecdd3;
-  border: 1px solid rgba(190, 18, 60, 0.6);
-  transition: color 150ms cubic-bezier(0.4, 0, 0.2, 1),
-    background-color 150ms cubic-bezier(0.4, 0, 0.2, 1),
-    border-color 150ms cubic-bezier(0.4, 0, 0.2, 1);
-  cursor: pointer;
+.t-meta {
+  font-size: var(--text-caption);
+  line-height: 1.4;
+  color: var(--fg-ash);
 }
 
-.crypt-btn-danger:hover:not(:disabled) {
-  background-color: rgba(136, 19, 55, 0.8);
+.t-label {
+  font-size: var(--text-caption);
+  font-weight: 700;
+  color: var(--fg-ash);
+  letter-spacing: 0.01em;
 }
 
-.crypt-btn-danger:focus-visible {
-  outline: 2px solid rgba(251, 113, 133, 0.65);
-  outline-offset: 2px;
+.t-mono {
+  font-size: var(--text-ui);
+  line-height: 1.5;
+  color: var(--fg-bone);
+  font-variant-ligatures: none;
 }
 
-.crypt-btn-danger:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-.crypt-kbd {
-  display: inline-flex;
-  align-items: center;
-  padding: 0.125rem 0.375rem;
-  font-size: 10px;
-  line-height: 1.2;
+.t-mono-sm {
   font-family: var(--font-mono-stack);
-  color: #a3a3a3;
-  background-color: #171717;
-  border: 1px solid rgba(64, 64, 64, 0.8);
-  border-radius: 0.25rem;
-  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.08);
+  font-size: 0.78rem;
+  line-height: 1.5;
+  color: var(--fg-parchment);
 }
 
-/* Motion Primitives */
+.t-num {
+  font-variant-numeric: tabular-nums;
+}
+
+@layer components {
+  /* Cryptic Gothic Terminal Surface & Atmosphere Utilities */
+  .crypt-bg-atmosphere {
+    background-color: var(--bg-abyss);
+    background-image:
+      radial-gradient(ellipse 80% 45% at 50% -10%, rgba(16, 185, 129, 0.08), transparent 70%),
+      radial-gradient(rgba(241, 236, 226, 0.035) 1px, transparent 1px);
+    background-size: 100% 100%, 24px 24px;
+    background-position: 0 0, 0 0;
+    background-attachment: fixed, scroll;
+  }
+
+  .crypt-panel {
+    background: var(--bg-slab);
+    border: 1px solid var(--border-hairline);
+    border-radius: var(--radius-slab);
+    box-shadow: var(--shadow-slab);
+    position: relative;
+  }
+
+  .crypt-panel-engraved {
+    background: var(--bg-slab);
+    border: 1px solid var(--border-engraved);
+    border-radius: var(--radius-slab);
+    box-shadow: var(--shadow-slab);
+    position: relative;
+  }
+
+  .crypt-panel-engraved::before {
+    content: "";
+    position: absolute;
+    inset: -1px;
+    pointer-events: none;
+    border-radius: inherit;
+    --t: rgba(241, 236, 226, 0.45);
+    background:
+      linear-gradient(var(--t), var(--t)) top left / 10px 1px no-repeat,
+      linear-gradient(var(--t), var(--t)) top left / 1px 10px no-repeat,
+      linear-gradient(var(--t), var(--t)) top right / 10px 1px no-repeat,
+      linear-gradient(var(--t), var(--t)) top right / 1px 10px no-repeat,
+      linear-gradient(var(--t), var(--t)) bottom left / 10px 1px no-repeat,
+      linear-gradient(var(--t), var(--t)) bottom left / 1px 10px no-repeat,
+      linear-gradient(var(--t), var(--t)) bottom right / 10px 1px no-repeat,
+      linear-gradient(var(--t), var(--t)) bottom right / 1px 10px no-repeat;
+  }
+
+  .crypt-well {
+    background: var(--bg-recessed);
+    border: 1px solid var(--border-hairline);
+    border-radius: var(--radius-well);
+    box-shadow: inset 0 2px 8px rgba(0, 0, 0, 0.7);
+  }
+
+  .crypt-sheet {
+    background: var(--bg-sheet);
+    border: 1px solid rgba(233, 225, 208, 0.16);
+    border-top: 3px double rgba(233, 225, 208, 0.32);
+    border-radius: var(--radius-sheet);
+    box-shadow: var(--shadow-sheet);
+    position: relative;
+  }
+
+  .crypt-sheet__head {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-3) var(--space-6);
+    align-items: flex-end;
+    justify-content: space-between;
+    padding: var(--space-6) var(--space-6) var(--space-4);
+    border-bottom: 1px solid rgba(233, 225, 208, 0.14);
+  }
+
+  .crypt-sheet__body {
+    padding: var(--space-6);
+  }
+
+  .crypt-headstone {
+    background:
+      radial-gradient(120% 70% at 50% 0%, rgba(241, 236, 226, 0.06), transparent 60%),
+      var(--bg-slab);
+    border: 1px solid var(--border-engraved);
+    border-radius: 46% 46% var(--radius-slab) var(--radius-slab) / 120px 120px var(--radius-slab) var(--radius-slab);
+    box-shadow: var(--shadow-slab);
+    padding: var(--space-16) var(--space-8) var(--space-8);
+    text-align: center;
+    position: relative;
+  }
+
+  /* Controls */
+  .crypt-btn-primary,
+  .crypt-btn-ghost,
+  .crypt-btn-danger {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-2);
+    min-height: 40px;
+    padding: 0 var(--space-4);
+    font-family: var(--font-body);
+    font-weight: 700;
+    font-size: var(--text-ui);
+    line-height: 1;
+    border-radius: var(--radius-control);
+    cursor: pointer;
+    position: relative;
+    isolation: isolate;
+    text-decoration: none;
+  }
+
+  .crypt-btn-primary::after,
+  .crypt-btn-ghost::after,
+  .crypt-btn-danger::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    z-index: -1;
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  .crypt-btn-primary {
+    background: var(--necromancy-emerald-bright);
+    color: #04150e;
+    border: 1px solid #7ff0c4;
+  }
+
+  .crypt-btn-primary::after {
+    background: #5fe3ad;
+  }
+
+  .crypt-btn-ghost {
+    background: var(--bg-slab-hover);
+    color: var(--fg-bone);
+    border: 1px solid var(--border-control);
+  }
+
+  .crypt-btn-ghost::after {
+    background: rgba(241, 236, 226, 0.07);
+  }
+
+  .crypt-btn-danger {
+    background: #8f1d33;
+    color: #ffe4e8;
+    border: 1px solid var(--crimson-seal-border);
+  }
+
+  .crypt-btn-danger::after {
+    background: rgba(255, 255, 255, 0.08);
+  }
+
+  .crypt-btn-primary:hover:not(:disabled)::after,
+  .crypt-btn-ghost:hover:not(:disabled)::after,
+  .crypt-btn-danger:hover:not(:disabled)::after {
+    opacity: 1;
+  }
+
+  .crypt-btn-primary:focus-visible,
+  .crypt-btn-ghost:focus-visible,
+  .crypt-btn-danger:focus-visible {
+    outline: 2px solid var(--focus-ring);
+    outline-offset: 2px;
+  }
+
+  .crypt-btn-primary:disabled,
+  .crypt-btn-ghost:disabled,
+  .crypt-btn-danger:disabled,
+  [aria-disabled="true"].crypt-btn-primary {
+    opacity: 0.55;
+    cursor: not-allowed;
+  }
+
+  .crypt-btn-sm {
+    min-height: 32px;
+    padding: 0 var(--space-3);
+    font-size: var(--text-caption);
+  }
+
+  .crypt-btn-primary svg,
+  .crypt-btn-ghost svg,
+  .crypt-btn-danger svg {
+    width: 16px;
+    height: 16px;
+    flex: none;
+  }
+
+  /* Inputs */
+  .crypt-field {
+    display: grid;
+    gap: 6px;
+  }
+
+  .crypt-field__hint {
+    font-size: var(--text-caption);
+    color: var(--fg-ash);
+  }
+
+  .crypt-field__error {
+    font-size: var(--text-caption);
+    color: var(--state-fail-fg);
+    display: flex;
+    gap: 6px;
+    align-items: flex-start;
+  }
+
+  .crypt-input {
+    width: 100%;
+    min-height: 44px;
+    padding: 0 var(--space-3);
+    background: var(--bg-recessed);
+    color: var(--fg-bone);
+    border: 1px solid var(--border-control);
+    border-radius: var(--radius-control);
+    font: 400 var(--text-ui)/1.4 var(--font-mono-stack);
+  }
+
+  .crypt-input::placeholder {
+    color: var(--fg-dust);
+  }
+
+  .crypt-input:focus-visible {
+    outline: 2px solid var(--focus-ring);
+    outline-offset: 1px;
+    border-color: var(--fg-bone);
+  }
+
+  .crypt-input[aria-invalid="true"] {
+    border-color: var(--crimson-seal);
+  }
+
+  .crypt-input-group {
+    display: flex;
+    align-items: stretch;
+  }
+
+  .crypt-input-group__prefix {
+    display: inline-flex;
+    align-items: center;
+    padding: 0 var(--space-3);
+    background: var(--bg-slab-hover);
+    color: var(--fg-ash);
+    border: 1px solid var(--border-control);
+    border-right: 0;
+    border-radius: var(--radius-control) 0 0 var(--radius-control);
+    font: 400 var(--text-ui)/1 var(--font-mono-stack);
+  }
+
+  .crypt-input-group .crypt-input {
+    border-radius: 0 var(--radius-control) var(--radius-control) 0;
+  }
+
+  textarea.crypt-input {
+    min-height: 88px;
+    padding: var(--space-3);
+    resize: vertical;
+  }
+
+  .crypt-segmented {
+    display: inline-flex;
+    border: 1px solid var(--border-control);
+    border-radius: var(--radius-control);
+    overflow: hidden;
+  }
+
+  .crypt-segmented button {
+    background: transparent;
+    color: var(--fg-ash);
+    border: 0;
+    padding: 6px 12px;
+    font: 700 var(--text-caption)/1.2 var(--font-body);
+    cursor: pointer;
+  }
+
+  .crypt-segmented button[aria-pressed="true"] {
+    background: var(--bg-slab-hover);
+    color: var(--fg-bone);
+    box-shadow: inset 0 -2px 0 var(--fg-bone);
+  }
+
+  /* State tags (icon + text, colour third) */
+  .crypt-tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 8px 3px 6px;
+    border-radius: var(--radius-tag);
+    font: 700 var(--text-caption)/1.25 var(--font-body);
+    border: 1px solid var(--border-engraved);
+    background: rgba(241, 236, 226, 0.06);
+    color: var(--state-idle-fg);
+    white-space: nowrap;
+  }
+
+  .crypt-tag svg {
+    width: 14px;
+    height: 14px;
+    flex: none;
+  }
+
+  .crypt-tag--risen {
+    color: var(--state-risen-fg);
+    background: var(--necromancy-emerald-dim);
+    border-color: var(--necromancy-emerald-border);
+  }
+
+  .crypt-tag--wait {
+    color: var(--state-wait-fg);
+    background: var(--arcane-amber-dim);
+    border-color: var(--arcane-amber-border);
+  }
+
+  .crypt-tag--fail {
+    color: var(--state-fail-fg);
+    background: var(--crimson-seal-dim);
+    border-color: var(--crimson-seal-border);
+  }
+
+  .crypt-tag--idle {
+    color: var(--state-idle-fg);
+  }
+
+  .crypt-tag--lg {
+    font-size: var(--text-ui);
+    padding: 5px 10px 5px 8px;
+  }
+
+  .crypt-tag--lg svg {
+    width: 16px;
+    height: 16px;
+  }
+
+  /* Kiro marker: violet rim and violet icon; the words stay bone (Req 46.11) */
+  .crypt-kiro {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 8px 3px 6px;
+    border-radius: var(--radius-tag);
+    border: 1px solid var(--spectral-violet-border);
+    background: var(--spectral-violet-dim);
+    color: var(--fg-bone);
+    font: 700 var(--text-caption)/1.25 var(--font-body);
+    white-space: nowrap;
+  }
+
+  .crypt-kiro svg {
+    width: 14px;
+    height: 14px;
+    color: var(--spectral-violet);
+    flex: none;
+  }
+
+  .crypt-kiro-rim {
+    border-left: 3px solid var(--spectral-violet);
+  }
+
+  /* Data primitives */
+  .crypt-ledger {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 8px 20px;
+    margin: 0;
+  }
+
+  .crypt-ledger dt {
+    font-size: var(--text-caption);
+    font-weight: 700;
+    color: var(--fg-ash);
+    padding-top: 2px;
+  }
+
+  .crypt-ledger dd {
+    margin: 0;
+    font-size: var(--text-ui);
+    color: var(--fg-bone);
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+
+  .crypt-ledger--cols {
+    grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+    gap: 16px 24px;
+  }
+
+  .crypt-ledger--cols > div {
+    display: grid;
+    gap: 4px;
+    align-content: start;
+  }
+
+  .crypt-receipt {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    font: 400 0.8rem/1.55 var(--font-mono-stack);
+  }
+
+  .crypt-receipt__no {
+    color: var(--fg-dust);
+    text-align: right;
+    padding-right: 12px;
+    border-right: 1px solid var(--border-hairline);
+    user-select: none;
+  }
+
+  .crypt-receipt__line {
+    padding-left: 12px;
+    color: var(--fg-parchment);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
+  .crypt-receipt__line--hit {
+    color: var(--fg-bone);
+    background: rgba(244, 63, 94, 0.12);
+    box-shadow: inset 2px 0 0 var(--crimson-seal);
+  }
+
+  .crypt-na {
+    color: var(--fg-ash);
+    font-style: normal;
+    display: inline-flex;
+    gap: 6px;
+    align-items: baseline;
+    flex-wrap: wrap;
+  }
+
+  .crypt-na__word {
+    border-bottom: 1px dashed var(--border-control);
+  }
+
+  .crypt-na__why {
+    font-size: var(--text-caption);
+    color: var(--fg-dust);
+  }
+
+  .crypt-code {
+    margin: 0;
+    padding: var(--space-3) var(--space-4);
+    overflow-x: auto;
+    font: 400 0.8rem/1.55 var(--font-mono-stack);
+    color: var(--fg-parchment);
+    white-space: pre;
+  }
+
+  .crypt-code--wrap {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
+  .crypt-meter {
+    display: grid;
+    gap: 6px;
+    min-width: 150px;
+  }
+
+  .crypt-meter__bar {
+    height: 6px;
+    background: var(--bg-recessed);
+    border: 1px solid var(--border-hairline);
+    border-radius: 999px;
+    overflow: hidden;
+  }
+
+  .crypt-meter__fill {
+    height: 100%;
+    width: 100%;
+    transform-origin: left center;
+    background: var(--necromancy-emerald);
+    border-radius: inherit;
+  }
+
+  .crypt-meter__fill--wait {
+    background: var(--arcane-amber);
+  }
+
+  .crypt-meter__fill--fail {
+    background: var(--crimson-seal);
+  }
+
+  .crypt-meter__text {
+    font: 400 var(--text-caption)/1.3 var(--font-mono-stack);
+    color: var(--fg-bone);
+  }
+
+  .crypt-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: var(--text-ui);
+  }
+
+  .crypt-table th {
+    text-align: left;
+    font-size: var(--text-caption);
+    font-weight: 700;
+    color: var(--fg-ash);
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border-engraved);
+  }
+
+  .crypt-table td {
+    padding: 12px;
+    border-bottom: 1px solid var(--border-hairline);
+    vertical-align: top;
+    color: var(--fg-parchment);
+  }
+
+  .crypt-table tr:last-child td {
+    border-bottom: 0;
+  }
+
+  .crypt-hash {
+    font: 400 0.78rem/1.4 var(--font-mono-stack);
+    color: var(--fg-bone);
+    overflow-wrap: anywhere;
+  }
+
+  .crypt-diff {
+    font: 400 0.78rem/1.6 var(--font-mono-stack);
+  }
+
+  .crypt-diff__line {
+    display: block;
+    padding: 0 12px;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    color: var(--fg-parchment);
+  }
+
+  .crypt-diff__line--add {
+    background: rgba(16, 185, 129, 0.12);
+    color: #d6f7e9;
+    box-shadow: inset 2px 0 0 var(--necromancy-emerald);
+  }
+
+  .crypt-diff__line--del {
+    background: rgba(244, 63, 94, 0.12);
+    color: #ffe0e5;
+    box-shadow: inset 2px 0 0 var(--crimson-seal);
+  }
+
+  .crypt-diff__line--hunk {
+    color: var(--fg-ash);
+    background: rgba(167, 139, 250, 0.06);
+    box-shadow: inset 2px 0 0 var(--spectral-violet);
+  }
+
+  .crypt-gloss {
+    border-bottom: 1px dotted var(--fg-ash);
+    cursor: help;
+  }
+
+  .crypt-gloss__text {
+    font-size: var(--text-caption);
+    color: var(--fg-ash);
+    margin-left: 6px;
+  }
+
+  .crypt-notice {
+    display: flex;
+    gap: var(--space-3);
+    align-items: flex-start;
+    padding: var(--space-3) var(--space-4);
+    border-radius: var(--radius-well);
+    border: 1px solid var(--border-engraved);
+    background: var(--bg-crypt);
+  }
+
+  .crypt-notice svg {
+    width: 18px;
+    height: 18px;
+    flex: none;
+    margin-top: 2px;
+  }
+
+  .crypt-notice--wait {
+    border-color: var(--arcane-amber-border);
+    background: rgba(245, 158, 11, 0.07);
+  }
+
+  .crypt-notice--wait svg {
+    color: var(--arcane-amber);
+  }
+
+  .crypt-notice--fail {
+    border-color: var(--crimson-seal-border);
+    background: rgba(244, 63, 94, 0.08);
+  }
+
+  .crypt-notice--fail svg {
+    color: var(--crimson-seal);
+  }
+
+  .crypt-notice--risen {
+    border-color: var(--necromancy-emerald-border);
+    background: rgba(16, 185, 129, 0.07);
+  }
+
+  .crypt-notice--risen svg {
+    color: var(--necromancy-emerald);
+  }
+
+  .crypt-kbd {
+    display: inline-flex;
+    align-items: center;
+    padding: 1px 6px;
+    margin: 0 2px;
+    font: 400 var(--text-caption)/1.4 var(--font-mono-stack);
+    color: var(--fg-bone);
+    background: var(--bg-slab-hover);
+    border: 1px solid var(--border-control);
+    border-radius: var(--radius-tag);
+    box-shadow: 0 1px 0 rgba(241, 236, 226, 0.08);
+  }
+
+  /* Ritual ribbon: five candles, one per station */
+  .crypt-ribbon {
+    display: flex;
+    align-items: flex-end;
+    gap: 22px;
+    list-style: none;
+    margin: 0;
+    padding: 0;
+  }
+
+  .crypt-ribbon__station {
+    display: grid;
+    justify-items: center;
+    gap: 2px;
+    min-width: 72px;
+    position: relative;
+  }
+
+  .crypt-ribbon__station + .crypt-ribbon__station::before {
+    content: "";
+    position: absolute;
+    top: 22px;
+    right: calc(100% + 1px);
+    width: 21px;
+    height: 1px;
+    background: var(--border-engraved);
+  }
+
+  .crypt-ribbon__station[data-prev="done"]::before {
+    background: linear-gradient(90deg, rgba(255, 179, 71, 0.7), rgba(255, 179, 71, 0.25));
+  }
+
+  .crypt-ribbon__link {
+    display: grid;
+    justify-items: center;
+    gap: 3px;
+    padding: 4px 6px 6px;
+    border-radius: var(--radius-control);
+    text-decoration: none;
+    color: var(--fg-ash);
+  }
+
+  .crypt-ribbon__link:hover {
+    background: rgba(241, 236, 226, 0.05);
+  }
+
+  .crypt-ribbon__name {
+    font: 700 var(--text-caption)/1.1 var(--font-body);
+    color: var(--fg-parchment);
+    white-space: nowrap;
+  }
+
+  .crypt-ribbon__state {
+    font: 400 0.75rem/1.1 var(--font-body);
+    color: var(--fg-ash);
+    display: inline-flex;
+    gap: 3px;
+    align-items: center;
+  }
+
+  .crypt-ribbon__state svg {
+    width: 11px;
+    height: 11px;
+  }
+
+  .crypt-ribbon__station[data-state="now"] .crypt-ribbon__name {
+    color: var(--fg-bone);
+  }
+
+  .crypt-ribbon__station[data-state="now"] .crypt-ribbon__state {
+    color: var(--state-wait-fg);
+  }
+
+  .crypt-ribbon__station[data-state="done"] .crypt-ribbon__state {
+    color: var(--state-risen-fg);
+  }
+
+  .crypt-ribbon__station[data-state="locked"] .crypt-ribbon__name {
+    color: var(--fg-dust);
+  }
+
+  /* Candle primitive */
+  .crypt-candle {
+    width: 22px;
+    height: 30px;
+    display: block;
+    overflow: visible;
+  }
+
+  .crypt-candle .wax {
+    fill: var(--candle-wax);
+  }
+
+  .crypt-candle .wax-shade {
+    fill: rgba(0, 0, 0, 0.18);
+  }
+
+  .crypt-candle .wick {
+    stroke: #3b352c;
+    stroke-width: 1.4;
+    stroke-linecap: round;
+  }
+
+  .crypt-candle .flame {
+    fill: var(--candle-flame);
+    transform-box: fill-box;
+    transform-origin: 50% 100%;
+  }
+
+  .crypt-candle .flame-core {
+    fill: var(--candle-core);
+    transform-box: fill-box;
+    transform-origin: 50% 100%;
+  }
+
+  .crypt-candle .halo {
+    fill: rgba(255, 170, 60, 0.32);
+    transform-box: fill-box;
+    transform-origin: 50% 60%;
+  }
+
+  .crypt-candle[data-lit="false"] .flame,
+  .crypt-candle[data-lit="false"] .flame-core,
+  .crypt-candle[data-lit="false"] .halo {
+    display: none;
+  }
+
+  .crypt-candle[data-lit="false"] .wax {
+    fill: #5d584f;
+  }
+
+  .crypt-candle--sm {
+    width: 16px;
+    height: 22px;
+  }
+
+  .crypt-candle--hero {
+    width: 34px;
+    height: 46px;
+    margin: 0 auto var(--space-2);
+  }
+
+  /* Wax seal primitive */
+  .crypt-seal {
+    width: 40px;
+    height: 40px;
+    display: block;
+    overflow: visible;
+  }
+
+  .crypt-seal .half {
+    transform-box: fill-box;
+  }
+
+  .crypt-seal .half-l {
+    transform-origin: 100% 50%;
+  }
+
+  .crypt-seal .half-r {
+    transform-origin: 0% 50%;
+  }
+
+  .crypt-seal[data-sealed="false"] .half-l {
+    transform: translateX(-5px) rotate(-16deg);
+    opacity: 0.55;
+  }
+
+  .crypt-seal[data-sealed="false"] .half-r {
+    transform: translateX(5px) rotate(16deg);
+    opacity: 0.55;
+  }
+
+  /* Ambient fog */
+  .crypt-fog {
+    position: absolute;
+    inset: 0;
+    overflow: hidden;
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  .crypt-fog::before,
+  .crypt-fog::after {
+    content: "";
+    position: absolute;
+    inset: -20% -30%;
+    background:
+      radial-gradient(40% 30% at 30% 60%, rgba(217, 210, 197, 0.07), transparent 70%),
+      radial-gradient(35% 25% at 70% 40%, rgba(16, 185, 129, 0.06), transparent 70%);
+    filter: blur(24px);
+  }
+
+  .crypt-fog::after {
+    background:
+      radial-gradient(30% 22% at 60% 70%, rgba(217, 210, 197, 0.05), transparent 70%),
+      radial-gradient(28% 20% at 20% 30%, rgba(167, 139, 250, 0.04), transparent 70%);
+  }
+
+  .has-fog {
+    position: relative;
+    isolation: isolate;
+  }
+
+  .has-fog > :not(.crypt-fog) {
+    position: relative;
+    z-index: 1;
+  }
+}
+
+/* Legacy Pulse & Shimmer Motion Primitives (transform/opacity only) */
 @media (prefers-reduced-motion: no-preference) {
   @keyframes cryptPulse {
-    0%, 100% {
+    0%,
+    100% {
       opacity: 1;
       transform: scale(1);
     }
@@ -266,26 +1109,20 @@
   }
 
   @keyframes cryptShimmer {
-    0% {
-      background-position: -200% 0;
-    }
+    0%,
     100% {
-      background-position: 200% 0;
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.72;
     }
   }
 
-  .crypt-pulse-emerald {
+  html:not([data-ui-reduced-motion="true"]) .crypt-pulse-emerald {
     animation: cryptPulse 2.4s cubic-bezier(0.4, 0, 0.6, 1) infinite;
   }
 
-  .crypt-shimmer {
-    background-image: linear-gradient(
-      90deg,
-      rgba(16, 185, 129, 0) 0%,
-      rgba(16, 185, 129, 0.12) 50%,
-      rgba(16, 185, 129, 0) 100%
-    );
-    background-size: 200% 100%;
+  html:not([data-ui-reduced-motion="true"]) .crypt-shimmer {
     animation: cryptShimmer 2.2s linear infinite;
   }
 }
