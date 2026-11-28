@@ -14,6 +14,16 @@ export interface HealthBadgeProps {
   queueLength?: number;
   badgeText?: string;
   loading?: boolean;
+  /**
+   * Production mode. In production the badge never says "waking up"; an
+   * unreadable admission state is reported as "Live runs: unavailable".
+   */
+  isProd?: boolean;
+  environment?: string;
+  /** Admission is stopped because of an authentication failure. */
+  authFailure?: boolean;
+  /** Live runs could not be read at all. */
+  liveRunsUnavailable?: boolean;
 }
 
 const STATUS_STYLE_MAP: Record<string, string> = {
@@ -34,6 +44,10 @@ export function HealthBadge({
   queueLength: propQueueLength,
   badgeText: propBadgeText,
   loading: propLoading,
+  isProd: propIsProd,
+  environment,
+  authFailure = false,
+  liveRunsUnavailable = false,
 }: HealthBadgeProps = {}) {
   const [internalStatus, setInternalStatus] = useState<string | null>(null);
   const [internalQueueLength, setInternalQueueLength] = useState<number>(0);
@@ -43,7 +57,9 @@ export function HealthBadge({
   const isControlled =
     propStatus !== undefined ||
     propBadgeText !== undefined ||
-    propLoading !== undefined;
+    propLoading !== undefined ||
+    authFailure ||
+    liveRunsUnavailable;
 
   useEffect(() => {
     if (isControlled) {
@@ -132,8 +148,22 @@ export function HealthBadge({
     }
   }
 
-  // Ensure "waking up" is never displayed in production mode (Requirement 34.2)
-  if (displayText.toLowerCase().includes("waking up")) {
+  // Suppress the transient "waking up" phrase unless the caller explicitly opts
+  // into development. It is hidden in production and whenever neither `isProd`
+  // nor `environment` marks the render as development, so a bare badge (or one
+  // rendered by a parent that passes neither prop) never surfaces "waking up".
+  const suppressWakingUp =
+    propIsProd !== false &&
+    (environment ?? "").toLowerCase() !== "development";
+  if (suppressWakingUp && displayText.toLowerCase().includes("waking up")) {
+    displayText = "Live runs: unavailable";
+    statusKey = "unavailable";
+  }
+
+  // Admission stopped by an auth failure, or live runs that cannot be read at
+  // all, are deterministic unavailable states: report them plainly without
+  // waiting on the loading flag (which stays true in controlled mode).
+  if (authFailure || liveRunsUnavailable) {
     displayText = "Live runs: unavailable";
     statusKey = "unavailable";
   }

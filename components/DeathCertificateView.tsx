@@ -106,6 +106,43 @@ export function DeathCertificateView({
 
   const uiState = rows.length > 0 ? "ready" : "empty";
 
+  // When install fails, build and test never ran. They are shown as the primary
+  // finding (install) with the later steps explicitly marked "Not run". A retry
+  // row that passed means the install ultimately succeeded, so the later steps
+  // did run and must show their real statuses.
+  const installRow = rows.find((r) => r.step === "install");
+  const retryRow = rows.find((r) => r.step === "retry");
+  const finalInstallRow = retryRow ?? installRow;
+  const installFailed =
+    String(finalInstallRow?.status || "").toLowerCase() === "failed";
+
+  function displayStatusForRow(r: BaselineCommandRow): {
+    label: string;
+    tone: "emerald" | "amber" | "crimson" | "neutral";
+    notRun: boolean;
+  } {
+    const statusLower = String(r.status || "").toLowerCase();
+    const isNoTestsFound =
+      statusLower === "no tests found" || r.status === "No tests found";
+    if (installFailed && (r.step === "build" || r.step === "test")) {
+      return { label: "Not run", tone: "neutral", notRun: true };
+    }
+    if (statusLower === "passed") {
+      return { label: r.status, tone: "emerald", notRun: false };
+    }
+    if (statusLower === "failed") {
+      return { label: r.status, tone: "crimson", notRun: false };
+    }
+    if (isNoTestsFound) {
+      return {
+        label: r.ruleId ? `No tests found (${r.ruleId})` : "No tests found",
+        tone: "amber",
+        notRun: false,
+      };
+    }
+    return { label: r.status || "Not run", tone: "neutral", notRun: true };
+  }
+
   function openFailureReceipt(failure: FailureClassification) {
     const refText = failure.ref || failure.step;
     const match = refText.match(/^(.*?):(\d+)$/);
@@ -289,6 +326,25 @@ export function DeathCertificateView({
         </div>
       </div>
 
+      {/* Install failure is the primary finding; build and test never ran. */}
+      {installFailed && (
+        <div
+          data-testid="install-failure-primary"
+          className="crypt-well p-4 border-l-2 border-l-rose-500 border-rose-500/35 bg-rose-950/20 text-rose-200 space-y-1.5"
+        >
+          <div className="font-semibold text-sm text-bone">
+            Install failed. This is the primary finding.
+          </div>
+          <p className="text-xs text-rose-200/90 leading-relaxed">
+            Because install failed, the build and test steps were not run. They
+            are marked &ldquo;Not run&rdquo; below.
+          </p>
+          {finalInstallRow?.reason && (
+            <p className="text-xs text-rose-100/90">{finalInstallRow.reason}</p>
+          )}
+        </div>
+      )}
+
       {/* Table of Baseline Commands (Requirement 35.13) */}
       <div className="space-y-2.5">
         <h4 className="text-xs font-semibold text-bone uppercase tracking-wider">
@@ -310,21 +366,17 @@ export function DeathCertificateView({
             </thead>
             <tbody className="divide-y divide-white/[0.06]">
               {rows.map((r, idx) => {
-                const statusLower = String(r.status || "").toLowerCase();
-                const isStepPassed = statusLower === "passed";
-                const isStepFailed = statusLower === "failed";
-                const isNoTestsFound =
-                  statusLower === "no tests found" ||
-                  r.status === "No tests found";
-                const statusLabel =
-                  isNoTestsFound && r.ruleId
-                    ? `No tests found (${r.ruleId})`
-                    : r.status;
+                const display = displayStatusForRow(r);
+                const isStepPassed = display.tone === "emerald";
+                const isStepFailed = display.tone === "crimson";
+                const isNoTestsFound = display.label.startsWith("No tests found");
+                const statusLabel = display.label;
 
                 return (
                   <tr
                     key={`${r.step}-${idx}`}
                     data-testid={`cert-row-${r.step}`}
+                    data-status={display.notRun ? "not run" : r.status}
                     className="hover:bg-slab-hover/70 transition-colors"
                   >
                     <td className="py-2.5 px-3 font-semibold uppercase text-[10px] text-parchment">

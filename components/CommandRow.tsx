@@ -83,12 +83,19 @@ export function CommandRow({ row, onViewOutput }: CommandRowProps) {
     ? "border-emerald-500/35 bg-emerald-950/40 text-emerald-300"
     : "border-rose-500/35 bg-rose-950/40 text-rose-300";
 
+  // A row that never executed because the run hit its time limit is labelled
+  // "Not run: time limit" so completed rows above it stay intact.
+  const notRunTimeLimit =
+    isNotRun && (row.timedOut || /time limit/i.test(row.reason ?? ""));
+
   // Label text for status badge
   let statusBadgeText = row.status;
   if (isNoTests) {
     statusBadgeText = row.ruleId
       ? `No tests found (${row.ruleId})`
       : "No tests found";
+  } else if (notRunTimeLimit) {
+    statusBadgeText = "Not run: time limit";
   } else if (row.timedOut) {
     statusBadgeText = "timedOut";
   } else if (row.oomKilled) {
@@ -197,8 +204,8 @@ export function CommandRow({ row, onViewOutput }: CommandRowProps) {
         </div>
       )}
 
-      {/* Plain English error notice */}
-      {isFailed && plainErrorMessage && (
+      {/* Plain English error notice (shown on an Exhume error, alongside View output) */}
+      {plainErrorMessage && (isFailed || row.errorMessage) && (
         <div
           data-testid="command-row-plain-error"
           className="p-2 rounded bg-rose-950/30 border border-rose-500/35 border-l-2 border-l-rose-500 text-rose-300 text-[11px]"

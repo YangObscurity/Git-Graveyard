@@ -770,22 +770,22 @@ Implementation plan for the resurrection engine (design Revision 4). It follows 
     - Write components/TaskTable.tsx providing a synchronized keyboard-navigable table view carrying identical task state, dependency, and attempt data
     - Implement accessible toggle between graph and table view, preserving selection and state synchronization across live run updates
     - _Requirements: 37.16_
-  - [ ] 24.4 Add the remaining Gate states
+  - [x] 24.4 Add the remaining Gate states
     - Extend components/GateView.tsx and components/HealthBadge.tsx from 15.1: in production mode the badge has no "waking up" state; while Admission is stopped by an authentication failure, the badge shows "Live runs: unavailable".
     - Show a distinct message for each of a wrong, expired, revoked and used-up Invite_Code.
     - While live runs are paused or unavailable, keep the autopsy working and explain why Exhume is disabled; when GitHub rate-limits the autopsy, show the GitHub reset time.
     - _Requirements: 34.2, 34.7, 34.8, 34.9, 41.14_
-  - [ ] 24.5 Add the Tombstone autopsy result and error states
+  - [x] 24.5 Add the Tombstone autopsy result and error states
     - Extend components/TombstoneView.tsx from 15.2: for status alive, show "still breathing" with the reasons checked and keep the full autopsy visible.
     - Show a not-found-or-private message for REPO_NOT_FOUND, the exceeded size limit for TOO_LARGE, the files the Grimoire looked for for LANGUAGE_UNKNOWN, and the GitHub reset time for RATE_LIMITED.
     - When some manifests cannot be read, show a partial state that lists the unreadable manifests.
     - _Requirements: 4.6, 35.2, 35.3, 35.4, 35.5, 35.6, 35.7_
-  - [ ] 24.6 Add the Exhume visitor, outcome and failure states
+  - [x] 24.6 Add the Exhume visitor, outcome and failure states
     - Extend components/ExhumeView.tsx from 15.2: while the visitor has no Invite_Code, keep the autopsy and the Replays of Recorded_Runs available, disable the Exhume button with the reason and offer a link to a Replay.
     - Extend components/DeathCertificateView.tsx: when install, build and tests all pass, state that the repository installs, builds and passes its tests today and offer "Plan modernization anyway" and "Stop here"; when install fails, show it as the primary finding with the build and test rows marked Not run; when no tests are found, show "No tests found" in the test row with the rule that decided it.
     - Extend components/CommandRow.tsx: on an Exhume error, show a plain-English message and View output; when the Exhumer times out, keep the completed rows and mark the rest "Not run: time limit"; show oomKilled or timedOut on a command row that ended that way.
     - _Requirements: 31.12, 35.10, 35.14, 35.15, 35.16, 35.17, 35.18, 41.18_
-  - [ ] 24.7 Add the Pact screen editing, revision, parked and failure states
+  - [x] 24.7 Add the Pact screen editing, revision, parked and failure states
     - Extend components/PactEditor.tsx from 15.3: when the Planner finds nothing to change, show the reason and a Stop button; when the Pact fails to parse or the Planner fails, show the validation error in plain language with "Try again" and "Stop".
     - Reject an edit that creates a dependency cycle and name the cycle; when the user turns a task off, flag every task that depends on it.
     - While the Planner revises the Pact, lock edits and show the diff between versions in components/PactDiff.tsx when the revision arrives; while the run is parked, offer "Resume" and state that resuming clones the repository again.
@@ -810,13 +810,13 @@ Implementation plan for the resurrection engine (design Revision 4). It follows 
     - _Requirements: 28.3, 33.4, 33.10, 39.7, 39.8, 39.9, 39.10, 39.11, 39.12, 39.13, 44.14, 45.11_
 
 - [ ] 25. [Teammate — Pure Code, A11y & Offline Playwright axe-core E2E] Honest metrics registry, accessibility and English copy
-  - [ ] 25.1 Implement Metric Registry and honest value formatters
+  - [x] 25.1 Implement Metric Registry and honest value formatters
     - Write lib/metrics/registry.ts and lib/metrics/formatters.ts mapping all displayed numerals and metrics to R4-13 Metric_Registry rows M1 to M31, computing values strictly from authoritative recorded sources
     - Render missing sources as not available with reason, credits as not reported without CLI reporting, test counts as Counts not available without runner reports, and npm deprecation warning counts as not available while Spike S3 has not recorded the format
     - Compute all durations from the Necromancer clock, derive install, build, and test command statuses strictly from exitCode, timedOut, and oomKilled flags, mark unexecuted steps as not run, and display GitHub numbers with asOf date and Kiro CLI version from recorded version command
     - Suppress all scores, health percentages, confidence percentages, time estimates on queue positions, and duration estimates when fewer than 3 comparable runs exist (No estimate yet), formatting Runs like this took between X and Y using shortest and longest recorded wall times
     - _Requirements: 40.1, 40.2, 40.3, 40.4, 40.5, 40.6, 40.7, 40.8, 40.10, 40.11, 40.12, 40.13, 40.14, 40.15, 41.18_
-  - [ ]* 25.2 Write property test for Metric provenance (P14)
+  - [x]* 25.2 Write property test for Metric provenance (P14)
     - **Property 14: Metric provenance (P14)**
     - **Validates: Requirements 30.10, 30.11, 40.1, 40.2**
     - Implement property-based test with fast-check in test/props/metric-provenance.test.ts generating arbitrary runs, missing fields, and command results to assert that every displayed number maps to an R4-13 source or renders not available or not reported, with zero estimated numerals
@@ -843,12 +843,12 @@ Implementation plan for the resurrection engine (design Revision 4). It follows 
     - _Requirements: 46.1_
 
 - [ ] 26. [Teammate — Pure Code, Build Script & UI Component] Built with Kiro evidence builder and Open in Kiro handoff
-  - [ ] 26.1 Implement build-time Kiro evidence builder script
+  - [x] 26.1 Implement build-time Kiro evidence builder script
     - Write scripts/evidence/build-evidence.ts and package.json script evidence:build generating kiro-evidence.json adhering to the verified build evidence schema
     - Scan repository and index only verified existing files: specs (.kiro/specs/**), steering files with their inclusion mode (.kiro/steering/**), hooks with their triggers (.kiro/hooks/*.json), role agent templates (lib/agents/templates/**), and spec-to-task-to-commit links derived from git log
     - Assert that every referenced file path exists on disk before writing kiro-evidence.json
     - _Requirements: 48.5_
-  - [ ] 26.2 Implement CI verification of Kiro evidence integrity
+  - [x] 26.2 Implement CI verification of Kiro evidence integrity
     - Write test/ci/evidence-integrity.test.ts verifying that every file path listed in kiro-evidence.json exists in the repository
     - Fail CI execution if kiro-evidence.json contains non-existent paths, stale commit links, or invalid schema formatting
     - _Requirements: 48.6_
@@ -858,7 +858,7 @@ Implementation plan for the resurrection engine (design Revision 4). It follows 
     - Extract from the three most recent published runs each Skeleton's role, agent name, model ID, kiro-cli version, session ID, and timestamp from run.started and skeleton.raised events
     - Present architectural boundaries identifying the Grimoire autopsy path under the section What does not use Kiro
     - _Requirements: 48.7, 48.8, 48.9, 48.10_
-  - [ ] 26.4 Implement Open in Kiro handoff instructions in Reliquary
+  - [x] 26.4 Implement Open in Kiro handoff instructions in Reliquary
     - Write lib/artifacts/kiro-handoff.ts and components/OpenInKiroHandoff.tsx embedded in components/ReliquaryView.tsx displaying handoff instructions for the run bundle
     - Instruct the user to execute git apply -p1 all.patch on a clone at the pinned sha, followed by copying spec/ to .kiro/specs/resurrection/<owner>-<repo>/
     - Provide fallback copy target directory .kiro/specs/<owner>-<repo>/ if unknown U14 shows that Kiro does not list nested spec folders

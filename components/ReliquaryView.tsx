@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import type { RunOutcome } from "@/lib/lifecycle/lifecycle-manager";
 import type { TaskState, EventEnvelope } from "@/lib/events/types";
@@ -26,6 +26,11 @@ import {
   ReliquaryArtifactDownloads,
   type ReliquaryArtifactItem,
 } from "./ReliquaryArtifactDownloads";
+import { OpenInKiroHandoff } from "./OpenInKiroHandoff";
+import type {
+  KiroHandoffCertificate,
+  KiroHandoffCommandStep,
+} from "@/lib/artifacts/kiro-handoff";
 
 export interface ReliquaryPushInfo {
   enabled: boolean;
@@ -56,6 +61,7 @@ export interface ReliquaryViewProps {
   tasks?: TaskLedgerItem[];
   artifacts?: ReliquaryArtifactItem[];
   initialEvents?: EventEnvelope[];
+  certificate?: KiroHandoffCertificate | null;
 }
 
 export function formatOutcomeBannerText(
@@ -104,24 +110,134 @@ export function formatOutcomeBannerText(
   return outcome ? String(outcome) : "Run Complete";
 }
 
+/**
+ * Merge certificate fragments into one, applying later parts over earlier ones
+ * for scalar and per-step fields. Rows are taken from the last part that
+ * actually recorded any. Returns null when nothing was supplied.
+ */
+function mergeHandoffCertificates(
+  ...parts: Array<KiroHandoffCertificate | null | undefined>
+): KiroHandoffCertificate | null {
+  const defined = parts.filter((p): p is KiroHandoffCertificate => !!p);
+  if (defined.length === 0) return null;
+  const merged: KiroHandoffCertificate = {};
+  for (const part of defined) {
+    if (part.primaryLanguage) merged.primaryLanguage = part.primaryLanguage;
+    if (part.packageManager) merged.packageManager = part.packageManager;
+    if (part.install) merged.install = part.install;
+    if (part.retry) merged.retry = part.retry;
+    if (part.build) merged.build = part.build;
+    if (part.test) merged.test = part.test;
+    if (part.rows && part.rows.length > 0) merged.rows = part.rows;
+  }
+  return merged;
+}
+
+/** Map before/after table keys to the certificate step they describe. */
+function beforeAfterStepKey(key: string): "install" | "build" | "test" | null {
+  if (key === "install") return "install";
+  if (key === "build") return "build";
+  if (key === "test" || key === "tests_repo") return "test";
+  return null;
+}
+
+/**
+ * Derive a view of the recorded certificate with before/after table statuses
+ * filled in for steps that carry a recorded command but no status yet. Pure:
+ * it never mutates the recorded certificate and never fabricates a command that
+ * was not recorded, so an inapplicable step stays omitted rather than guessed.
+ * Only an absent status (undefined or empty) is populated; an explicit recorded
+ * status is never overwritten.
+ */
+function applyBeforeAfterFallback(
+  cert: KiroHandoffCertificate | null,
+  rows: BeforeAfterRowData[] | undefined
+): KiroHandoffCertificate | null {
+  if (!cert || !rows || rows.length === 0) return cert;
+
+  const fallback: Partial<Record<"install" | "build" | "test", string>> = {};
+  for (const row of rows) {
+    const step = beforeAfterStepKey(row.key);
+    if (!step || fallback[step] !== undefined) continue;
+    const status = row.after?.status ?? row.before?.status;
+    if (typeof status === "string" && status.length > 0) fallback[step] = status;
+  }
+
+  const hasExplicitStatus = (step: KiroHandoffCommandStep): boolean =>
+    typeof step.status === "string" && step.status.trim().length > 0;
+
+  const withFallback = (
+    step: KiroHandoffCommandStep | undefined,
+    key: "install" | "build" | "test"
+  ): KiroHandoffCommandStep | undefined => {
+    if (!step || hasExplicitStatus(step)) return step;
+    const status = fallback[key];
+    return status ? { ...step, status } : step;
+  };
+
+  let changed = false;
+
+  const install = withFallback(cert.install, "install");
+  const build = withFallback(cert.build, "build");
+  const test = withFallback(cert.test, "test");
+  if (install !== cert.install) changed = true;
+  if (build !== cert.build) changed = true;
+  if (test !== cert.test) changed = true;
+
+  // Retry has no dedicated before/after row; keep it as recorded.
+  const retry = cert.retry;
+
+  let certRows = cert.rows;
+  if (Array.isArray(cert.rows) && cert.rows.length > 0) {
+    let rowsChanged = false;
+    const nextRows = cert.rows.map((entry) => {
+      const key =
+        entry.step === "install" || entry.step === "build" || entry.step === "test"
+          ? entry.step
+          : entry.step === "tests_repo"
+            ? "test"
+            : null;
+      if (!key) return entry;
+      const patched = withFallback(entry, key);
+      if (patched !== entry) rowsChanged = true;
+      return patched;
+    });
+    if (rowsChanged) {
+      certRows = nextRows;
+      changed = true;
+    }
+  }
+
+  if (!changed) return cert;
+  return { ...cert, install, retry, build, test, rows: certRows };
+}
+
 export function parseEventsData(events: EventEnvelope[]): {
   outcome?: string;
   packing?: boolean;
   hidden?: boolean;
   baseSha?: string;
+  owner?: string;
+  repo?: string;
   buildPassed?: boolean;
   testsPassed?: boolean;
   tasks?: Record<string, TaskLedgerItem>;
   artifacts?: ReliquaryArtifactItem[];
   reportCheck?: ReliquaryReportCheckInfo;
+  certificate?: KiroHandoffCertificate;
 } {
   let runOutcome: string | undefined = undefined;
   let isPacking: boolean | undefined = undefined;
   let isHidden: boolean | undefined = undefined;
   let certBaseSha: string | undefined = undefined;
+  let certOwner: string | undefined = undefined;
+  let certRepo: string | undefined = undefined;
   let finalBuildPassed: boolean | undefined = undefined;
   let finalTestsPassed: boolean | undefined = undefined;
   let repCheck: ReliquaryReportCheckInfo | undefined = undefined;
+  let certPrimaryLanguage: string | undefined = undefined;
+  let certPackageManager: string | undefined = undefined;
+  const certCommandRows: KiroHandoffCommandStep[] = [];
   const discoveredTasks: Record<string, TaskLedgerItem> = {};
   const discoveredArtifacts: ReliquaryArtifactItem[] = [];
 
@@ -131,9 +247,52 @@ export function parseEventsData(events: EventEnvelope[]): {
     }
 
     if (ev.kind === "exhume.certificate") {
-      const bs = (ev.data as Record<string, unknown>)?.baseSha;
+      const d = ev.data as Record<string, unknown>;
+      const bs = d?.baseSha;
       if (typeof bs === "string" && bs.length > 0) {
         certBaseSha = bs;
+      }
+      if (typeof d?.owner === "string" && d.owner.length > 0) certOwner = d.owner;
+      if (typeof d?.repo === "string" && d.repo.length > 0) certRepo = d.repo;
+      if ((!certOwner || !certRepo) && typeof d?.repoUrl === "string" && d.repoUrl.length > 0) {
+        const parsed = repoFromUrl(d.repoUrl);
+        if (parsed) {
+          if (!certOwner) certOwner = parsed.owner;
+          if (!certRepo) certRepo = parsed.repo;
+        }
+      }
+      if (typeof d?.primaryLanguage === "string" && d.primaryLanguage.length > 0) {
+        certPrimaryLanguage = d.primaryLanguage;
+      }
+      if (typeof d?.packageManager === "string" && d.packageManager.length > 0) {
+        certPackageManager = d.packageManager;
+      }
+    }
+
+    if (ev.kind === "command.result") {
+      const d = ev.data as Record<string, unknown>;
+      const step = typeof d?.step === "string" ? d.step : undefined;
+      // Prefer a recorded argv array (each element shell-quoted individually by
+      // the handoff builder) over a flattened commandLine/command string so
+      // arguments with spaces or shell metacharacters keep their quoting.
+      const argv = d?.argv;
+      let commandLine: string | string[] | undefined;
+      if (Array.isArray(argv) && argv.every((x) => typeof x === "string")) {
+        commandLine = argv as string[];
+      } else if (typeof d?.commandLine === "string") {
+        commandLine = d.commandLine;
+      } else if (typeof d?.command === "string") {
+        commandLine = d.command;
+      }
+      const status = typeof d?.status === "string" ? d.status : undefined;
+      const noTestsFound = d?.noTestsFound === true;
+      if (step !== undefined || commandLine !== undefined || status !== undefined) {
+        const row: KiroHandoffCommandStep = {};
+        if (step !== undefined) row.step = step;
+        if (commandLine !== undefined) row.command = commandLine;
+        if (status !== undefined) row.status = status;
+        if (noTestsFound) row.noTestsFound = true;
+        certCommandRows.push(row);
       }
     }
 
@@ -246,16 +405,46 @@ export function parseEventsData(events: EventEnvelope[]): {
     }
   }
 
+  let certificate: KiroHandoffCertificate | undefined = undefined;
+  if (
+    certPrimaryLanguage !== undefined ||
+    certPackageManager !== undefined ||
+    certCommandRows.length > 0
+  ) {
+    const lastByStep = (name: string): KiroHandoffCommandStep | undefined => {
+      for (let i = certCommandRows.length - 1; i >= 0; i--) {
+        if (certCommandRows[i].step === name) return certCommandRows[i];
+      }
+      return undefined;
+    };
+    const installRow = lastByStep("install");
+    const retryRow = lastByStep("retry");
+    const buildRow = lastByStep("build");
+    const testRow = lastByStep("test");
+    certificate = {
+      ...(certPrimaryLanguage !== undefined ? { primaryLanguage: certPrimaryLanguage } : {}),
+      ...(certPackageManager !== undefined ? { packageManager: certPackageManager } : {}),
+      ...(installRow ? { install: installRow } : {}),
+      ...(retryRow ? { retry: retryRow } : {}),
+      ...(buildRow ? { build: buildRow } : {}),
+      ...(testRow ? { test: testRow } : {}),
+      ...(certCommandRows.length > 0 ? { rows: certCommandRows } : {}),
+    };
+  }
+
   return {
     outcome: runOutcome,
     packing: isPacking,
     hidden: isHidden,
     baseSha: certBaseSha,
+    owner: certOwner,
+    repo: certRepo,
     buildPassed: finalBuildPassed,
     testsPassed: finalTestsPassed,
     tasks: Object.keys(discoveredTasks).length > 0 ? discoveredTasks : undefined,
     artifacts: discoveredArtifacts.length > 0 ? discoveredArtifacts : undefined,
     reportCheck: repCheck,
+    certificate,
   };
 }
 
@@ -276,6 +465,7 @@ export function ReliquaryView({
   tasks: propTasks,
   artifacts: propArtifacts,
   initialEvents,
+  certificate: propCertificate,
 }: ReliquaryViewProps) {
   const initialParsed = initialEvents ? parseEventsData(initialEvents) : null;
 
@@ -310,10 +500,13 @@ export function ReliquaryView({
   const [hidden, setHidden] = useState<boolean>(
     propHidden !== undefined ? Boolean(propHidden) : Boolean(initialParsed?.hidden)
   );
-  const [owner, setOwner] = useState<string>(propOwner ?? "owner");
-  const [repo, setRepo] = useState<string>(propRepo ?? "repo");
+  const [owner, setOwner] = useState<string | undefined>(propOwner ?? initialParsed?.owner);
+  const [repo, setRepo] = useState<string | undefined>(propRepo ?? initialParsed?.repo);
   const [baseSha, setBaseSha] = useState<string>(propBaseSha ?? initialParsed?.baseSha ?? "0000000");
   const [headSha, setHeadSha] = useState<string>(propHeadSha ?? "0000000");
+  // Repository metadata is available whenever both owner and repo are known,
+  // regardless of whether they came from props, events, or the run record.
+  const hasRepoMetadata = Boolean(owner && repo);
   const [eventBuildPassed, setEventBuildPassed] = useState<boolean | undefined>(
     initialParsed?.buildPassed
   );
@@ -336,6 +529,19 @@ export function ReliquaryView({
   );
   const [artifacts, setArtifacts] = useState<ReliquaryArtifactItem[] | undefined>(
     propArtifacts ?? initialParsed?.artifacts
+  );
+  // Verification commands for the handoff are derived only from what the run
+  // actually recorded (certificate / command rows); never assumed.
+  const [handoffCertificate, setHandoffCertificate] = useState<KiroHandoffCertificate | null>(
+    mergeHandoffCertificates(initialParsed?.certificate, propCertificate) ?? null
+  );
+
+  // Derived purely from the recorded certificate and the before/after table so
+  // late-arriving data or table updates recompute cleanly without stale values
+  // or effect loops. The recorded certificate itself is never mutated.
+  const effectiveHandoffCertificate = useMemo(
+    () => applyBeforeAfterFallback(handoffCertificate, beforeAfterRows),
+    [handoffCertificate, beforeAfterRows]
   );
 
   // Sync prop changes
@@ -360,6 +566,22 @@ export function ReliquaryView({
   }, [propReportCheck]);
 
   useEffect(() => {
+    if (propOwner !== undefined) setOwner(propOwner);
+  }, [propOwner]);
+
+  useEffect(() => {
+    if (propRepo !== undefined) setRepo(propRepo);
+  }, [propRepo]);
+
+  useEffect(() => {
+    if (propBaseSha !== undefined) setBaseSha(propBaseSha);
+  }, [propBaseSha]);
+
+  useEffect(() => {
+    if (propHeadSha !== undefined) setHeadSha(propHeadSha);
+  }, [propHeadSha]);
+
+  useEffect(() => {
     if (propBeforeAfterRows !== undefined) setBeforeAfterRows(propBeforeAfterRows);
   }, [propBeforeAfterRows]);
 
@@ -379,6 +601,12 @@ export function ReliquaryView({
     if (propArtifacts !== undefined) setArtifacts(propArtifacts);
   }, [propArtifacts]);
 
+  useEffect(() => {
+    if (propCertificate !== undefined) {
+      setHandoffCertificate((prev) => mergeHandoffCertificates(prev, propCertificate));
+    }
+  }, [propCertificate]);
+
   // If initial props are omitted, fetch BOTH /api/runs/[runId] (authoritative) AND /api/runs/[runId]/events?from=1 (supplement/fallback)
   useEffect(() => {
     if (initialOutcome || propBeforeAfterRows || initialEvents) {
@@ -387,9 +615,17 @@ export function ReliquaryView({
         if (parsed.outcome !== undefined) setOutcome(parsed.outcome);
         if (parsed.packing !== undefined) setPacking(parsed.packing);
         if (parsed.hidden !== undefined) setHidden(parsed.hidden);
+        if (parsed.baseSha !== undefined) {
+          setBaseSha((prev) => (prev === "0000000" ? parsed.baseSha! : prev));
+        }
+        if (parsed.owner) setOwner(parsed.owner);
+        if (parsed.repo) setRepo(parsed.repo);
         if (parsed.tasks) setTasks(Object.values(parsed.tasks));
         if (parsed.artifacts) setArtifacts(parsed.artifacts);
         if (parsed.reportCheck) setReportCheckInfo(parsed.reportCheck);
+        if (parsed.certificate) {
+          setHandoffCertificate((prev) => mergeHandoffCertificates(prev, parsed.certificate));
+        }
       }
       setLoading(false);
       return;
@@ -466,10 +702,10 @@ export function ReliquaryView({
           }
           if (runData.run) {
             const parsedRepo = repoFromUrl(runData.run.url);
-            if (runData.run.owner) setOwner(runData.run.owner);
-            else if (parsedRepo) setOwner(parsedRepo.owner);
-            if (runData.run.repo) setRepo(runData.run.repo);
-            else if (parsedRepo) setRepo(parsedRepo.repo);
+            const realOwner = runData.run.owner ?? parsedRepo?.owner;
+            const realRepo = runData.run.repo ?? parsedRepo?.repo;
+            if (realOwner) setOwner(realOwner);
+            if (realRepo) setRepo(realRepo);
             if (runData.run.baseSha) setBaseSha(runData.run.baseSha);
             else if (typeof runData.run.sha === "string" && runData.run.sha && runData.run.sha !== "HEAD") {
               setBaseSha(runData.run.sha);
@@ -480,6 +716,10 @@ export function ReliquaryView({
             setPacking(true);
           } else if (runData.phase === "done") {
             setPacking(false);
+          }
+          if (runData.certificate) {
+            const runCert = runData.certificate as KiroHandoffCertificate;
+            setHandoffCertificate((prev) => mergeHandoffCertificates(runCert, prev));
           }
         }
 
@@ -498,6 +738,8 @@ export function ReliquaryView({
           if (parsed.baseSha && !runData?.run?.baseSha) {
             setBaseSha((prev) => (prev === "0000000" ? parsed.baseSha! : prev));
           }
+          if (parsed.owner) setOwner((prev) => prev ?? parsed.owner);
+          if (parsed.repo) setRepo((prev) => prev ?? parsed.repo);
           if (parsed.buildPassed !== undefined) {
             setEventBuildPassed(parsed.buildPassed);
           }
@@ -512,6 +754,9 @@ export function ReliquaryView({
           }
           if (runData?.phase === undefined && parsed.packing !== undefined) {
             setPacking(parsed.packing);
+          }
+          if (parsed.certificate) {
+            setHandoffCertificate((prev) => mergeHandoffCertificates(prev, parsed.certificate));
           }
         }
 
@@ -685,7 +930,7 @@ export function ReliquaryView({
             <h1 className="text-xl md:text-2xl font-bold text-bone font-mono tracking-tight">
               Run: {runId}
             </h1>
-            {(owner !== "owner" || repo !== "repo") && (
+            {hasRepoMetadata && owner && repo ? (
               <div className="text-xs text-ash">
                 Target: <span className="text-parchment">{owner}/{repo}</span>
                 {baseSha !== "0000000" && (
@@ -695,7 +940,7 @@ export function ReliquaryView({
                   <span className="ml-1 text-dust">→ head {headSha.slice(0, 7)}</span>
                 )}
               </div>
-            )}
+            ) : null}
           </div>
           {packing && (
             <StatusPill
@@ -908,32 +1153,26 @@ export function ReliquaryView({
         />
       </section>
 
-      {/* 6. Open in Kiro handoff instructions (Requirement 38.9) */}
-      <section
-        className="crypt-panel p-5 font-mono text-xs space-y-3"
-        data-testid="open-in-kiro-handoff"
-      >
-        <h3 className="text-sm font-semibold text-bone">
-          Open in Kiro Handoff Instructions
-        </h3>
-        <ol className="list-decimal list-inside space-y-2 text-ash">
-          <li>
-            Clone the source repository and check out at the pinned base sha.
-          </li>
-          <li>
-            Execute <code className="crypt-well text-emerald-300 px-1.5 py-0.5">git apply -p1 all.patch</code>.
-          </li>
-          <li>
-            Copy <code className="crypt-well text-emerald-300 px-1.5 py-0.5">spec/</code> to{" "}
-            <code className="crypt-well text-emerald-300 px-1.5 py-0.5">
-              .kiro/specs/resurrection/{owner}-{repo}/
-            </code>.
-          </li>
-          <li>
-            Run <code className="crypt-well text-emerald-300 px-1.5 py-0.5">/spec run &lt;name&gt;</code> in Kiro CLI or open the spec in the Kiro IDE.
-          </li>
-        </ol>
-      </section>
+      {/* 6. Open in Kiro handoff instructions (Requirement 38.9). Only shown when
+          real repository metadata is available; placeholder fallbacks would
+          produce broken clone/checkout commands. */}
+      {hasRepoMetadata && owner && repo ? (
+        <OpenInKiroHandoff
+          owner={owner}
+          repo={repo}
+          baseSha={baseSha !== "0000000" ? baseSha : "BASE_SHA"}
+          runId={runId}
+          certificate={effectiveHandoffCertificate}
+        />
+      ) : (
+        <p
+          data-testid="open-in-kiro-unavailable"
+          className="crypt-panel p-5 font-mono text-xs text-ash"
+        >
+          Open in Kiro handoff instructions are unavailable until the run records
+          its repository.
+        </p>
+      )}
 
       <CryptOrnament kind="divider" />
 
