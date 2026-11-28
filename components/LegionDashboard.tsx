@@ -14,6 +14,7 @@ import {
   mergedTaskCount,
   openAsks,
   pendingApprovals as selectPendingApprovals,
+  reconnectBannerText,
 } from "@/lib/ui/run-model";
 import { announceRunPhase } from "@/lib/ui/run-phase-bus";
 import { rememberInviteCode } from "@/lib/ui/invite-session";
@@ -26,6 +27,8 @@ import { LegionAskCard } from "./LegionAskCard";
 import { LegionRunHeader } from "./LegionRunHeader";
 import { LegionNecromancerChannel } from "./LegionNecromancerChannel";
 import { LegionRunControls } from "./LegionRunControls";
+import { TaskGraph, type TaskNode } from "./TaskGraph";
+import { TaskTable } from "./TaskTable";
 import { CryptOrnament } from "./ui/CryptOrnament";
 import { StatusPill } from "./ui/StatusPill";
 
@@ -81,6 +84,10 @@ export function LegionDashboard({
   const [controlAuthRequired, setControlAuthRequired] = useState<boolean>(false);
   const [unlockDraft, setUnlockDraft] = useState<string>("");
   const [now, setNow] = useState<number>(() => Date.now());
+  // Synchronized task views: the same tasks render as a graph or a table, and
+  // the selected task is preserved when the user toggles between them.
+  const [taskView, setTaskView] = useState<"graph" | "table">("graph");
+  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
 
   // A run with no events yet is shown as queued (its first event is run.queued).
   const phase: string = view.phase === "unknown" ? "queued" : view.phase;
@@ -98,13 +105,18 @@ export function LegionDashboard({
     return () => clearInterval(timer);
   }, [isDone]);
 
-  // Tab title when something needs the user (Requirement 37.4)
+  // Tab title when something needs the user (Requirement 37.4). The previous
+  // title is restored on unmount or when the needs-user state clears.
   useEffect(() => {
     if (typeof document === "undefined") return;
+    const previous = document.title;
     document.title =
       needsUserCount > 0
         ? `[Action Needed] Legion - Git-Graveyard`
         : `Git-Graveyard: Legion - ${runId}`;
+    return () => {
+      document.title = previous;
+    };
   }, [needsUserCount, runId]);
 
   // Let the nav stepper follow the run.
@@ -365,6 +377,15 @@ export function LegionDashboard({
 
   const tasksTotal = view.tasks.length > 0 ? view.tasks.length : undefined;
 
+  // The graph and table render this exact list, so they always agree.
+  const taskNodes: TaskNode[] = view.tasks.map((t) => ({
+    taskId: t.taskId,
+    state: t.state,
+    attempt: t.attempt,
+    verdict: t.verdict ?? null,
+    dependencies: t.dependencies ?? [],
+  }));
+
   return (
     <div
       data-ui-element="legion-dashboard"
@@ -406,10 +427,23 @@ export function LegionDashboard({
         onKill={handleKillRun}
       />
 
+      {/* Inbox attention badge (Task 24.1) */}
+      {needsUserCount > 0 && (
+        <div
+          data-testid="legion-inbox-badge"
+          className="crypt-panel border-amber-500/45 bg-amber-950/25 p-3 text-xs text-amber-200 flex items-center gap-2"
+        >
+          <StatusPill tone="amber" pulse label={`Inbox: ${needsUserCount}`} uiState="needs-user" />
+          <span>
+            {needsUserCount} item{needsUserCount === 1 ? "" : "s"} need your attention.
+          </span>
+        </div>
+      )}
+
       {/* SSE Down / Reconnecting Indicator (Requirement 37.5) */}
       {reconnecting && (
         <div className="crypt-panel border-amber-500/45 bg-amber-950/20 p-3 text-xs text-amber-300 flex items-center justify-between gap-2">
-          <span>Reconnecting... showing events up to #{view.lastSeq}</span>
+          <span>{reconnectBannerText(view.lastSeq)}</span>
           <StatusPill tone="amber" pulse label="Offline" uiState="reconnecting" />
         </div>
       )}
@@ -529,12 +563,18 @@ export function LegionDashboard({
         <div className="crypt-panel border-l-2 border-l-rose-500 border-rose-500/45 bg-rose-950/25 p-4 space-y-2 text-xs">
           <div className="font-bold text-rose-200">Run-level error occurred:</div>
           <div className="text-parchment">{view.error}</div>
-          <div className="pt-1">
+          <div className="pt-1 flex flex-wrap gap-4">
             <a
               href={routes.eventLog(runId)}
               className="text-emerald-400 hover:text-emerald-300 underline underline-offset-4"
             >
               View kept event evidence log
+            </a>
+            <a
+              href={routes.relic(runId)}
+              className="text-emerald-400 hover:text-emerald-300 underline underline-offset-4"
+            >
+              View kept artifacts and commit state
             </a>
           </div>
         </div>
@@ -615,6 +655,7 @@ export function LegionDashboard({
                     key={skel.skeletonId}
                     skeleton={skel}
                     runDone={isDone}
+                    recovering={view.recovering}
                     onInterrupt={handleInterrupt}
                     onReraise={handleReraise}
                     onLayToRest={handleLayToRest}
@@ -625,6 +666,62 @@ export function LegionDashboard({
               </div>
             )}
           </section>
+
+          {/* Synchronized Task Graph / Table (Task 24.3) */}
+          {taskNodes.length > 0 && (
+            <section className="space-y-3" data-testid="legion-task-views">
+              <div className="flex items-center justify-between gap-2">
+                <h2 className="text-sm font-bold text-parchment uppercase tracking-wider">
+                  Tasks ({taskNodes.length})
+                </h2>
+                <div
+                  role="group"
+                  aria-label="Task view"
+                  className="inline-flex rounded border border-white/10 overflow-hidden"
+                >
+                  <button
+                    type="button"
+                    data-testid="task-view-graph"
+                    aria-pressed={taskView === "graph"}
+                    onClick={() => setTaskView("graph")}
+                    className={`px-3 py-1 text-xs ${
+                      taskView === "graph"
+                        ? "bg-emerald-950/50 text-emerald-300"
+                        : "text-ash hover:text-bone"
+                    }`}
+                  >
+                    Graph
+                  </button>
+                  <button
+                    type="button"
+                    data-testid="task-view-table"
+                    aria-pressed={taskView === "table"}
+                    onClick={() => setTaskView("table")}
+                    className={`px-3 py-1 text-xs ${
+                      taskView === "table"
+                        ? "bg-emerald-950/50 text-emerald-300"
+                        : "text-ash hover:text-bone"
+                    }`}
+                  >
+                    Table
+                  </button>
+                </div>
+              </div>
+              {taskView === "graph" ? (
+                <TaskGraph
+                  tasks={taskNodes}
+                  selectedTaskId={selectedTaskId}
+                  onSelectTask={setSelectedTaskId}
+                />
+              ) : (
+                <TaskTable
+                  tasks={taskNodes}
+                  selectedTaskId={selectedTaskId}
+                  onSelectTask={setSelectedTaskId}
+                />
+              )}
+            </section>
+          )}
 
           {/* Necromancer Channel (Requirement 37.14) */}
           <LegionNecromancerChannel entries={view.channel} />
