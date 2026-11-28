@@ -82,6 +82,14 @@ export interface DestroyHandle {
   destroy(): Promise<void>;
 }
 
+/** Outcome of a pull-and-destroy cycle, including any pull error. */
+export interface PullAndDestroyResult {
+  readonly id: string;
+  readonly destroyed: boolean;
+  /** Error raised by syncOut/exportLogs, if any. The sandbox is still destroyed. */
+  readonly pullError?: unknown;
+}
+
 /**
  * Manages the lifecycle of cloud sandboxes: TTL with 24h hard cap, the 5-run
  * concurrency quota, snapshot prohibition, and artifact/log pull before destroy.
@@ -91,6 +99,8 @@ export class CloudSandboxLifecycle {
   private readonly handles = new Map<string, DestroyHandle>();
   private readonly pullers = new Map<string, PullArtifacts>();
   private readonly runIds = new Set<string>();
+  /** Per-record pull errors captured by the most recent expireStale pass. */
+  readonly errors = new Map<string, unknown>();
 
   constructor(
     private readonly options?: {
@@ -199,10 +209,16 @@ export class CloudSandboxLifecycle {
    */
   async expireStale(now = this.now()): Promise<string[]> {
     const expired: string[] = [];
+    this.errors.clear();
     for (const record of this.records.values()) {
       if (record.state !== "running") continue;
       if (record.expiresAt !== null && now >= record.expiresAt) {
-        await this.pullAndDestroy(record.id);
+        // A pull failure must not stop the sweep: destroy the sandbox, record
+        // the error for this record, and continue with the remaining records.
+        const result = await this.pullAndDestroy(record.id);
+        if (result.pullError !== undefined) {
+          this.errors.set(record.id, result.pullError);
+        }
         record.state = "expired";
         expired.push(record.id);
       }
@@ -221,17 +237,25 @@ export class CloudSandboxLifecycle {
    * Pulls artifacts and logs (syncOut + log export) before destroying a sandbox
    * on run completion or expiry.
    */
-  async pullAndDestroy(id: string): Promise<void> {
-    const pull = this.pullers.get(id);
-    if (pull) {
-      if (pull.syncOut) {
-        await pull.syncOut();
+  async pullAndDestroy(id: string): Promise<PullAndDestroyResult> {
+    let pullError: unknown;
+    try {
+      const pull = this.pullers.get(id);
+      if (pull) {
+        if (pull.syncOut) {
+          await pull.syncOut();
+        }
+        if (pull.exportLogs) {
+          await pull.exportLogs();
+        }
       }
-      if (pull.exportLogs) {
-        await pull.exportLogs();
-      }
+    } catch (err) {
+      // Preserve the pull error but still destroy and release the run slot.
+      pullError = err;
+    } finally {
+      await this.destroy(id);
     }
-    await this.destroy(id);
+    return { id, destroyed: true, pullError };
   }
 
   /**
