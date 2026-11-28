@@ -82,12 +82,14 @@ export interface DestroyHandle {
   destroy(): Promise<void>;
 }
 
-/** Outcome of a pull-and-destroy cycle, including any pull error. */
+/** Outcome of a pull-and-destroy cycle, including any pull errors. */
 export interface PullAndDestroyResult {
   readonly id: string;
   readonly destroyed: boolean;
-  /** Error raised by syncOut/exportLogs, if any. The sandbox is still destroyed. */
+  /** Error raised by syncOut, if any. The sandbox is still destroyed. */
   readonly pullError?: unknown;
+  /** Error raised by exportLogs, if any. The sandbox is still destroyed. */
+  readonly exportError?: unknown;
 }
 
 /**
@@ -216,8 +218,9 @@ export class CloudSandboxLifecycle {
         // A pull failure must not stop the sweep: destroy the sandbox, record
         // the error for this record, and continue with the remaining records.
         const result = await this.pullAndDestroy(record.id);
-        if (result.pullError !== undefined) {
-          this.errors.set(record.id, result.pullError);
+        const err = result.pullError !== undefined ? result.pullError : result.exportError;
+        if (err !== undefined) {
+          this.errors.set(record.id, err);
         }
         record.state = "expired";
         expired.push(record.id);
@@ -239,23 +242,30 @@ export class CloudSandboxLifecycle {
    */
   async pullAndDestroy(id: string): Promise<PullAndDestroyResult> {
     let pullError: unknown;
+    let exportError: unknown;
     try {
       const pull = this.pullers.get(id);
-      if (pull) {
-        if (pull.syncOut) {
+      // Attempt syncOut and exportLogs independently: a failure in one must not
+      // skip the other. Both are always attempted in this order.
+      try {
+        if (pull?.syncOut) {
           await pull.syncOut();
         }
-        if (pull.exportLogs) {
+      } catch (err) {
+        pullError = err;
+      }
+      try {
+        if (pull?.exportLogs) {
           await pull.exportLogs();
         }
+      } catch (err) {
+        exportError = err;
       }
-    } catch (err) {
-      // Preserve the pull error but still destroy and release the run slot.
-      pullError = err;
     } finally {
+      // Destroy is attempted regardless of pull failures, releasing the run slot.
       await this.destroy(id);
     }
-    return { id, destroyed: true, pullError };
+    return { id, destroyed: true, pullError, exportError };
   }
 
   /**
