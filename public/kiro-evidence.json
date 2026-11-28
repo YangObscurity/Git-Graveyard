@@ -1,6 +1,6 @@
 {
   "schemaVersion": "v1",
-  "generatedFromSha": "4f854fa",
+  "generatedFromSha": "11fb4bc",
   "specs": [
     {
       "path": ".kiro/specs/resurrection-engine/.config.kiro",
@@ -461,6 +461,12 @@
   ],
   "commitLinks": [
     {
+      "sha": "11fb4bccdf9272092157dd3c6fdfa8fa39066994",
+      "shortSha": "11fb4bc",
+      "subject": "fix(wave-5): let per-create labels override defaults and refuse a sandbox destroyed during create",
+      "refs": "HEAD -> wave/5"
+    },
+    {
       "sha": "e05fb381243379d42f6057291c68b02dcdb07f36",
       "shortSha": "e05fb38",
       "subject": "fix(wave-5): re-attach only a sandbox that carries the requested idempotency key",
@@ -602,12 +608,6 @@
       "sha": "0bc8075d036a8e19c0db46cb3e78a57aa99ac98a",
       "shortSha": "0bc8075",
       "subject": "fix(wave-3): harden run routes, admin/admission/governor, scribe, and recovery",
-      "refs": ""
-    },
-    {
-      "sha": "0fe4bfe38578e739639cc720f69ab2ec07b6c61c",
-      "shortSha": "0fe4bfe",
-      "subject": "feat(scribe,recovery): add ScribeService, ReportCheck verification, failure recovery, and boot reconciliation",
       "refs": ""
     }
   ]
