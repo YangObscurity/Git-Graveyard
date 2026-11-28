@@ -421,7 +421,10 @@ export class DockerCloudSandboxBackend implements ExecutionBackend {
       );
     }
 
-    const { id } = await this.options.client.createSandbox(spec);
+    // The client must receive the resolved default-deny network, not the raw
+    // spec, or egress would be unrestricted whenever spec.network was omitted.
+    const resolvedSpec: SandboxSpec = { ...spec, network };
+    const { id } = await this.options.client.createSandbox(resolvedSpec);
     const labels: Record<string, string> = {
       "git-graveyard.managed": "true",
       "git-graveyard.idempotency-key": spec.idempotencyKey,

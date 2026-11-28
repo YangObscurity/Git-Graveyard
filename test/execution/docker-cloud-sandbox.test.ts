@@ -570,6 +570,9 @@ describe("SandboxSpec security rejection and default-deny network", () => {
     const box = await backend.create({ idempotencyKey: "s5", image: PINNED_IMAGE });
     assert.ok(box);
     assert.equal(client.created.length, 1);
+    // The spec handed to the cloud client carries the resolved default-deny network.
+    const sent = client.created[0] as SandboxSpec & { network?: { default?: string } };
+    assert.equal(sent.network?.default, "deny");
   });
 });
 
