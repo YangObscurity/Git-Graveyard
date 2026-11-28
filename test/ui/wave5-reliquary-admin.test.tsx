@@ -5,6 +5,8 @@
  */
 import { afterEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 
@@ -23,7 +25,6 @@ import { routes } from "@/lib/ui/run-routes";
 import type { EventEnvelope } from "@/lib/events/types";
 import type { EvidenceBundle, KiroEvidenceDoc } from "@/lib/evidence/evidence-service";
 import {
-  buildRequestBaseUrl,
   executeKillSwitch,
   getPromotionAudit,
   listAdminRuns,
@@ -220,6 +221,41 @@ describe("Task 24.9 HistoryList: every row carries the recorded facts", () => {
     assert.ok(html.includes("7f5f8996"));
   });
 });
+describe("Task 24.9 HistoryList: a missing mode is not labelled live", () => {
+  it("shows 'Mode not recorded' when the record has no mode", () => {
+    const html = render(
+      <HistoryList
+        initialRuns={[
+          {
+            runId: "run-no-mode",
+            repository: "owner/repo",
+            outcome: "resurrected",
+            createdAt: 1700000000000,
+          },
+        ]}
+      />
+    );
+    assert.ok(html.includes("Mode not recorded"));
+    assert.ok(!html.includes("Recorded live run"));
+  });
+
+  it("still shows 'Recorded live run' when the record explicitly says live", () => {
+    const html = render(
+      <HistoryList
+        initialRuns={[
+          {
+            runId: "run-live",
+            repository: "owner/repo",
+            outcome: "resurrected",
+            createdAt: 1700000000000,
+            mode: "live",
+          },
+        ]}
+      />
+    );
+    assert.ok(html.includes("Recorded live run"));
+  });
+});
 
 function ev(seq: number, ts: number, kind: string, data: Record<string, unknown> = {}): EventEnvelope {
   return {
@@ -399,7 +435,7 @@ describe("Task 24.10 AdminDashboard: authenticated states", () => {
     assert.ok(!html.includes('data-testid="admin-production-unlocked"'));
   });
 
-  it("unlocks production mode once a signed pre-promotion audit record exists", () => {
+  it("keeps production mode locked to deployment configuration even with a verified audit", () => {
     const html = render(
       <AdminDashboard
         authenticated
@@ -411,9 +447,12 @@ describe("Task 24.10 AdminDashboard: authenticated states", () => {
     );
     assert.ok(html.includes('data-testid="admin-production-unlocked"'));
     assert.ok(!html.includes('data-testid="admin-production-lock"'));
+    assert.ok(
+      html.includes("Switching to production mode is done in the deployment configuration.")
+    );
     const toggle = html.match(/<button[^>]*data-testid="admin-production-toggle"[^>]*>/);
     assert.ok(toggle, "production toggle must render");
-    assert.ok(!/\sdisabled(=|\s|>)/.test(toggle[0]), "production toggle must be enabled");
+    assert.ok(/\sdisabled(=|\s|>)/.test(toggle[0]), "production toggle must stay disabled");
   });
 
   it("directs the Owner to the Kiro portal when probe P15 is unavailable", () => {
@@ -493,6 +532,39 @@ describe("Task 24.10 KillSwitchModal: three levels with typed confirmation count
 
   it("renders nothing when closed", () => {
     assert.equal(render(<KillSwitchModal open={false} />), "");
+  });
+});
+describe("AdminDashboard kill-switch counts", () => {
+  it("shows 'Affected run count unavailable' and no zero default when counts are unknown", () => {
+    const html = render(
+      <AdminDashboard
+        authenticated
+        actor={{ id: "owner", role: "owner" }}
+        inviteCodes={[]}
+        runs={[]}
+      />
+    );
+    assert.ok(html.includes('data-testid="admin-kill-switch-unavailable"'));
+    assert.ok(html.includes("Affected run count unavailable"));
+    assert.ok(!html.includes('data-testid="admin-kill-switch-counts"'));
+    // The modal must not open with a zeroed blast radius.
+    assert.ok(!html.includes('data-testid="kill-switch-modal"'));
+  });
+
+  it("shows the provided counts when they are known", () => {
+    const html = render(
+      <AdminDashboard
+        authenticated
+        actor={{ id: "owner", role: "owner" }}
+        inviteCodes={[]}
+        runs={[]}
+        activeRunCount={4}
+        queuedRunCount={2}
+      />
+    );
+    assert.ok(html.includes('data-testid="admin-kill-switch-counts"'));
+    assert.ok(html.includes("4 active and 2 queued runs"));
+    assert.ok(!html.includes('data-testid="admin-kill-switch-unavailable"'));
   });
 });
 
@@ -641,25 +713,28 @@ describe("Admin API wiring: kill switch", () => {
   });
 });
 
-describe("Built with Kiro base URL helper", () => {
-  it("builds https://host from x-forwarded-proto: https", () => {
-    const base = buildRequestBaseUrl({
-      get: (name: string) =>
-        name === "host" ? "example.test" : name === "x-forwarded-proto" ? "https" : null,
-    });
-    assert.equal(base, "https://example.test");
+describe("Built with Kiro page reads runs in-process (no server fetch)", () => {
+  const ROOT = process.cwd();
+  const pageSource = fs.readFileSync(
+    path.join(ROOT, "app/built-with-kiro/page.tsx"),
+    "utf8"
+  );
+
+  it("does not fetch over HTTP from the server page", () => {
+    assert.ok(!/\bfetch\s*\(/.test(pageSource), "page must not call fetch");
+    assert.ok(!/loadEvidenceBundle\([^)]*fetch/.test(pageSource));
   });
 
-  it("defaults to http://host when x-forwarded-proto is absent", () => {
-    const base = buildRequestBaseUrl({
-      get: (name: string) => (name === "host" ? "example.test" : null),
-    });
-    assert.equal(base, "http://example.test");
+  it("does not read request headers to build a base URL", () => {
+    assert.ok(!/next\/headers/.test(pageSource), "page must not import next/headers");
+    assert.ok(!/buildRequestBaseUrl/.test(pageSource));
+    assert.ok(!/x-forwarded-proto/.test(pageSource));
   });
 
-  it("returns null when the host header is unavailable", () => {
-    const base = buildRequestBaseUrl({ get: () => null });
-    assert.equal(base, null);
+  it("lists the published runs in-process via the shared helper", () => {
+    assert.ok(/listPublishedRuns/.test(pageSource));
+    assert.ok(/resolveRunStore/.test(pageSource));
+    assert.ok(/resolveEventStore/.test(pageSource));
   });
 });
 

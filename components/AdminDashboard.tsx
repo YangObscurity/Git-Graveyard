@@ -9,12 +9,16 @@ import { routes } from "@/lib/ui/run-routes";
 import {
   executeKillSwitch,
   getAdminSession,
+  getKillSwitch,
   getPromotionAudit,
   getQueue,
   listAdminRuns,
   listInviteCodes,
   runAdminAction,
   signInAdmin,
+  type AdminApiResult,
+  type AdminKillSwitchData,
+  type AdminKillSwitchPreview,
   type AdminRunData,
 } from "@/lib/ui/admin-api";
 
@@ -64,8 +68,26 @@ export interface AdminDashboardProps {
 const PRODUCTION_LOCK_MESSAGE =
   "Production mode is locked. A signed pre-promotion audit record is required before the Necromancer can switch to production mode.";
 
+const PRODUCTION_MODE_DEPLOYMENT_MESSAGE =
+  "Switching to production mode is done in the deployment configuration.";
+
 const P15_CREDIT_NOTE =
   "The Kiro CLI does not advertise _kiro/account/getUsage, so the credit balance cannot be read here. Check the credit balance in the Kiro portal.";
+
+// The logical redaction fields the Admin redact route accepts. Kept in sync with
+// the route's allowed list so the dashboard form can validate before sending.
+const ALLOWED_REDACTION_FIELDS: readonly string[] = [
+  "logs",
+  "stdout",
+  "stderr",
+  "diff",
+  "messages",
+  "prompts",
+  "commands",
+  "report",
+];
+
+const KILL_SWITCH_UNAVAILABLE_MESSAGE = "Affected run count unavailable";
 
 function mapRunData(raw: AdminRunData): AdminRunView {
   const metadata =
@@ -111,6 +133,13 @@ export function AdminDashboard({
   const [runActionError, setRunActionError] = useState<string | null>(null);
   const [killSwitchError, setKillSwitchError] = useState<string | null>(null);
   const [killSwitchResult, setKillSwitchResult] = useState<string | null>(null);
+  const [fetchedKillPreviews, setFetchedKillPreviews] = useState<AdminKillSwitchPreview[] | null>(
+    null
+  );
+  const [killPreviewsUnavailable, setKillPreviewsUnavailable] = useState<boolean>(false);
+  const [redactTarget, setRedactTarget] = useState<string | null>(null);
+  const [redactFieldsInput, setRedactFieldsInput] = useState<string>("");
+  const [redactError, setRedactError] = useState<string | null>(null);
 
   // Only the client fetches the session; an explicit prop (tests, SSR) wins.
   useEffect(() => {
@@ -142,11 +171,12 @@ export function AdminDashboard({
     setLoading(true);
     setSectionErrors({});
     (async () => {
-      const [codes, runList, audit, queue] = await Promise.all([
+      const [codes, runList, audit, queue, killSwitch] = await Promise.all([
         listInviteCodes(),
         listAdminRuns(),
         getPromotionAudit(),
         getQueue(),
+        getKillSwitch(),
       ]);
       if (cancelled) return;
       const errors: Record<string, string> = {};
@@ -177,6 +207,7 @@ export function AdminDashboard({
       } else {
         errors.queue = queue.message;
       }
+      applyKillPreviews(killSwitch);
       setSectionErrors(errors);
       setLoading(false);
     })();
@@ -261,6 +292,78 @@ export function AdminDashboard({
     setKillSwitchOpen(false);
   }
 
+  /** Records the kill-switch previews, or marks them unavailable so the UI never shows 0. */
+  function applyKillPreviews(result: AdminApiResult<AdminKillSwitchData>): void {
+    if (result.ok && Array.isArray(result.data.previews)) {
+      setFetchedKillPreviews(result.data.previews);
+      setKillPreviewsUnavailable(false);
+    } else {
+      setFetchedKillPreviews(null);
+      setKillPreviewsUnavailable(true);
+    }
+  }
+
+  /** Re-reads the kill-switch previews; used when the modal opens. */
+  async function refreshKillSwitchPreviews(): Promise<void> {
+    const result = await getKillSwitch();
+    applyKillPreviews(result);
+  }
+
+  function openKillSwitch(): void {
+    setKillSwitchOpen(true);
+    void refreshKillSwitchPreviews();
+  }
+
+  /** Opens the redact form for a run, resetting any prior input and error. */
+  function openRedactForm(runId: string): void {
+    setRedactTarget(runId);
+    setRedactFieldsInput("");
+    setRedactError(null);
+  }
+
+  function closeRedactForm(): void {
+    setRedactTarget(null);
+    setRedactFieldsInput("");
+    setRedactError(null);
+  }
+
+  /**
+   * Validates the requested field names against the route's allowed redaction
+   * fields, then sends the redact action. An empty or invalid list is rejected
+   * client-side and never sent (the route also rejects an empty target list).
+   */
+  async function submitRedact(runId: string): Promise<void> {
+    const requested = redactFieldsInput
+      .split(/[\s,]+/)
+      .map((name) => name.trim())
+      .filter((name) => name.length > 0);
+    if (requested.length === 0) {
+      setRedactError("Enter at least one redaction field.");
+      return;
+    }
+    const invalid = requested.filter((name) => !ALLOWED_REDACTION_FIELDS.includes(name));
+    if (invalid.length > 0) {
+      setRedactError(
+        `Unsupported redaction field${invalid.length === 1 ? "" : "s"}: ${invalid.join(", ")}.`
+      );
+      return;
+    }
+    setRedactError(null);
+    setRunActionError(null);
+    const result = await runAdminAction(runId, { action: "redact", fields: requested });
+    if (!result.ok) {
+      setRedactError(result.message);
+      setRunActionError(result.message);
+      return;
+    }
+    closeRedactForm();
+    setReviewed((current) => ({ ...current, [runId]: true }));
+    const reloaded = await listAdminRuns();
+    if (reloaded.ok) {
+      setFetchedRuns(reloaded.data.map(mapRunData));
+    }
+  }
+
   const shownSignInError = signInErrorState ?? signInError ?? null;
 
   // Unauthenticated: the sign-in state is the ONLY thing rendered. No invite
@@ -324,9 +427,26 @@ export function AdminDashboard({
   const runList = runs ?? fetchedRuns ?? [];
   const audit = promotionAudit !== undefined ? promotionAudit : fetchedAudit;
   const auditVerified = Boolean(audit?.present && audit?.verified);
-  const active = activeRunCount ?? 0;
-  const queued = queuedRunCount ?? fetchedQueueDepth ?? 0;
-  const finishedRuns = runList.filter((run) => (run.phase ?? "").toLowerCase() === "done");
+
+  // The server list is authoritative: it already excludes unfinished runs and
+  // includes killed/failed runs in other phases, so the client must not re-filter.
+  const finishedRuns = runList;
+
+  // Derive the affected run counts from the kill-switch previews so the modal and
+  // the summary reflect the server's blast radius. When the previews cannot be
+  // read the counts stay undefined (never defaulted to 0) and the UI shows an
+  // explicit unavailable message with Execute kept disabled.
+  const previewByLevel = new Map<string, AdminKillSwitchPreview>();
+  if (fetchedKillPreviews) {
+    for (const preview of fetchedKillPreviews) {
+      previewByLevel.set(preview.level, preview);
+    }
+  }
+  const activeFromPreview = previewByLevel.get("stop_gracefully")?.affectedRunCount;
+  const queuedFromPreview = previewByLevel.get("pause_new_runs")?.affectedRunCount;
+  const active = activeFromPreview ?? activeRunCount;
+  const queued = queuedFromPreview ?? queuedRunCount ?? fetchedQueueDepth;
+  const killCountsKnown = active !== undefined && queued !== undefined;
 
   return (
     <div
@@ -370,10 +490,13 @@ export function AdminDashboard({
             {PRODUCTION_LOCK_MESSAGE}
           </p>
         )}
+        <p data-testid="admin-production-deployment-note" className="text-xs text-ash">
+          {PRODUCTION_MODE_DEPLOYMENT_MESSAGE}
+        </p>
         <button
           type="button"
           data-testid="admin-production-toggle"
-          disabled={!auditVerified}
+          disabled
           className="crypt-btn-ghost px-3 py-1.5 rounded text-xs disabled:opacity-50 disabled:cursor-not-allowed"
         >
           Switch Necromancer to production mode
@@ -483,7 +606,7 @@ export function AdminDashboard({
                     <button
                       type="button"
                       data-testid={`admin-redact-${run.runId}`}
-                      onClick={() => handleRunAction(run.runId, "redact")}
+                      onClick={() => openRedactForm(run.runId)}
                       className="crypt-btn-ghost px-3 py-1 rounded text-[11px]"
                     >
                       Redact
@@ -497,6 +620,54 @@ export function AdminDashboard({
                       Hide (Removed by the owner)
                     </button>
                   </div>
+                  {redactTarget === run.runId ? (
+                    <div
+                      data-testid={`admin-redact-form-${run.runId}`}
+                      className="crypt-well p-2 space-y-1.5 border border-white/10"
+                    >
+                      <label
+                        htmlFor={`admin-redact-fields-${run.runId}`}
+                        className="text-[11px] text-ash block"
+                      >
+                        Redaction fields (comma separated): {ALLOWED_REDACTION_FIELDS.join(", ")}
+                      </label>
+                      <input
+                        id={`admin-redact-fields-${run.runId}`}
+                        data-testid={`admin-redact-fields-input-${run.runId}`}
+                        type="text"
+                        value={redactFieldsInput}
+                        onChange={(event) => setRedactFieldsInput(event.target.value)}
+                        placeholder="logs, diff"
+                        className="w-full crypt-well px-2 py-1 text-[11px] text-bone placeholder:text-dust focus:outline-none"
+                      />
+                      {redactError ? (
+                        <p
+                          data-testid={`admin-redact-error-${run.runId}`}
+                          className="text-[11px] text-red-300"
+                        >
+                          {redactError}
+                        </p>
+                      ) : null}
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button
+                          type="button"
+                          data-testid={`admin-redact-submit-${run.runId}`}
+                          onClick={() => submitRedact(run.runId)}
+                          className="crypt-btn-primary px-3 py-1 rounded text-[11px]"
+                        >
+                          Apply redaction
+                        </button>
+                        <button
+                          type="button"
+                          data-testid={`admin-redact-cancel-${run.runId}`}
+                          onClick={closeRedactForm}
+                          className="crypt-btn-ghost px-3 py-1 rounded text-[11px]"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  ) : null}
                 </li>
               );
             })}
@@ -516,10 +687,16 @@ export function AdminDashboard({
       {/* Kill switch */}
       <section data-testid="admin-kill-switch" className="crypt-panel p-4 space-y-2">
         <h2 className="text-sm font-semibold text-bone">Kill switch</h2>
-        <p className="text-xs text-ash">
-          {active} active and {queued} queued runs are affected by a kill-switch
-          level.
-        </p>
+        {killCountsKnown ? (
+          <p data-testid="admin-kill-switch-counts" className="text-xs text-ash">
+            {active} active and {queued} queued runs are affected by a kill-switch
+            level.
+          </p>
+        ) : (
+          <p data-testid="admin-kill-switch-unavailable" className="text-xs text-amber-200">
+            {KILL_SWITCH_UNAVAILABLE_MESSAGE}
+          </p>
+        )}
         {sectionErrors.queue ? (
           <p data-testid="admin-queue-error" className="text-xs text-red-300">
             {sectionErrors.queue}
@@ -533,7 +710,7 @@ export function AdminDashboard({
         <button
           type="button"
           data-testid="admin-open-kill-switch"
-          onClick={() => setKillSwitchOpen(true)}
+          onClick={openKillSwitch}
           className="crypt-btn-ghost px-3 py-1.5 rounded text-xs"
         >
           Open kill switch
@@ -541,9 +718,9 @@ export function AdminDashboard({
       </section>
 
       <KillSwitchModal
-        open={killSwitchOpen}
-        activeRunCount={active}
-        queuedRunCount={queued}
+        open={killSwitchOpen && killCountsKnown}
+        activeRunCount={active ?? undefined}
+        queuedRunCount={queued ?? undefined}
         onClose={() => setKillSwitchOpen(false)}
         onConfirm={handleKillSwitchConfirm}
         error={killSwitchError}

@@ -57,8 +57,15 @@ export interface AdminKillSwitchState {
   lastExecutedAt?: number | null;
 }
 
+export interface AdminKillSwitchPreview {
+  level: string;
+  affectedRunCount: number;
+  affectedRunIds: string[];
+  summary: string;
+}
+
 export interface AdminKillSwitchData {
-  previews?: unknown[];
+  previews?: AdminKillSwitchPreview[];
   state?: AdminKillSwitchState;
   requiresConfirmation?: boolean;
   result?: unknown;
@@ -212,24 +219,4 @@ export function executeKillSwitch(
     "/api/admin/kill-switch",
     postJson("/api/admin/kill-switch", { level, confirmed: true, confirm: phrase })
   );
-}
-
-/**
- * Build an absolute base URL for the current request from its headers. Uses
- * `x-forwarded-proto` (defaulting to `http`) and `host`. Returns null when the
- * host header is unavailable so callers keep their existing behaviour.
- */
-export function buildRequestBaseUrl(headersList: {
-  get(name: string): string | null;
-}): string | null {
-  const host = headersList.get("host");
-  if (!host || host.trim().length === 0) {
-    return null;
-  }
-  const rawProto = headersList.get("x-forwarded-proto");
-  const proto =
-    rawProto && rawProto.trim().length > 0
-      ? rawProto.split(",")[0].trim()
-      : "http";
-  return `${proto}://${host.trim()}`;
 }

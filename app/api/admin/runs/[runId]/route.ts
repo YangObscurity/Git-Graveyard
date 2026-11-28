@@ -206,6 +206,20 @@ export async function POST(request: Request, context: RouteContext): Promise<Res
       const targetSeqs = parseSeqList(body.targetSeqs);
       const secrets = parseStringList(body.secrets);
       const patterns = parseStringList(body.patterns);
+      // A redaction with no target at all (no fields, no targetSeqs, no secrets,
+      // no patterns) would record a reviewed run and an `admin.redaction` event
+      // that scrub nothing, so it is rejected with 400 before any write.
+      if (
+        fields.length === 0 &&
+        !targetSeqs &&
+        !secrets &&
+        !patterns
+      ) {
+        return Response.json(
+          { ok: false, error: "redaction_targets_required" },
+          { status: 400 }
+        );
+      }
       // Pre-validate every caller-supplied pattern before mutating the run row or appending the
       // audit event: an uncompilable regex must be rejected with zero DB/event writes, otherwise the
       // read path could silently skip the intended redaction.
