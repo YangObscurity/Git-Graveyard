@@ -89,6 +89,7 @@ export interface KillSwitchModalProps {
   queuedRunCount?: number;
   onClose?: () => void;
   onConfirm?: (level: KillSwitchModalLevel, phrase: string) => void;
+  error?: string | null;
 }
 
 export function KillSwitchModal({
@@ -97,6 +98,7 @@ export function KillSwitchModal({
   queuedRunCount = 0,
   onClose,
   onConfirm,
+  error,
 }: KillSwitchModalProps) {
   const [selected, setSelected] = useState<KillSwitchModalLevel>("pause_new_runs");
   const [typed, setTyped] = useState<string>("");
@@ -216,6 +218,11 @@ export function KillSwitchModal({
               Execute {KILL_SWITCH_LEVEL_COPY[selected].title}
             </button>
           </div>
+          {error ? (
+            <p data-testid="kill-switch-error" className="text-xs text-red-300">
+              {error}
+            </p>
+          ) : null}
         </div>
       </div>
     </div>

@@ -3,7 +3,7 @@
  * (Tasks 24.8-24.10). Every state is rendered with renderToStaticMarkup (no
  * DOM, no network) or asserted through the exported pure helpers.
  */
-import { describe, it } from "node:test";
+import { afterEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
@@ -22,6 +22,14 @@ import {
 import { routes } from "@/lib/ui/run-routes";
 import type { EventEnvelope } from "@/lib/events/types";
 import type { EvidenceBundle, KiroEvidenceDoc } from "@/lib/evidence/evidence-service";
+import {
+  buildRequestBaseUrl,
+  executeKillSwitch,
+  getPromotionAudit,
+  listInviteCodes,
+  runAdminAction,
+  signInAdmin,
+} from "@/lib/ui/admin-api";
 
 function render(el: React.ReactElement): string {
   return renderToStaticMarkup(el);
@@ -496,4 +504,161 @@ describe("Task 24.10 run-routes: Built with Kiro and Admin helpers", () => {
     assert.equal(routes.builtWithKiro(), "/built-with-kiro");
     assert.equal(routes.admin(), "/admin");
   });
+// ---------------------------------------------------------------------------
+// Admin API wiring: typed fetch wrappers and the dashboard actions
+// ---------------------------------------------------------------------------
+
+interface RecordedCall {
+  url: string;
+  init: RequestInit | undefined;
+}
+
+function stubFetch(
+  handler: (url: string, init: RequestInit | undefined) => Response | Promise<Response>
+): RecordedCall[] {
+  const calls: RecordedCall[] = [];
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    calls.push({ url, init });
+    return handler(url, init);
+  }) as typeof fetch;
+  return calls;
+}
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+describe("Admin API wiring: sign-in", () => {
+  const originalFetch = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  it("POSTs the admin token to /api/admin/session", async () => {
+    const calls = stubFetch(() =>
+      jsonResponse({ ok: true, authenticated: true, actor: { id: "owner", role: "owner" } })
+    );
+    const result = await signInAdmin("secret-token");
+    assert.equal(result.ok, true);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, "/api/admin/session");
+    assert.equal(calls[0].init?.method, "POST");
+    assert.deepEqual(JSON.parse(String(calls[0].init?.body)), { token: "secret-token" });
+  });
+
+  it("keeps the sign-in state and shows the error when sign-in fails", async () => {
+    stubFetch(() => jsonResponse({ ok: false, error: "invalid_credentials" }, 401));
+    const result = await signInAdmin("wrong");
+    assert.equal(result.ok, false);
+    const message = result.ok ? "" : result.message;
+    assert.equal(message, "invalid_credentials");
+
+    const html = render(<AdminDashboard authenticated={false} signInError={message} />);
+    assert.ok(html.includes('data-testid="admin-signin"'));
+    assert.ok(html.includes('data-testid="admin-signin-error"'));
+    assert.ok(html.includes("invalid_credentials"));
+    // The dashboard never leaves the sign-in state on a failed sign-in.
+    assert.ok(!html.includes('data-testid="admin-dashboard"'));
+  });
+});
+describe("Admin API wiring: non-2xx responses are failures", () => {
+  const originalFetch = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  it("returns ok:false for a non-2xx response", async () => {
+    stubFetch(() => jsonResponse({ ok: false, error: "boom" }, 500));
+    const result = await listInviteCodes();
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.status, 500);
+      assert.equal(result.message, "boom");
+    }
+  });
+
+  it("treats an unreadable promotion audit as missing (fail closed)", async () => {
+    stubFetch(() => jsonResponse({ ok: false, error: "admin_auth_unconfigured" }, 503));
+    const audit = await getPromotionAudit();
+    assert.equal(audit.ok, false);
+    // A failed audit read is rendered as the production lock, never as unlocked.
+    const html = render(
+      <AdminDashboard authenticated actor={{ id: "owner", role: "owner" }} inviteCodes={[]} runs={[]} />
+    );
+    assert.ok(html.includes('data-testid="admin-production-lock"'));
+    assert.ok(!html.includes('data-testid="admin-production-unlocked"'));
+    const toggle = html.match(/<button[^>]*data-testid="admin-production-toggle"[^>]*>/);
+    assert.ok(toggle, "production toggle must render");
+    assert.ok(/\sdisabled(=|\s|>)/.test(toggle[0]), "production toggle must be disabled");
+  });
+});
+
+describe("Admin API wiring: run actions", () => {
+  const originalFetch = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  it("sends the correct method, URL and body for publish, redact and hide", async () => {
+    const cases: Array<{ action: "publish" | "redact" | "hide"; runId: string }> = [
+      { action: "publish", runId: "run-pub" },
+      { action: "redact", runId: "run-red" },
+      { action: "hide", runId: "run-hide" },
+    ];
+    for (const { action, runId } of cases) {
+      const calls = stubFetch(() => jsonResponse({ ok: true, action }));
+      const result = await runAdminAction(runId, { action });
+      assert.equal(result.ok, true);
+      assert.equal(calls[0].url, `/api/admin/runs/${runId}`);
+      assert.equal(calls[0].init?.method, "POST");
+      assert.deepEqual(JSON.parse(String(calls[0].init?.body)), { action });
+    }
+  });
+});
+
+describe("Admin API wiring: kill switch", () => {
+  const originalFetch = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  it("sends the selected level and typed confirmation phrase", async () => {
+    const calls = stubFetch(() => jsonResponse({ ok: true, result: { executed: true } }));
+    const phrase = "KILL 2 ACTIVE 3 QUEUED";
+    const result = await executeKillSwitch("hard_kill", phrase);
+    assert.equal(result.ok, true);
+    assert.equal(calls[0].url, "/api/admin/kill-switch");
+    assert.equal(calls[0].init?.method, "POST");
+    const body = JSON.parse(String(calls[0].init?.body)) as Record<string, unknown>;
+    assert.equal(body.level, "hard_kill");
+    assert.equal(body.confirmed, true);
+    assert.equal(body.confirm, phrase);
+  });
+});
+
+describe("Built with Kiro base URL helper", () => {
+  it("builds https://host from x-forwarded-proto: https", () => {
+    const base = buildRequestBaseUrl({
+      get: (name: string) =>
+        name === "host" ? "example.test" : name === "x-forwarded-proto" ? "https" : null,
+    });
+    assert.equal(base, "https://example.test");
+  });
+
+  it("defaults to http://host when x-forwarded-proto is absent", () => {
+    const base = buildRequestBaseUrl({
+      get: (name: string) => (name === "host" ? "example.test" : null),
+    });
+    assert.equal(base, "http://example.test");
+  });
+
+  it("returns null when the host header is unavailable", () => {
+    const base = buildRequestBaseUrl({ get: () => null });
+    assert.equal(base, null);
+  });
+});
 });
