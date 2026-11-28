@@ -140,6 +140,14 @@ export interface CloudExecOutcome {
 }
 
 /**
+ * Shared pre-exec guard. Enforces Topology P-B (no kiro-cli / Necromancer
+ * inside a cloud sandbox) and the secret env denylist. Passed into every
+ * DockerCloudSandbox so exec, run and execWithIdempotency all enforce it
+ * before touching the transport.
+ */
+export type ExecGuard = (req: ExecRequest) => void;
+
+/**
  * Transport/client adapter for Docker Cloud. Injected so offline tests never
  * touch the network or real credentials.
  */
@@ -214,7 +222,8 @@ export class DockerCloudSandbox implements Sandbox {
     private readonly client: DockerCloudClient,
     private readonly spec: SandboxSpec,
     private readonly separateStderr: boolean,
-    labels?: Record<string, string>
+    labels?: Record<string, string>,
+    private readonly guard?: ExecGuard
   ) {
     this.id = id;
     this.labels = { ...(labels ?? spec.labels ?? {}) };
@@ -239,6 +248,7 @@ export class DockerCloudSandbox implements Sandbox {
     assertArgvArray(argv);
     this.rejectRoot((req as Record<string, unknown>).user);
     this.rejectRoot((req as Record<string, unknown>).uid);
+    this.guard?.(req);
 
     const outcome = await this.client.exec(this.id, argv, {
       cwd: req.cwd,
@@ -281,6 +291,7 @@ export class DockerCloudSandbox implements Sandbox {
     assertArgvArray(argv);
     this.rejectRoot((req as Record<string, unknown>).user);
     this.rejectRoot((req as Record<string, unknown>).uid);
+    this.guard?.(req);
 
     const outcome = await this.client.exec(this.id, argv, {
       cwd: req.cwd,
@@ -334,15 +345,45 @@ export class DockerCloudSandboxBackend implements ExecutionBackend {
   readonly options: DockerCloudSandboxBackendOptions;
 
   private readonly sandboxesById = new Map<string, DockerCloudSandbox>();
-  private readonly sandboxesByIdempotencyKey = new Map<string, DockerCloudSandbox>();
-  /** Idempotency keys seen for exec calls, mapped to their first outcome. */
-  private readonly execIdempotency = new Map<string, CloudExecOutcome>();
+  private readonly sandboxesByIdempotencyKey = new Map<
+    string,
+    DockerCloudSandbox | Promise<DockerCloudSandbox>
+  >();
+  /** Exec idempotency keys (`sandboxId:idempotencyKey`) mapped to in-flight outcomes. */
+  private readonly execIdempotency = new Map<string, Promise<CloudExecOutcome>>();
+  /** Shared Topology P-B + env denylist guard enforced on every exec path. */
+  private readonly execGuard: ExecGuard;
 
   constructor(options: DockerCloudSandboxBackendOptions) {
     if (!options || !options.client) {
       throw new SpecValidationError("DockerCloudSandboxBackend requires a client adapter");
     }
     this.options = options;
+    this.execGuard = this.buildExecGuard();
+  }
+
+  /**
+   * Builds the shared pre-exec guard: Topology P-B plus the secret env
+   * denylist. Used by exec, run and execWithIdempotency.
+   */
+  private buildExecGuard(): ExecGuard {
+    return (req: ExecRequest): void => {
+      this.enforceTopologyPB(req.argv);
+      if (req.env && typeof req.env === "object") {
+        for (const [k, v] of Object.entries(req.env)) {
+          if (isForbiddenEnvName(k)) {
+            throw new SpecValidationError(
+              `Environment variable name '${k}' matches secret denylist`
+            );
+          }
+          if (isForbiddenEnvValue(v)) {
+            throw new SpecValidationError(
+              `Environment variable '${k}' value matches secret pattern`
+            );
+          }
+        }
+      }
+    };
   }
 
   /** Returns whether P10 and P11 both have a recorded pass. */
@@ -394,10 +435,12 @@ export class DockerCloudSandboxBackend implements ExecutionBackend {
       throw new SpecValidationError("idempotencyKey is required");
     }
 
-    // Idempotency: return the existing sandbox for a repeated create.
+    // Idempotency: return the existing (or in-flight) sandbox for a repeated
+    // create. The map may hold a pending promise so concurrent callers share
+    // a single provisioning attempt.
     const existing = this.sandboxesByIdempotencyKey.get(spec.idempotencyKey);
     if (existing) {
-      return existing;
+      return await existing;
     }
 
     // Reject root/uid 0 in the spec.
@@ -424,10 +467,47 @@ export class DockerCloudSandboxBackend implements ExecutionBackend {
     // The client must receive the resolved default-deny network, not the raw
     // spec, or egress would be unrestricted whenever spec.network was omitted.
     const resolvedSpec: SandboxSpec = { ...spec, network };
+
+    // Store the in-flight promise before the first await so concurrent creates
+    // with the same key share one sandbox instead of provisioning twice.
+    const pending = this.provision(spec.idempotencyKey, resolvedSpec, spec);
+    this.sandboxesByIdempotencyKey.set(spec.idempotencyKey, pending);
+    try {
+      return await pending;
+    } catch (err) {
+      // Do not leave a rejected promise cached for a failed creation.
+      if (this.sandboxesByIdempotencyKey.get(spec.idempotencyKey) === pending) {
+        this.sandboxesByIdempotencyKey.delete(spec.idempotencyKey);
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Re-attaches an existing sandbox (from a previous process) or provisions a
+   * new one. On a local miss the client is queried by idempotency-key label so
+   * a restart does not create a duplicate sandbox.
+   */
+  private async provision(
+    idempotencyKey: string,
+    resolvedSpec: SandboxSpec,
+    spec: SandboxSpec
+  ): Promise<DockerCloudSandbox> {
+    const matches = await this.options.client.listSandboxes({
+      "git-graveyard.idempotency-key": idempotencyKey,
+    });
+    const match =
+      matches.find(
+        (s) => s.labels?.["git-graveyard.idempotency-key"] === idempotencyKey
+      ) ?? matches[0];
+    if (match) {
+      return this.attach(match.id, match.labels, idempotencyKey);
+    }
+
     const { id } = await this.options.client.createSandbox(resolvedSpec);
     const labels: Record<string, string> = {
       "git-graveyard.managed": "true",
-      "git-graveyard.idempotency-key": spec.idempotencyKey,
+      "git-graveyard.idempotency-key": idempotencyKey,
       ...(this.options.labels ?? {}),
       ...(spec.labels ?? {}),
     };
@@ -436,46 +516,62 @@ export class DockerCloudSandboxBackend implements ExecutionBackend {
       this.options.client,
       spec,
       this.separateStderr,
-      labels
+      labels,
+      this.execGuard
     );
     this.sandboxesById.set(id, sandbox);
-    this.sandboxesByIdempotencyKey.set(spec.idempotencyKey, sandbox);
+    this.sandboxesByIdempotencyKey.set(idempotencyKey, sandbox);
+    return sandbox;
+  }
+
+  /**
+   * Builds (or reuses) a sandbox wrapper for an existing remote sandbox and
+   * indexes it by its `git-graveyard.idempotency-key` label.
+   */
+  private attach(
+    id: string,
+    labels: Record<string, string> | undefined,
+    idempotencyKey: string
+  ): DockerCloudSandbox {
+    let sandbox = this.sandboxesById.get(id);
+    if (!sandbox) {
+      sandbox = new DockerCloudSandbox(
+        id,
+        this.options.client,
+        { idempotencyKey, labels },
+        this.separateStderr,
+        labels,
+        this.execGuard
+      );
+      this.sandboxesById.set(id, sandbox);
+    }
+    const key = labels?.["git-graveyard.idempotency-key"] ?? idempotencyKey;
+    if (key) {
+      this.sandboxesByIdempotencyKey.set(key, sandbox);
+    }
     return sandbox;
   }
 async get(id: string): Promise<DockerCloudSandbox | undefined> {
     const local = this.sandboxesById.get(id);
     if (local) return local;
-    for (const sandbox of this.sandboxesByIdempotencyKey.values()) {
-      if (sandbox.id === id) return sandbox;
-    }
     const remote = await this.options.client.getSandbox(id);
     if (!remote) return undefined;
-    const sandbox = new DockerCloudSandbox(
-      remote.id,
-      this.options.client,
-      { idempotencyKey: remote.id, labels: remote.labels },
-      this.separateStderr,
-      remote.labels
+    return this.attach(
+      id,
+      remote.labels,
+      remote.labels?.["git-graveyard.idempotency-key"] ?? ""
     );
-    this.sandboxesById.set(sandbox.id, sandbox);
-    return sandbox;
   }
 
   async list(labels?: Record<string, string>): Promise<DockerCloudSandbox[]> {
     const remotes = await this.options.client.listSandboxes(labels);
     const result: DockerCloudSandbox[] = [];
     for (const remote of remotes) {
-      let sandbox = this.sandboxesById.get(remote.id);
-      if (!sandbox) {
-        sandbox = new DockerCloudSandbox(
-          remote.id,
-          this.options.client,
-          { idempotencyKey: remote.id, labels: remote.labels },
-          this.separateStderr,
-          remote.labels
-        );
-        this.sandboxesById.set(remote.id, sandbox);
-      }
+      const sandbox = this.attach(
+        remote.id,
+        remote.labels,
+        remote.labels?.["git-graveyard.idempotency-key"] ?? ""
+      );
       if (this.matchesLabels(sandbox.labels, labels)) {
         result.push(sandbox);
       }
@@ -503,7 +599,13 @@ async get(id: string): Promise<DockerCloudSandbox | undefined> {
     }
     this.sandboxesById.delete(id);
     for (const [key, s] of this.sandboxesByIdempotencyKey.entries()) {
+      if (s instanceof Promise) continue;
       if (s.id === id) this.sandboxesByIdempotencyKey.delete(key);
+    }
+    // Drop any cached exec outcomes for this sandbox.
+    const prefix = `${id}:`;
+    for (const key of [...this.execIdempotency.keys()]) {
+      if (key.startsWith(prefix)) this.execIdempotency.delete(key);
     }
   }
 
@@ -523,41 +625,37 @@ async get(id: string): Promise<DockerCloudSandbox | undefined> {
     validateExecRequest(req);
     assertArgvArray(req.argv);
     this.rejectRootUser(req);
-    this.enforceTopologyPB(req.argv);
+    this.execGuard(req);
     const key = req.idempotencyKey;
-    if (key && this.execIdempotency.has(key)) {
-      return this.execIdempotency.get(key)!;
+    const cacheKey = key ? `${id}:${key}` : undefined;
+    if (cacheKey) {
+      const existing = this.execIdempotency.get(cacheKey);
+      if (existing) return existing;
     }
-    const outcome = await this.options.client.exec(id, req.argv, {
+    const pending = this.options.client.exec(id, req.argv, {
       cwd: req.cwd,
       env: req.env,
       timeoutMs: req.timeoutMs,
       maxOutputBytes: req.maxOutputBytes,
     });
-    if (key) {
-      this.execIdempotency.set(key, outcome);
+    if (cacheKey) {
+      this.execIdempotency.set(cacheKey, pending);
     }
-    return outcome;
+    try {
+      return await pending;
+    } catch (err) {
+      // Do not cache a failed exec; a retry should hit the transport again.
+      if (cacheKey && this.execIdempotency.get(cacheKey) === pending) {
+        this.execIdempotency.delete(cacheKey);
+      }
+      throw err;
+    }
   }
 
   private rejectRootUser(req: ExecRequest): void {
     const raw = req as Record<string, unknown>;
     if (isRootUser(raw.user) || isRootUser(raw.uid)) {
       throw new RootUserRejectedError();
-    }
-    if (req.env && typeof req.env === "object") {
-      for (const [k, v] of Object.entries(req.env)) {
-        if (isForbiddenEnvName(k)) {
-          throw new SpecValidationError(
-            `Environment variable name '${k}' matches secret denylist`
-          );
-        }
-        if (isForbiddenEnvValue(v)) {
-          throw new SpecValidationError(
-            `Environment variable '${k}' value matches secret pattern`
-          );
-        }
-      }
     }
   }
 

@@ -4,7 +4,8 @@
 // (TTL, concurrency cap, egress allowlist, kiro-cli binary) is present.
 // Strictly rejects missing required production config.
 
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
+import { isAbsolute } from "node:path";
 import {
   DEFAULT_SANDBOX_TTL_MS,
   MAX_CONCURRENT_RUNS,
@@ -70,6 +71,11 @@ export interface LoadHostConfigOptions {
   env?: NodeJS.ProcessEnv;
   /** Injected file existence check (defaults to fs.existsSync). */
   exists?: (p: string) => boolean;
+  /**
+   * Injected stat check used to confirm KIRO_CLI_BIN points at a regular file
+   * (defaults to fs.statSync). Returning undefined skips the file-type check.
+   */
+  stat?: (p: string) => { isFile(): boolean } | undefined;
   /** Override TTL (defaults to DEFAULT_SANDBOX_TTL_MS). */
   ttlMs?: number;
   /** Override concurrency cap (defaults to MAX_CONCURRENT_RUNS). */
@@ -80,12 +86,38 @@ export interface LoadHostConfigOptions {
 
 function resolveKiroCliBinary(
   env: NodeJS.ProcessEnv,
-  exists: (p: string) => boolean
+  exists: (p: string) => boolean,
+  stat: (p: string) => { isFile(): boolean } | undefined
 ): string {
-  const candidates: string[] = [];
-  if (env.KIRO_CLI_BIN && env.KIRO_CLI_BIN.trim()) {
-    candidates.push(env.KIRO_CLI_BIN.trim());
+  const configured = env.KIRO_CLI_BIN;
+  if (configured !== undefined && configured !== null && configured.trim() !== "") {
+    // An explicitly configured binary must be an absolute path to an existing
+    // regular file; never silently fall back to the default locations.
+    const candidate = configured.trim();
+    if (!isAbsolute(candidate)) {
+      throw new HostConfigError(
+        `KIRO_CLI_BIN must be an absolute path: '${candidate}'`
+      );
+    }
+    if (!exists(candidate)) {
+      throw new HostConfigError(`KIRO_CLI_BIN does not exist: '${candidate}'`);
+    }
+    let info: { isFile(): boolean } | undefined;
+    try {
+      info = stat(candidate);
+    } catch {
+      info = undefined;
+    }
+    if (info && !info.isFile()) {
+      throw new HostConfigError(
+        `KIRO_CLI_BIN must be a regular file, not a directory: '${candidate}'`
+      );
+    }
+    return candidate;
   }
+
+  // KIRO_CLI_BIN unset: fall back to the standard host locations.
+  const candidates: string[] = [];
   const home = env.HOME ?? "";
   if (home) {
     candidates.push(`${home}/.local/bin/kiro-cli`);
@@ -111,6 +143,15 @@ export function loadProductionHostConfig(
 ): ProductionHostConfig {
   const env = options?.env ?? process.env;
   const exists = options?.exists ?? existsSync;
+  const stat =
+    options?.stat ??
+    ((p: string) => {
+      try {
+        return statSync(p);
+      } catch {
+        return undefined;
+      }
+    });
 
   const ttlMs = options?.ttlMs ?? DEFAULT_SANDBOX_TTL_MS;
   if (
@@ -147,7 +188,7 @@ export function loadProductionHostConfig(
     }
   }
 
-  const kiroCliBinary = resolveKiroCliBinary(env, exists);
+  const kiroCliBinary = resolveKiroCliBinary(env, exists, stat);
 
   return {
     ttlMs,

@@ -63,6 +63,7 @@ class FakeCloudClient implements DockerCloudClient {
   readonly created: SandboxSpec[] = [];
   readonly destroyed: string[] = [];
   readonly files = new Map<string, Map<string, Uint8Array | string>>();
+  readonly labelsById = new Map<string, Record<string, string>>();
   private nextId = 1;
   /** Scripted outcome per argv[0] match, or a default. */
   constructor(
@@ -77,12 +78,20 @@ class FakeCloudClient implements DockerCloudClient {
     this.created.push(spec);
     const id = `box-${this.nextId++}`;
     this.files.set(id, new Map());
+    this.labelsById.set(id, {
+      "git-graveyard.managed": "true",
+      "git-graveyard.idempotency-key": spec.idempotencyKey,
+      ...(spec.labels ?? {}),
+    });
     return { id };
   }
 
   async getSandbox(id: string): Promise<{ id: string; labels?: Record<string, string> } | undefined> {
-    if (id.startsWith("box-")) {
-      return { id, labels: { "git-graveyard.managed": "true" } };
+    if (this.files.has(id)) {
+      return {
+        id,
+        labels: this.labelsById.get(id) ?? { "git-graveyard.managed": "true" },
+      };
     }
     return undefined;
   }
@@ -90,9 +99,12 @@ class FakeCloudClient implements DockerCloudClient {
   async listSandboxes(labels?: Record<string, string>): Promise<Array<{ id: string; labels?: Record<string, string> }>> {
     const all = [...this.files.keys()].map((id) => ({
       id,
-      labels: { "git-graveyard.managed": "true", ...(labels ?? {}) },
+      labels: this.labelsById.get(id) ?? { "git-graveyard.managed": "true" },
     }));
-    return all;
+    if (!labels) return all;
+    return all.filter((s) =>
+      Object.entries(labels).every(([k, v]) => s.labels?.[k] === v)
+    );
   }
 
   async destroySandbox(id: string): Promise<void> {
@@ -640,6 +652,216 @@ describe("Re-attachment, idempotency and streaming", () => {
     }
   });
 });
+describe("Sandbox exec/run enforce the shared Topology P-B and env guard", () => {
+  it("box.exec rejects kiro-cli without calling client.exec", async () => {
+    const client = new FakeCloudClient();
+    const backend = makeBackend(client, allProbesPass());
+    const box = await backend.create({ idempotencyKey: "g1", image: PINNED_IMAGE });
+    await assert.rejects(
+      () => box.exec({ argv: ["kiro-cli", "run"] }),
+      (err: unknown) => err instanceof TopologyViolationError
+    );
+    assert.equal(client.execCalls.length, 0);
+  });
+
+  it("box.run rejects Necromancer argv without calling client.exec", async () => {
+    const client = new FakeCloudClient();
+    const backend = makeBackend(client, allProbesPass());
+    const box = await backend.create({ idempotencyKey: "g2", image: PINNED_IMAGE });
+    await assert.rejects(
+      () => box.run({ argv: ["necromancer", "--serve"] }),
+      (err: unknown) => err instanceof TopologyViolationError
+    );
+    assert.equal(client.execCalls.length, 0);
+  });
+
+  it("box.exec rejects a denylisted env var name without calling client.exec", async () => {
+    const client = new FakeCloudClient();
+    const backend = makeBackend(client, allProbesPass());
+    const box = await backend.create({ idempotencyKey: "g3", image: PINNED_IMAGE });
+    await assert.rejects(
+      () => box.exec({ argv: ["echo", "hi"], env: { GITHUB_TOKEN: "anything" } }),
+      (err: unknown) => err instanceof SpecValidationError
+    );
+    assert.equal(client.execCalls.length, 0);
+  });
+
+  it("box.run rejects a denylisted env var value without calling client.exec", async () => {
+    const client = new FakeCloudClient();
+    const backend = makeBackend(client, allProbesPass());
+    const box = await backend.create({ idempotencyKey: "g4", image: PINNED_IMAGE });
+    await assert.rejects(
+      () => box.run({ argv: ["echo", "hi"], env: { GREETING: "ghp_secretvalue" } }),
+      (err: unknown) => err instanceof SpecValidationError
+    );
+    assert.equal(client.execCalls.length, 0);
+  });
+});
+
+describe("create() idempotency and restart re-attachment", () => {
+  it("two concurrent creates with one key call createSandbox once", async () => {
+    const client = new FakeCloudClient();
+    const backend = makeBackend(client, allProbesPass());
+    const [a, b] = await Promise.all([
+      backend.create({ idempotencyKey: "cc", image: PINNED_IMAGE }),
+      backend.create({ idempotencyKey: "cc", image: PINNED_IMAGE }),
+    ]);
+    assert.equal(a.id, b.id);
+    assert.equal(client.created.length, 1);
+  });
+
+  it("a fresh backend over the same client re-attaches instead of creating", async () => {
+    const client = new FakeCloudClient();
+    const backend = makeBackend(client, allProbesPass());
+    const box = await backend.create({ idempotencyKey: "re", image: PINNED_IMAGE });
+    const backend2 = makeBackend(client, allProbesPass());
+    const again = await backend2.create({ idempotencyKey: "re", image: PINNED_IMAGE });
+    assert.equal(again.id, box.id);
+    assert.equal(client.created.length, 1);
+  });
+});
+
+describe("exec idempotency cache", () => {
+  it("keys by sandbox id so the same key on two sandboxes runs twice", async () => {
+    const client = new FakeCloudClient();
+    const backend = makeBackend(client, allProbesPass());
+    const b1 = await backend.create({ idempotencyKey: "e1", image: PINNED_IMAGE });
+    const b2 = await backend.create({ idempotencyKey: "e2", image: PINNED_IMAGE });
+    await backend.execWithIdempotency(b1.id, { argv: ["echo"], idempotencyKey: "same" });
+    await backend.execWithIdempotency(b2.id, { argv: ["echo"], idempotencyKey: "same" });
+    assert.equal(client.execCalls.length, 2);
+  });
+
+  it("concurrent same-key calls share one client.exec", async () => {
+    const client = new FakeCloudClient();
+    const backend = makeBackend(client, allProbesPass());
+    const box = await backend.create({ idempotencyKey: "e3", image: PINNED_IMAGE });
+    const [o1, o2] = await Promise.all([
+      backend.execWithIdempotency(box.id, { argv: ["echo"], idempotencyKey: "ck" }),
+      backend.execWithIdempotency(box.id, { argv: ["echo"], idempotencyKey: "ck" }),
+    ]);
+    assert.equal(o1, o2);
+    assert.equal(client.execCalls.length, 1);
+  });
+
+  it("clears a sandbox's entries on destroy", async () => {
+    const client = new FakeCloudClient();
+    const backend = makeBackend(client, allProbesPass());
+    const box = await backend.create({ idempotencyKey: "e4", image: PINNED_IMAGE });
+    await backend.execWithIdempotency(box.id, { argv: ["echo"], idempotencyKey: "dk" });
+    assert.equal(client.execCalls.length, 1);
+    await backend.destroy(box.id);
+    await backend.execWithIdempotency(box.id, { argv: ["echo"], idempotencyKey: "dk" });
+    assert.equal(client.execCalls.length, 2);
+  });
+});
+
+describe("Cloud lifecycle: pull failures and stale sweeps", () => {
+  it("destroys the sandbox and frees the slot when syncOut fails", async () => {
+    const lc = new CloudSandboxLifecycle();
+    const boom = new Error("sync failed");
+    let destroyed = false;
+    lc.register(
+      "box-1",
+      "run-1",
+      {
+        async destroy() {
+          destroyed = true;
+        },
+      },
+      {
+        async syncOut() {
+          throw boom;
+        },
+      }
+    );
+    const result = await lc.pullAndDestroy("box-1");
+    assert.equal(destroyed, true);
+    assert.equal(result.destroyed, true);
+    assert.equal(result.pullError, boom);
+    assert.equal(lc.get("box-1")!.state, "destroyed");
+    // Slot released, so a new run can register.
+    lc.register("box-2", "run-2");
+  });
+
+  it("expireStale processes every stale record even when one fails", async () => {
+    let now = 1_000_000;
+    const lc = new CloudSandboxLifecycle({ now: () => now });
+    const destroyed: string[] = [];
+    lc.register(
+      "box-1",
+      "run-1",
+      {
+        async destroy() {
+          destroyed.push("box-1");
+        },
+      },
+      {
+        async syncOut() {
+          throw new Error("boom");
+        },
+      }
+    );
+    lc.register(
+      "box-2",
+      "run-2",
+      {
+        async destroy() {
+          destroyed.push("box-2");
+        },
+      },
+      {
+        async syncOut() {
+          return { ok: true, transferred: [], skipped: [], rejected: [] };
+        },
+      }
+    );
+    now += DEFAULT_SANDBOX_TTL_MS + 1;
+    const expired = await lc.expireStale();
+    assert.deepEqual(expired.sort(), ["box-1", "box-2"]);
+    assert.deepEqual(destroyed.sort(), ["box-1", "box-2"]);
+    assert.ok(lc.errors.has("box-1"));
+    assert.equal(lc.get("box-1")!.state, "expired");
+    assert.equal(lc.get("box-2")!.state, "expired");
+  });
+});
+
+describe("Host configuration: strict KIRO_CLI_BIN validation", () => {
+  it("rejects a KIRO_CLI_BIN that does not exist", () => {
+    assert.throws(
+      () =>
+        loadProductionHostConfig({
+          env: { KIRO_CLI_BIN: "/opt/missing/kiro-cli" } as unknown as NodeJS.ProcessEnv,
+          exists: () => false,
+        }),
+      (err: unknown) => err instanceof HostConfigError
+    );
+  });
+
+  it("rejects a relative KIRO_CLI_BIN path", () => {
+    assert.throws(
+      () =>
+        loadProductionHostConfig({
+          env: { KIRO_CLI_BIN: "bin/kiro-cli" } as unknown as NodeJS.ProcessEnv,
+          exists: () => true,
+        }),
+      (err: unknown) => err instanceof HostConfigError
+    );
+  });
+
+  it("rejects a KIRO_CLI_BIN that is a directory", () => {
+    assert.throws(
+      () =>
+        loadProductionHostConfig({
+          env: { KIRO_CLI_BIN: "/opt/kiro-cli" } as unknown as NodeJS.ProcessEnv,
+          exists: () => true,
+          stat: () => ({ isFile: () => false }),
+        }),
+      (err: unknown) => err instanceof HostConfigError
+    );
+  });
+});
+
 describe("Cloud lifecycle: TTL, concurrency, snapshot, pull-before-destroy", () => {
   it("uses a default 1h TTL and a 24h hard cap", () => {
     assert.equal(DEFAULT_SANDBOX_TTL_MS, 3_600_000);
