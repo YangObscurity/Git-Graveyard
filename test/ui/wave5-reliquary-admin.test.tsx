@@ -736,6 +736,14 @@ describe("Built with Kiro page reads runs in-process (no server fetch)", () => {
     assert.ok(/resolveRunStore/.test(pageSource));
     assert.ok(/resolveEventStore/.test(pageSource));
   });
+
+  it("wraps the in-process run lookup in try/catch and falls back to an empty list", () => {
+    // A run-store error must not fail the whole page: the lookup is guarded and the
+    // fallback is an empty list (never an HTTP request).
+    assert.ok(/try\s*\{[\s\S]*listPublishedRuns[\s\S]*\}\s*catch/.test(pageSource));
+    assert.ok(/catch\s*\{\s*recentRuns\s*=\s*\[\]/.test(pageSource));
+    assert.ok(!/\bfetch\s*\(/.test(pageSource), "fallback must not fetch over HTTP");
+  });
 });
 
 describe("Admin API wiring: the dashboard loads the admin run list", () => {

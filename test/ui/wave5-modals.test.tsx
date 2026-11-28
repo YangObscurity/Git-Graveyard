@@ -127,6 +127,19 @@ describe("kill-switch confirmation reset on reopen", () => {
   it("renders nothing when closed", () => {
     assert.equal(render(<KillSwitchModal open={false} />), "");
   });
+
+  it("shows no phrase and keeps Execute disabled before the previews load", () => {
+    // No activeRunCount/queuedRunCount => the dashboard has not loaded fresh previews yet.
+    const html = render(<KillSwitchModal open />);
+    assert.ok(!/Required phrase:\s*<span/.test(html), "no phrase must be shown before load");
+    assert.ok(!html.includes("PAUSE 0 QUEUED"));
+    assert.ok(!html.includes("STOP 0 RUNNING"));
+    assert.ok(!html.includes("KILL 0 ACTIVE 0 QUEUED"));
+    assert.ok(html.includes("waiting for the current affected run count"));
+    const confirm = html.match(/<button[^>]*data-testid="kill-switch-confirm"[^>]*>/);
+    assert.ok(confirm, "confirm button must render");
+    assert.ok(/disabled/.test(confirm[0]), "confirm must be disabled before previews load");
+  });
 });
 
 // ---------------------------------------------------------------------------

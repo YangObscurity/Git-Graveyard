@@ -284,8 +284,18 @@ export function AdminDashboard({
     setKillSwitchResult(null);
     const result = await executeKillSwitch(level, phrase);
     if (!result.ok) {
-      // Keep the modal open with the error so the operator can retry.
-      setKillSwitchError(result.message);
+      // A 409 means the affected runs changed after the Admin read the count, so the typed
+      // phrase is now stale. Surface the new count and reload the previews; the modal keeps
+      // Execute disabled until the operator types the new phrase.
+      if (result.status === 409) {
+        setKillSwitchError(
+          "The number of affected runs changed. Review the new count and type the new phrase."
+        );
+        void refreshKillSwitchPreviews();
+      } else {
+        // Keep the modal open with the error so the operator can retry.
+        setKillSwitchError(result.message);
+      }
       return;
     }
     setKillSwitchResult(`Kill switch executed: ${level}.`);
@@ -310,6 +320,12 @@ export function AdminDashboard({
   }
 
   function openKillSwitch(): void {
+    // Drop the previously loaded previews so the modal cannot arm Execute against a stale
+    // count; it stays disabled until the refresh below succeeds and the phrase is rebuilt from
+    // the fresh count.
+    setKillSwitchError(null);
+    setFetchedKillPreviews(null);
+    setKillPreviewsUnavailable(false);
     setKillSwitchOpen(true);
     void refreshKillSwitchPreviews();
   }
@@ -718,7 +734,7 @@ export function AdminDashboard({
       </section>
 
       <KillSwitchModal
-        open={killSwitchOpen && killCountsKnown}
+        open={killSwitchOpen}
         activeRunCount={active ?? undefined}
         queuedRunCount={queued ?? undefined}
         onClose={() => setKillSwitchOpen(false)}

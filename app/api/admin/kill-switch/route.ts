@@ -12,6 +12,7 @@ import {
   KillSwitchService,
   clearKillSwitchUnpersistedAuthority,
   isKillSwitchUnpersistedAuthority,
+  killSwitchConfirmationPhrase,
   killSwitchServiceRegistry,
   markKillSwitchUnpersistedAuthority,
   type KillSwitchLevel,
@@ -355,6 +356,20 @@ export async function POST(request: Request): Promise<Response> {
       requiresConfirmation: true,
       preview,
     });
+  }
+
+  // Recompute the confirmation phrase from the CURRENT preview (the same wording the modal
+  // shows) and require the request's `confirm` string to match it exactly. The affected runs
+  // can change between the moment the Admin read the count and the moment they confirm, so a
+  // stale phrase must never execute a larger kill than the one the Admin actually reviewed.
+  const activeRunCount = service.preview("stop_gracefully").affectedRunCount;
+  const queuedRunCount = service.preview("pause_new_runs").affectedRunCount;
+  const expected = killSwitchConfirmationPhrase(body.level, activeRunCount, queuedRunCount);
+  if (body.confirm !== expected) {
+    return Response.json(
+      { ok: false, error: "confirmation_mismatch", expected },
+      { status: 409 }
+    );
   }
 
   // Run the synchronous state mutation first, then persist the kill-switch flags BEFORE awaiting any

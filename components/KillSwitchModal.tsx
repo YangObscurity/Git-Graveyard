@@ -2,6 +2,11 @@
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
 
+import { killSwitchConfirmationPhrase } from "@/lib/admin/kill-switch";
+
+// Re-exported so existing callers keep importing the phrase builder from the modal module.
+export { killSwitchConfirmationPhrase };
+
 /** Selector matching every control that can receive keyboard focus inside a dialog. */
 export const KILL_SWITCH_FOCUSABLE_SELECTOR = [
   "a[href]",
@@ -82,30 +87,6 @@ export function killSwitchAffectedSummary(
   }
 }
 
-/**
- * The exact phrase the operator must type before a level can be executed. It
- * states the number of active and queued runs the action affects, so the
- * confirmation cannot be given without reading the blast radius.
- */
-export function killSwitchConfirmationPhrase(
-  level: KillSwitchModalLevel,
-  activeRunCount: number | undefined,
-  queuedRunCount: number | undefined
-): string {
-  const active = safeCount(activeRunCount);
-  const queued = safeCount(queuedRunCount);
-  switch (level) {
-    case "pause_new_runs":
-      return `PAUSE ${queued} QUEUED`;
-    case "stop_gracefully":
-      return `STOP ${active} RUNNING`;
-    case "hard_kill":
-      return `KILL ${active} ACTIVE ${queued} QUEUED`;
-    default:
-      return "KILL 0 ACTIVE 0 QUEUED";
-  }
-}
-
 export interface KillSwitchModalProps {
   open?: boolean;
   activeRunCount?: number;
@@ -117,8 +98,8 @@ export interface KillSwitchModalProps {
 
 export function KillSwitchModal({
   open = true,
-  activeRunCount = 0,
-  queuedRunCount = 0,
+  activeRunCount,
+  queuedRunCount,
   onClose,
   onConfirm,
   error,
@@ -184,8 +165,14 @@ export function KillSwitchModal({
     return null;
   }
 
-  const phrase = killSwitchConfirmationPhrase(selected, activeRunCount, queuedRunCount);
-  const armed = typed.trim() === phrase;
+  // The affected counts are only known once the dashboard has loaded fresh previews. Until
+  // then there is no phrase to type and Execute stays disabled, so a stale count can never be
+  // armed.
+  const countsLoaded = activeRunCount !== undefined && queuedRunCount !== undefined;
+  const phrase = countsLoaded
+    ? killSwitchConfirmationPhrase(selected, activeRunCount, queuedRunCount)
+    : "";
+  const armed = countsLoaded && typed.trim() === phrase;
 
   const handleConfirm = () => {
     if (!armed) return;
@@ -231,11 +218,9 @@ export function KillSwitchModal({
         <div className="space-y-3">
           {KILL_SWITCH_LEVELS.map((level) => {
             const copy = KILL_SWITCH_LEVEL_COPY[level];
-            const levelPhrase = killSwitchConfirmationPhrase(
-              level,
-              activeRunCount,
-              queuedRunCount
-            );
+            const levelPhrase = countsLoaded
+              ? killSwitchConfirmationPhrase(level, activeRunCount, queuedRunCount)
+              : "";
             const isSelected = selected === level;
             return (
               <div
@@ -265,10 +250,18 @@ export function KillSwitchModal({
                   data-testid={`kill-switch-affected-${level}`}
                   className="text-xs text-parchment"
                 >
-                  {killSwitchAffectedSummary(level, activeRunCount, queuedRunCount)}
+                  {countsLoaded
+                    ? killSwitchAffectedSummary(level, activeRunCount, queuedRunCount)
+                    : "Loading affected run count…"}
                 </p>
                 <p className="text-[11px] text-dust">
-                  Type <span className="text-amber-200">{levelPhrase}</span> to confirm.
+                  {countsLoaded ? (
+                    <>
+                      Type <span className="text-amber-200">{levelPhrase}</span> to confirm.
+                    </>
+                  ) : (
+                    "Waiting for the current affected run count."
+                  )}
                 </p>
               </div>
             );
@@ -290,7 +283,13 @@ export function KillSwitchModal({
           />
           <div className="flex flex-wrap items-center justify-between gap-2">
             <span data-testid="kill-switch-required-phrase" className="text-[11px] text-dust">
-              Required phrase: <span className="text-amber-200">{phrase}</span>
+              {countsLoaded ? (
+                <>
+                  Required phrase: <span className="text-amber-200">{phrase}</span>
+                </>
+              ) : (
+                "Required phrase: waiting for the current affected run count."
+              )}
             </span>
             <button
               type="button"

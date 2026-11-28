@@ -18,6 +18,38 @@ export const KILL_SWITCH_LEVELS: readonly KillSwitchLevel[] = [
 
 const SYSTEM_RUN_ID = "system";
 
+/** Normalizes a possibly-missing/negative count to a non-negative integer, matching the modal. */
+function normalizeRunCount(value: number | undefined): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return 0;
+  return Math.floor(value);
+}
+
+/**
+ * The exact phrase an operator must type before a level can be executed. It states the
+ * number of active and queued runs the action affects, so the confirmation cannot be given
+ * without reading the current blast radius. The Admin route recomputes this from the live
+ * preview and rejects a request whose `confirm` string does not match, so a stale phrase can
+ * never execute a larger kill than the operator confirmed.
+ */
+export function killSwitchConfirmationPhrase(
+  level: KillSwitchLevel,
+  activeRunCount: number | undefined,
+  queuedRunCount: number | undefined
+): string {
+  const active = normalizeRunCount(activeRunCount);
+  const queued = normalizeRunCount(queuedRunCount);
+  switch (level) {
+    case "pause_new_runs":
+      return `PAUSE ${queued} QUEUED`;
+    case "stop_gracefully":
+      return `STOP ${active} RUNNING`;
+    case "hard_kill":
+      return `KILL ${active} ACTIVE ${queued} QUEUED`;
+    default:
+      return "KILL 0 ACTIVE 0 QUEUED";
+  }
+}
+
 export interface KillSwitchPreview {
   level: KillSwitchLevel;
   affectedRunCount: number;
