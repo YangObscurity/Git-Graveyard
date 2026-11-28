@@ -26,6 +26,7 @@ import {
   buildRequestBaseUrl,
   executeKillSwitch,
   getPromotionAudit,
+  listAdminRuns,
   listInviteCodes,
   runAdminAction,
   signInAdmin,
@@ -659,6 +660,78 @@ describe("Built with Kiro base URL helper", () => {
   it("returns null when the host header is unavailable", () => {
     const base = buildRequestBaseUrl({ get: () => null });
     assert.equal(base, null);
+  });
+});
+
+describe("Admin API wiring: the dashboard loads the admin run list", () => {
+  const originalFetch = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  it("requests /api/admin/runs (not /api/history) after sign-in", async () => {
+    const calls = stubFetch((url) => {
+      if (url === "/api/admin/session") {
+        return jsonResponse({ ok: true, authenticated: true, actor: { id: "owner", role: "owner" } });
+      }
+      if (url === "/api/admin/runs") {
+        return jsonResponse({
+          ok: true,
+          runs: [
+            {
+              runId: "run-unpublished",
+              repository: "owner/repo",
+              outcome: "resurrected",
+              phase: "done",
+              createdAt: 1700000000000,
+              isPublished: false,
+              isRemoved: false,
+              reviewed: false,
+            },
+          ],
+        });
+      }
+      return jsonResponse({ ok: false, error: "unexpected_url" }, 500);
+    });
+
+    const signIn = await signInAdmin("secret-token");
+    assert.equal(signIn.ok, true);
+
+    const runs = await listAdminRuns();
+    assert.equal(runs.ok, true);
+    assert.equal(runs.ok && runs.data.length, 1);
+    assert.equal(runs.ok && runs.data[0].runId, "run-unpublished");
+
+    const urls = calls.map((call) => call.url);
+    assert.ok(urls.includes("/api/admin/runs"));
+    assert.ok(!urls.includes("/api/history"));
+  });
+
+  it("uses the server reviewed flag as the initial review state", () => {
+    const html = render(
+      <AdminDashboard
+        authenticated
+        actor={{ id: "owner", role: "owner" }}
+        inviteCodes={[]}
+        runs={[
+          {
+            runId: "run-reviewed",
+            repository: "owner/repo",
+            phase: "done",
+            outcome: "resurrected",
+            isPublished: false,
+            isRemoved: false,
+            reviewed: true,
+          },
+        ]}
+      />
+    );
+    const publish = html.match(/<button[^>]*data-testid="admin-publish-run-reviewed"[^>]*>/);
+    assert.ok(publish, "publish button must render");
+    assert.ok(!/\sdisabled(=|\s|>)/.test(publish[0]), "a reviewed run must be publishable");
+    const checkbox = html.match(/<input[^>]*data-testid="admin-review-confirm-run-reviewed"[^>]*>/);
+    assert.ok(checkbox, "review checkbox must render");
+    assert.ok(/checked(=|\s|>)/.test(checkbox[0]), "the server reviewed flag must pre-check the box");
   });
 });
 });

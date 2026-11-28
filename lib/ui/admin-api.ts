@@ -157,9 +157,15 @@ export function listInviteCodes(): Promise<AdminApiResult<AdminInviteCodesRespon
   return request<AdminInviteCodesResponse>("/api/admin/invite-codes");
 }
 
-/** GET /api/history — the runs the Admin dashboard reviews and publishes. */
+/** GET /api/admin/runs — the finished runs the Admin dashboard reviews and publishes. */
 export function listAdminRuns(): Promise<AdminApiResult<AdminRunData[]>> {
-  return request<AdminRunData[]>("/api/history");
+  return request<{ runs?: AdminRunData[] }>("/api/admin/runs").then((result) => {
+    if (!result.ok) {
+      return result;
+    }
+    const runs = Array.isArray(result.data?.runs) ? result.data.runs : [];
+    return { ok: true, data: runs };
+  });
 }
 
 /** GET /api/admin/promotion-audit — the signed pre-promotion audit record. */

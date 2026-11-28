@@ -215,6 +215,20 @@ export function AdminDashboard({
     setSignInPending(false);
   }
 
+  async function handleReviewChange(runId: string, checked: boolean): Promise<void> {
+    setReviewed((prev) => ({ ...prev, [runId]: checked }));
+    if (!checked) {
+      return;
+    }
+    setRunActionError(null);
+    const result = await runAdminAction(runId, { action: "review" });
+    if (!result.ok) {
+      // The server refused the review, so the local gate must not stay open.
+      setReviewed((prev) => ({ ...prev, [runId]: false }));
+      setRunActionError(result.message);
+    }
+  }
+
   async function handleRunAction(
     runId: string,
     action: "publish" | "redact" | "hide"
@@ -428,7 +442,7 @@ export function AdminDashboard({
         ) : (
           <ul className="space-y-3">
             {finishedRuns.map((run) => {
-              const isReviewed = reviewed[run.runId] === true;
+              const isReviewed = reviewed[run.runId] ?? run.reviewed === true;
               return (
                 <li
                   key={run.runId}
@@ -452,12 +466,7 @@ export function AdminDashboard({
                       type="checkbox"
                       data-testid={`admin-review-confirm-${run.runId}`}
                       checked={isReviewed}
-                      onChange={(event) =>
-                        setReviewed((prev) => ({
-                          ...prev,
-                          [run.runId]: event.target.checked,
-                        }))
-                      }
+                      onChange={(event) => handleReviewChange(run.runId, event.target.checked)}
                     />
                     I have reviewed this run and confirmed the redactions.
                   </label>

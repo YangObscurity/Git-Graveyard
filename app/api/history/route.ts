@@ -2,77 +2,10 @@ import { type RunRecord } from "@/lib/runs/run-store";
 import { EventStore, type EventEnvelope } from "@/lib/events/event-store";
 import { parseRepoInput } from "@/lib/grimoire/normalize";
 import { resolveEventStore, resolveRunStore } from "@/lib/runtime/store-context";
+import { hasAdminPublishEvent, isRunRemoved } from "@/lib/history/run-visibility";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
-
-function hasAdminPublishEvent(
-  run: RunRecord,
-  eventStore: EventStore | null,
-  db: unknown
-): boolean {
-  if (run.isPublished) {
-    return true;
-  }
-  if (eventStore) {
-    try {
-      const events = eventStore.getEvents(run.runId, { kind: "admin.publish", limit: 1 });
-      if (events && events.length > 0) {
-        return true;
-      }
-    } catch {
-      // Ignore
-    }
-  }
-  if (db && typeof (db as { prepare?: (s: string) => { get: (id: string) => unknown } }).prepare === "function") {
-    try {
-      const stmt = (db as { prepare: (s: string) => { get: (id: string) => unknown } }).prepare(
-        "SELECT 1 FROM events WHERE runId = ? AND kind = 'admin.publish' LIMIT 1"
-      );
-      const row = stmt.get(run.runId);
-      if (row) {
-        return true;
-      }
-    } catch {
-      // Table might not exist in db
-    }
-  }
-  return false;
-}
-
-function isRunRemoved(
-  run: RunRecord,
-  eventStore: EventStore | null,
-  db: unknown
-): boolean {
-  if (run.isRemoved) {
-    return true;
-  }
-  if (eventStore) {
-    try {
-      const events = eventStore.getEvents(run.runId, { kind: "admin.hide", limit: 1 });
-      if (events && events.length > 0) {
-        return true;
-      }
-    } catch {
-      // Ignore
-    }
-  }
-  if (db && typeof (db as { prepare?: (s: string) => { get: (id: string) => unknown } }).prepare === "function") {
-    try {
-      const stmt = (db as { prepare: (s: string) => { get: (id: string) => unknown } }).prepare(
-        "SELECT 1 FROM events WHERE runId = ? AND kind = 'admin.hide' LIMIT 1"
-      );
-      const row = stmt.get(run.runId);
-      if (row) {
-        return true;
-      }
-    } catch {
-      // Table might not exist in db
-    }
-  }
-  return false;
-}
 
 function formatRepository(url: string): string {
   try {
