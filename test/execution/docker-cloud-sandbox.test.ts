@@ -1130,6 +1130,32 @@ describe("Sandbox destroyed while createSandbox is in flight", () => {
     await destroyStarted;
     assert.equal(await backend.get("box-1"), undefined);
   });
+
+  it("keeps the in-flight mark until every overlapping destroy has finished", async () => {
+    let calls = 0;
+    let finishFirst!: () => void;
+    class OverlapClient extends FakeCloudClient {
+      override async destroySandbox(id: string): Promise<void> {
+        calls += 1;
+        if (calls === 2) throw new Error("second destroy failed");
+        await new Promise<void>((resolve) => {
+          finishFirst = resolve;
+        });
+        return super.destroySandbox(id);
+      }
+    }
+    const client = new OverlapClient();
+    const backend = makeBackend(client, allProbesPass());
+    const box = await backend.create({ idempotencyKey: "overlap", image: PINNED_IMAGE });
+    // The first destroy waits on the remote; the overlapping second one fails.
+    const first = backend.destroy(box.id);
+    await assert.rejects(backend.destroy(box.id), /second destroy failed/);
+    // The first destroy is still running: the sandbox must not be handed out.
+    assert.equal(await backend.get(box.id), undefined);
+    finishFirst();
+    await first;
+    assert.equal(await backend.get(box.id), undefined);
+  });
 });
 
 describe("Destroyed sandbox is not re-cached during provision", () => {

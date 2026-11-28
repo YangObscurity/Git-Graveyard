@@ -369,8 +369,8 @@ export class DockerCloudSandboxBackend implements ExecutionBackend {
   >();
   /** Ids destroyed in this process; never re-attached or cached again. */
   private readonly destroyedIds = new Set<string>();
-  /** Ids whose destroy has started but not finished; treated like destroyed by create(). */
-  private readonly destroyingIds = new Set<string>();
+  /** In-flight destroy count per id; while above zero, create(), attach() and get() treat the id as destroyed. */
+  private readonly destroyingIds = new Map<string, number>();
   /** Exec idempotency keys (`sandboxId:idempotencyKey`) mapped to in-flight outcomes. */
   private readonly execIdempotency = new Map<string, Promise<CloudExecOutcome>>();
   /** Shared Topology P-B + env denylist guard enforced on every exec path. */
@@ -593,10 +593,12 @@ export class DockerCloudSandboxBackend implements ExecutionBackend {
     }
     return sandbox;
   }
-async get(id: string): Promise<DockerCloudSandbox | undefined> {
+  async get(id: string): Promise<DockerCloudSandbox | undefined> {
+    // A sandbox that is destroyed or being destroyed is never handed out, even
+    // if its wrapper is still cached.
+    if (this.destroyedIds.has(id) || this.destroyingIds.has(id)) return undefined;
     const local = this.sandboxesById.get(id);
     if (local) return local;
-    if (this.destroyedIds.has(id) || this.destroyingIds.has(id)) return undefined;
     const remote = await this.options.client.getSandbox(id);
     if (!remote) return undefined;
     return this.attach(
@@ -637,7 +639,7 @@ async get(id: string): Promise<DockerCloudSandbox | undefined> {
   async destroy(id: string): Promise<void> {
     // Mark the destroy as in flight first, so a create() that returns this id
     // while the remote destroy is still running refuses it too.
-    this.destroyingIds.add(id);
+    this.destroyingIds.set(id, (this.destroyingIds.get(id) ?? 0) + 1);
     try {
       const sandbox = this.sandboxesById.get(id);
       if (sandbox) {
@@ -646,7 +648,9 @@ async get(id: string): Promise<DockerCloudSandbox | undefined> {
         await this.options.client.destroySandbox(id);
       }
     } finally {
-      this.destroyingIds.delete(id);
+      const left = (this.destroyingIds.get(id) ?? 1) - 1;
+      if (left > 0) this.destroyingIds.set(id, left);
+      else this.destroyingIds.delete(id);
     }
     this.sandboxesById.delete(id);
     for (const [key, s] of this.sandboxesByIdempotencyKey.entries()) {
