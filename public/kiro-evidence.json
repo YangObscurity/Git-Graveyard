@@ -1,6 +1,6 @@
 {
   "schemaVersion": "v1",
-  "generatedFromSha": "e05fb38",
+  "generatedFromSha": "4f854fa",
   "specs": [
     {
       "path": ".kiro/specs/resurrection-engine/.config.kiro",
@@ -464,7 +464,7 @@
       "sha": "e05fb381243379d42f6057291c68b02dcdb07f36",
       "shortSha": "e05fb38",
       "subject": "fix(wave-5): re-attach only a sandbox that carries the requested idempotency key",
-      "refs": "HEAD -> wave/5"
+      "refs": ""
     },
     {
       "sha": "cf2e28b5107bb1797bf4a347523099e0d5565e21",
