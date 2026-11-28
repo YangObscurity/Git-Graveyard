@@ -1100,6 +1100,36 @@ describe("Sandbox destroyed while createSandbox is in flight", () => {
     );
     assert.equal(await backend.get("box-1"), undefined);
   });
+
+  it("is refused when its destroy has started but not finished", async () => {
+    let backend!: DockerCloudSandboxBackend;
+    let finishDestroy!: () => void;
+    let destroyStarted!: Promise<void>;
+    class SlowDestroyClient extends FakeCloudClient {
+      override async destroySandbox(id: string): Promise<void> {
+        await new Promise<void>((resolve) => {
+          finishDestroy = resolve;
+        });
+        return super.destroySandbox(id);
+      }
+      override async createSandbox(spec: SandboxSpec): Promise<{ id: string }> {
+        const created = await super.createSandbox(spec);
+        // A concurrent caller starts destroying the new sandbox; the remote
+        // destroy is still running when createSandbox returns.
+        destroyStarted = backend.destroy(created.id);
+        return created;
+      }
+    }
+    const client = new SlowDestroyClient();
+    backend = makeBackend(client, allProbesPass());
+    await assert.rejects(
+      backend.create({ idempotencyKey: "half-gone", image: PINNED_IMAGE }),
+      (err: unknown) => err instanceof SandboxDestroyedDuringCreateError
+    );
+    finishDestroy();
+    await destroyStarted;
+    assert.equal(await backend.get("box-1"), undefined);
+  });
 });
 
 describe("Destroyed sandbox is not re-cached during provision", () => {

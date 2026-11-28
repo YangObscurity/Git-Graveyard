@@ -369,6 +369,8 @@ export class DockerCloudSandboxBackend implements ExecutionBackend {
   >();
   /** Ids destroyed in this process; never re-attached or cached again. */
   private readonly destroyedIds = new Set<string>();
+  /** Ids whose destroy has started but not finished; treated like destroyed by create(). */
+  private readonly destroyingIds = new Set<string>();
   /** Exec idempotency keys (`sandboxId:idempotencyKey`) mapped to in-flight outcomes. */
   private readonly execIdempotency = new Map<string, Promise<CloudExecOutcome>>();
   /** Shared Topology P-B + env denylist guard enforced on every exec path. */
@@ -546,7 +548,7 @@ export class DockerCloudSandboxBackend implements ExecutionBackend {
     // Same rule as the list path: a sandbox destroyed while createSandbox was
     // in flight is never cached or returned as usable. The caller must create
     // again with a new attempt.
-    if (this.destroyedIds.has(id)) {
+    if (this.destroyedIds.has(id) || this.destroyingIds.has(id)) {
       throw new SandboxDestroyedDuringCreateError(id);
     }
     const sandbox = new DockerCloudSandbox(
@@ -572,7 +574,7 @@ export class DockerCloudSandboxBackend implements ExecutionBackend {
     idempotencyKey: string
   ): DockerCloudSandbox | undefined {
     // Never re-attach or cache a sandbox that was destroyed in this process.
-    if (this.destroyedIds.has(id)) return undefined;
+    if (this.destroyedIds.has(id) || this.destroyingIds.has(id)) return undefined;
     let sandbox = this.sandboxesById.get(id);
     if (!sandbox) {
       sandbox = new DockerCloudSandbox(
@@ -594,7 +596,7 @@ export class DockerCloudSandboxBackend implements ExecutionBackend {
 async get(id: string): Promise<DockerCloudSandbox | undefined> {
     const local = this.sandboxesById.get(id);
     if (local) return local;
-    if (this.destroyedIds.has(id)) return undefined;
+    if (this.destroyedIds.has(id) || this.destroyingIds.has(id)) return undefined;
     const remote = await this.options.client.getSandbox(id);
     if (!remote) return undefined;
     return this.attach(
@@ -633,11 +635,18 @@ async get(id: string): Promise<DockerCloudSandbox | undefined> {
   }
 
   async destroy(id: string): Promise<void> {
-    const sandbox = this.sandboxesById.get(id);
-    if (sandbox) {
-      await sandbox.destroy();
-    } else {
-      await this.options.client.destroySandbox(id);
+    // Mark the destroy as in flight first, so a create() that returns this id
+    // while the remote destroy is still running refuses it too.
+    this.destroyingIds.add(id);
+    try {
+      const sandbox = this.sandboxesById.get(id);
+      if (sandbox) {
+        await sandbox.destroy();
+      } else {
+        await this.options.client.destroySandbox(id);
+      }
+    } finally {
+      this.destroyingIds.delete(id);
     }
     this.sandboxesById.delete(id);
     for (const [key, s] of this.sandboxesByIdempotencyKey.entries()) {
