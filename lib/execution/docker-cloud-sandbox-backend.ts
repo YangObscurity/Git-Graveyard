@@ -80,6 +80,20 @@ function lookupProbe(results: ProbeResultLookup | undefined, id: string): unknow
  * Error thrown when Topology P-B is violated: kiro-cli or Necromancer may not
  * run inside a cloud sandbox, and P10/P11 must have a recorded pass.
  */
+/** Thrown when the sandbox a create returned was destroyed while the create was in flight. */
+export class SandboxDestroyedDuringCreateError extends Error {
+  readonly ok = false as const;
+  readonly code = "SANDBOX_DESTROYED_DURING_CREATE" as const;
+  readonly sandboxId: string;
+
+  constructor(sandboxId: string) {
+    super(`Sandbox '${sandboxId}' was destroyed while it was being created; create it again`);
+    this.name = "SandboxDestroyedDuringCreateError";
+    this.sandboxId = sandboxId;
+    Object.setPrototypeOf(this, SandboxDestroyedDuringCreateError.prototype);
+  }
+}
+
 export class TopologyViolationError extends Error {
   readonly ok = false as const;
   readonly code = "TOPOLOGY_P_B_VIOLATION" as const;
@@ -500,11 +514,12 @@ export class DockerCloudSandboxBackend implements ExecutionBackend {
     spec: SandboxSpec
   ): Promise<DockerCloudSandbox> {
     // Build the merged labels before contacting the client so the adapter can
-    // persist them on the remote sandbox. Merge order lets callers add their
-    // own labels but never override the reserved `git-graveyard.*` keys.
+    // persist them on the remote sandbox. Backend defaults come first, this
+    // create's own labels override them, and the reserved `git-graveyard.*`
+    // keys are written last so neither can override them.
     const labels: Record<string, string> = {
-      ...(spec.labels ?? {}),
       ...(this.options.labels ?? {}),
+      ...(spec.labels ?? {}),
       "git-graveyard.managed": "true",
       "git-graveyard.idempotency-key": idempotencyKey,
     };
@@ -528,6 +543,12 @@ export class DockerCloudSandboxBackend implements ExecutionBackend {
     }
 
     const { id } = await this.options.client.createSandbox(specWithLabels);
+    // Same rule as the list path: a sandbox destroyed while createSandbox was
+    // in flight is never cached or returned as usable. The caller must create
+    // again with a new attempt.
+    if (this.destroyedIds.has(id)) {
+      throw new SandboxDestroyedDuringCreateError(id);
+    }
     const sandbox = new DockerCloudSandbox(
       id,
       this.options.client,

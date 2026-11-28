@@ -7,6 +7,7 @@ import * as assert from "node:assert/strict";
 import {
   DockerCloudSandboxBackend,
   TopologyViolationError,
+  SandboxDestroyedDuringCreateError,
   ArgvValidationError,
   RootUserRejectedError,
   type DockerCloudClient,
@@ -1060,6 +1061,44 @@ describe("Remote sandbox labels reach the client", () => {
     const stored = client.labelsById.get(box.id);
     assert.equal(stored?.["git-graveyard.managed"], "true");
     assert.equal(stored?.["git-graveyard.idempotency-key"], "lbl-2");
+  });
+
+  it("lets a create's own labels override the backend default labels", async () => {
+    const client = new FakeCloudClient();
+    const backend = new DockerCloudSandboxBackend({
+      client,
+      probes: allProbesPass(),
+      networkPolicy: buildRunNetworkPolicy("run-labels-order"),
+      labels: { team: "default" },
+    });
+    const box = await backend.create({
+      idempotencyKey: "lbl-3",
+      image: PINNED_IMAGE,
+      labels: { team: "run" },
+    });
+    assert.equal(client.labelsById.get(box.id)?.team, "run");
+  });
+});
+
+describe("Sandbox destroyed while createSandbox is in flight", () => {
+  it("is neither cached nor returned", async () => {
+    let backend!: DockerCloudSandboxBackend;
+    class DestroyingClient extends FakeCloudClient {
+      override async createSandbox(spec: SandboxSpec): Promise<{ id: string }> {
+        const created = await super.createSandbox(spec);
+        // A concurrent caller destroys the new sandbox before create() resumes.
+        await backend.destroy(created.id);
+        return created;
+      }
+    }
+    const client = new DestroyingClient();
+    backend = makeBackend(client, allProbesPass());
+    await assert.rejects(
+      backend.create({ idempotencyKey: "gone", image: PINNED_IMAGE }),
+      (err: unknown) =>
+        err instanceof SandboxDestroyedDuringCreateError && err.sandboxId === "box-1"
+    );
+    assert.equal(await backend.get("box-1"), undefined);
   });
 });
 
