@@ -1,6 +1,6 @@
 {
   "schemaVersion": "v1",
-  "generatedFromSha": "828c8c9",
+  "generatedFromSha": "cf2e28b",
   "specs": [
     {
       "path": ".kiro/specs/resurrection-engine/.config.kiro",
@@ -461,16 +461,22 @@
   ],
   "commitLinks": [
     {
+      "sha": "cf2e28b5107bb1797bf4a347523099e0d5565e21",
+      "shortSha": "cf2e28b",
+      "subject": "docs(wave-5): mark tasks 24, 26 and 28.1-28.4 complete",
+      "refs": "HEAD -> wave/5"
+    },
+    {
       "sha": "828c8c96ffcba8b2d85d5eceab6651259e2382c5",
       "shortSha": "828c8c9",
       "subject": "fix(wave-4): restore HealthBadge prod guard, harden evidence integrity, refine handoff steps, and align tasks.md",
-      "refs": "HEAD -> wave/4"
+      "refs": ""
     },
     {
       "sha": "8b3cb7c6bff4ed0c13b42d1c74088a153115ea3e",
       "shortSha": "8b3cb7c",
       "subject": "fix(wave-4): derive Reliquary certificate fallback purely, preserve command quoting/spaces, and drop unrecorded defaults",
-      "refs": "origin/wave/4"
+      "refs": ""
     },
     {
       "sha": "b08ead691555fa7b5c0056099baee7fa19d5597a",
@@ -602,12 +608,6 @@
       "sha": "1b07abb185324011111718b8e3c3c69cac594b74",
       "shortSha": "1b07abb",
       "subject": "feat(admission,admin): add invite codes, FIFO queue, BudgetGovernor, admin auth, and kill switch",
-      "refs": ""
-    },
-    {
-      "sha": "2a5792c07415ddddcd9fbd4e0761d4cdb79d2926",
-      "shortSha": "2a5792c",
-      "subject": "feat(api): add R4-10 mutating run routes, fork-push confirmation, and UI API wrappers",
       "refs": ""
     }
   ]
