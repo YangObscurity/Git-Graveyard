@@ -719,6 +719,21 @@ describe("create() idempotency and restart re-attachment", () => {
     assert.equal(again.id, box.id);
     assert.equal(client.created.length, 1);
   });
+
+  it("never re-attaches another key's sandbox when the client ignores the label filter", async () => {
+    class UnfilteredClient extends FakeCloudClient {
+      override async listSandboxes(): Promise<Array<{ id: string; labels?: Record<string, string> }>> {
+        return super.listSandboxes();
+      }
+    }
+    const client = new UnfilteredClient();
+    const backend = makeBackend(client, allProbesPass());
+    const first = await backend.create({ idempotencyKey: "key-a", image: PINNED_IMAGE });
+    const backend2 = makeBackend(client, allProbesPass());
+    const second = await backend2.create({ idempotencyKey: "key-b", image: PINNED_IMAGE });
+    assert.notEqual(second.id, first.id);
+    assert.equal(client.created.length, 2);
+  });
 });
 
 describe("exec idempotency cache", () => {

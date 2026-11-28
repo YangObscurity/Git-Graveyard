@@ -496,10 +496,12 @@ export class DockerCloudSandboxBackend implements ExecutionBackend {
     const matches = await this.options.client.listSandboxes({
       "git-graveyard.idempotency-key": idempotencyKey,
     });
-    const match =
-      matches.find(
-        (s) => s.labels?.["git-graveyard.idempotency-key"] === idempotencyKey
-      ) ?? matches[0];
+    // The client is not required to honour the label filter, so only a sandbox
+    // that actually carries this idempotency key may be re-attached; anything
+    // else would hand this run another run's sandbox.
+    const match = matches.find(
+      (s) => s.labels?.["git-graveyard.idempotency-key"] === idempotencyKey
+    );
     if (match) {
       return this.attach(match.id, match.labels, idempotencyKey);
     }
