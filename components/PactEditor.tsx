@@ -1509,6 +1509,7 @@ export function PactEditor({
                         disabled={true}
                         readOnly
                         aria-disabled="true"
+                        aria-label={`${item.name} (required check, cannot be removed)`}
                         className="rounded border-white/20 bg-recessed text-amber-400 cursor-not-allowed"
                       />
                       <span className="font-bold text-bone text-xs">
@@ -1719,6 +1720,7 @@ export function PactEditor({
                               checked={!isDisabled}
                               disabled={lockInfo.locked || mutationsLocked}
                               onChange={() => handleToggleTask(task.id)}
+                              aria-label={`Include task ${task.id}: ${task.title}`}
                               className="rounded border-white/20 bg-recessed text-emerald-400"
                             />
                             <span className="font-bold text-bone text-xs">
