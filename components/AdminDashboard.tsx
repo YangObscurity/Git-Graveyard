@@ -11,6 +11,7 @@ import {
   getAdminSession,
   getKillSwitch,
   getPromotionAudit,
+  isPromotionAuditPassed,
   getQueue,
   listAdminRuns,
   listInviteCodes,
@@ -191,10 +192,12 @@ export function AdminDashboard({
         errors.runs = runList.message;
       }
       if (audit.ok) {
-        // Fail closed: an unreadable or unverified audit is treated as missing.
+        // Fail closed: an unreadable or unverified audit is treated as missing. A
+        // valid signature alone is not enough; the promotion gate must report a
+        // passing pre-promotion (G1) audit document.
         setFetchedAudit({
           present: audit.data.present === true,
-          verified: audit.data.present === true && audit.data.verified === true,
+          verified: isPromotionAuditPassed(audit.data),
           actor: audit.data.actor ?? null,
           signedAt: audit.data.signedAt ?? null,
         });
