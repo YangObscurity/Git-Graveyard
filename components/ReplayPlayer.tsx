@@ -6,6 +6,31 @@ import type { EventEnvelope } from "@/lib/events/types";
 import { summarizeEvent } from "@/lib/ui/event-summary";
 import { StatusPill } from "@/components/ui/StatusPill";
 import { CryptOrnament } from "@/components/ui/CryptOrnament";
+import {
+  isShortcutsDisabled,
+  subscribeShortcutsPreference,
+} from "@/lib/a11y/shortcuts";
+import { announcePolite } from "@/components/a11y/AriaAnnouncer";
+
+/** Returns true when system or page-level reduced motion is active. */
+export function isReducedMotionPreferred(): boolean {
+  if (typeof window === "undefined" || typeof document === "undefined") {
+    return false;
+  }
+  if (
+    document.documentElement.getAttribute("data-ui-reduced-motion") === "true"
+  ) {
+    return true;
+  }
+  try {
+    return (
+      typeof window.matchMedia === "function" &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches
+    );
+  } catch {
+    return false;
+  }
+}
 
 export interface ReplayPlayerProps {
   runId: string;
@@ -98,12 +123,29 @@ function getEventKindBadgeClass(kind: string): string {
     return "bg-emerald-950/50 text-emerald-300 border-[var(--necromancy-emerald-border)]";
   }
   if (k.startsWith("pact.") || k.startsWith("necromancer.")) {
-    return "bg-violet-950/50 text-violet-300 border-[var(--spectral-violet-border)]";
+    return "bg-violet-950/40 text-bone border-[var(--spectral-violet-border)]";
   }
   if (k.startsWith("run.") || k.startsWith("artifact.")) {
     return "bg-amber-950/50 text-amber-300 border-[var(--arcane-amber-border)]";
   }
   return "bg-neutral-900 text-parchment border-white/15";
+}
+
+export function getEventKindIcon(kind: string): string {
+  const k = kind.toLowerCase();
+  if (k.startsWith("admin.") || k.includes("error") || k.includes("exceeded") || k.includes("fail")) {
+    return "[!]";
+  }
+  if (k.startsWith("skeleton.") || k.startsWith("gate.") || k.startsWith("verdict")) {
+    return "[✓]";
+  }
+  if (k.startsWith("pact.") || k.startsWith("necromancer.")) {
+    return "[◆]";
+  }
+  if (k.startsWith("run.") || k.startsWith("artifact.")) {
+    return "[•]";
+  }
+  return "[·]";
 }
 
 function mapEventToChapter(kind: string): "Tomb" | "Pact" | "Legion" | "Relic" | null {
@@ -150,6 +192,46 @@ export function ReplayPlayer({
   const [isPlaying, setIsPlaying] = useState<boolean>(autoPlay);
   const [playbackSpeed, setPlaybackSpeed] = useState<number>(1);
   const [elapsedReplayMs, setElapsedReplayMs] = useState<number>(0);
+  const [shortcutsDisabled, setShortcutsDisabled] = useState<boolean>(false);
+  const [reducedMotion, setReducedMotion] = useState<boolean>(false);
+
+  useEffect(() => {
+    setShortcutsDisabled(isShortcutsDisabled());
+    return subscribeShortcutsPreference((disabled) => {
+      setShortcutsDisabled(disabled);
+    });
+  }, []);
+
+  useEffect(() => {
+    const syncMotion = () => {
+      setReducedMotion(isReducedMotionPreferred());
+    };
+    syncMotion();
+
+    if (typeof window === "undefined" || typeof document === "undefined") {
+      return;
+    }
+
+    const mq =
+      typeof window.matchMedia === "function"
+        ? window.matchMedia("(prefers-reduced-motion: reduce)")
+        : null;
+    mq?.addEventListener?.("change", syncMotion);
+
+    const observer =
+      typeof MutationObserver !== "undefined"
+        ? new MutationObserver(syncMotion)
+        : null;
+    observer?.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ["data-ui-reduced-motion"],
+    });
+
+    return () => {
+      mq?.removeEventListener?.("change", syncMotion);
+      observer?.disconnect();
+    };
+  }, []);
 
   // Requirement 33.11: Retrieve stored events via GET /api/runs/{runId}/events with from and to as JSON
   useEffect(() => {
@@ -269,25 +351,31 @@ export function ReplayPlayer({
       setPlaybackIndex(1);
       setElapsedReplayMs(0);
       setIsPlaying(true);
+      announcePolite("Replay started.");
     } else {
-      setIsPlaying((prev) => !prev);
+      const next = !isPlaying;
+      setIsPlaying(next);
+      announcePolite(next ? "Replay playing." : "Replay paused.");
     }
   }, [isAtEnd, isPlaying, timeline.length]);
 
   const handleStepForward = useCallback(() => {
     setIsPlaying(false);
     setPlaybackIndex((prev) => Math.min(timeline.length, prev + 1));
+    announcePolite("Stepped forward in replay.");
   }, [timeline.length]);
 
   const handleStepBackward = useCallback(() => {
     setIsPlaying(false);
     setPlaybackIndex((prev) => Math.max(0, prev - 1));
+    announcePolite("Stepped back in replay.");
   }, []);
 
   // Keyboard shortcuts: Space (Play/Pause), ArrowRight (+1), ArrowLeft (-1)
   useEffect(() => {
-    if (typeof window === "undefined") return;
+    if (typeof window === "undefined" || shortcutsDisabled) return;
     function onKeyDown(e: KeyboardEvent) {
+      if (isShortcutsDisabled()) return;
       const target = e.target as HTMLElement | null;
       if (
         target &&
@@ -295,6 +383,15 @@ export function ReplayPlayer({
           target.tagName === "TEXTAREA" ||
           target.tagName === "SELECT" ||
           target.isContentEditable)
+      ) {
+        return;
+      }
+      if (
+        target &&
+        (target.tagName === "BUTTON" ||
+          target.tagName === "A" ||
+          target.tagName === "SUMMARY") &&
+        (e.code === "Space" || e.code === "Enter")
       ) {
         return;
       }
@@ -311,7 +408,7 @@ export function ReplayPlayer({
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [handleTogglePlay, handleStepForward, handleStepBackward]);
+  }, [shortcutsDisabled, handleTogglePlay, handleStepForward, handleStepBackward]);
 
   const seqBounds = useMemo(() => {
     if (events.length === 0) {
@@ -379,7 +476,8 @@ export function ReplayPlayer({
           <div className="flex flex-wrap items-center gap-3">
             <StatusPill
               tone="amber"
-              pulse={isPlaying}
+              pulse={isPlaying && !reducedMotion}
+              icon={<span aria-hidden="true">{isPlaying ? "▶" : "❚❚"}</span>}
               label="Replay"
               testId="replay-badge"
               uiState={uiState}
@@ -445,7 +543,9 @@ export function ReplayPlayer({
             <div className="relative h-6 flex items-center">
               <div className="w-full h-1.5 rounded-full bg-recessed border border-white/10 overflow-hidden">
                 <div
-                  className="h-full bg-gradient-to-r from-emerald-600 to-emerald-400 transition-all duration-150"
+                  className={`h-full bg-gradient-to-r from-emerald-600 to-emerald-400 ${
+                    reducedMotion ? "transition-none" : "transition-all duration-150"
+                  }`}
                   style={{ width: `${progressPct}%` }}
                 />
               </div>
@@ -557,11 +657,20 @@ export function ReplayPlayer({
               </div>
 
               {/* Keyboard Hints */}
-              <div className="hidden sm:flex items-center gap-1.5 text-[10px] text-dust">
-                <span className="crypt-kbd">Space</span>
-                <span>play</span>
-                <span className="crypt-kbd">←/→</span>
-                <span>step</span>
+              <div
+                data-testid="replay-shortcut-hints"
+                className="hidden sm:flex items-center gap-1.5 text-[10px] text-dust"
+              >
+                {shortcutsDisabled ? (
+                  <span>Shortcuts disabled</span>
+                ) : (
+                  <>
+                    <span className="crypt-kbd">Space</span>
+                    <span>play</span>
+                    <span className="crypt-kbd">←/→</span>
+                    <span>step</span>
+                  </>
+                )}
               </div>
             </div>
           </div>
@@ -652,6 +761,7 @@ export function ReplayPlayer({
       data-ui-element="replay-player"
       data-ui-state={uiState}
       data-ui-variant={uiVariant}
+      data-reduced-motion={reducedMotion ? "true" : "false"}
       className="space-y-5 font-mono pb-8"
     >
       {renderBanner()}
@@ -669,7 +779,7 @@ export function ReplayPlayer({
                 data-testid="replay-gap"
                 className="p-3 rounded-lg border border-dashed border-amber-500/50 bg-amber-950/20 text-amber-300 text-xs font-mono flex items-center gap-2"
               >
-                <span className="w-1.5 h-1.5 rounded-full bg-amber-400" aria-hidden="true" />
+                <span aria-hidden="true">[!]</span>
                 <span>Gap: missing event {gapLabel}</span>
               </div>
             );
@@ -691,7 +801,9 @@ export function ReplayPlayer({
             <div
               key={`event-${ev.seq}`}
               data-testid={`replay-event-${ev.seq}`}
-              className="crypt-panel p-4 text-xs space-y-2.5 hover:border-white/20 transition-colors"
+              className={`crypt-panel p-4 text-xs space-y-2.5 hover:border-white/20 ${
+                reducedMotion ? "transition-none" : "transition-colors"
+              }`}
             >
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <div className="flex flex-wrap items-center gap-2">
@@ -703,9 +815,10 @@ export function ReplayPlayer({
                   </span>
                   <span
                     data-testid="event-kind"
-                    className={`px-2 py-0.5 rounded font-semibold border ${getEventKindBadgeClass(ev.kind)}`}
+                    className={`inline-flex items-center gap-1 px-2 py-0.5 rounded font-semibold border ${getEventKindBadgeClass(ev.kind)}`}
                   >
-                    {ev.kind}
+                    <span aria-hidden="true">{getEventKindIcon(ev.kind)}</span>
+                    <span>{ev.kind}</span>
                   </span>
                   <span
                     data-testid="event-actor"
@@ -723,6 +836,7 @@ export function ReplayPlayer({
                       data-testid="shortened-wait-label"
                       className="px-2 py-0.5 rounded text-[11px] bg-amber-950/40 text-amber-300 border border-[var(--arcane-amber-border)]"
                     >
+                      <span aria-hidden="true">[⏱] </span>
                       Shortened wait (time between events was compressed)
                     </span>
                   ) : null}
@@ -753,7 +867,11 @@ export function ReplayPlayer({
                       Raw event
                     </summary>
                     <div className="overflow-x-auto mt-2">
-                      <pre className="crypt-well font-mono text-[11px] whitespace-pre-wrap break-all text-parchment p-3">
+                      <pre
+                        tabIndex={0}
+                        aria-label={`Raw event payload for seq ${ev.seq}`}
+                        className="crypt-well font-mono text-[11px] whitespace-pre-wrap break-all text-parchment p-3"
+                      >
                         {JSON.stringify(ev.data, null, 2)}
                       </pre>
                     </div>
@@ -766,6 +884,7 @@ export function ReplayPlayer({
                   data-testid="run-stopped-label"
                   className="p-2.5 rounded border border-[var(--crimson-seal-border)] border-l-2 border-l-rose-500 bg-rose-950/30 text-rose-300 text-xs font-semibold"
                 >
+                  <span aria-hidden="true">[✕] </span>
                   Point where the run was stopped
                 </div>
               ) : null}

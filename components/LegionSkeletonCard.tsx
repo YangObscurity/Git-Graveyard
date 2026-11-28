@@ -1,11 +1,29 @@
 "use client";
 
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { CryptOrnament } from "./ui/CryptOrnament";
 import { StatusPill } from "./ui/StatusPill";
 import { CommandRow, type CommandRowItem } from "./CommandRow";
 import { LayToRestModal } from "./LayToRestModal";
 import { recoveryOutcomeLabel } from "@/lib/ui/run-model";
+import { announcePolite } from "@/components/a11y/AriaAnnouncer";
+
+/**
+ * Extracts optional Grimoire rule ID (M1-M6) and file reference from a console
+ * log line so each DOM log row carries `data-rule` and `data-file` attributes.
+ */
+export function parseLogLineMeta(line: string): { rule: string; file: string } {
+  const ruleMatch =
+    line.match(/\b(?:rule|grimoire)[:=\s]+(M[1-6]|[A-Za-z0-9_.-]+)\b/i) ??
+    line.match(/\b(M[1-6])\b/);
+  const fileMatch =
+    line.match(/\bfile[:=\s]+([^\s,;)'"]+)/i) ??
+    line.match(/(?:^|[\s([`'"@])([A-Za-z0-9_./-]+\.[A-Za-z][A-Za-z0-9]{0,7})(?::\d+)?(?:[\s)\]`'",;]|$)/);
+  return {
+    rule: ruleMatch?.[1] ?? "",
+    file: fileMatch?.[1] ?? "",
+  };
+}
 
 export interface SkeletonData {
   skeletonId: string;
@@ -134,6 +152,10 @@ export function LegionSkeletonCard({
   const [composerOpen, setComposerOpen] = useState(false);
   const [composerText, setComposerText] = useState("");
   const [focusedDisabledReason, setFocusedDisabledReason] = useState<string | null>(null);
+  const [announceLogs, setAnnounceLogs] = useState(false);
+  const [staleInterruptNotice, setStaleInterruptNotice] = useState<string | null>(null);
+  const interruptBtnRef = useRef<HTMLButtonElement>(null);
+  const composerBtnRef = useRef<HTMLButtonElement>(null);
 
   const role = skeleton.role || "unknown";
   const isWarden = role.toLowerCase() === "warden";
@@ -237,6 +259,9 @@ export function LegionSkeletonCard({
     if (!interruptConfirmStillValid(interruptConfirmBinding, currentToolCallId, runDone)) {
       setShowInterruptConfirm(false);
       setInterruptConfirmBinding(null);
+      setStaleInterruptNotice(INTERRUPT_STALE_MESSAGE);
+      announcePolite(INTERRUPT_STALE_MESSAGE);
+      interruptBtnRef.current?.focus();
     }
   }, [showInterruptConfirm, interruptConfirmBinding, skeleton.currentToolCall, runDone]);
 
@@ -321,16 +346,32 @@ export function LegionSkeletonCard({
       ? "amber"
       : "neutral";
 
+  const verdictIcon =
+    verdictTone === "emerald"
+      ? "✓"
+      : verdictTone === "crimson"
+      ? "✕"
+      : verdictTone === "amber"
+      ? "…"
+      : "—";
+
+  const cardTitleId = `skeleton-card-title-${skeleton.skeletonId}`;
+  const allLogs = skeleton.logs ?? [];
+  const logStartIndex = Math.max(0, allLogs.length - 50);
+  const tailLogs = allLogs.slice(logStartIndex);
+
   return (
     <article
       data-ui-element="legion-skeleton-card"
       data-ui-state={uiState}
       data-skeleton-id={skeleton.skeletonId}
+      aria-labelledby={cardTitleId}
+      aria-label={`Skeleton ${role} ${skeleton.skeletonId}`}
       className={`crypt-panel border-t-2 p-5 space-y-4 font-mono text-bone ${cardAuraClass}`}
     >
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between border-b border-white/[0.08] pb-3 gap-2">
-        <div className="flex items-center gap-2.5 flex-wrap">
+        <div id={cardTitleId} className="flex items-center gap-2.5 flex-wrap">
           <CryptOrnament kind="skeleton-skull" className={`w-4 h-4 ${skullClass}`} />
           <span className="text-[11px] uppercase tracking-wider px-2 py-0.5 rounded border border-[var(--border-engraved)] bg-recessed text-parchment font-semibold">
             {role}
@@ -342,7 +383,12 @@ export function LegionSkeletonCard({
 
         <div className="flex items-center gap-2 flex-wrap">
           {silentDisplay && (
-            <StatusPill tone="amber" label={silentDisplay} uiState="silent" />
+            <StatusPill
+              tone="amber"
+              icon={<span aria-hidden="true">[!]</span>}
+              label={silentDisplay}
+              uiState="silent"
+            />
           )}
           <StatusPill
             tone={stateTone}
@@ -351,10 +397,21 @@ export function LegionSkeletonCard({
             uiState={uiState}
           />
           {isRecovering && (
-            <StatusPill tone="violet" pulse label="Recovering" uiState="recovering" />
+            <StatusPill
+              tone="violet"
+              pulse
+              icon={<span aria-hidden="true">[↻]</span>}
+              label="Recovering"
+              uiState="recovering"
+            />
           )}
           {recoveryLabel && (
-            <StatusPill tone="violet" label={recoveryLabel} uiState="recovered" />
+            <StatusPill
+              tone="violet"
+              icon={<span aria-hidden="true">[↻]</span>}
+              label={recoveryLabel}
+              uiState="recovered"
+            />
           )}
         </div>
       </div>
@@ -464,18 +521,48 @@ export function LegionSkeletonCard({
 
       {/* Log Tail / Terminal Stream */}
       <div className="space-y-1.5">
-        <span className="text-[11px] uppercase tracking-wider text-dust block">
-          Log Tail
-        </span>
-        {skeleton.logs && skeleton.logs.length > 0 ? (
-          <pre className="crypt-well text-xs p-3 overflow-x-auto overflow-y-auto text-parchment max-h-64 whitespace-pre-wrap leading-relaxed">
-            {skeleton.logs.slice(-50).join("\n")}
-          </pre>
-        ) : (
-          <div className="crypt-well text-xs text-dust p-3">
-            No logs yet
-          </div>
-        )}
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <span className="text-[11px] uppercase tracking-wider text-dust block">
+            Log Tail
+          </span>
+          <button
+            type="button"
+            data-testid={`skeleton-log-announce-toggle-${skeleton.skeletonId}`}
+            aria-pressed={announceLogs}
+            onClick={() => setAnnounceLogs((prev) => !prev)}
+            className="crypt-btn-ghost px-2 py-0.5 text-[11px] rounded"
+          >
+            {announceLogs ? "Log announcements: On" : "Log announcements: Off"}
+          </button>
+        </div>
+        <div
+          role="log"
+          aria-live={announceLogs ? "polite" : "off"}
+          aria-label={`Log tail for ${role} ${skeleton.skeletonId}`}
+          data-testid={`skeleton-log-${skeleton.skeletonId}`}
+          tabIndex={0}
+          className="crypt-well text-xs p-3 overflow-x-auto overflow-y-auto text-parchment max-h-64 leading-relaxed"
+        >
+          {tailLogs.length > 0 ? (
+            tailLogs.map((line, idx) => {
+              const absIdx = logStartIndex + idx;
+              const meta = parseLogLineMeta(line);
+              return (
+                <div
+                  key={`log-${absIdx}`}
+                  data-testid={`skeleton-log-row-${skeleton.skeletonId}-${absIdx}`}
+                  data-rule={meta.rule}
+                  data-file={meta.file}
+                  className="whitespace-pre-wrap break-words py-0.5"
+                >
+                  {line}
+                </div>
+              );
+            })
+          ) : (
+            <div className="text-dust">No logs yet</div>
+          )}
+        </div>
       </div>
 
       {/* Bottom Candidate SHA & Warden Verdict Strip */}
@@ -492,6 +579,7 @@ export function LegionSkeletonCard({
           <span className="text-dust uppercase tracking-wider">Warden:</span>
           <StatusPill
             tone={verdictTone}
+            icon={<span aria-hidden="true">{verdictIcon}</span>}
             label={verdictLabel}
             className="text-[10px] px-2 py-0"
           />
@@ -505,6 +593,16 @@ export function LegionSkeletonCard({
         </div>
       )}
 
+      {/* Stale Interrupt Notice */}
+      {staleInterruptNotice && (
+        <div
+          data-testid={`skeleton-interrupt-stale-${skeleton.skeletonId}`}
+          className="crypt-well text-xs text-amber-300 border-amber-500/40 bg-amber-950/30 p-2.5"
+        >
+          Notice: {staleInterruptNotice}
+        </div>
+      )}
+
       {/* Interrupt Confirmation: warn that the running output will be lost */}
       {showInterruptConfirm && !showLayToRestConfirm && (
         <SkeletonInterruptConfirm
@@ -514,15 +612,20 @@ export function LegionSkeletonCard({
             if (!interruptConfirmStillValid(interruptConfirmBinding, currentToolCallId, runDone)) {
               setShowInterruptConfirm(false);
               setInterruptConfirmBinding(null);
+              setStaleInterruptNotice(INTERRUPT_STALE_MESSAGE);
+              announcePolite(INTERRUPT_STALE_MESSAGE);
+              interruptBtnRef.current?.focus();
               return;
             }
             setShowInterruptConfirm(false);
             setInterruptConfirmBinding(null);
             onInterrupt?.(skeleton.skeletonId);
+            interruptBtnRef.current?.focus();
           }}
           onCancel={() => {
             setShowInterruptConfirm(false);
             setInterruptConfirmBinding(null);
+            interruptBtnRef.current?.focus();
           }}
         />
       )}
@@ -576,6 +679,7 @@ export function LegionSkeletonCard({
               onClick={() => {
                 setComposerOpen(false);
                 setComposerText("");
+                composerBtnRef.current?.focus();
               }}
               className="crypt-btn-ghost px-3 py-1.5 text-xs rounded text-ash"
             >
@@ -605,6 +709,7 @@ export function LegionSkeletonCard({
         <div className="flex flex-wrap gap-2 pt-2 border-t border-white/[0.08]">
           {isWarden ? (
             <button
+              ref={composerBtnRef}
               type="button"
               onClick={() => setComposerOpen(true)}
               disabled={sendInstructionDisabled}
@@ -621,6 +726,7 @@ export function LegionSkeletonCard({
             </button>
           ) : (
             <button
+              ref={composerBtnRef}
               type="button"
               onClick={() => setComposerOpen(true)}
               disabled={sendInstructionDisabled}
@@ -638,8 +744,10 @@ export function LegionSkeletonCard({
           )}
 
           <button
+            ref={interruptBtnRef}
             type="button"
             onClick={() => {
+              setStaleInterruptNotice(null);
               setInterruptConfirmBinding({
                 toolCallId: skeleton.currentToolCall?.toolCallId ?? null,
               });
@@ -719,6 +827,13 @@ export function SkeletonInterruptConfirm({
       <p className="text-xs text-amber-200">
         Interrupt now? The command this Skeleton is running will be stopped and its
         output so far will be lost. This cannot be undone.
+      </p>
+      <p
+        data-testid={`skeleton-interrupt-expiry-notice-${skeletonId}`}
+        className="text-[11px] text-parchment"
+      >
+        Advance notice: This confirmation applies only to the current tool call and
+        closes automatically when it finishes.
       </p>
       <div className="flex flex-wrap gap-2">
         <button
