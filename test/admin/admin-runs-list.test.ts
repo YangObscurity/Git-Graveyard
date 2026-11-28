@@ -7,6 +7,7 @@ import { EventStore } from "@/lib/events/event-store";
 import { SettingsStore } from "@/lib/admin/settings-store";
 import { resetAdminSessionState } from "@/lib/admin/admin-session";
 import { GET as adminRunsGet } from "@/app/api/admin/runs/route";
+import { POST as runActionPost } from "@/app/api/admin/runs/[runId]/route";
 
 const ADMIN_SECRET = "test-admin-secret-value";
 
@@ -251,5 +252,84 @@ describe("GET /api/admin/runs lists finished runs for review", () => {
       "reviewed",
       "runId",
     ]);
+  });
+});
+describe("GET /api/admin/runs trusts the server phase filter", () => {
+  it("includes a killed run whose phase is not done", async () => {
+    createRun("run-killed", { phase: "legion", outcome: "killed" });
+    createRun("run-done", { phase: "done", outcome: "resurrected" });
+
+    const { status, body } = await listRuns();
+    assert.equal(status, 200);
+    const ids = body.runs.map((item) => item.runId);
+    assert.ok(ids.includes("run-killed"));
+    const killed = body.runs.find((item) => item.runId === "run-killed");
+    assert.ok(killed);
+    assert.equal(killed.phase, "legion");
+    assert.equal(killed.outcome, "killed");
+  });
+});
+
+describe("POST /api/admin/runs/[runId] redact requires a target", () => {
+  function post(runId: string, body: unknown): Promise<Response> {
+    return runActionPost(
+      attach(
+        new Request(`http://test/api/admin/runs/${runId}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...adminHeaders() },
+          body: JSON.stringify(body),
+        })
+      ),
+      { params: { runId } }
+    );
+  }
+
+  it("rejects an empty target list with 400 and writes nothing", async () => {
+    createRun("run-redact-empty", { phase: "done", outcome: "resurrected" });
+
+    const response = await post("run-redact-empty", { action: "redact" });
+    assert.equal(response.status, 400);
+    const body = (await response.json()) as { ok: boolean; error?: string };
+    assert.equal(body.ok, false);
+    assert.equal(body.error, "redaction_targets_required");
+
+    // No review marker and no audit event were written.
+    const run = stores.runStore.getRun("run-redact-empty");
+    const metadata = (run?.metadata ?? {}) as Record<string, unknown>;
+    assert.notEqual(metadata.reviewed, true);
+    assert.equal(
+      stores.eventStore.getEvents("run-redact-empty", { kind: "admin.redaction" }).length,
+      0
+    );
+    assert.equal(
+      stores.eventStore.getEvents("run-redact-empty", { kind: "admin.review" }).length,
+      0
+    );
+  });
+
+  it("rejects an explicitly empty fields array with 400", async () => {
+    createRun("run-redact-empty-array", { phase: "done", outcome: "resurrected" });
+
+    const response = await post("run-redact-empty-array", {
+      action: "redact",
+      fields: [],
+    });
+    assert.equal(response.status, 400);
+    assert.equal(
+      stores.eventStore.getEvents("run-redact-empty-array", { kind: "admin.redaction" })
+        .length,
+      0
+    );
+  });
+
+  it("still redacts when a valid field is supplied", async () => {
+    createRun("run-redact-ok", { phase: "done", outcome: "resurrected" });
+
+    const response = await post("run-redact-ok", { action: "redact", fields: ["logs"] });
+    assert.equal(response.status, 200);
+    assert.equal(
+      stores.eventStore.getEvents("run-redact-ok", { kind: "admin.redaction" }).length,
+      1
+    );
   });
 });

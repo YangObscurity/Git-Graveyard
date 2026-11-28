@@ -1,25 +1,32 @@
 import React from "react";
-import { headers } from "next/headers";
 import { BuiltWithKiroView } from "@/components/BuiltWithKiroView";
-import { loadEvidenceBundle } from "@/lib/evidence/evidence-service";
-import { buildRequestBaseUrl } from "@/lib/ui/admin-api";
+import {
+  loadEvidenceBundle,
+  mapHistoryRun,
+} from "@/lib/evidence/evidence-service";
+import { listPublishedRuns } from "@/lib/history/published-runs";
+import { resolveEventStore, resolveRunStore } from "@/lib/runtime/store-context";
 
 export const dynamic = "force-dynamic";
 
 export default async function BuiltWithKiroPage() {
-  // Build-time evidence is read from disk; the runtime run list is fetched from
-  // the history endpoint. A server-side fetch of a relative path cannot resolve,
-  // so an absolute base URL is built from the request headers. When the headers
-  // are unavailable the base URL stays undefined and the run list stays empty.
-  let baseUrl: string | undefined;
-  try {
-    const requestHeaders = await headers();
-    baseUrl = buildRequestBaseUrl(requestHeaders) ?? undefined;
-  } catch {
-    baseUrl = undefined;
-  }
+  // Build-time evidence is read from disk. The runtime run list is read
+  // in-process from the shared run/event stores (never over HTTP and never from
+  // request headers), limited to the three most recent published runs with Kiro
+  // fields, then handed to the evidence bundle already loaded.
+  const runStore = resolveRunStore();
+  const eventStore = resolveEventStore(undefined, undefined, runStore);
+  const recentRuns = listPublishedRuns(runStore, eventStore, {
+    limit: 3,
+    fields: "kiro",
+  }).map(mapHistoryRun);
 
-  const bundle = await loadEvidenceBundle(process.cwd(), fetch, baseUrl);
+  const bundle = await loadEvidenceBundle(
+    process.cwd(),
+    undefined,
+    undefined,
+    recentRuns
+  );
 
   return (
     <main className="min-h-[calc(100vh-3.5rem)] bg-transparent text-bone p-4 md:p-8 font-mono">

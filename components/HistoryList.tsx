@@ -42,7 +42,7 @@ export interface HistoryRunItem {
 export interface HistoryRunMetadataView {
   roles: string[];
   engineVersion: string | null;
-  mode: string;
+  mode: string | null;
   beforeBuild: string | null;
   afterBuild: string | null;
 }
@@ -107,7 +107,7 @@ export function describeRunMetadata(run: HistoryRunItem): HistoryRunMetadataView
   );
 
   const rawMode = firstString(run.mode, meta.mode, meta.recordedOn, meta.recordedMode);
-  const mode = rawMode ? rawMode.toLowerCase() : "live";
+  const mode = rawMode ? rawMode.toLowerCase() : null;
 
   const beforeBuild = firstString(
     run.beforeBuildStatus,
@@ -396,7 +396,11 @@ export function HistoryList({ initialRuns, limit, initialError }: HistoryListPro
             const durationDisplay = formatDuration(run.startedAt, run.endedAt);
             const meta = describeRunMetadata(run);
             const modeLabel =
-              meta.mode === "live" ? "Recorded live run" : `Recorded ${meta.mode} run`;
+              meta.mode === "live"
+                ? "Recorded live run"
+                : meta.mode
+                ? `Recorded ${meta.mode} run`
+                : "Mode not recorded";
             const buildLabel =
               meta.beforeBuild || meta.afterBuild
                 ? `before ${meta.beforeBuild ?? "not recorded"} -> after ${
