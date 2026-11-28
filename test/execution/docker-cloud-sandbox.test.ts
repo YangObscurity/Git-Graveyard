@@ -78,11 +78,9 @@ class FakeCloudClient implements DockerCloudClient {
     this.created.push(spec);
     const id = `box-${this.nextId++}`;
     this.files.set(id, new Map());
-    this.labelsById.set(id, {
-      "git-graveyard.managed": "true",
-      "git-graveyard.idempotency-key": spec.idempotencyKey,
-      ...(spec.labels ?? {}),
-    });
+    // Store exactly the labels handed to createSandbox, so re-attachment relies
+    // only on what the client persisted (not on labels the backend sets later).
+    this.labelsById.set(id, { ...(spec.labels ?? {}) });
     return { id };
   }
 
@@ -1018,5 +1016,135 @@ describe("Host configuration", () => {
     assert.equal(d.runsOutsideCloudSandboxes, true);
     assert.equal(d.kiroCliRunsOnHost, true);
     assert.equal(d.topology, "P-B");
+  });
+});
+
+describe("Remote sandbox labels reach the client", () => {
+  it("persists merged labels so a fresh backend re-attaches from client storage", async () => {
+    const client = new FakeCloudClient();
+    const backend = makeBackend(client, allProbesPass());
+    const box = await backend.create({
+      idempotencyKey: "lbl-1",
+      image: PINNED_IMAGE,
+      labels: { "git-graveyard.run-id": "run-9", custom: "v" },
+    });
+    // The spec handed to the client carries the merged labels, reserved last.
+    const sent = client.created[0] as SandboxSpec & {
+      labels?: Record<string, string>;
+    };
+    assert.equal(sent.labels?.["git-graveyard.managed"], "true");
+    assert.equal(sent.labels?.["git-graveyard.idempotency-key"], "lbl-1");
+    assert.equal(sent.labels?.["git-graveyard.run-id"], "run-9");
+    assert.equal(sent.labels?.custom, "v");
+    // The client stored exactly what it received.
+    assert.deepEqual(client.labelsById.get(box.id), sent.labels);
+
+    // A fresh backend re-attaches using only what the client stored.
+    const backend2 = makeBackend(client, allProbesPass());
+    const again = await backend2.create({ idempotencyKey: "lbl-1", image: PINNED_IMAGE });
+    assert.equal(again.id, box.id);
+    assert.equal(client.created.length, 1);
+  });
+
+  it("does not let spec.labels override the reserved labels", async () => {
+    const client = new FakeCloudClient();
+    const backend = makeBackend(client, allProbesPass());
+    const box = await backend.create({
+      idempotencyKey: "lbl-2",
+      image: PINNED_IMAGE,
+      labels: {
+        "git-graveyard.managed": "false",
+        "git-graveyard.idempotency-key": "spoofed",
+      },
+    });
+    const stored = client.labelsById.get(box.id);
+    assert.equal(stored?.["git-graveyard.managed"], "true");
+    assert.equal(stored?.["git-graveyard.idempotency-key"], "lbl-2");
+  });
+});
+
+describe("Destroyed sandbox is not re-cached during provision", () => {
+  it("does not return or cache a sandbox destroyed while create() awaits the remote list", async () => {
+    const client = new FakeCloudClient();
+    // Pre-seed an existing remote sandbox S carrying the idempotency key.
+    const S = "box-existing";
+    client.files.set(S, new Map());
+    client.labelsById.set(S, {
+      "git-graveyard.managed": "true",
+      "git-graveyard.idempotency-key": "K",
+    });
+
+    let releaseList!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseList = resolve;
+    });
+    const originalList = client.listSandboxes.bind(client);
+    let listEntered = false;
+    (
+      client as unknown as {
+        listSandboxes: (labels?: Record<string, string>) => Promise<
+          Array<{ id: string; labels?: Record<string, string> }>
+        >;
+      }
+    ).listSandboxes = async (labels?: Record<string, string>) => {
+      listEntered = true;
+      await gate;
+      return originalList(labels);
+    };
+
+    const backend = makeBackend(client, allProbesPass());
+    const createPromise = backend.create({ idempotencyKey: "K", image: PINNED_IMAGE });
+
+    // Wait until provision has entered the delayed listSandboxes.
+    while (!listEntered) {
+      await new Promise((r) => setTimeout(r, 0));
+    }
+
+    // Attach S, then destroy it before the list resolves.
+    const got = await backend.get(S);
+    assert.equal(got?.id, S);
+    await backend.destroy(S);
+
+    releaseList();
+    const result = await createPromise;
+
+    // The destroyed S is neither returned nor cached; a new sandbox is created.
+    assert.notEqual(result.id, S);
+    assert.equal(client.created.length, 1);
+    assert.equal(await backend.get(S), undefined);
+  });
+});
+
+describe("Cloud lifecycle: log export after a failed sync", () => {
+  it("exports logs even when syncOut fails, before destroy", async () => {
+    const lc = new CloudSandboxLifecycle();
+    const events: string[] = [];
+    const syncErr = new Error("sync failed");
+    const exportErr = new Error("export failed");
+    lc.register(
+      "box-1",
+      "run-1",
+      {
+        async destroy() {
+          events.push("destroy");
+        },
+      },
+      {
+        async syncOut() {
+          events.push("syncOut");
+          throw syncErr;
+        },
+        async exportLogs() {
+          events.push("exportLogs");
+          throw exportErr;
+        },
+      }
+    );
+    const result = await lc.pullAndDestroy("box-1");
+    assert.deepEqual(events, ["syncOut", "exportLogs", "destroy"]);
+    assert.equal(result.pullError, syncErr);
+    assert.equal(result.exportError, exportErr);
+    assert.equal(result.destroyed, true);
+    assert.equal(lc.get("box-1")!.state, "destroyed");
   });
 });

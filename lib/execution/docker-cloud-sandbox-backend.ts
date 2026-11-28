@@ -152,7 +152,11 @@ export type ExecGuard = (req: ExecRequest) => void;
  * touch the network or real credentials.
  */
 export interface DockerCloudClient {
-  /** Provisions a sandbox and returns its id. */
+  /**
+   * Provisions a sandbox and returns its id. The adapter MUST persist
+   * `spec.labels` on the remote sandbox so a later label-filtered lookup
+   * (e.g. by `git-graveyard.idempotency-key`) can re-attach it after a restart.
+   */
   createSandbox(spec: SandboxSpec): Promise<{ id: string }>;
   /** Re-attaches an existing sandbox by id, or undefined if not found. */
   getSandbox(id: string): Promise<{ id: string; labels?: Record<string, string> } | undefined>;
@@ -349,6 +353,8 @@ export class DockerCloudSandboxBackend implements ExecutionBackend {
     string,
     DockerCloudSandbox | Promise<DockerCloudSandbox>
   >();
+  /** Ids destroyed in this process; never re-attached or cached again. */
+  private readonly destroyedIds = new Set<string>();
   /** Exec idempotency keys (`sandboxId:idempotencyKey`) mapped to in-flight outcomes. */
   private readonly execIdempotency = new Map<string, Promise<CloudExecOutcome>>();
   /** Shared Topology P-B + env denylist guard enforced on every exec path. */
@@ -493,30 +499,39 @@ export class DockerCloudSandboxBackend implements ExecutionBackend {
     resolvedSpec: SandboxSpec,
     spec: SandboxSpec
   ): Promise<DockerCloudSandbox> {
+    // Build the merged labels before contacting the client so the adapter can
+    // persist them on the remote sandbox. Merge order lets callers add their
+    // own labels but never override the reserved `git-graveyard.*` keys.
+    const labels: Record<string, string> = {
+      ...(spec.labels ?? {}),
+      ...(this.options.labels ?? {}),
+      "git-graveyard.managed": "true",
+      "git-graveyard.idempotency-key": idempotencyKey,
+    };
+    const specWithLabels: SandboxSpec = { ...resolvedSpec, labels };
+
     const matches = await this.options.client.listSandboxes({
       "git-graveyard.idempotency-key": idempotencyKey,
     });
     // The client is not required to honour the label filter, so only a sandbox
     // that actually carries this idempotency key may be re-attached; anything
-    // else would hand this run another run's sandbox.
+    // else would hand this run another run's sandbox. A sandbox destroyed while
+    // this list was in flight must not be cached or returned.
     const match = matches.find(
-      (s) => s.labels?.["git-graveyard.idempotency-key"] === idempotencyKey
+      (s) =>
+        s.labels?.["git-graveyard.idempotency-key"] === idempotencyKey &&
+        !this.destroyedIds.has(s.id)
     );
     if (match) {
-      return this.attach(match.id, match.labels, idempotencyKey);
+      const attached = this.attach(match.id, match.labels, idempotencyKey);
+      if (attached) return attached;
     }
 
-    const { id } = await this.options.client.createSandbox(resolvedSpec);
-    const labels: Record<string, string> = {
-      "git-graveyard.managed": "true",
-      "git-graveyard.idempotency-key": idempotencyKey,
-      ...(this.options.labels ?? {}),
-      ...(spec.labels ?? {}),
-    };
+    const { id } = await this.options.client.createSandbox(specWithLabels);
     const sandbox = new DockerCloudSandbox(
       id,
       this.options.client,
-      spec,
+      specWithLabels,
       this.separateStderr,
       labels,
       this.execGuard
@@ -534,7 +549,9 @@ export class DockerCloudSandboxBackend implements ExecutionBackend {
     id: string,
     labels: Record<string, string> | undefined,
     idempotencyKey: string
-  ): DockerCloudSandbox {
+  ): DockerCloudSandbox | undefined {
+    // Never re-attach or cache a sandbox that was destroyed in this process.
+    if (this.destroyedIds.has(id)) return undefined;
     let sandbox = this.sandboxesById.get(id);
     if (!sandbox) {
       sandbox = new DockerCloudSandbox(
@@ -556,6 +573,7 @@ export class DockerCloudSandboxBackend implements ExecutionBackend {
 async get(id: string): Promise<DockerCloudSandbox | undefined> {
     const local = this.sandboxesById.get(id);
     if (local) return local;
+    if (this.destroyedIds.has(id)) return undefined;
     const remote = await this.options.client.getSandbox(id);
     if (!remote) return undefined;
     return this.attach(
@@ -574,6 +592,7 @@ async get(id: string): Promise<DockerCloudSandbox | undefined> {
         remote.labels,
         remote.labels?.["git-graveyard.idempotency-key"] ?? ""
       );
+      if (!sandbox) continue;
       if (this.matchesLabels(sandbox.labels, labels)) {
         result.push(sandbox);
       }
@@ -609,6 +628,9 @@ async get(id: string): Promise<DockerCloudSandbox | undefined> {
     for (const key of [...this.execIdempotency.keys()]) {
       if (key.startsWith(prefix)) this.execIdempotency.delete(key);
     }
+    // Record the id so a sandbox destroyed while an await was in flight is
+    // never re-attached or cached again by this backend.
+    this.destroyedIds.add(id);
   }
 
   /** Prohibits snapshot creation. */
