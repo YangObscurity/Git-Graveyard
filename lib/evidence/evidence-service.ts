@@ -191,7 +191,9 @@ export function mapHistoryRun(raw: RawHistoryRun): PublishedRunEvidence {
     modelId: toStringValue(s.modelId ?? s.model),
     kiroCliVersion: toStringValue(s.kiroCliVersion ?? s.version),
     sessionId: toStringValue(s.sessionId ?? s.session_id),
-    timestamp: toNumberValue(s.timestamp ?? s.ts, toNumberValue(raw.createdAt, 0)),
+    // A skeleton without a valid numeric timestamp falls back to 0 so the
+    // component renders "None found" rather than inheriting the run's createdAt.
+    timestamp: toNumberValue(s.timestamp ?? s.ts, 0),
   }));
   return {
     runId: toStringValue(raw.runId),
@@ -204,15 +206,22 @@ export function mapHistoryRun(raw: RawHistoryRun): PublishedRunEvidence {
 
 /**
  * Fetch the three most recent published runs' Skeleton records from
- * `GET /api/history?fields=kiro`. Returns [] on any failure (never throws).
+ * `GET /api/history?fields=kiro`. When `baseUrl` is a non-empty origin it is
+ * used as the request prefix (with any trailing slashes trimmed) so server-side
+ * callers can pass an explicit origin; otherwise the relative path is used.
+ * Returns [] on any failure (never throws).
  */
 export async function fetchRecentKiroRuns(
   limit = 3,
-  fetchImpl: typeof fetch | undefined = typeof fetch === "function" ? fetch : undefined
+  fetchImpl: typeof fetch | undefined = typeof fetch === "function" ? fetch : undefined,
+  baseUrl?: string
 ): Promise<PublishedRunEvidence[]> {
   if (!fetchImpl) return [];
   try {
-    const res = await fetchImpl(`/api/history?fields=kiro&limit=${limit}`);
+    const base = typeof baseUrl === "string" ? baseUrl.replace(/\/+$/, "") : "";
+    const path = `/api/history?fields=kiro&limit=${limit}`;
+    const url = base.length > 0 ? `${base}${path}` : path;
+    const res = await fetchImpl(url);
     if (!res.ok) return [];
     const json = (await res.json()) as unknown;
     if (!Array.isArray(json)) return [];
@@ -225,11 +234,12 @@ export async function fetchRecentKiroRuns(
 /** Load build evidence and merge the three most recent published runs. */
 export async function loadEvidenceBundle(
   repoRoot?: string,
-  fetchImpl?: typeof fetch
+  fetchImpl?: typeof fetch,
+  baseUrl?: string
 ): Promise<EvidenceBundle> {
   const [build, recentRuns] = await Promise.all([
     loadBuildEvidence(repoRoot),
-    fetchRecentKiroRuns(3, fetchImpl),
+    fetchRecentKiroRuns(3, fetchImpl, baseUrl),
   ]);
   return { build, recentRuns };
 }

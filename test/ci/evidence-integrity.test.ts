@@ -5,6 +5,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
+import { buildKiroEvidence } from "../../scripts/evidence/build-evidence";
+
 /**
  * Task 26.2 / Requirements 48.6 — CI verification of Kiro evidence integrity.
  *
@@ -107,6 +109,111 @@ function catFileType(sha: string): string | null {
   }
 }
 
+/** True when the repository at `root` is a shallow clone. */
+function gitIsShallow(root: string = REPO_ROOT): boolean {
+  try {
+    const out = execFileSync("git", ["rev-parse", "--is-shallow-repository"], {
+      cwd: root,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return out.trim() === "true";
+  } catch {
+    return false;
+  }
+}
+
+/** True when `sha` is an ancestor of `ref` in the repository at `root`. */
+function isAncestor(sha: string, ref: string, root: string = REPO_ROOT): boolean {
+  try {
+    execFileSync("git", ["merge-base", "--is-ancestor", sha, ref], {
+      cwd: root,
+      stdio: "ignore",
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+interface BuildInventories {
+  specs: Array<{ path: string }>;
+  steering: Array<{ path: string }>;
+  hooks: Array<{ name: string; trigger: string; matcher?: string; command?: string }>;
+  agents: Array<{ path: string }>;
+}
+
+function hookKey(h: {
+  name: string;
+  trigger: string;
+  matcher?: string;
+  command?: string;
+}): string {
+  return [h.name, h.trigger, h.matcher ?? "", h.command ?? ""].join("\u0000");
+}
+
+/**
+ * Compare the committed artifact inventories against freshly-derived ones.
+ * Returns a list of human-readable problems (empty when the committed evidence
+ * is up to date).
+ */
+function diffInventories(committed: EvidenceDoc, expected: BuildInventories): string[] {
+  const problems: string[] = [];
+  const specsCommitted = committed.specs.map((s) => s.path).sort();
+  const specsExpected = expected.specs.map((s) => s.path).sort();
+  if (specsCommitted.join("\n") !== specsExpected.join("\n")) {
+    problems.push(
+      `specs inventory is stale (committed ${specsCommitted.length}, derived ${specsExpected.length})`
+    );
+  }
+  const steeringCommitted = committed.steering.map((s) => s.path).sort();
+  const steeringExpected = expected.steering.map((s) => s.path).sort();
+  if (steeringCommitted.join("\n") !== steeringExpected.join("\n")) {
+    problems.push(
+      `steering inventory is stale (committed ${steeringCommitted.length}, derived ${steeringExpected.length})`
+    );
+  }
+  const agentsCommitted = committed.agents.map((a) => a.path).sort();
+  const agentsExpected = expected.agents.map((a) => a.path).sort();
+  if (agentsCommitted.join("\n") !== agentsExpected.join("\n")) {
+    problems.push(
+      `agents inventory is stale (committed ${agentsCommitted.length}, derived ${agentsExpected.length})`
+    );
+  }
+  const hooksCommitted = committed.hooks.map(hookKey).sort();
+  const hooksExpected = expected.hooks.map(hookKey).sort();
+  if (hooksCommitted.join("\n") !== hooksExpected.join("\n")) {
+    problems.push(
+      `hooks inventory is stale (committed ${hooksCommitted.length}, derived ${hooksExpected.length})`
+    );
+  }
+  return problems;
+}
+
+/** Create a throwaway two-commit git repository for ancestry helper tests. */
+function makeTempGitRepo(): { dir: string; firstSha: string } {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kiro-evidence-git-"));
+  const git = (args: string[]): void => {
+    execFileSync("git", args, { cwd: dir, stdio: "ignore" });
+  };
+  git(["init", "-q"]);
+  git(["config", "user.email", "test@example.com"]);
+  git(["config", "user.name", "Test"]);
+  git(["config", "commit.gpgsign", "false"]);
+  fs.writeFileSync(path.join(dir, "a.txt"), "a\n");
+  git(["add", "a.txt"]);
+  git(["commit", "-q", "-m", "first"]);
+  const firstSha = execFileSync("git", ["rev-parse", "HEAD"], {
+    cwd: dir,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+  }).trim();
+  fs.writeFileSync(path.join(dir, "b.txt"), "b\n");
+  git(["add", "b.txt"]);
+  git(["commit", "-q", "-m", "second"]);
+  return { dir, firstSha };
+}
+
 describe("Task 26.2 / Requirement 48.6: Kiro evidence integrity", () => {
   const evidence = loadEvidence();
 
@@ -195,6 +302,45 @@ describe("Task 26.2 / Requirement 48.6: Kiro evidence integrity", () => {
     }
   });
 
+  it("lists only commit SHAs that are ancestors of HEAD in a full clone", (ctx) => {
+    if (!gitAvailable()) {
+      ctx.skip("git is unavailable (source-archive run); skipping ancestry checks");
+      return;
+    }
+    if (gitIsShallow()) {
+      ctx.skip("shallow clone; skipping ancestry checks");
+      return;
+    }
+    for (const link of evidence.commitLinks) {
+      assert.ok(
+        isAncestor(link.sha, "HEAD"),
+        `commit ${link.sha} must be an ancestor of HEAD`
+      );
+    }
+  });
+
+  it("derives the artifact from a commit that is an ancestor of HEAD", (ctx) => {
+    if (!gitAvailable()) {
+      ctx.skip("git is unavailable (source-archive run); skipping ancestry checks");
+      return;
+    }
+    if (gitIsShallow()) {
+      ctx.skip("shallow clone; skipping ancestry checks");
+      return;
+    }
+    if (evidence.generatedFromSha.length === 0) return;
+    assert.ok(
+      isAncestor(evidence.generatedFromSha, "HEAD"),
+      `generatedFromSha ${evidence.generatedFromSha} must be an ancestor of HEAD`
+    );
+  });
+
+  it("matches a fresh build for specs, steering, hooks and agents (no stale inventory)", () => {
+    const expected = buildKiroEvidence(REPO_ROOT);
+    const problems = diffInventories(evidence, expected);
+    assert.deepEqual(problems, [], `stale evidence inventories:\n${problems.join("\n")}`);
+  });
+
   it("does not leak author emails into commit links", () => {
     for (const link of evidence.commitLinks) {
       assert.ok(!link.subject.includes("@"), `subject must not contain an email: ${link.subject}`);
@@ -210,5 +356,72 @@ describe("Task 26.2 / Requirement 48.6: Kiro evidence integrity", () => {
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("Kiro evidence integrity helpers (synthetic fixtures)", () => {
+  it("isAncestor detects ancestry and rejects unknown shas in a synthetic repo", (ctx) => {
+    let repo: { dir: string; firstSha: string };
+    try {
+      repo = makeTempGitRepo();
+    } catch {
+      ctx.skip("git is unavailable; skipping synthetic ancestry test");
+      return;
+    }
+    try {
+      assert.equal(isAncestor(repo.firstSha, "HEAD", repo.dir), true);
+      assert.equal(isAncestor("HEAD", "HEAD", repo.dir), true);
+      assert.equal(
+        isAncestor("0000000000000000000000000000000000000000", "HEAD", repo.dir),
+        false
+      );
+    } finally {
+      fs.rmSync(repo.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("gitIsShallow is false for a freshly created repository", (ctx) => {
+    let repo: { dir: string; firstSha: string };
+    try {
+      repo = makeTempGitRepo();
+    } catch {
+      ctx.skip("git is unavailable; skipping shallow-repo test");
+      return;
+    }
+    try {
+      assert.equal(gitIsShallow(repo.dir), false);
+    } finally {
+      fs.rmSync(repo.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("diffInventories reports stale specs and passes when inventories match", () => {
+    const committed: EvidenceDoc = {
+      schemaVersion: "v1",
+      generatedFromSha: "",
+      specs: [{ path: ".kiro/specs/a/design.md", name: "a" }],
+      steering: [],
+      hooks: [],
+      agents: [],
+      commitLinks: [],
+    };
+    const stale = diffInventories(committed, {
+      specs: [
+        { path: ".kiro/specs/a/design.md" },
+        { path: ".kiro/specs/b/design.md" },
+      ],
+      steering: [],
+      hooks: [],
+      agents: [],
+    });
+    assert.ok(stale.some((p) => p.startsWith("specs")));
+
+    const fresh = diffInventories(committed, {
+      specs: [{ path: ".kiro/specs/a/design.md" }],
+      steering: [],
+      hooks: [],
+      agents: [],
+    });
+    assert.deepEqual(fresh, []);
   });
 });

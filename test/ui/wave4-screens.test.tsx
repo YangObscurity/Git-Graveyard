@@ -100,6 +100,29 @@ describe("Task 24.4 Gate: HealthBadge production & auth-failure states", () => {
     assert.ok(html.includes("Live runs: unavailable"));
     assert.ok(html.includes('data-ui-state="unavailable"'));
   });
+
+  it("suppresses 'waking up' when no development opt-in is given (the GateView path)", () => {
+    // GateView renders HealthBadge without isProd/environment, so a bare badge
+    // must never surface the transient "waking up" phrase.
+    const html = render(<HealthBadge badgeText="waking up" loading={false} />);
+    assert.ok(!html.includes("waking up"));
+    assert.ok(html.includes("Live runs: unavailable"));
+    assert.ok(html.includes('data-ui-state="unavailable"'));
+  });
+
+  it("still shows 'waking up' when the caller explicitly opts into development", () => {
+    const viaFlag = render(
+      <HealthBadge isProd={false} badgeText="waking up" loading={false} />
+    );
+    assert.ok(viaFlag.includes("waking up"));
+    assert.ok(!viaFlag.includes("Live runs: unavailable"));
+
+    const viaEnv = render(
+      <HealthBadge environment="development" badgeText="waking up" loading={false} />
+    );
+    assert.ok(viaEnv.includes("waking up"));
+    assert.ok(!viaEnv.includes("Live runs: unavailable"));
+  });
 });
 
 describe("Task 24.4 Gate: distinct invite-code messages", () => {
@@ -133,17 +156,21 @@ describe("Task 24.4 Gate: distinct invite-code messages", () => {
 });
 
 describe("Task 24.4 Gate: formatted GitHub reset time", () => {
-  it("formats an ISO timestamp as hh:mm", () => {
-    const d = new Date(2024, 0, 1, 14, 5, 0);
-    assert.equal(formatGithubResetTime(d.toISOString()), "14:05");
+  it("formats a valid ISO timestamp as an explicit UTC clock time", () => {
+    assert.equal(formatGithubResetTime("2024-01-01T14:05:00.000Z"), "14:05 UTC");
   });
-  it("formats epoch seconds as hh:mm", () => {
-    const d = new Date(2024, 0, 1, 9, 30, 0);
-    assert.equal(formatGithubResetTime(Math.floor(d.getTime() / 1000)), "09:30");
+  it("formats epoch seconds as an explicit UTC clock time", () => {
+    assert.equal(formatGithubResetTime(1704110400), "12:00 UTC");
   });
-  it("returns a placeholder when nothing is reported", () => {
-    assert.equal(formatGithubResetTime(undefined), "a later time");
-    assert.equal(formatGithubResetTime(null), "a later time");
+  it("reports a missing, empty, or 'not reported' reset time plainly", () => {
+    assert.equal(formatGithubResetTime(undefined), "The reset time was not reported.");
+    assert.equal(formatGithubResetTime(null), "The reset time was not reported.");
+    assert.equal(formatGithubResetTime("not reported"), "The reset time was not reported.");
+    assert.equal(formatGithubResetTime("NOT REPORTED"), "The reset time was not reported.");
+    assert.equal(formatGithubResetTime(""), "The reset time was not reported.");
+  });
+  it("reports an unparseable reset time plainly", () => {
+    assert.equal(formatGithubResetTime("sometime soon"), "The reset time was not reported.");
   });
 });
 
@@ -257,13 +284,12 @@ describe("Task 24.5 Tombstone: distinct error states", () => {
     assert.match(r.explanation, /pyproject\.toml/);
   });
   it("RATE_LIMITED shows the formatted reset time", () => {
-    const d = new Date(2024, 0, 1, 16, 45, 0);
     const r = describeTombstoneError({
       code: "RATE_LIMITED",
       message: "boom",
-      resetTime: d.toISOString(),
+      resetTime: "2024-01-01T16:45:00.000Z",
     });
-    assert.match(r.explanation, /resets at: 16:45/);
+    assert.match(r.explanation, /resets at: 16:45 UTC/);
   });
 });
 

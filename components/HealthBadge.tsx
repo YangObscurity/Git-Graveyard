@@ -20,7 +20,7 @@ export interface HealthBadgeProps {
    */
   isProd?: boolean;
   environment?: string;
-  /** Admission is stopped because the invite code was rejected. */
+  /** Admission is stopped because of an authentication failure. */
   authFailure?: boolean;
   /** Live runs could not be read at all. */
   liveRunsUnavailable?: boolean;
@@ -148,13 +148,14 @@ export function HealthBadge({
     }
   }
 
-  // Ensure "waking up" is never displayed in production mode (Requirement 34.2).
-  // Outside production the phrase may be shown, but never in production.
-  const isProd =
-    typeof propIsProd === "boolean"
-      ? propIsProd
-      : (environment ?? "").toLowerCase() === "production";
-  if (isProd && displayText.toLowerCase().includes("waking up")) {
+  // Suppress the transient "waking up" phrase unless the caller explicitly opts
+  // into development. It is hidden in production and whenever neither `isProd`
+  // nor `environment` marks the render as development, so a bare badge (or one
+  // rendered by a parent that passes neither prop) never surfaces "waking up".
+  const suppressWakingUp =
+    propIsProd !== false &&
+    (environment ?? "").toLowerCase() !== "development";
+  if (suppressWakingUp && displayText.toLowerCase().includes("waking up")) {
     displayText = "Live runs: unavailable";
     statusKey = "unavailable";
   }

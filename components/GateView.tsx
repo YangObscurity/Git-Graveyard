@@ -14,12 +14,21 @@ import { StatusPill } from "./ui/StatusPill";
 
 /**
  * Formats a GitHub rate-limit reset value (ISO timestamp or epoch seconds or
- * milliseconds) as a local `hh:mm` clock string. Returns the input unchanged
- * when it cannot be parsed so nothing is invented.
+ * milliseconds) as an explicit UTC `HH:MM UTC` clock string so the server and
+ * client render the same value deterministically. When the value is missing,
+ * empty, the literal "not reported", or cannot be parsed, it returns a plain
+ * "The reset time was not reported." sentence so nothing is invented.
  */
 export function formatGithubResetTime(resetAt?: string | number | null): string {
-  if (resetAt === null || resetAt === undefined || resetAt === "") {
-    return "a later time";
+  const notReported = "The reset time was not reported.";
+  if (resetAt === null || resetAt === undefined) {
+    return notReported;
+  }
+  if (typeof resetAt === "string") {
+    const trimmed = resetAt.trim();
+    if (trimmed === "" || trimmed.toLowerCase() === "not reported") {
+      return notReported;
+    }
   }
   let date: Date;
   if (typeof resetAt === "number") {
@@ -36,11 +45,11 @@ export function formatGithubResetTime(resetAt?: string | number | null): string 
     }
   }
   if (Number.isNaN(date.getTime())) {
-    return String(resetAt);
+    return notReported;
   }
-  const hh = String(date.getHours()).padStart(2, "0");
-  const mm = String(date.getMinutes()).padStart(2, "0");
-  return `${hh}:${mm}`;
+  const hh = String(date.getUTCHours()).padStart(2, "0");
+  const mm = String(date.getUTCMinutes()).padStart(2, "0");
+  return `${hh}:${mm} UTC`;
 }
 
 /**

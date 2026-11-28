@@ -130,6 +130,28 @@ describe("Task 26.3: evidence-service loader", () => {
     assert.ok(bundle.build.specs.length > 0);
     assert.equal(bundle.recentRuns.length, 1);
   });
+
+  it("honors an explicit baseUrl (trimming trailing slashes) when fetching recent runs", async () => {
+    const calls: string[] = [];
+    const stub = (async (input: string | URL | Request) => {
+      calls.push(String(input));
+      return {
+        ok: true,
+        json: async () => [{ runId: "r1", skeletons: [] }],
+      } as Response;
+    }) as unknown as typeof fetch;
+    await fetchRecentKiroRuns(3, stub, "https://example.test/");
+    assert.equal(calls[0], "https://example.test/api/history?fields=kiro&limit=3");
+  });
+
+  it("maps a skeleton without a numeric timestamp to 0 even when the run has createdAt", () => {
+    const mapped = mapHistoryRun({
+      runId: "run-no-ts",
+      createdAt: 1700000000000,
+      skeletons: [{ role: "builder", agentName: "soul-stitcher" }],
+    });
+    assert.equal(mapped.skeletons[0].timestamp, 0);
+  });
 });
 
 describe("Task 26.3: BuiltWithKiroEvidence component", () => {
@@ -337,11 +359,17 @@ describe("Task 26.4: ReliquaryView Open in Kiro handoff gating", () => {
 
 describe("Open in Kiro handoff: verification commands follow the recorded certificate", () => {
   const RESUME_TITLE = "Resume development locally with the Kiro CLI";
+  const VERIFY_TITLE = "Verify locally in your shell";
 
   function resumeCommands(plan: ReturnType<typeof buildKiroHandoff>): string[] {
     const step = plan.steps.find((s) => s.title === RESUME_TITLE);
     assert.ok(step, "resume step must exist");
     return step!.commands;
+  }
+
+  function verifyCommands(plan: ReturnType<typeof buildKiroHandoff>): string[] {
+    const step = plan.steps.find((s) => s.title === VERIFY_TITLE);
+    return step ? step.commands : [];
   }
 
   it("emits the recorded python install and test commands and omits the build", () => {
@@ -366,7 +394,12 @@ describe("Open in Kiro handoff: verification commands follow the recorded certif
       certificate,
     });
 
-    const commands = resumeCommands(plan);
+    // REPL step stays limited to launching the CLI and running the spec.
+    const repl = resumeCommands(plan);
+    assert.deepEqual(repl, ["kiro-cli", "/spec run resurrection"]);
+
+    // Shell verification commands live in their own step, never in the REPL.
+    const commands = verifyCommands(plan);
     assert.ok(commands.includes("pip install -r requirements.txt"));
     assert.ok(commands.includes("pytest"));
     // The build was recorded as "not run", so no build command may appear.
@@ -376,9 +409,10 @@ describe("Open in Kiro handoff: verification commands follow the recorded certif
 
     const text = formatKiroHandoffText(plan);
     assert.ok(!text.includes("npm"));
+    assert.ok(text.includes(VERIFY_TITLE));
 
-    const step = plan.steps.find((s) => s.title === RESUME_TITLE);
-    assert.match(step!.detail, /recorded verification commands from the certificate/);
+    const verifyStep = plan.steps.find((s) => s.title === VERIFY_TITLE);
+    assert.match(verifyStep!.detail, /in your own shell/);
   });
 
   it("omits pytest and the build when no tests were found", () => {
@@ -437,6 +471,9 @@ describe("Open in Kiro handoff: verification commands follow the recorded certif
     assert.ok(!commands.includes("npm test"));
     // Only the CLI invocation and spec run remain.
     assert.deepEqual(commands, ["kiro-cli", "/spec run resurrection"]);
+    // No certificate means no shell verification step is appended.
+    assert.equal(verifyCommands(plan).length, 0);
+    assert.ok(!plan.steps.some((s) => s.title === VERIFY_TITLE));
 
     const text = formatKiroHandoffText(plan);
     assert.ok(!text.includes("npm install"));
@@ -662,5 +699,59 @@ describe("ReliquaryView Open in Kiro handoff: pure before/after derivation", () 
     );
     assert.ok(html.includes('data-testid="open-in-kiro-handoff"'));
     assert.ok(!html.includes("npm run build"));
+  });
+});
+describe("Open in Kiro handoff: REPL and shell verification steps are separated", () => {
+  const RESUME_TITLE = "Resume development locally with the Kiro CLI";
+  const VERIFY_TITLE = "Verify locally in your shell";
+
+  it("keeps the REPL commands separate from the shell verification step", () => {
+    const plan = buildKiroHandoff({
+      owner: "octocat",
+      repo: "legacy",
+      baseSha: "abc1234def",
+      runId: "run-split",
+      verificationCommands: ["pytest -q", "npm run lint"],
+    });
+
+    const resume = plan.steps.find((s) => s.title === RESUME_TITLE);
+    const verify = plan.steps.find((s) => s.title === VERIFY_TITLE);
+    assert.ok(resume, "resume step must exist");
+    assert.ok(verify, "verify step must exist when verification commands are recorded");
+
+    // The REPL step only launches the CLI and runs the spec.
+    assert.deepEqual(resume!.commands, ["kiro-cli", "/spec run resurrection"]);
+    // Shell verification commands are isolated in their own step.
+    assert.deepEqual(verify!.commands, ["pytest -q", "npm run lint"]);
+    // The REPL step never contains the shell verification commands.
+    assert.ok(!resume!.commands.some((c) => verify!.commands.includes(c)));
+  });
+
+  it("omits the shell verification step when no verification commands are recorded", () => {
+    const plan = buildKiroHandoff({
+      owner: "octocat",
+      repo: "legacy",
+      baseSha: "abc1234def",
+      runId: "run-no-verify",
+    });
+    assert.ok(!plan.steps.some((s) => s.title === VERIFY_TITLE));
+    const resume = plan.steps.find((s) => s.title === RESUME_TITLE);
+    assert.deepEqual(resume!.commands, ["kiro-cli", "/spec run resurrection"]);
+  });
+
+  it("states the downloaded spec/ directory goes inside the clone directory", () => {
+    const plan = buildKiroHandoff({
+      owner: "octocat",
+      repo: "legacy",
+      baseSha: "abc1234def",
+      runId: "run-spec-dir",
+    });
+    const copyStep = plan.steps.find(
+      (s) => s.title === "Copy the spec bundle into Kiro's spec folder"
+    );
+    assert.ok(copyStep, "spec copy step must exist");
+    assert.ok(copyStep!.detail.includes(plan.cloneDir));
+    assert.match(copyStep!.detail, /inside /);
+    assert.ok(copyStep!.commands.includes(`cp -R spec/. ${plan.specCopyTarget}`));
   });
 });

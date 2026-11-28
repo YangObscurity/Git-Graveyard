@@ -234,10 +234,10 @@ export function buildKiroHandoff(input: KiroHandoffInput): KiroHandoffPlan {
     {
       title: "Copy the spec bundle into Kiro's spec folder",
       detail:
-        "Place the downloaded spec/ bundle directory alongside the clone (or copy it " +
-        "from the downloaded spec export) so the copy source is available, then copy " +
-        "the generated spec/ directory into the Kiro specs folder so the spec appears " +
-        "in the Kiro IDE / CLI.",
+        `Place the downloaded spec/ bundle directory inside ${cloneDir} (the clone ` +
+        "created in the previous step) so the copy source sits next to the checked-out " +
+        "tree, then copy the generated spec/ directory into the Kiro specs folder so " +
+        "the spec appears in the Kiro IDE / CLI.",
       commands: [
         `mkdir -p ${specCopyTarget}`,
         `cp -R spec/. ${specCopyTarget}`,
@@ -246,15 +246,22 @@ export function buildKiroHandoff(input: KiroHandoffInput): KiroHandoffPlan {
     {
       title: "Resume development locally with the Kiro CLI",
       detail:
-        verificationCommands.length > 0
-          ? "Run the spec to resume the resurrection workflow, then run the recorded verification commands from the certificate."
-          : "Run the spec to resume the resurrection workflow, then run the verification commands recorded in the Death Certificate (inapplicable build/test steps are omitted).",
-      commands: [
-        `kiro-cli`,
-        `/spec run ${specRunName}`,
-        ...verificationCommands,
-      ],
+        "Run these inside the Kiro CLI session to resume the resurrection workflow " +
+        "for the applied spec.",
+      commands: [`kiro-cli`, `/spec run ${specRunName}`],
     },
+    ...(verificationCommands.length > 0
+      ? [
+          {
+            title: "Verify locally in your shell",
+            detail:
+              "Run these recorded verification commands from the Death Certificate " +
+              "in your own shell (not inside the Kiro CLI); inapplicable build/test " +
+              "steps are omitted.",
+            commands: verificationCommands,
+          },
+        ]
+      : []),
   ];
 
   return {

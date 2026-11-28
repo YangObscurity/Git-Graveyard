@@ -821,7 +821,7 @@ Implementation plan for the resurrection engine (design Revision 4). It follows 
     - **Validates: Requirements 30.10, 30.11, 40.1, 40.2**
     - Implement property-based test with fast-check in test/props/metric-provenance.test.ts generating arbitrary runs, missing fields, and command results to assert that every displayed number maps to an R4-13 source or renders not available or not reported, with zero estimated numerals
     - _Requirements: 30.10, 30.11, 40.1, 40.2_
-  - [x] 25.3 Implement English copy rules, forbidden claims linter, and gothic glossing
+  - [ ] 25.3 Implement English copy rules, forbidden claims linter, and gothic glossing
     - Write components/GlossedTerm.tsx using lib/copy/glossary.ts from 3.3 to show plain-English glosses upon first appearance of gothic terms (Necromancer, Skeleton, Grimoire, Pact, Death_Certificate, Legion, Reliquary, Lay_to_rest)
     - Enforce English-only text across all user-facing UI components, restricting the gothic voice strictly to headings and empty states, and ensuring error messages provide plain words stating what action to take next
     - Enforce exact Kiro role description Skeleton sessions run on Kiro CLI. and Gate footer statement Git-Graveyard is an independent project., and implement lib/copy/claims-linter.ts asserting absence of forbidden claims (X% faster, hours saved, production ready, safe, understood, or Kiro product)
@@ -842,7 +842,7 @@ Implementation plan for the resurrection engine (design Revision 4). It follows 
     - Execute automated axe-core accessibility audit using npm run test:e2e asserting zero violations of impact serious or critical across all states
     - _Requirements: 46.1_
 
-- [x] 26. [Teammate — Pure Code, Build Script & UI Component] Built with Kiro evidence builder and Open in Kiro handoff
+- [ ] 26. [Teammate — Pure Code, Build Script & UI Component] Built with Kiro evidence builder and Open in Kiro handoff
   - [x] 26.1 Implement build-time Kiro evidence builder script
     - Write scripts/evidence/build-evidence.ts and package.json script evidence:build generating kiro-evidence.json adhering to the verified build evidence schema
     - Scan repository and index only verified existing files: specs (.kiro/specs/**), steering files with their inclusion mode (.kiro/steering/**), hooks with their triggers (.kiro/hooks/*.json), role agent templates (lib/agents/templates/**), and spec-to-task-to-commit links derived from git log
@@ -852,7 +852,7 @@ Implementation plan for the resurrection engine (design Revision 4). It follows 
     - Write test/ci/evidence-integrity.test.ts verifying that every file path listed in kiro-evidence.json exists in the repository
     - Fail CI execution if kiro-evidence.json contains non-existent paths, stale commit links, or invalid schema formatting
     - _Requirements: 48.6_
-  - [x] 26.3 Implement Built with Kiro evidence runtime data loader and page integration
+  - [ ] 26.3 Implement Built with Kiro evidence runtime data loader and page integration
     - Write lib/evidence/evidence-service.ts loading kiro-evidence.json and fetching GET /api/history?fields=kiro to feed app/built-with-kiro/page.tsx
     - Render build-time evidence in components/BuiltWithKiroEvidence.tsx showing specs, steering files, hooks, and committed role agent templates with configured tool permissions from lib/agents/templates/
     - Extract from the three most recent published runs each Skeleton's role, agent name, model ID, kiro-cli version, session ID, and timestamp from run.started and skeleton.raised events

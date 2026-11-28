@@ -272,12 +272,18 @@ export function parseEventsData(events: EventEnvelope[]): {
     if (ev.kind === "command.result") {
       const d = ev.data as Record<string, unknown>;
       const step = typeof d?.step === "string" ? d.step : undefined;
-      const commandLine =
-        typeof d?.commandLine === "string"
-          ? d.commandLine
-          : typeof d?.command === "string"
-            ? d.command
-            : undefined;
+      // Prefer a recorded argv array (each element shell-quoted individually by
+      // the handoff builder) over a flattened commandLine/command string so
+      // arguments with spaces or shell metacharacters keep their quoting.
+      const argv = d?.argv;
+      let commandLine: string | string[] | undefined;
+      if (Array.isArray(argv) && argv.every((x) => typeof x === "string")) {
+        commandLine = argv as string[];
+      } else if (typeof d?.commandLine === "string") {
+        commandLine = d.commandLine;
+      } else if (typeof d?.command === "string") {
+        commandLine = d.command;
+      }
       const status = typeof d?.status === "string" ? d.status : undefined;
       const noTestsFound = d?.noTestsFound === true;
       if (step !== undefined || commandLine !== undefined || status !== undefined) {

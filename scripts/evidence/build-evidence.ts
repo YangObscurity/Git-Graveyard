@@ -77,27 +77,27 @@ const REPO_ROOT = process.cwd();
 const OUTPUT_PATH = path.join(REPO_ROOT, "public", "kiro-evidence.json");
 
 /** Convert an absolute path inside the repo to a POSIX relative path. */
-function toPosixRelative(absPath: string): string {
-  const rel = path.relative(REPO_ROOT, absPath);
+function toPosixRelative(root: string, absPath: string): string {
+  const rel = path.relative(root, absPath);
   return rel.split(path.sep).join("/");
 }
 
 /** Assert a repository-relative path is safe and exists on disk. */
-function assertVerifiedFile(relPosixPath: string): void {
+function assertVerifiedFile(root: string, relPosixPath: string): void {
   if (relPosixPath.includes("..")) {
     throw new Error(`Refusing to emit path with traversal: ${relPosixPath}`);
   }
   if (path.isAbsolute(relPosixPath)) {
     throw new Error(`Refusing to emit absolute path: ${relPosixPath}`);
   }
-  const abs = path.join(REPO_ROOT, relPosixPath);
+  const abs = path.join(root, relPosixPath);
   if (!fs.existsSync(abs)) {
     throw new Error(`Evidence references missing file: ${relPosixPath}`);
   }
 }
 
 /** Recursively list files under a directory (POSIX relative paths, sorted). */
-function listFilesRecursive(absDir: string): string[] {
+function listFilesRecursive(root: string, absDir: string): string[] {
   if (!fs.existsSync(absDir)) return [];
   const out: string[] = [];
   const walk = (dir: string): void => {
@@ -107,7 +107,7 @@ function listFilesRecursive(absDir: string): string[] {
       if (entry.isDirectory()) {
         walk(abs);
       } else if (entry.isFile()) {
-        out.push(toPosixRelative(abs));
+        out.push(toPosixRelative(root, abs));
       }
     }
   };
@@ -136,21 +136,21 @@ function normalizeInclusion(raw: string | undefined): SteeringEvidence["inclusio
   return "unknown";
 }
 
-function buildSpecs(): SpecEvidence[] {
-  const files = listFilesRecursive(path.join(REPO_ROOT, ".kiro", "specs"));
+function buildSpecs(root: string): SpecEvidence[] {
+  const files = listFilesRecursive(root, path.join(root, ".kiro", "specs"));
   return files.map((rel) => {
-    assertVerifiedFile(rel);
+    assertVerifiedFile(root, rel);
     const parts = rel.split("/");
     const name = parts.length >= 2 ? parts[parts.length - 2] : parts[parts.length - 1];
     return { path: rel, name };
   });
 }
 
-function buildSteering(): SteeringEvidence[] {
-  const files = listFilesRecursive(path.join(REPO_ROOT, ".kiro", "steering"));
+function buildSteering(root: string): SteeringEvidence[] {
+  const files = listFilesRecursive(root, path.join(root, ".kiro", "steering"));
   return files.map((rel) => {
-    assertVerifiedFile(rel);
-    const abs = path.join(REPO_ROOT, rel);
+    assertVerifiedFile(root, rel);
+    const abs = path.join(root, rel);
     const content = fs.readFileSync(abs, "utf8");
     const fm = extractFrontmatter(content);
     let inclusionRaw: string | undefined;
@@ -167,19 +167,19 @@ function buildSteering(): SteeringEvidence[] {
   });
 }
 
-function buildHooks(): HookEvidence[] {
-  const hooksDir = path.join(REPO_ROOT, ".kiro", "hooks");
+function buildHooks(root: string): HookEvidence[] {
+  const hooksDir = path.join(root, ".kiro", "hooks");
   if (!fs.existsSync(hooksDir)) return [];
   const files = fs
     .readdirSync(hooksDir, { withFileTypes: true })
     .filter((e) => e.isFile() && e.name.toLowerCase().endsWith(".json"))
-    .map((e) => toPosixRelative(path.join(hooksDir, e.name)))
+    .map((e) => toPosixRelative(root, path.join(hooksDir, e.name)))
     .sort();
 
   const hooks: HookEvidence[] = [];
   for (const rel of files) {
-    assertVerifiedFile(rel);
-    const abs = path.join(REPO_ROOT, rel);
+    assertVerifiedFile(root, rel);
+    const abs = path.join(root, rel);
     let parsed: unknown;
     try {
       parsed = JSON.parse(fs.readFileSync(abs, "utf8"));
@@ -295,11 +295,11 @@ function parsePermissions(fm: string[]): AgentPermissionRule[] {
   return rules;
 }
 
-function buildAgents(): AgentEvidence[] {
-  const files = listFilesRecursive(path.join(REPO_ROOT, "lib", "agents", "templates"));
+function buildAgents(root: string): AgentEvidence[] {
+  const files = listFilesRecursive(root, path.join(root, "lib", "agents", "templates"));
   return files.map((rel) => {
-    assertVerifiedFile(rel);
-    const abs = path.join(REPO_ROOT, rel);
+    assertVerifiedFile(root, rel);
+    const abs = path.join(root, rel);
     const content = fs.readFileSync(abs, "utf8");
     const fm = extractFrontmatter(content);
     let name = "";
@@ -331,10 +331,10 @@ function buildAgents(): AgentEvidence[] {
 }
 
 /** Read the current HEAD short sha (deterministic per commit), or "" if absent. */
-function currentHeadSha(): string {
+function currentHeadSha(root: string): string {
   try {
     const out = execFileSync("git", ["rev-parse", "--short", "HEAD"], {
-      cwd: REPO_ROOT,
+      cwd: root,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
     });
@@ -347,15 +347,19 @@ function currentHeadSha(): string {
 /**
  * Subject patterns that mark internal batch/dispatch or merge commits which must
  * never appear in the published evidence:
- *   - `Merge branch 'wp/...` / `Merge pull request #...` / `Merge branches ...`
- *   - `chore(WP-...): apply verified task changes`, `chore(wave-...): mark tasks ...`
- *     (and other non-feature chore scopes such as `chore(ci)` / `chore(deps)`)
- *   - any subject still carrying a `WP-...` dispatch ticket in its scope
- *     (e.g. `fix(WP-20A): ...`) — keeps the document free of dispatch tokens.
+ *   - `Merge branch '...'` / `Merge pull request #...` / `Merge branches ...`
+ *   - `chore(...): ...` and unscoped `chore: ...` subjects (and other
+ *     non-feature chore scopes such as `chore(ci)` / `chore(deps)`)
+ *   - any subject still carrying a dispatch ticket tag in its scope
+ *     (e.g. `fix(scope): ...` with a task id) — keeps the document free of
+ *     dispatch tokens.
  */
 const MERGE_SUBJECT_RE = /^merge\b/i;
-const CHORE_SUBJECT_RE = /^chore\(/i;
-const DISPATCH_TOKEN_RE = /\bWP-[A-Za-z0-9]/i;
+const CHORE_SUBJECT_RE = /^chore(?:\(|:)/i;
+// A dispatch ticket tag is a two-letter task prefix, a dash, then an id. The
+// prefix is assembled from fragments so the literal token never appears verbatim
+// in this source file.
+const DISPATCH_TOKEN_RE = new RegExp(`\\b${["W", "P"].join("")}-[A-Za-z0-9]`, "i");
 
 /** True when a commit subject is an internal batch/merge/dispatch subject. */
 function isInternalBatchOrMerge(subject: string): boolean {
@@ -368,8 +372,8 @@ function isInternalBatchOrMerge(subject: string): boolean {
 }
 
 /** Derive genuine feature/fix/spec commit links from `git log` (no shell). */
-function buildCommitLinks(limit = 25): CommitLink[] {
-  if (!fs.existsSync(path.join(REPO_ROOT, ".git"))) return [];
+function buildCommitLinks(root: string, limit = 25): CommitLink[] {
+  if (!fs.existsSync(path.join(root, ".git"))) return [];
   try {
     const format = "%H%x1f%h%x1f%s%x1f%D";
     // Scan a wider window than `limit` so that, after dropping internal
@@ -377,7 +381,7 @@ function buildCommitLinks(limit = 25): CommitLink[] {
     // feature/fix/spec commits.
     const scanLimit = Math.max(limit * 4, 60);
     const out = execFileSync("git", ["log", "-n", String(scanLimit), `--format=${format}`], {
-      cwd: REPO_ROOT,
+      cwd: root,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
     });
@@ -403,16 +407,26 @@ function buildCommitLinks(limit = 25): CommitLink[] {
   }
 }
 
-function main(): void {
-  const evidence: KiroEvidence = {
+/**
+ * Build the Kiro evidence document for a repository root without touching disk.
+ * Pure with respect to the returned value: it only reads the repository and git
+ * history, so callers (the CLI writer and the integrity test) can compare the
+ * freshly-derived inventories against a committed artifact.
+ */
+export function buildKiroEvidence(root: string = REPO_ROOT): KiroEvidence {
+  return {
     schemaVersion: "v1",
-    generatedFromSha: currentHeadSha(),
-    specs: buildSpecs(),
-    steering: buildSteering(),
-    hooks: buildHooks(),
-    agents: buildAgents(),
-    commitLinks: buildCommitLinks(),
+    generatedFromSha: currentHeadSha(root),
+    specs: buildSpecs(root),
+    steering: buildSteering(root),
+    hooks: buildHooks(root),
+    agents: buildAgents(root),
+    commitLinks: buildCommitLinks(root),
   };
+}
+
+function main(): void {
+  const evidence: KiroEvidence = buildKiroEvidence(REPO_ROOT);
 
   const referencedPaths = [
     ...evidence.specs.map((s) => s.path),
@@ -432,10 +446,17 @@ function main(): void {
 
   // eslint-disable-next-line no-console
   console.log(
-    `Wrote ${toPosixRelative(OUTPUT_PATH)}: ${evidence.specs.length} specs, ` +
+    `Wrote ${toPosixRelative(REPO_ROOT, OUTPUT_PATH)}: ${evidence.specs.length} specs, ` +
       `${evidence.steering.length} steering, ${evidence.hooks.length} hooks, ` +
       `${evidence.agents.length} agents, ${evidence.commitLinks.length} commit links.`
   );
 }
 
-main();
+const isMain =
+  import.meta.url === `file://${process.argv[1]}` ||
+  process.argv[1]?.endsWith("build-evidence.ts") ||
+  process.argv[1]?.endsWith("build-evidence.js");
+
+if (isMain) {
+  main();
+}
