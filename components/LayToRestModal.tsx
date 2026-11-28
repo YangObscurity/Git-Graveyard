@@ -1,6 +1,6 @@
 "use client";
 
-import React from "react";
+import React, { useCallback, useEffect, useRef } from "react";
 
 export interface LayToRestModalProps {
   /** Skeleton being laid to rest, shown in the heading for context. */
@@ -15,6 +15,31 @@ export interface LayToRestModalProps {
   onCancel: () => void;
 }
 
+/** Selector matching every control that can receive keyboard focus inside a dialog. */
+export const FOCUSABLE_SELECTOR = [
+  "a[href]",
+  "button:not([disabled])",
+  "input:not([disabled])",
+  "select:not([disabled])",
+  "textarea:not([disabled])",
+  "summary",
+  "[tabindex]:not([tabindex='-1'])",
+].join(",");
+
+/** Returns the focusable controls inside a container, in DOM order. */
+export function getFocusableElements(container: HTMLElement | null): HTMLElement[] {
+  if (!container) return [];
+  return Array.from(container.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
+    (el) => !el.hasAttribute("disabled") && el.getAttribute("aria-hidden") !== "true"
+  );
+}
+
+/** Moves focus to the first focusable control in the container, if any. */
+export function focusFirstElement(container: HTMLElement | null): void {
+  const first = getFocusableElements(container)[0];
+  if (first) first.focus();
+}
+
 /**
  * Confirmation dialog for laying a Skeleton to rest. The user must choose what
  * happens to the Skeleton's work (keep its commits or discard it) or cancel.
@@ -27,8 +52,51 @@ export function LayToRestModal({
   onDiscard,
   onCancel,
 }: LayToRestModalProps) {
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const restoreFocusRef = useRef<HTMLElement | null>(null);
+  const cancelRef = useRef(onCancel);
+  cancelRef.current = onCancel;
+
+  // Move focus into the dialog on open and return it to the previous element on close.
+  useEffect(() => {
+    restoreFocusRef.current =
+      typeof document !== "undefined" && document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
+    focusFirstElement(dialogRef.current);
+    return () => {
+      const previous = restoreFocusRef.current;
+      if (previous && typeof previous.focus === "function") previous.focus();
+    };
+  }, []);
+
+  const handleKeyDown = useCallback((event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (event.key === "Escape") {
+      event.stopPropagation();
+      cancelRef.current();
+      return;
+    }
+    if (event.key !== "Tab") return;
+    const focusable = getFocusableElements(dialogRef.current);
+    if (focusable.length === 0) {
+      event.preventDefault();
+      return;
+    }
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  }, []);
+
   return (
     <div
+      ref={dialogRef}
+      onKeyDown={handleKeyDown}
       data-testid="lay-to-rest-modal"
       data-ui-element="lay-to-rest-modal"
       role="dialog"

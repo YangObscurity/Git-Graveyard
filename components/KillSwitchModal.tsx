@@ -1,6 +1,29 @@
 "use client";
 
-import React, { useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
+
+/** Selector matching every control that can receive keyboard focus inside a dialog. */
+export const KILL_SWITCH_FOCUSABLE_SELECTOR = [
+  "a[href]",
+  "button:not([disabled])",
+  "input:not([disabled])",
+  "select:not([disabled])",
+  "textarea:not([disabled])",
+  "summary",
+  "[tabindex]:not([tabindex='-1'])",
+].join(",");
+
+/** Returns the focusable controls inside a container, in DOM order. */
+export function getKillSwitchFocusableElements(
+  container: HTMLElement | null
+): HTMLElement[] {
+  if (!container) return [];
+  return Array.from(
+    container.querySelectorAll<HTMLElement>(KILL_SWITCH_FOCUSABLE_SELECTOR)
+  ).filter(
+    (el) => !el.hasAttribute("disabled") && el.getAttribute("aria-hidden") !== "true"
+  );
+}
 
 /** The three kill-switch levels, named exactly as the Admin API expects them. */
 export type KillSwitchModalLevel = "pause_new_runs" | "stop_gracefully" | "hard_kill";
@@ -102,6 +125,60 @@ export function KillSwitchModal({
 }: KillSwitchModalProps) {
   const [selected, setSelected] = useState<KillSwitchModalLevel>("pause_new_runs");
   const [typed, setTyped] = useState<string>("");
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const restoreFocusRef = useRef<HTMLElement | null>(null);
+  const wasOpenRef = useRef(false);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+
+  // Reset the selected level and typed phrase every time the modal opens so a
+  // previously armed confirmation never survives a close and reopen.
+  useEffect(() => {
+    if (open && !wasOpenRef.current) {
+      setSelected("pause_new_runs");
+      setTyped("");
+    }
+    wasOpenRef.current = open;
+  }, [open]);
+
+  // W3C dialog pattern: move focus into the dialog on open, trap Tab/Shift+Tab,
+  // and return focus to the previously focused element when it closes.
+  useEffect(() => {
+    if (!open) return;
+    restoreFocusRef.current =
+      typeof document !== "undefined" && document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
+    const first = getKillSwitchFocusableElements(dialogRef.current)[0];
+    if (first) first.focus();
+    return () => {
+      const previous = restoreFocusRef.current;
+      if (previous && typeof previous.focus === "function") previous.focus();
+    };
+  }, [open]);
+
+  const handleKeyDown = useCallback((event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (event.key === "Escape") {
+      event.stopPropagation();
+      if (onCloseRef.current) onCloseRef.current();
+      return;
+    }
+    if (event.key !== "Tab") return;
+    const focusable = getKillSwitchFocusableElements(dialogRef.current);
+    if (focusable.length === 0) {
+      event.preventDefault();
+      return;
+    }
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  }, []);
 
   if (!open) {
     return null;
@@ -110,20 +187,30 @@ export function KillSwitchModal({
   const phrase = killSwitchConfirmationPhrase(selected, activeRunCount, queuedRunCount);
   const armed = typed.trim() === phrase;
 
+  const handleConfirm = () => {
+    if (!armed) return;
+    if (onConfirm) onConfirm(selected, phrase);
+    // Reset after a successful execute so the modal cannot stay armed.
+    setSelected("pause_new_runs");
+    setTyped("");
+  };
+
   return (
     <div
+      ref={dialogRef}
+      onKeyDown={handleKeyDown}
       data-testid="kill-switch-modal"
       data-ui-element="kill-switch-modal"
       data-ui-state="open"
       role="dialog"
       aria-modal="true"
-      aria-label="Kill switch"
+      aria-labelledby="kill-switch-title"
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 font-mono"
     >
       <div className="crypt-panel-engraved w-full max-w-2xl p-5 space-y-4 max-h-[90vh] overflow-auto">
         <div className="flex items-start justify-between gap-3">
           <div>
-            <h2 className="text-lg font-bold text-bone">Kill switch</h2>
+            <h2 id="kill-switch-title" className="text-lg font-bold text-bone">Kill switch</h2>
             <p className="text-xs text-ash mt-1">
               Every level halts new admission. Each level states how many active and
               queued runs it affects before it acts.
@@ -209,10 +296,7 @@ export function KillSwitchModal({
               type="button"
               data-testid="kill-switch-confirm"
               disabled={!armed}
-              onClick={() => {
-                if (!armed) return;
-                if (onConfirm) onConfirm(selected, phrase);
-              }}
+              onClick={handleConfirm}
               className="crypt-btn-primary px-3 py-1.5 rounded text-xs disabled:opacity-50 disabled:cursor-not-allowed"
             >
               Execute {KILL_SWITCH_LEVEL_COPY[selected].title}

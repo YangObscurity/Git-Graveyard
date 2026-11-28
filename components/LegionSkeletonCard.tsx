@@ -85,6 +85,35 @@ function resolveUiState(state: string): CanonicalSkeletonUiState {
   return "working";
 }
 
+/**
+ * The message shown when an interrupt confirmation can no longer be trusted
+ * because the command it was opened for has already finished.
+ */
+export const INTERRUPT_STALE_MESSAGE =
+  "The command finished before the interrupt was sent.";
+
+export interface InterruptConfirmBinding {
+  /** Tool call id captured when the confirmation opened, or null if none. */
+  toolCallId: string | null;
+}
+
+/**
+ * Decides whether an open interrupt confirmation still refers to the command
+ * the operator meant to stop. It is stale when the run has ended, the Skeleton
+ * has no running tool call, or the current tool call id differs from the one
+ * captured when the confirmation opened.
+ */
+export function interruptConfirmStillValid(
+  binding: InterruptConfirmBinding | null,
+  currentToolCallId: string | null | undefined,
+  runDone: boolean
+): boolean {
+  if (runDone) return false;
+  if (binding === null) return false;
+  if (currentToolCallId === null || currentToolCallId === undefined) return false;
+  return binding.toolCallId === currentToolCallId;
+}
+
 export function LegionSkeletonCard({
   skeleton,
   runDone = false,
@@ -97,6 +126,10 @@ export function LegionSkeletonCard({
 }: LegionSkeletonCardProps) {
   const [showLayToRestConfirm, setShowLayToRestConfirm] = useState(false);
   const [showInterruptConfirm, setShowInterruptConfirm] = useState(false);
+  // The tool call id captured when the interrupt confirmation was opened, so a
+  // confirmation can never be applied to a different command than the one shown.
+  const [interruptConfirmBinding, setInterruptConfirmBinding] =
+    useState<InterruptConfirmBinding | null>(null);
   // The user writes the instruction or review focus; nothing is sent without text.
   const [composerOpen, setComposerOpen] = useState(false);
   const [composerText, setComposerText] = useState("");
@@ -194,6 +227,18 @@ export function LegionSkeletonCard({
     }, 1000);
     return () => clearInterval(timer);
   }, [activeToolStartedAt]);
+
+  // Close the interrupt confirmation automatically when it no longer refers to
+  // the command the operator meant to stop: the run ended, the Skeleton has no
+  // running tool call, or the tool call id changed since the confirmation opened.
+  useEffect(() => {
+    if (!showInterruptConfirm) return;
+    const currentToolCallId = skeleton.currentToolCall?.toolCallId ?? null;
+    if (!interruptConfirmStillValid(interruptConfirmBinding, currentToolCallId, runDone)) {
+      setShowInterruptConfirm(false);
+      setInterruptConfirmBinding(null);
+    }
+  }, [showInterruptConfirm, interruptConfirmBinding, skeleton.currentToolCall, runDone]);
 
   const toolRunningSeconds =
     activeToolStartedAt !== null && clientNowMs !== null
@@ -465,10 +510,20 @@ export function LegionSkeletonCard({
         <SkeletonInterruptConfirm
           skeletonId={skeleton.skeletonId}
           onConfirm={() => {
+            const currentToolCallId = skeleton.currentToolCall?.toolCallId ?? null;
+            if (!interruptConfirmStillValid(interruptConfirmBinding, currentToolCallId, runDone)) {
+              setShowInterruptConfirm(false);
+              setInterruptConfirmBinding(null);
+              return;
+            }
             setShowInterruptConfirm(false);
+            setInterruptConfirmBinding(null);
             onInterrupt?.(skeleton.skeletonId);
           }}
-          onCancel={() => setShowInterruptConfirm(false)}
+          onCancel={() => {
+            setShowInterruptConfirm(false);
+            setInterruptConfirmBinding(null);
+          }}
         />
       )}
 
@@ -584,7 +639,12 @@ export function LegionSkeletonCard({
 
           <button
             type="button"
-            onClick={() => setShowInterruptConfirm(true)}
+            onClick={() => {
+              setInterruptConfirmBinding({
+                toolCallId: skeleton.currentToolCall?.toolCallId ?? null,
+              });
+              setShowInterruptConfirm(true);
+            }}
             disabled={interruptDisabled}
             title={interruptDisabledReason}
             onFocus={() => {
