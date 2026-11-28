@@ -5,6 +5,12 @@ import {
   getAdminSecret,
   requireAdminAuth,
 } from "@/lib/admin/admin-session";
+import {
+  type AuditValidationError,
+  isAuditDocument,
+  validateAuditDocument,
+} from "@/lib/audit/audit-schema";
+import { evaluatePromotionGate } from "@/lib/audit/promotion-gate";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -13,6 +19,12 @@ interface PromotionAuditBody {
   status?: unknown;
   actor?: unknown;
   items?: unknown;
+  /**
+   * Optional structured audit document (G1/G3). When present it is validated against the
+   * promotion-gate schema before the record is signed and stored; legacy callers that only
+   * send `status` / `items` keep the exact previous behaviour.
+   */
+  audit?: unknown;
   signature?: unknown;
 }
 
@@ -169,7 +181,13 @@ export async function GET(request: Request): Promise<Response> {
       }
     }
   }
-  return Response.json({ ok: true, record, verified, present: record !== null });
+  return Response.json({
+    ok: true,
+    record,
+    verified,
+    present: record !== null,
+    gate: evaluatePromotionGate({ record, secret }),
+  });
 }
 
 export async function POST(request: Request): Promise<Response> {
@@ -189,9 +207,41 @@ export async function POST(request: Request): Promise<Response> {
     : "signed";
   const actor = auth.actor.id;
   const signedAt = Date.now();
-  // Strip prototype-pollution keys before the items are signed AND stored, so neither the signature
-  // nor the persisted record can carry `__proto__` / `constructor` / `prototype`.
-  const items = sanitizeValue(body.items ?? null);
+
+  // When a structured audit document is supplied, validate it against the promotion-gate
+  // schema BEFORE signing. An unsigned / incomplete / failing audit is rejected cleanly and
+  // nothing is persisted. Legacy callers that omit `audit` keep the exact previous behaviour.
+  let items: unknown;
+  if (body.audit !== undefined) {
+    const validation = validateAuditDocument(body.audit);
+    if (!validation.ok) {
+      const errors: AuditValidationError[] = validation.errors;
+      return Response.json(
+        { ok: false, error: "audit_validation_failed", errors },
+        { status: 400 }
+      );
+    }
+    if (!isAuditDocument(body.audit)) {
+      return Response.json(
+        {
+          ok: false,
+          error: "audit_validation_failed",
+          errors: [
+            {
+              code: "INVALID_DOCUMENT",
+              message: "Structured audit must be a valid G1/G3 audit document.",
+            },
+          ],
+        },
+        { status: 400 }
+      );
+    }
+    items = sanitizeValue(body.audit);
+  } else {
+    // Strip prototype-pollution keys before the items are signed AND stored, so neither the
+    // signature nor the persisted record can carry `__proto__` / `constructor` / `prototype`.
+    items = sanitizeValue(body.items ?? null);
+  }
   const canonical = canonicalize({ actor, signedAt, status, items });
   const signature = sign(secret, canonical);
 

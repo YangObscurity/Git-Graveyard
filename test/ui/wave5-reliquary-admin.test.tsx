@@ -27,6 +27,7 @@ import type { EvidenceBundle, KiroEvidenceDoc } from "@/lib/evidence/evidence-se
 import {
   executeKillSwitch,
   getPromotionAudit,
+  isPromotionAuditPassed,
   listAdminRuns,
   listInviteCodes,
   runAdminAction,
@@ -817,4 +818,25 @@ describe("Admin API wiring: the dashboard loads the admin run list", () => {
     assert.ok(/checked(=|\s|>)/.test(checkbox[0]), "the server reviewed flag must pre-check the box");
   });
 });
+});
+describe("Admin production lock reads the promotion gate, not the signature alone", () => {
+  it("treats a signed record without a passing G1 audit as not passed", () => {
+    assert.equal(isPromotionAuditPassed({ present: true, verified: true }), false);
+    assert.equal(
+      isPromotionAuditPassed({ present: true, verified: true, gate: { g1Passed: false } }),
+      false
+    );
+  });
+
+  it("passes only when the record is present, signed and the gate reports a passing G1 audit", () => {
+    assert.equal(
+      isPromotionAuditPassed({ present: true, verified: true, gate: { g1Passed: true } }),
+      true
+    );
+    assert.equal(
+      isPromotionAuditPassed({ present: true, verified: false, gate: { g1Passed: true } }),
+      false
+    );
+    assert.equal(isPromotionAuditPassed(null), false);
+  });
 });

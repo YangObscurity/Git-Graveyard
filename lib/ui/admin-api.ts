@@ -44,7 +44,10 @@ export interface AdminRunData {
 
 export interface AdminPromotionAuditData {
   present: boolean;
+  /** The stored record's signature is valid. This alone does not mean the audit passed. */
   verified: boolean;
+  /** Promotion gate evaluation; `g1Passed` is true only for a valid, passing G1 audit document. */
+  gate?: { g1Passed?: boolean } | null;
   actor?: string | null;
   signedAt?: number | null;
   record?: unknown;
@@ -176,6 +179,19 @@ export function listAdminRuns(): Promise<AdminApiResult<AdminRunData[]>> {
 }
 
 /** GET /api/admin/promotion-audit — the signed pre-promotion audit record. */
+/**
+ * Whether the promotion audit counts as passed for the production lock. A valid
+ * signature is not enough: the promotion gate must also report a passing G1
+ * (pre-promotion) audit document. Anything missing fails closed.
+ */
+export function isPromotionAuditPassed(
+  data: Pick<AdminPromotionAuditData, "present" | "verified" | "gate"> | null | undefined
+): boolean {
+  return (
+    data?.present === true && data.verified === true && data.gate?.g1Passed === true
+  );
+}
+
 export function getPromotionAudit(): Promise<AdminApiResult<AdminPromotionAuditData>> {
   return request<AdminPromotionAuditData>("/api/admin/promotion-audit");
 }
