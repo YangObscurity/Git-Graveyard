@@ -20,6 +20,7 @@ import {
 import { resetFifoQueueRegistry, resolveFifoQueue } from "@/lib/admission/fifo-queue";
 import {
   KillSwitchService,
+  killSwitchConfirmationPhrase,
   resetKillSwitchRegistry,
   type KillSwitchLevel,
 } from "@/lib/admin/kill-switch";
@@ -106,6 +107,19 @@ function jsonRequest(
 function cookieFrom(response: Response): string {
   const setCookie = response.headers.get("set-cookie") ?? "";
   return setCookie.split(";")[0].trim();
+}
+
+/**
+ * Builds the confirmation phrase the kill-switch route now requires, computed from the current
+ * living runs in the shared store exactly as the route's preview does (active = non-queued,
+ * non-done; queued = queued). Used to keep every existing execution test in sync with the
+ * server-side phrase check.
+ */
+function confirmPhrase(level: string): string {
+  const living = stores.runStore.getLivingRuns();
+  const queued = living.filter((run) => run.phase === "queued").length;
+  const active = living.filter((run) => run.phase !== "queued" && run.phase !== "done").length;
+  return killSwitchConfirmationPhrase(level as KillSwitchLevel, active, queued);
 }
 
 beforeEach(() => {
@@ -831,7 +845,7 @@ describe("Kill switch (Task 22.5)", () => {
       attach(
         jsonRequest(
           "http://test/api/admin/kill-switch",
-          { level: "hard_kill", confirmed: true, reason: "test" },
+          { level: "hard_kill", confirmed: true, confirm: confirmPhrase("hard_kill"), reason: "test" },
           { method: "POST", headers: adminHeaders() }
         )
       )
@@ -846,6 +860,56 @@ describe("Kill switch (Task 22.5)", () => {
     assert.ok(stores.eventStore.getEvents("queued-2", { kind: "admin.kill" }).length >= 1);
   });
 
+  it("rejects a stale confirmation phrase with 409 and does not execute", async () => {
+    stores.runStore.createRun({
+      runId: "active-stale",
+      url: "https://github.com/owner/active-stale",
+      sha: "c".repeat(40),
+      phase: "legion",
+    });
+    const res = await killPost(
+      attach(
+        jsonRequest(
+          "http://test/api/admin/kill-switch",
+          { level: "hard_kill", confirmed: true, confirm: "KILL 0 ACTIVE 0 QUEUED" },
+          { method: "POST", headers: adminHeaders() }
+        )
+      )
+    );
+    assert.equal(res.status, 409);
+    const body = (await res.json()) as { ok?: boolean; error?: string; expected?: string };
+    assert.equal(body.ok, false);
+    assert.equal(body.error, "confirmation_mismatch");
+    // The expected phrase reflects the one active run the stale phrase understated.
+    assert.equal(body.expected, "KILL 1 ACTIVE 0 QUEUED");
+    // Nothing executed: the run is untouched and no admin.kill event was recorded.
+    assert.equal(stores.runStore.getRun("active-stale")?.outcome, null);
+    assert.equal(stores.runStore.getRun("active-stale")?.phase, "legion");
+    assert.equal(stores.eventStore.getEvents("active-stale", { kind: "admin.kill" }).length, 0);
+  });
+
+  it("accepts the current confirmation phrase and executes", async () => {
+    stores.runStore.createRun({
+      runId: "active-current",
+      url: "https://github.com/owner/active-current",
+      sha: "d".repeat(40),
+      phase: "legion",
+    });
+    const res = await killPost(
+      attach(
+        jsonRequest(
+          "http://test/api/admin/kill-switch",
+          { level: "hard_kill", confirmed: true, confirm: confirmPhrase("hard_kill") },
+          { method: "POST", headers: adminHeaders() }
+        )
+      )
+    );
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as { result: { executed: boolean } };
+    assert.equal(body.result.executed, true);
+    assert.equal(stores.runStore.getRun("active-current")?.outcome, "killed");
+  });
+
   it("pauses new runs while preserving the queue", async () => {
     const queue = resolveFifoQueue({ eventStore: stores.eventStore, runStore: stores.runStore });
     queue.enqueue({ runId: "queued-keep" });
@@ -856,7 +920,7 @@ describe("Kill switch (Task 22.5)", () => {
       attach(
         jsonRequest(
           "http://test/api/admin/kill-switch",
-          { level: "pause_new_runs", confirmed: true },
+          { level: "pause_new_runs", confirmed: true, confirm: confirmPhrase("pause_new_runs") },
           { method: "POST", headers: adminHeaders() }
         )
       )
@@ -876,7 +940,7 @@ describe("Kill switch (Task 22.5)", () => {
       attach(
         jsonRequest(
           "http://test/api/admin/kill-switch",
-          { level: "pause_new_runs", confirmed: true },
+          { level: "pause_new_runs", confirmed: true, confirm: confirmPhrase("pause_new_runs") },
           { method: "POST", headers: adminHeaders() }
         )
       )
@@ -925,7 +989,7 @@ describe("Kill switch (Task 22.5)", () => {
       attach(
         jsonRequest(
           "http://test/api/admin/kill-switch",
-          { level: "pause_new_runs", confirmed: true },
+          { level: "pause_new_runs", confirmed: true, confirm: confirmPhrase("pause_new_runs") },
           { method: "POST", headers: adminHeaders() }
         )
       )
@@ -949,7 +1013,7 @@ describe("Kill switch (Task 22.5)", () => {
       attach(
         jsonRequest(
           "http://test/api/admin/kill-switch",
-          { level: "pause_new_runs", confirmed: true },
+          { level: "pause_new_runs", confirmed: true, confirm: confirmPhrase("pause_new_runs") },
           { method: "POST", headers: adminHeaders() }
         )
       )
@@ -978,7 +1042,7 @@ describe("Kill switch (Task 22.5)", () => {
         attach(
           jsonRequest(
             "http://test/api/admin/kill-switch",
-            { level: "pause_new_runs", confirmed: true },
+            { level: "pause_new_runs", confirmed: true, confirm: confirmPhrase("pause_new_runs") },
             { method: "POST", headers: adminHeaders() }
           )
         )
@@ -1013,7 +1077,7 @@ describe("Kill switch (Task 22.5)", () => {
         attach(
           jsonRequest(
             "http://test/api/admin/kill-switch",
-            { level: "pause_new_runs", confirmed: true },
+            { level: "pause_new_runs", confirmed: true, confirm: confirmPhrase("pause_new_runs") },
             { method: "POST", headers: adminHeaders() }
           )
         )
@@ -1045,7 +1109,7 @@ describe("Kill switch (Task 22.5)", () => {
         attach(
           jsonRequest(
             "http://test/api/admin/kill-switch",
-            { level: "pause_new_runs", confirmed: true },
+            { level: "pause_new_runs", confirmed: true, confirm: confirmPhrase("pause_new_runs") },
             { method: "POST", headers: adminHeaders() }
           )
         )
@@ -1066,7 +1130,7 @@ describe("Kill switch (Task 22.5)", () => {
       attach(
         jsonRequest(
           "http://test/api/admin/kill-switch",
-          { level: "pause_new_runs", confirmed: true },
+          { level: "pause_new_runs", confirmed: true, confirm: confirmPhrase("pause_new_runs") },
           { method: "POST", headers: adminHeaders() }
         )
       )
@@ -1090,7 +1154,7 @@ describe("Kill switch (Task 22.5)", () => {
       attach(
         jsonRequest(
           "http://test/api/admin/kill-switch",
-          { level: "hard_kill", confirmed: true },
+          { level: "hard_kill", confirmed: true, confirm: confirmPhrase("hard_kill") },
           { method: "POST", headers: adminHeaders() }
         )
       )
@@ -1877,7 +1941,7 @@ describe("Kill switch live runtime wiring (Task 22.5)", () => {
         attach(
           jsonRequest(
             "http://test/api/admin/kill-switch",
-            { level, confirmed: true, reason: "drill" },
+            { level, confirmed: true, confirm: confirmPhrase(level), reason: "drill" },
             { method: "POST", headers: adminHeaders() }
           )
         )
@@ -1960,7 +2024,7 @@ function killPostLevel(level: string): Promise<Response> {
     attach(
       jsonRequest(
         KILL_SWITCH_URL,
-        { level, confirmed: true },
+        { level, confirmed: true, confirm: confirmPhrase(level) },
         { method: "POST", headers: adminHeaders() }
       )
     )
